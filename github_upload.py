@@ -14,7 +14,7 @@ import os
 # ══════════════════════════════════════════════════════
 #  PREENCHA AQUI
 # ══════════════════════════════════════════════════════
-GITHUB_TOKEN = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIMgWoNUFlpeZIXaWZ6shz9jMavWVnv7TgwL/NrQrR1l3 key-1781964563734"
+GITHUB_TOKEN = "SvrOKt5R6Dlpj47fKaRnIO4NmE70Ej4aS8j4Hs1uaAU"
 # Como gerar: https://github.com/settings/tokens/new
 #   -> Note: "railway-upload"
 #   -> Expiration: 7 days (ou o que preferir)
