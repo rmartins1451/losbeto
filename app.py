@@ -447,32 +447,35 @@ class BinanceBSCVerifier:
         price_float = float(PRICES[endpoint])
         price_wei   = int(price_float * 10 ** TOKEN_DEC)
 
+        # "resource" deve ser a URL absoluta do recurso, conforme a spec x402
+        # (clientes/scanners resolvem o endpoint a partir desse campo).
+        base_url      = request.host_url.rstrip("/")
+        resource_url  = f"{base_url}{endpoint}"
+
         return {
-            "x402Version": "1",
+            "x402Version": 1,
             "error":       "Payment Required",
             "accepts": [{
                 "scheme":            "exact",
                 "network":           "bsc" if NETWORK_MODE == "mainnet" else "bsc-testnet",
-                "chainId":           BSC_CHAIN_ID,
                 "maxAmountRequired": str(price_wei),
-                "resource":          endpoint,
+                "resource":          resource_url,
                 "description":       ENDPOINT_DESC.get(endpoint, "NexusAI API"),
                 "mimeType":          "application/json",
                 "payTo":             BINANCE_WALLET,
                 "maxTimeoutSeconds": 300,
                 "asset":             PAYMENT_TOKEN_CA,
+                "outputSchema":      None,
                 "extra": {
-                    "token":       PAYMENT_TOKEN,
-                    "decimals":    TOKEN_DEC,
-                    "facilitator": "binance-x402",
-                    "network":     "BNB Smart Chain (BEP-20)",
-                    "wallet_hint": "Use seu endereço BEP-20 — BNB Smart Chain",
+                    "name":    PAYMENT_TOKEN,
+                    "version": "1",
                 },
             }],
         }
 
     def verify(self, payment_header: str, endpoint: str) -> tuple:
         """
+
         Verifica o pagamento recebido no header X-Payment.
 
         Estratégia em 4 camadas:
@@ -620,6 +623,7 @@ def payment_required(endpoint: str):
                 payload              = verifier.build_402_payload(endpoint)
                 resp                 = jsonify(payload)
                 resp.status_code     = 402
+                resp.headers["WWW-Authenticate"] = "x402"
                 resp.headers["X-ACCEPTS-PAYMENT"] = "x402"
                 return resp
 
@@ -632,6 +636,7 @@ def payment_required(endpoint: str):
                 payload["x402Debug"] = reason
                 resp                 = jsonify(payload)
                 resp.status_code     = 402
+                resp.headers["WWW-Authenticate"] = "x402"
                 return resp
 
             g.endpoint_price = price
@@ -1120,7 +1125,7 @@ def openapi_spec():
             "title":       "NexusAI Crypto Intelligence API",
             "description": "Análise autônoma de mercado cripto via IA. Pagamento via x402 (BNB Smart Chain / USDT BEP-20).",
             "version":     APP_VERSION,
-            "contact":     {"url": "https://x402scan.com"},
+            "contact":     {"url": "https://x402scan.com", "email": os.getenv("CONTACT_EMAIL", "contato@nexusai-x402.app")},
         },
         "servers":    [{"url": base_url}],
         "paths":      paths,
@@ -1193,6 +1198,20 @@ def version():
         "port_env":      os.getenv("PORT", "não definido pelo host"),
         "uptime_s":      int(time.time() - _stats["start_time"]),
     })
+
+
+@app.route("/favicon.ico")
+def favicon():
+    """Ícone simples para exibição no x402scan e navegadores."""
+    svg = (
+        '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">'
+        '<rect width="64" height="64" rx="12" fill="#F0B90B"/>'
+        '<text x="32" y="42" font-size="30" font-family="Arial, sans-serif" '
+        'font-weight="bold" fill="#1E2329" text-anchor="middle">N</text>'
+        '</svg>'
+    )
+    from flask import Response
+    return Response(svg, mimetype="image/svg+xml")
 
 
 @app.route("/health")
