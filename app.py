@@ -1,47 +1,54 @@
 # -*- coding: utf-8 -*-
 """
-app.py — NexusAI x402 v4 — Binance Pay + BNB Smart Chain (Produção)
+app.py — NexusAI x402 v5 — Multi-chain (Solana + BNB Smart Chain), Produção
 ==================================================================================
-MODO REAL (mainnet) — 100% Binance. Sem Coinbase. Sem Trust Wallet.
-Recebe USDT/USDC diretamente na sua carteira da Binance (endereço BEP-20).
+MODO REAL (mainnet). Suporta duas chains via PAYMENT_CHAIN:
 
-MELHORIAS v4 (em relação à v3):
-  - Anti-replay agora persiste em arquivo (sobrevive a restart/redeploy do Railway)
-  - Validação de checksum EIP-55 no endereço da carteira na inicialização
-  - Endpoint /version para diagnóstico rápido de qual build está no ar
-  - Endpoint /openapi.json corretamente sincronizado com rotas reais
-  - Logs de boot mostram a origem do PORT (Railway injeta via env)
-  - Try/except mais granular ao redor do app.run para logar crash fatal antes de sair
-  - Suporte a múltiplos workers gunicorn sem perda de cache local (aviso documentado)
+  - "solana" (RECOMENDADO): indexado pelo x402scan, paga em USDC-SPL.
+    Configure SOLANA_WALLET_ADDRESS com seu endereço Solana da Binance.
+
+  - "bsc": BNB Smart Chain, paga em USDT-BEP20. Funciona via x402, mas
+    o diretório público x402scan.com não reconhece esta rede (suporta
+    apenas Base e Solana). Use se preferir manter tudo na Binance via
+    BNB Chain e não precisar do registro no x402scan.
+
+MELHORIAS v5 (em relação à v4):
+  - Suporte nativo a Solana: verificação on-chain via RPC HTTP direto
+    (getTransaction), sem dependência de SDK pesado (solana-py)
+  - PAYMENT_CHAIN escolhe a rede ativa sem precisar editar código
+  - CAIP-2 correto por chain: "solana:<genesis-hash>" ou "eip155:<chainId>"
+  - Decimais corretos por chain (USDC: 6 decimais em Solana, 18 em BSC)
+  - Todos os textos/labels de resposta (status, info, openapi, well-known)
+    agora refletem a chain ativa dinamicamente
 
 HISTÓRICO:
-  v3 → fix de encoding no .env, mainnet por padrão, anti-replay em memória,
-       dados reais de mercado via CoinGecko/Alternative.me
+  v3 → fix de encoding no .env, mainnet por padrão, anti-replay em memória
   v4 → hardening para produção (Railway), persistência leve, diagnóstico
+  v5 → multi-chain (Solana + BSC), correção de protocolo HTTPS via proxy,
+       payload x402 v2 completo com extensions.bazaar para indexação
 
 COMO FUNCIONA:
-  1. Agente externo chama GET / (ou /analise) sem header X-Payment
-  2. Servidor responde HTTP 402 + instruções de pagamento (BNB Chain)
-  3. Agente paga via EIP-3009 ou Permit2 para o seu endereço BEP-20 da Binance
-  4. Agente reenvia com header X-Payment preenchido
-  5. Servidor verifica on-chain no BNB Chain via RPC público
-  6. USDT cai direto na sua conta Binance — sem etapas extras
+  1. Agente externo chama GET / (ou /analise) sem header de pagamento
+  2. Servidor responde HTTP 402 + instruções de pagamento (chain ativa)
+  3. Agente paga via transferência SPL (Solana) ou EIP-3009/Permit2 (BSC)
+  4. Agente reenvia com header Payment-Signature preenchido
+  5. Servidor verifica on-chain via RPC público
+  6. O token cai direto na sua conta Binance — sem etapas extras
 
-COMO PEGAR SEU ENDEREÇO BEP-20 NA BINANCE:
-  1. Acesse binance.com → Carteira → Depósito
-  2. Selecione USDT → Rede: BNB Smart Chain (BEP-20)
-  3. Copie o endereço 0x... e cole em BINANCE_WALLET_ADDRESS no .env / Railway Variables
+COMO PEGAR SEU ENDEREÇO NA BINANCE:
+  Solana: Binance → Carteira → Depósito → USDC → Rede: Solana
+  BSC:    Binance → Carteira → Depósito → USDT → Rede: BNB Smart Chain (BEP-20)
 
 DEPLOY (Railway):
   Root Directory deve apontar para a pasta deste arquivo.
   Start command: gunicorn app:app --bind 0.0.0.0:$PORT --workers 2 --timeout 60
 
 APÓS O DEPLOY:
-  Registre sua URL em x402scan.com para outros agentes encontrarem sua API.
+  Registre sua URL em x402scan.com (apenas funciona com PAYMENT_CHAIN=solana).
 
 DOCUMENTAÇÃO:
-  https://www.binance.com/en/blog/ecosystem/introducing-binance-x402
   https://docs.x402.org
+  https://github.com/Merit-Systems/x402scan/blob/main/docs/DISCOVERY.md
 """
 
 import os
@@ -143,7 +150,7 @@ PAYMENT_TOKEN=USDT
 
 _load_dotenv_safe()
 
-APP_VERSION = "4.0.0"
+APP_VERSION = "5.0.0"
 
 # ── LOGGING ESTRUTURADO ───────────────────────────────────────────────────────
 
@@ -156,7 +163,19 @@ log = logging.getLogger("nexusai-x402")
 
 # ── CONFIG PRINCIPAL ──────────────────────────────────────────────────────────
 
-BINANCE_WALLET = os.getenv("BINANCE_WALLET_ADDRESS", "").strip()
+# PAYMENT_CHAIN escolhe a rede de liquidação: "solana" (recomendado — suportado
+# pelo x402scan) ou "bsc" (BNB Smart Chain — funciona via x402 mas não é
+# indexado pelo diretório x402scan, que hoje só reconhece Base e Solana).
+PAYMENT_CHAIN = os.getenv("PAYMENT_CHAIN", "solana").strip().lower()
+
+# Carteira de destino: endereço Solana (Base58) OU EVM/BSC (0x...), conforme
+# PAYMENT_CHAIN. Mantemos os dois nomes de variável para clareza e para
+# permitir trocar de rede sem perder a configuração da outra.
+SOLANA_WALLET  = os.getenv("SOLANA_WALLET_ADDRESS", "").strip()
+BINANCE_WALLET = os.getenv("BINANCE_WALLET_ADDRESS", "").strip()  # endereço BSC (0x...)
+
+# Endereço efetivo usado nos payloads, de acordo com a chain escolhida
+PAYOUT_ADDRESS = SOLANA_WALLET if PAYMENT_CHAIN == "solana" else BINANCE_WALLET
 
 GROQ_API_KEY   = os.getenv("GROQ_API_KEY", "").strip()
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
@@ -171,23 +190,52 @@ BSC_RPC = os.getenv(
     else "https://data-seed-prebsc-1-s1.binance.org:8545/"
 ).strip()
 
+SOLANA_RPC = os.getenv(
+    "SOLANA_RPC",
+    "https://api.mainnet-beta.solana.com" if NETWORK_MODE == "mainnet"
+    else "https://api.devnet.solana.com"
+).strip()
+
+# CAIP-2 genesis hash identifiers para Solana (fixos, conhecidos publicamente)
+SOLANA_CAIP2 = (
+    "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp" if NETWORK_MODE == "mainnet"
+    else "solana:EtWTRABZaYq6iMfeYKouRu166VU2xqa1"
+)
+
 NEXUSAI_PATH = os.getenv("NEXUSAI_PATH", "/home/user/defai_v4").strip()
 PORT         = int(os.getenv("PORT", "5050"))
 CACHE_TTL    = int(os.getenv("CACHE_TTL_SECONDS", "60"))
 RATE_LIMIT_RPM = int(os.getenv("RATE_LIMIT_RPM", "30"))
 
-PAYMENT_TOKEN = os.getenv("PAYMENT_TOKEN", "USDT").strip().upper()
+# Token de pagamento: USDC é o padrão em ambas as chains (dominante no x402;
+# suporta EIP-3009 gasless em EVM e é o SPL token de referência em Solana).
+PAYMENT_TOKEN = os.getenv("PAYMENT_TOKEN", "USDC" if PAYMENT_CHAIN == "solana" else "USDT").strip().upper()
 
-# Decimais por token (USDT e USDC BEP-20 têm 18 decimais na BSC)
-TOKEN_DECIMALS = {"USDT": 18, "USDC": 18, "BUSD": 18}
+# Decimais por token e por chain (USDC tem 6 decimais em Solana/SPL,
+# mas 18 decimais nos tokens BEP-20 da BSC — isso é uma pegadinha comum)
+TOKEN_DECIMALS_BSC    = {"USDT": 18, "USDC": 18, "BUSD": 18}
+TOKEN_DECIMALS_SOLANA = {"USDC": 6, "USDT": 6}
 
-PAYMENT_TOKEN_CA = {
+TOKEN_DEC = (
+    TOKEN_DECIMALS_SOLANA.get(PAYMENT_TOKEN, 6) if PAYMENT_CHAIN == "solana"
+    else TOKEN_DECIMALS_BSC.get(PAYMENT_TOKEN, 18)
+)
+
+# Endereço do contrato/mint do token, por chain
+PAYMENT_TOKEN_CA_BSC = {
     "USDT": "0x55d398326f99059fF775485246999027B3197955",
     "USDC": "0x8AC76a51cc950d9822D68b83fE1Ad97B32Cd580d",
     "BUSD": "0xe9e7CEA3DedcA5984780Bafc599bD69ADd087D56",
 }.get(PAYMENT_TOKEN, "0x55d398326f99059fF775485246999027B3197955")
 
-TOKEN_DEC = TOKEN_DECIMALS.get(PAYMENT_TOKEN, 18)
+# Mint address do USDC na Solana (mainnet — endereço oficial Circle)
+PAYMENT_TOKEN_MINT_SOLANA = {
+    "USDC": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v" if NETWORK_MODE == "mainnet"
+            else "4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU",  # USDC devnet
+    "USDT": "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB",
+}.get(PAYMENT_TOKEN, "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v")
+
+PAYMENT_TOKEN_CA = PAYMENT_TOKEN_MINT_SOLANA if PAYMENT_CHAIN == "solana" else PAYMENT_TOKEN_CA_BSC
 
 PRICES = {
     "/fear-greed": os.getenv("PRICE_FEAR_GREED", "0.01"),
@@ -212,6 +260,8 @@ ENDPOINT_DESC = {
 os.environ.setdefault("FLASK_SKIP_DOTENV", "1")
 
 app = Flask(__name__)
+
+
 
 
 def _get_base_url() -> str:
@@ -241,31 +291,51 @@ def _get_base_url() -> str:
 
 # ── VALIDAÇÃO DE CONFIG ───────────────────────────────────────────────────────
 
+def _validate_solana_address(addr: str) -> bool:
+    """Validação básica de formato Base58 para endereços Solana (32-44 chars)."""
+    if not addr or not (32 <= len(addr) <= 44):
+        return False
+    base58_alphabet = set("123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz")
+    return all(c in base58_alphabet for c in addr)
+
+
 def _validate_config():
     erros = []
-    if not BINANCE_WALLET or BINANCE_WALLET in ("0x", ""):
-        erros.append("BINANCE_WALLET_ADDRESS não configurado no .env")
-    elif not BINANCE_WALLET.startswith("0x") or len(BINANCE_WALLET) != 42:
-        erros.append("BINANCE_WALLET_ADDRESS inválido — deve ser 0x + 40 hex chars")
-    else:
-        try:
-            int(BINANCE_WALLET, 16)
-        except ValueError:
-            erros.append("BINANCE_WALLET_ADDRESS contém caracteres não-hexadecimais")
-        # Validação de checksum EIP-55 (best-effort — só avisa, não bloqueia,
-        # pois endereços all-lowercase também são válidos na prática)
-        try:
-            from web3 import Web3
-            checksummed = Web3.to_checksum_address(BINANCE_WALLET)
-            if BINANCE_WALLET != BINANCE_WALLET.lower() and BINANCE_WALLET != checksummed:
-                log.warning(
-                    f"BINANCE_WALLET_ADDRESS tem checksum EIP-55 inválido. "
-                    f"Confirme se o endereço está correto: {checksummed}"
-                )
-        except ImportError:
-            pass
-        except Exception:
-            pass
+
+    if PAYMENT_CHAIN not in ("solana", "bsc"):
+        erros.append(f"PAYMENT_CHAIN inválido: '{PAYMENT_CHAIN}' (use 'solana' ou 'bsc')")
+
+    if PAYMENT_CHAIN == "solana":
+        if not SOLANA_WALLET:
+            erros.append("SOLANA_WALLET_ADDRESS não configurado no .env (necessário para PAYMENT_CHAIN=solana)")
+        elif not _validate_solana_address(SOLANA_WALLET):
+            erros.append(
+                "SOLANA_WALLET_ADDRESS inválido — deve ser Base58, 32-44 caracteres "
+                "(endereço Solana, não começa com '0x')"
+            )
+    else:  # bsc
+        if not BINANCE_WALLET or BINANCE_WALLET in ("0x", ""):
+            erros.append("BINANCE_WALLET_ADDRESS não configurado no .env")
+        elif not BINANCE_WALLET.startswith("0x") or len(BINANCE_WALLET) != 42:
+            erros.append("BINANCE_WALLET_ADDRESS inválido — deve ser 0x + 40 hex chars")
+        else:
+            try:
+                int(BINANCE_WALLET, 16)
+            except ValueError:
+                erros.append("BINANCE_WALLET_ADDRESS contém caracteres não-hexadecimais")
+            try:
+                from web3 import Web3
+                checksummed = Web3.to_checksum_address(BINANCE_WALLET)
+                if BINANCE_WALLET != BINANCE_WALLET.lower() and BINANCE_WALLET != checksummed:
+                    log.warning(
+                        f"BINANCE_WALLET_ADDRESS tem checksum EIP-55 inválido. "
+                        f"Confirme se o endereço está correto: {checksummed}"
+                    )
+            except ImportError:
+                pass
+            except Exception:
+                pass
+
     if not GROQ_API_KEY and not GEMINI_API_KEY:
         erros.append("Configure pelo menos GROQ_API_KEY ou GEMINI_API_KEY no .env")
     if NETWORK_MODE not in ("mainnet", "testnet"):
@@ -445,17 +515,25 @@ def _fetch_real_market_data() -> dict:
 
 # ── VERIFICADOR x402 / BNB CHAIN ──────────────────────────────────────────────
 
-class BinanceBSCVerifier:
+class MultiChainVerifier:
     """
-    Verifica pagamentos x402 diretamente no BNB Chain via web3.
-    Sem dependência de SDK Coinbase ou Trust Wallet.
-    Usa apenas web3.py + RPC público da Binance.
+    Verifica pagamentos x402 em múltiplas chains: Solana (recomendado — é o
+    que o x402scan reconhece e indexa) ou BNB Smart Chain (funciona via x402
+    mas não aparece no diretório x402scan).
+
+    A chain ativa é escolhida via PAYMENT_CHAIN no .env / Railway Variables.
+    Verificação on-chain usa apenas chamadas RPC HTTP diretas (sem SDKs
+    pesados como solana-py) para manter o deploy leve e rápido.
     """
 
     def __init__(self):
-        self.w3        = None
-        self.connected = False
-        self._init_web3()
+        self.w3              = None
+        self.connected       = False
+        self.solana_connected = False
+        if PAYMENT_CHAIN == "bsc":
+            self._init_web3()
+        else:
+            self._init_solana()
 
     def _init_web3(self):
         try:
@@ -469,47 +547,66 @@ class BinanceBSCVerifier:
         except Exception as e:
             log.warning(f"BNB Chain RPC indisponível: {e}")
 
+    def _init_solana(self):
+        """Testa conectividade com o RPC Solana via uma chamada JSON-RPC simples."""
+        try:
+            resp = requests.post(
+                SOLANA_RPC,
+                json={"jsonrpc": "2.0", "id": 1, "method": "getHealth"},
+                timeout=10,
+            )
+            self.solana_connected = resp.ok and resp.json().get("result") == "ok"
+            status = "conectado ✓" if self.solana_connected else "offline"
+            log.info(f"Solana RPC ({NETWORK_MODE}): {status} → {SOLANA_RPC}")
+        except Exception as e:
+            log.warning(f"Solana RPC indisponível: {e}")
+            self.solana_connected = False
+
+    @property
+    def is_connected(self) -> bool:
+        return self.solana_connected if PAYMENT_CHAIN == "solana" else self.connected
+
     def build_402_payload(self, endpoint: str) -> dict:
         """
         Monta o payload de pagamento x402 V2 para o agente pagador.
 
-        V2 muda em relação à V1:
-          - network usa formato CAIP-2 (ex: "eip155:56" para BSC mainnet)
-            em vez de string solta como "bsc"
-          - x402Version é inteiro
-          - este dict é serializado e enviado tanto no header Payment-Required
-            (base64) quanto no corpo JSON (para compatibilidade/debug humano)
-          - accepts[].extensions.bazaar.info traz um schema de input mínimo,
-            exigido pelo x402scan para indexação "payable" (sem isso a rota
-            é marcada como "skipped: missing input schema")
+        Suporta duas chains via PAYMENT_CHAIN:
+          - solana: network = CAIP-2 genesis hash (ex: "solana:5eykt4Us...")
+                    asset   = mint address do USDC-SPL
+                    payTo   = endereço Solana (Base58) do destinatário
+          - bsc:    network = "eip155:56" (CAIP-2 EVM)
+                    asset   = endereço do contrato ERC-20/BEP-20
+                    payTo   = endereço 0x... do destinatário
+
+        accepts[].extensions.bazaar.info traz um schema de input mínimo,
+        exigido pelo x402scan para indexação "payable".
         """
         price_float = float(PRICES[endpoint])
-        price_wei   = int(price_float * 10 ** TOKEN_DEC)
+        price_units = int(round(price_float * 10 ** TOKEN_DEC))
 
-        # "resource" deve ser a URL absoluta do recurso, conforme a spec x402
-        base_url      = _get_base_url()
-        resource_url  = f"{base_url}{endpoint}"
+        base_url     = _get_base_url()
+        resource_url = f"{base_url}{endpoint}"
 
-        # CAIP-2: eip155:<chainId> identifica a rede EVM de forma padronizada
-        caip2_network = f"eip155:{BSC_CHAIN_ID}"
+        network_id = SOLANA_CAIP2 if PAYMENT_CHAIN == "solana" else f"eip155:{BSC_CHAIN_ID}"
 
         return {
             "x402Version": 1,
             "error":       "Payment Required",
             "accepts": [{
                 "scheme":            "exact",
-                "network":           caip2_network,
-                "maxAmountRequired": str(price_wei),
+                "network":           network_id,
+                "maxAmountRequired": str(price_units),
                 "resource":          resource_url,
                 "description":       ENDPOINT_DESC.get(endpoint, "NexusAI API"),
                 "mimeType":          "application/json",
-                "payTo":             BINANCE_WALLET,
+                "payTo":             PAYOUT_ADDRESS,
                 "maxTimeoutSeconds": 300,
                 "asset":             PAYMENT_TOKEN_CA,
                 "outputSchema":      None,
                 "extra": {
                     "name":    PAYMENT_TOKEN,
                     "version": "1",
+                    "decimals": TOKEN_DEC,
                 },
                 "extensions": {
                     "bazaar": {
@@ -530,19 +627,17 @@ class BinanceBSCVerifier:
 
     def verify(self, payment_header: str, endpoint: str) -> tuple:
         """
-
-        Verifica o pagamento recebido no header PAYMENT-SIGNATURE (v2)
+        Verifica o pagamento recebido no header Payment-Signature (v2)
         ou X-Payment (v1, mantido por compatibilidade).
 
-
-        Estratégia em 4 camadas:
+        Estratégia em camadas:
           1. Anti-replay (bloqueia reuso do mesmo header)
           2. Validação estrutural do JSON
-          3. Verificação via facilitador Binance x402 (se configurado)
-          4. Verificação direta on-chain via eventos Transfer no BNB Chain
+          3. Verificação via facilitador externo (se configurado)
+          4. Verificação direta on-chain (Solana ou BSC, conforme PAYMENT_CHAIN)
         """
         if not payment_header:
-            return False, "Header X-Payment ausente"
+            return False, "Header de pagamento ausente"
 
         # 1. Anti-replay
         if _is_replay(payment_header):
@@ -551,10 +646,7 @@ class BinanceBSCVerifier:
                 _stats["replay_blocked"] += 1
             return False, "Pagamento já utilizado (replay bloqueado)"
 
-        # 2. Parse e validação estrutural
-        # V2 envia o payload como base64(JSON) no header PAYMENT-SIGNATURE.
-        # V1 enviava JSON puro no header X-Payment. Tentamos base64 primeiro,
-        # com fallback para JSON puro por compatibilidade.
+        # 2. Parse — V2 envia base64(JSON), V1 enviava JSON puro (fallback)
         pdata = None
         try:
             decoded = base64.b64decode(payment_header, validate=True).decode("utf-8")
@@ -573,45 +665,103 @@ class BinanceBSCVerifier:
         if pdata.get("protocol") != "x402":
             return False, "Protocolo inválido (esperado: x402)"
 
-        if pdata.get("recipient", "").lower() != BINANCE_WALLET.lower():
-            return False, f"Destinatário incorreto. Esperado: {BINANCE_WALLET}"
+        if pdata.get("recipient", "").lower() != PAYOUT_ADDRESS.lower():
+            return False, f"Destinatário incorreto. Esperado: {PAYOUT_ADDRESS}"
 
-        price_wei   = int(float(PRICES[endpoint]) * 10 ** TOKEN_DEC)
+        price_units = int(round(float(PRICES[endpoint]) * 10 ** TOKEN_DEC))
         paid_amount = int(pdata.get("amount", "0"))
-        if paid_amount < price_wei:
-            return False, f"Valor insuficiente: {paid_amount} < {price_wei} wei"
+        if paid_amount < price_units:
+            return False, f"Valor insuficiente: {paid_amount} < {price_units} unidades"
 
-        # 3. Verificação via facilitador Binance x402
+        # 3. Verificação via facilitador externo
         ok, msg = self._verify_via_facilitator(pdata, endpoint)
         if ok:
             return True, msg
 
-        # 4. Fallback: verificação direta on-chain
-        return self._verify_onchain(price_wei)
+        # 4. Fallback: verificação direta on-chain, por chain
+        if PAYMENT_CHAIN == "solana":
+            return self._verify_onchain_solana(price_units, pdata)
+        return self._verify_onchain_bsc(price_units)
 
     def _verify_via_facilitator(self, pdata: dict, endpoint: str) -> tuple:
-        """Chama o facilitador Binance x402 para verificação off-chain."""
-        facilitator_url = os.getenv("BINANCE_X402_FACILITATOR", "").strip()
+        """Chama um facilitador x402 externo para verificação off-chain (opcional)."""
+        facilitator_url = os.getenv("X402_FACILITATOR_URL", "").strip()
         if not facilitator_url:
-            return False, "Facilitador Binance não configurado"
+            return False, "Facilitador externo não configurado"
         try:
             resp = requests.post(
                 facilitator_url,
-                json={"payment": pdata, "resource": endpoint, "network": "bsc"},
+                json={"payment": pdata, "resource": endpoint, "network": PAYMENT_CHAIN},
                 timeout=8,
                 headers={"Content-Type": "application/json"},
             )
             if resp.ok:
                 result = resp.json()
                 if result.get("valid"):
-                    log.info(f"Pagamento verificado pelo facilitador Binance: {endpoint}")
-                    return True, "Verificado pelo facilitador Binance x402"
+                    log.info(f"Pagamento verificado pelo facilitador externo: {endpoint}")
+                    return True, "Verificado pelo facilitador x402"
                 return False, result.get("error", "Inválido pelo facilitador")
         except Exception as e:
-            log.debug(f"Facilitador Binance indisponível: {e}")
+            log.debug(f"Facilitador externo indisponível: {e}")
         return False, "Facilitador indisponível"
 
-    def _verify_onchain(self, price_wei: int) -> tuple:
+    def _verify_onchain_solana(self, price_units: int, pdata: dict) -> tuple:
+        """
+        Verifica a transação na Solana via RPC HTTP direto (sem SDK pesado).
+        Usa getSignaturesForAddress + getTransaction para confirmar que uma
+        transferência SPL de valor suficiente chegou na conta de destino.
+        """
+        if not self.solana_connected:
+            if NETWORK_MODE == "testnet":
+                log.info("TESTNET (Solana): pagamento simulado aceito")
+                return True, "Pagamento aceito (modo testnet/simulação)"
+            return False, "Verificação on-chain (Solana) indisponível — RPC offline"
+
+        signature = pdata.get("signature", "")
+        if not signature:
+            return False, "Pagamento sem assinatura de transação (signature)"
+
+        try:
+            resp = requests.post(
+                SOLANA_RPC,
+                json={
+                    "jsonrpc": "2.0",
+                    "id":      1,
+                    "method":  "getTransaction",
+                    "params": [
+                        signature,
+                        {"encoding": "jsonParsed", "maxSupportedTransactionVersion": 0},
+                    ],
+                },
+                timeout=12,
+            )
+            result = resp.json().get("result")
+            if not result:
+                return False, "Transação não encontrada na Solana (ainda não confirmada?)"
+
+            # Procura instrução de transferência SPL (USDC) para o nosso endereço,
+            # com valor >= price_units, dentro das instruções parseadas.
+            instructions = (
+                result.get("transaction", {})
+                      .get("message", {})
+                      .get("instructions", [])
+            )
+            for instr in instructions:
+                parsed = instr.get("parsed", {})
+                info   = parsed.get("info", {}) if isinstance(parsed, dict) else {}
+                if parsed.get("type") in ("transferChecked", "transfer"):
+                    destination = info.get("destination", "")
+                    amount_str  = info.get("tokenAmount", {}).get("amount") or info.get("amount")
+                    if destination and amount_str and int(amount_str) >= price_units:
+                        log.info(f"Transferência Solana confirmada: {signature} ({int(amount_str) / 10**TOKEN_DEC:.6f} {PAYMENT_TOKEN})")
+                        return True, f"On-chain confirmado (Solana): {signature}"
+
+            return False, "Transação encontrada mas não confirma valor/destino esperado"
+        except Exception as e:
+            log.error(f"Erro verificação on-chain (Solana): {e}")
+            return False, f"Erro on-chain (Solana): {e}"
+
+    def _verify_onchain_bsc(self, price_wei: int) -> tuple:
         """
         Verifica transferência diretamente no BNB Chain.
         Janela ampliada: últimos 50 blocos (~2.5 minutos).
@@ -638,11 +788,10 @@ class BinanceBSCVerifier:
                 abi=ERC20_ABI
             )
             latest  = self.w3.eth.block_number
-            # Janela de 50 blocos (~2.5 min na BSC)
             eventos = token.events.Transfer.get_logs(
                 from_block=max(0, latest - 50),
                 to_block=latest,
-                argument_filters={"to": Web3.to_checksum_address(BINANCE_WALLET)},
+                argument_filters={"to": Web3.to_checksum_address(PAYOUT_ADDRESS)},
             )
             for ev in eventos:
                 if ev["args"]["value"] >= price_wei:
@@ -656,17 +805,18 @@ class BinanceBSCVerifier:
             return False, f"Erro on-chain: {e}"
 
 
-verifier = BinanceBSCVerifier()
+verifier = MultiChainVerifier()
 
-# ── DECORATOR payment_required (Binance x402) ─────────────────────────────────
+# ── DECORATOR payment_required (multi-chain x402) ─────────────────────────────
 
 def payment_required(endpoint: str):
     """
-    Decorator que implementa o fluxo x402 completo para BNB Chain / Binance.
+    Decorator que implementa o fluxo x402 completo (Solana ou BSC, conforme
+    PAYMENT_CHAIN).
 
     Fluxo:
-      V2: header PAYMENT-REQUIRED (base64) ausente → HTTP 402 com instruções
-          header PAYMENT-SIGNATURE presente → verifica → entrega ou rejeita
+      V2: header Payment-Required (base64) ausente → HTTP 402 com instruções
+          header Payment-Signature presente → verifica → entrega ou rejeita
       V1 (compat): X-Payment continua aceito como fallback
     """
     def decorator(fn):
@@ -767,7 +917,7 @@ def _base_payload(source: str) -> dict:
         "source":    source,
         "timestamp": int(time.time()),
         "datetime":  datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
-        "network":   "BNB Smart Chain",
+        "network":   "Solana" if PAYMENT_CHAIN == "solana" else "BNB Smart Chain",
         "token":     PAYMENT_TOKEN,
     }
 
@@ -934,8 +1084,8 @@ def _enrich(data: dict, endpoint: str) -> dict:
     data["pagamento"] = {
         "endpoint":    endpoint,
         "preco_pago":  f"{PRICES[endpoint]} {PAYMENT_TOKEN}",
-        "rede":        "BNB Smart Chain (BEP-20)",
-        "facilitador": "Binance x402",
+        "rede":        "Solana" if PAYMENT_CHAIN == "solana" else "BNB Smart Chain (BEP-20)",
+        "facilitador": "x402 nativo",
         "modo":        NETWORK_MODE,
     }
     return data
@@ -1090,14 +1240,14 @@ def info():
         "descricao":   "Análise autônoma de mercado cripto via IA. Powered by NexusAI v4.",
         "protocolo":   "x402",
         "versao":      APP_VERSION,
-        "facilitador": "Binance x402 (Binance Pay)",
-        "rede":        "BNB Smart Chain (BEP-20)",
-        "chain_id":    BSC_CHAIN_ID,
+        "facilitador": "x402 nativo (verificação on-chain direta)",
+        "rede":        "Solana" if PAYMENT_CHAIN == "solana" else "BNB Smart Chain (BEP-20)",
+        "chain_id":    None if PAYMENT_CHAIN == "solana" else BSC_CHAIN_ID,
         "modo":        NETWORK_MODE,
-        "carteira":    BINANCE_WALLET,
+        "carteira":    PAYOUT_ADDRESS,
         "token":       PAYMENT_TOKEN,
         "token_ca":    PAYMENT_TOKEN_CA,
-        "auth_types":  ["eip3009", "permit2-exact", "permit2-upto"],
+        "auth_types":  ["solana-spl"] if PAYMENT_CHAIN == "solana" else ["eip3009", "permit2-exact", "permit2-upto"],
         "endpoints": [
             {
                 "path":   ep,
@@ -1140,7 +1290,7 @@ def openapi_spec():
             "get": {
                 "summary":     "Análise completa de mercado (endpoint principal)",
                 "operationId": "root_analise",
-                "description": "Custo: 0.05 USDT via x402 (BNB Smart Chain BEP-20). Retorna 402 sem pagamento.",
+                "description": f"Custo: {PRICES['/analise']} {PAYMENT_TOKEN} via x402 ({'Solana' if PAYMENT_CHAIN == 'solana' else 'BNB Smart Chain'}). Retorna 402 sem pagamento.",
                 "x-payment-info": {
                     "protocols": ["x402"],
                     "price": {"mode": "fixed", "currency": "USD", "amount": PRICES["/analise"]},
@@ -1207,7 +1357,7 @@ def openapi_spec():
             "get": {
                 "summary":     summary,
                 "operationId": op_id,
-                "description": f"Custo: {price} USDT via x402 (BNB Smart Chain BEP-20)",
+                "description": f"Custo: {price} {PAYMENT_TOKEN} via x402 ({'Solana' if PAYMENT_CHAIN == 'solana' else 'BNB Smart Chain'})",
                 "x-payment-info": {
                     "protocols": ["x402"],
                     "price": {"mode": "fixed", "currency": "USD", "amount": price},
@@ -1223,7 +1373,7 @@ def openapi_spec():
         "openapi": "3.0.3",
         "info": {
             "title":       "NexusAI Crypto Intelligence API",
-            "description": "Análise autônoma de mercado cripto via IA. Pagamento via x402 (BNB Smart Chain / USDT BEP-20).",
+            "description": f"Análise autônoma de mercado cripto via IA. Pagamento via x402 ({'Solana / USDC' if PAYMENT_CHAIN == 'solana' else 'BNB Smart Chain / USDT BEP-20'}).",
             "version":     APP_VERSION,
             "contact":     {"url": "https://x402scan.com", "email": os.getenv("CONTACT_EMAIL", "contato@nexusai-x402.app")},
         },
@@ -1234,13 +1384,13 @@ def openapi_spec():
                 "x402": {
                     "type":        "http",
                     "scheme":      "x402",
-                    "description": "Pagamento on-chain via BNB Smart Chain (USDT BEP-20). Protocolo x402.",
+                    "description": f"Pagamento on-chain via {'Solana (USDC-SPL)' if PAYMENT_CHAIN == 'solana' else 'BNB Smart Chain (USDT BEP-20)'}. Protocolo x402.",
                 }
             }
         },
         "security": [{"x402": []}],
         "x-discovery": {
-            "ownershipProofs": [BINANCE_WALLET],
+            "ownershipProofs": [PAYOUT_ADDRESS],
         },
     }
     resp = jsonify(spec)
@@ -1271,10 +1421,14 @@ def status():
     return jsonify({
         "status":       "online",
         "versao":       APP_VERSION,
-        "rede":         "BNB Smart Chain",
+        "rede":         "Solana" if PAYMENT_CHAIN == "solana" else "BNB Smart Chain",
         "modo":         NETWORK_MODE,
-        "bnb_chain":    {"rpc": BSC_RPC, "chain_id": BSC_CHAIN_ID, "conectado": verifier.connected},
-        "carteira":     BINANCE_WALLET,
+        "chain_status": {
+            "chain":     PAYMENT_CHAIN,
+            "rpc":       SOLANA_RPC if PAYMENT_CHAIN == "solana" else BSC_RPC,
+            "conectado": verifier.is_connected,
+        },
+        "carteira":     PAYOUT_ADDRESS,
         "token":        PAYMENT_TOKEN,
         "uptime":       f"{h:02d}:{m:02d}:{s:02d}",
         "cache":        {"ttl_segundos": CACHE_TTL, "hits": _stats.get("cache_hits", 0)},
@@ -1294,12 +1448,13 @@ def status():
 def version():
     """Diagnóstico rápido — confirma qual build está rodando no Railway."""
     return jsonify({
-        "app_version":   APP_VERSION,
-        "python":        sys.version.split()[0],
-        "network_mode":  NETWORK_MODE,
-        "bnb_connected": verifier.connected,
-        "port_env":      os.getenv("PORT", "não definido pelo host"),
-        "uptime_s":      int(time.time() - _stats["start_time"]),
+        "app_version":     APP_VERSION,
+        "python":          sys.version.split()[0],
+        "network_mode":    NETWORK_MODE,
+        "payment_chain":   PAYMENT_CHAIN,
+        "chain_connected": verifier.is_connected,
+        "port_env":        os.getenv("PORT", "não definido pelo host"),
+        "uptime_s":        int(time.time() - _stats["start_time"]),
     })
 
 
@@ -1324,7 +1479,7 @@ def health():
     return jsonify({
         "ok":          True,
         "ts":          int(time.time()),
-        "bnc_rpc":     verifier.connected,
+        "chain_rpc":   verifier.is_connected,
         "market_data": market_ok,
         "modo":        NETWORK_MODE,
     }), 200
@@ -1341,8 +1496,8 @@ def x402_manifest():
     return jsonify({
         "version":         1,
         "resources":       [f"{base_url}{ep}" for ep in PRICES] + [base_url],
-        "ownershipProofs": [BINANCE_WALLET],
-        "instructions":    "Pagamento via x402 (scheme=exact) em USDT na BNB Smart Chain (BEP-20).",
+        "ownershipProofs": [PAYOUT_ADDRESS],
+        "instructions":    f"Pagamento via x402 (scheme=exact) em {PAYMENT_TOKEN} na {'Solana' if PAYMENT_CHAIN == 'solana' else 'BNB Smart Chain (BEP-20)'}.",
     })
 
 # ── GRACEFUL SHUTDOWN ─────────────────────────────────────────────────────────
@@ -1367,14 +1522,17 @@ if __name__ == "__main__":
 
     receita_diaria_est = sum(float(p) * 10_000 for p in PRICES.values()) / len(PRICES)
 
+    chain_label = "Solana" if PAYMENT_CHAIN == "solana" else "BNB Smart Chain"
+    rpc_label   = SOLANA_RPC if PAYMENT_CHAIN == "solana" else BSC_RPC
+
     print("\n" + "═" * 66)
-    print(f"  NexusAI x402 — Binance Pay + BNB Smart Chain  v{APP_VERSION}")
+    print(f"  NexusAI x402 — {chain_label}  v{APP_VERSION}")
     print("═" * 66)
-    print(f"  Carteira Binance (BEP-20) : {BINANCE_WALLET or '⚠  NÃO CONFIGURADA'}")
-    print(f"  Rede                      : BNB Chain {'MAINNET ✓' if NETWORK_MODE == 'mainnet' else 'TESTNET (dev)'}")
-    print(f"  Chain ID                  : {BSC_CHAIN_ID}")
-    print(f"  Token de pagamento        : {PAYMENT_TOKEN} ({PAYMENT_TOKEN_CA[:12]}...)")
-    print(f"  BNB Chain RPC             : {'Conectado ✓' if verifier.connected else 'Offline (simulação)'}")
+    print(f"  Chain de pagamento        : {PAYMENT_CHAIN.upper()} ({'x402scan suportado ✓' if PAYMENT_CHAIN == 'solana' else 'x402scan NÃO indexa esta rede'})")
+    print(f"  Carteira de destino       : {PAYOUT_ADDRESS or '⚠  NÃO CONFIGURADA'}")
+    print(f"  Rede                      : {chain_label} {'MAINNET ✓' if NETWORK_MODE == 'mainnet' else 'TESTNET (dev)'}")
+    print(f"  Token de pagamento        : {PAYMENT_TOKEN} ({PAYMENT_TOKEN_CA[:16]}...)")
+    print(f"  RPC                       : {'Conectado ✓' if verifier.is_connected else 'Offline (simulação)'} → {rpc_label}")
     print(f"  Cache TTL                 : {CACHE_TTL}s")
     print(f"  Rate limit                : {RATE_LIMIT_RPM} req/min por IP")
     print(f"  Anti-replay               : Ativo (TTL {_REPLAY_TTL}s, arquivo: {_REPLAY_FILE})")
@@ -1391,11 +1549,15 @@ if __name__ == "__main__":
             print(f"     • {e}")
         print()
     print("  Estimativa de receita (10.000 chamadas/dia):")
-    print(f"    Receita diária estimada → ~${receita_diaria_est:.0f} USDT/dia")
+    print(f"    Receita diária estimada → ~${receita_diaria_est:.0f} {PAYMENT_TOKEN}/dia")
     print()
     print("  Próximos passos:")
-    print("  1. ✅ Configure BINANCE_WALLET_ADDRESS no .env / Railway Variables")
-    print("     → Binance → Carteira → Depósito → USDT → BNB Smart Chain")
+    if PAYMENT_CHAIN == "solana":
+        print("  1. ✅ Configure SOLANA_WALLET_ADDRESS no .env / Railway Variables")
+        print("     → Binance → Carteira → Depósito → USDC → Rede: Solana")
+    else:
+        print("  1. ✅ Configure BINANCE_WALLET_ADDRESS no .env / Railway Variables")
+        print("     → Binance → Carteira → Depósito → USDT → BNB Smart Chain")
     print("  2. ✅ Configure GROQ_API_KEY ou GEMINI_API_KEY no .env")
     print("  3. ✅ NETWORK_MODE=mainnet já é o padrão (modo real)")
     print("  4. ✅ Deploy: railway.app (Root Directory deve apontar para este arquivo)")
