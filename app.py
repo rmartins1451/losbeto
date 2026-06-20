@@ -825,14 +825,21 @@ def payment_required(endpoint: str):
             ip    = (request.headers.get("X-Forwarded-For", request.remote_addr) or "unknown").split(",")[0].strip()
             price = float(PRICES.get(endpoint, "0.05"))
 
-            if _is_rate_limited(ip):
+            # V2 usa PAYMENT-SIGNATURE; mantemos X-Payment como fallback V1
+            payment_header = request.headers.get("Payment-Signature") or request.headers.get("X-Payment")
+
+            # IMPORTANTE: o desafio 402 inicial (sem payment_header) NUNCA é
+            # rate-limited. Scanners de discovery como o x402scan fazem GET
+            # simples em vários endpoints em sequência rápida para descobrir
+            # preços — bloquear isso faz o probe receber 429 em vez de 402,
+            # o que invalida o registro mesmo com payload correto. Rate limit
+            # só se aplica a partir daqui, quando já há uma tentativa real de
+            # pagamento (superfície de abuso real).
+            if payment_header and _is_rate_limited(ip):
                 with _stats_lock:
                     _stats["rejected_rl"] += 1
                 log.warning(f"Rate limit atingido: {ip} → {endpoint}")
                 return jsonify({"error": "Too Many Requests", "retry_after": "60s"}), 429
-
-            # V2 usa PAYMENT-SIGNATURE; mantemos X-Payment como fallback V1
-            payment_header = request.headers.get("Payment-Signature") or request.headers.get("X-Payment")
 
             if not payment_header:
                 _record(endpoint, paid=False)
