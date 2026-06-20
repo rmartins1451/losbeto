@@ -213,6 +213,32 @@ os.environ.setdefault("FLASK_SKIP_DOTENV", "1")
 
 app = Flask(__name__)
 
+
+def _get_base_url() -> str:
+    """
+    Monta a base_url externa correta (https) mesmo atrás de proxies reversos
+    (Railway, Render, etc.) que terminam o TLS e repassam a conexão interna
+    como HTTP puro — o que faria request.host_url retornar 'http://...'
+    mesmo quando o usuário acessa via 'https://...'.
+
+    Prioridade:
+      1. X-Forwarded-Proto (header padrão setado por proxies/load balancers)
+      2. Força https em produção (mainnet) por padrão, já que APIs x402
+         devem sempre ser servidas via HTTPS
+    """
+    forwarded_proto = request.headers.get("X-Forwarded-Proto", "").split(",")[0].strip()
+    host = request.headers.get("X-Forwarded-Host", request.host)
+
+    if forwarded_proto:
+        scheme = forwarded_proto
+    elif NETWORK_MODE == "mainnet":
+        scheme = "https"
+    else:
+        scheme = request.scheme
+
+    return f"{scheme}://{host}".rstrip("/")
+
+
 # ── VALIDAÇÃO DE CONFIG ───────────────────────────────────────────────────────
 
 def _validate_config():
@@ -461,7 +487,7 @@ class BinanceBSCVerifier:
         price_wei   = int(price_float * 10 ** TOKEN_DEC)
 
         # "resource" deve ser a URL absoluta do recurso, conforme a spec x402
-        base_url      = request.host_url.rstrip("/")
+        base_url      = _get_base_url()
         resource_url  = f"{base_url}{endpoint}"
 
         # CAIP-2: eip155:<chainId> identifica a rede EVM de forma padronizada
@@ -1108,7 +1134,7 @@ def openapi_spec():
 
     Endpoints públicos usam security: [] para não entrar no probe de pagamento.
     """
-    base_url = request.host_url.rstrip("/")
+    base_url = _get_base_url()
     paths = {
         "/": {
             "get": {
@@ -1311,7 +1337,7 @@ def x402_manifest():
     Manifesto x402 — formato de fan-out conforme x402scan DISCOVERY.md seção B.
     'resources' deve ser uma lista de URLs absolutas (strings), não objetos.
     """
-    base_url = request.host_url.rstrip("/")
+    base_url = _get_base_url()
     return jsonify({
         "version":         1,
         "resources":       [f"{base_url}{ep}" for ep in PRICES] + [base_url],
