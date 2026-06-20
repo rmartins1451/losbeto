@@ -451,8 +451,11 @@ class BinanceBSCVerifier:
           - network usa formato CAIP-2 (ex: "eip155:56" para BSC mainnet)
             em vez de string solta como "bsc"
           - x402Version é inteiro
-          - este dict é serializado e enviado tanto no header PAYMENT-REQUIRED
+          - este dict é serializado e enviado tanto no header Payment-Required
             (base64) quanto no corpo JSON (para compatibilidade/debug humano)
+          - accepts[].extensions.bazaar.info traz um schema de input mínimo,
+            exigido pelo x402scan para indexação "payable" (sem isso a rota
+            é marcada como "skipped: missing input schema")
         """
         price_float = float(PRICES[endpoint])
         price_wei   = int(price_float * 10 ** TOKEN_DEC)
@@ -481,6 +484,20 @@ class BinanceBSCVerifier:
                 "extra": {
                     "name":    PAYMENT_TOKEN,
                     "version": "1",
+                },
+                "extensions": {
+                    "bazaar": {
+                        "info": {
+                            "name":        endpoint.strip("/") or "root",
+                            "description": ENDPOINT_DESC.get(endpoint, "NexusAI API"),
+                            "method":      "GET",
+                            "inputSchema": {
+                                "type":       "object",
+                                "properties": {},
+                                "required":   [],
+                            },
+                        },
+                    },
                 },
             }],
         }
@@ -639,7 +656,7 @@ def payment_required(endpoint: str):
                 return jsonify({"error": "Too Many Requests", "retry_after": "60s"}), 429
 
             # V2 usa PAYMENT-SIGNATURE; mantemos X-Payment como fallback V1
-            payment_header = request.headers.get("PAYMENT-SIGNATURE") or request.headers.get("X-Payment")
+            payment_header = request.headers.get("Payment-Signature") or request.headers.get("X-Payment")
 
             if not payment_header:
                 _record(endpoint, paid=False)
@@ -650,7 +667,7 @@ def payment_required(endpoint: str):
                 resp                 = jsonify(payload)
                 resp.status_code     = 402
                 resp.headers["WWW-Authenticate"]  = "x402"
-                resp.headers["PAYMENT-REQUIRED"]  = b64_payload
+                resp.headers["Payment-Required"]  = b64_payload
                 resp.headers["X-ACCEPTS-PAYMENT"] = "x402"
                 return resp
 
@@ -666,7 +683,7 @@ def payment_required(endpoint: str):
                 resp                 = jsonify(payload)
                 resp.status_code     = 402
                 resp.headers["WWW-Authenticate"] = "x402"
-                resp.headers["PAYMENT-REQUIRED"] = b64_payload
+                resp.headers["Payment-Required"] = b64_payload
                 return resp
 
             g.endpoint_price = price
@@ -680,7 +697,7 @@ def payment_required(endpoint: str):
 
             response_obj = fn(*args, **kwargs)
             try:
-                response_obj.headers["PAYMENT-RESPONSE"] = settle_info
+                response_obj.headers["Payment-Response"] = settle_info
             except Exception:
                 pass
             return response_obj
@@ -1080,9 +1097,16 @@ def info():
 @app.route("/openapi.json")
 def openapi_spec():
     """
-    OpenAPI 3.0 spec com marcação correta de segurança x402.
-    Endpoints pagos não têm 'security: []' — o x402scan sabe que são pagos.
-    Endpoints públicos têm 'security: []' — o x402scan não faz probe neles.
+    OpenAPI 3.0 spec seguindo o x402scan Discovery & Registration Spec:
+    https://github.com/Merit-Systems/x402scan/blob/main/docs/DISCOVERY.md
+
+    Requisitos por operação paga (seção "Per-paid-operation requirements"):
+      - declarar x-payment-info
+      - incluir resposta 402 em responses
+      - x-payment-info.protocols incluir "x402"
+      - x-payment-info.price com pricing metadata válido (modo fixed)
+
+    Endpoints públicos usam security: [] para não entrar no probe de pagamento.
     """
     base_url = request.host_url.rstrip("/")
     paths = {
@@ -1091,9 +1115,13 @@ def openapi_spec():
                 "summary":     "Análise completa de mercado (endpoint principal)",
                 "operationId": "root_analise",
                 "description": "Custo: 0.05 USDT via x402 (BNB Smart Chain BEP-20). Retorna 402 sem pagamento.",
+                "x-payment-info": {
+                    "protocols": ["x402"],
+                    "price": {"mode": "fixed", "currency": "USD", "amount": PRICES["/analise"]},
+                },
                 "responses": {
                     "200": {"description": "Análise JSON após pagamento confirmado"},
-                    "402": {"description": "Payment Required — instruções x402 no corpo"},
+                    "402": {"description": "Payment Required — instruções x402 no header Payment-Required"},
                 },
             }
         },
@@ -1139,14 +1167,14 @@ def openapi_spec():
         },
     }
 
-    # Endpoints pagos — sem security:[] para o x402scan identificar como x402
+    # Endpoints pagos — cada um declara x-payment-info conforme a spec
     paid_ops = {
-        "/fear-greed": ("fear_greed",  "Fear & Greed Index processado pela IA",   "0.01"),
-        "/regime":     ("regime",      "Regime de mercado cripto atual",           "0.02"),
-        "/anomalias":  ("anomalias",   "Anomalias detectadas por z-score",         "0.03"),
-        "/analise":    ("analise",     "Análise completa de mercado",              "0.05"),
-        "/sinais":     ("sinais",      "Sinais de trading com confiança",          "0.10"),
-        "/relatorio":  ("relatorio",   "Relatório premium completo",               "0.25"),
+        "/fear-greed": ("fear_greed",  "Fear & Greed Index processado pela IA",   PRICES["/fear-greed"]),
+        "/regime":     ("regime",      "Regime de mercado cripto atual",           PRICES["/regime"]),
+        "/anomalias":  ("anomalias",   "Anomalias detectadas por z-score",         PRICES["/anomalias"]),
+        "/analise":    ("analise",     "Análise completa de mercado",              PRICES["/analise"]),
+        "/sinais":     ("sinais",      "Sinais de trading com confiança",          PRICES["/sinais"]),
+        "/relatorio":  ("relatorio",   "Relatório premium completo",               PRICES["/relatorio"]),
     }
     for path, (op_id, summary, price) in paid_ops.items():
         paths[path] = {
@@ -1154,9 +1182,13 @@ def openapi_spec():
                 "summary":     summary,
                 "operationId": op_id,
                 "description": f"Custo: {price} USDT via x402 (BNB Smart Chain BEP-20)",
+                "x-payment-info": {
+                    "protocols": ["x402"],
+                    "price": {"mode": "fixed", "currency": "USD", "amount": price},
+                },
                 "responses": {
                     "200": {"description": "Análise JSON retornada após pagamento confirmado"},
-                    "402": {"description": "Payment Required — siga as instruções x402 no corpo da resposta"},
+                    "402": {"description": "Payment Required — instruções x402 no header Payment-Required"},
                 },
             }
         }
@@ -1181,6 +1213,9 @@ def openapi_spec():
             }
         },
         "security": [{"x402": []}],
+        "x-discovery": {
+            "ownershipProofs": [BINANCE_WALLET],
+        },
     }
     resp = jsonify(spec)
     resp.headers["X-ACCEPTS-PAYMENT"] = "x402"
@@ -1270,31 +1305,18 @@ def health():
 
 
 @app.route("/.well-known/x402.json")
+@app.route("/.well-known/x402")
 def x402_manifest():
-    """Manifesto x402 padrão — discovery automático por agentes."""
+    """
+    Manifesto x402 — formato de fan-out conforme x402scan DISCOVERY.md seção B.
+    'resources' deve ser uma lista de URLs absolutas (strings), não objetos.
+    """
+    base_url = request.host_url.rstrip("/")
     return jsonify({
-        "version":  "1.0",
-        "provider": {
-            "name":        "NexusAI Crypto Intelligence",
-            "wallet":      BINANCE_WALLET,
-            "network":     "bsc" if NETWORK_MODE == "mainnet" else "bsc-testnet",
-            "chain_id":    BSC_CHAIN_ID,
-            "currency":    PAYMENT_TOKEN,
-            "token":       PAYMENT_TOKEN_CA,
-            "facilitator": "binance-x402",
-            "auth_types":  ["eip3009", "permit2-exact", "permit2-upto"],
-        },
-        "resources": [
-            {
-                "path":        ep,
-                "price":       PRICES[ep],
-                "currency":    PAYMENT_TOKEN,
-                "token":       PAYMENT_TOKEN_CA,
-                "description": ENDPOINT_DESC[ep],
-                "method":      "GET",
-            }
-            for ep in PRICES
-        ],
+        "version":         1,
+        "resources":       [f"{base_url}{ep}" for ep in PRICES] + [base_url],
+        "ownershipProofs": [BINANCE_WALLET],
+        "instructions":    "Pagamento via x402 (scheme=exact) em USDT na BNB Smart Chain (BEP-20).",
     })
 
 # ── GRACEFUL SHUTDOWN ─────────────────────────────────────────────────────────
