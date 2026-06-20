@@ -50,6 +50,7 @@ import time
 import json
 import signal
 import hashlib
+import base64
 import logging
 import threading
 from collections import defaultdict, deque
@@ -443,21 +444,32 @@ class BinanceBSCVerifier:
             log.warning(f"BNB Chain RPC indisponível: {e}")
 
     def build_402_payload(self, endpoint: str) -> dict:
-        """Monta o payload HTTP 402 padrão x402 para o agente pagador."""
+        """
+        Monta o payload de pagamento x402 V2 para o agente pagador.
+
+        V2 muda em relação à V1:
+          - network usa formato CAIP-2 (ex: "eip155:56" para BSC mainnet)
+            em vez de string solta como "bsc"
+          - x402Version é inteiro
+          - este dict é serializado e enviado tanto no header PAYMENT-REQUIRED
+            (base64) quanto no corpo JSON (para compatibilidade/debug humano)
+        """
         price_float = float(PRICES[endpoint])
         price_wei   = int(price_float * 10 ** TOKEN_DEC)
 
         # "resource" deve ser a URL absoluta do recurso, conforme a spec x402
-        # (clientes/scanners resolvem o endpoint a partir desse campo).
         base_url      = request.host_url.rstrip("/")
         resource_url  = f"{base_url}{endpoint}"
+
+        # CAIP-2: eip155:<chainId> identifica a rede EVM de forma padronizada
+        caip2_network = f"eip155:{BSC_CHAIN_ID}"
 
         return {
             "x402Version": 1,
             "error":       "Payment Required",
             "accepts": [{
                 "scheme":            "exact",
-                "network":           "bsc" if NETWORK_MODE == "mainnet" else "bsc-testnet",
+                "network":           caip2_network,
                 "maxAmountRequired": str(price_wei),
                 "resource":          resource_url,
                 "description":       ENDPOINT_DESC.get(endpoint, "NexusAI API"),
@@ -476,7 +488,9 @@ class BinanceBSCVerifier:
     def verify(self, payment_header: str, endpoint: str) -> tuple:
         """
 
-        Verifica o pagamento recebido no header X-Payment.
+        Verifica o pagamento recebido no header PAYMENT-SIGNATURE (v2)
+        ou X-Payment (v1, mantido por compatibilidade).
+
 
         Estratégia em 4 camadas:
           1. Anti-replay (bloqueia reuso do mesmo header)
@@ -495,15 +509,23 @@ class BinanceBSCVerifier:
             return False, "Pagamento já utilizado (replay bloqueado)"
 
         # 2. Parse e validação estrutural
+        # V2 envia o payload como base64(JSON) no header PAYMENT-SIGNATURE.
+        # V1 enviava JSON puro no header X-Payment. Tentamos base64 primeiro,
+        # com fallback para JSON puro por compatibilidade.
+        pdata = None
         try:
-            pdata = json.loads(payment_header)
-        except (json.JSONDecodeError, TypeError):
-            return False, "X-Payment: JSON inválido"
+            decoded = base64.b64decode(payment_header, validate=True).decode("utf-8")
+            pdata = json.loads(decoded)
+        except Exception:
+            try:
+                pdata = json.loads(payment_header)
+            except (json.JSONDecodeError, TypeError):
+                return False, "Header de pagamento: formato inválido (nem base64 nem JSON)"
 
         required = ["protocol", "network", "amount", "recipient", "signature"]
         missing  = [f for f in required if f not in pdata]
         if missing:
-            return False, f"X-Payment: campos ausentes {missing}"
+            return False, f"Pagamento: campos ausentes {missing}"
 
         if pdata.get("protocol") != "x402":
             return False, "Protocolo inválido (esperado: x402)"
@@ -600,8 +622,9 @@ def payment_required(endpoint: str):
     Decorator que implementa o fluxo x402 completo para BNB Chain / Binance.
 
     Fluxo:
-      Sem X-Payment  → HTTP 402 com instruções
-      Com X-Payment  → verifica → entrega resultado ou rejeita
+      V2: header PAYMENT-REQUIRED (base64) ausente → HTTP 402 com instruções
+          header PAYMENT-SIGNATURE presente → verifica → entrega ou rejeita
+      V1 (compat): X-Payment continua aceito como fallback
     """
     def decorator(fn):
         @wraps(fn)
@@ -615,15 +638,19 @@ def payment_required(endpoint: str):
                 log.warning(f"Rate limit atingido: {ip} → {endpoint}")
                 return jsonify({"error": "Too Many Requests", "retry_after": "60s"}), 429
 
-            payment_header = request.headers.get("X-Payment")
+            # V2 usa PAYMENT-SIGNATURE; mantemos X-Payment como fallback V1
+            payment_header = request.headers.get("PAYMENT-SIGNATURE") or request.headers.get("X-Payment")
 
             if not payment_header:
                 _record(endpoint, paid=False)
                 log.info(f"402 enviado → {ip} {endpoint} ({PRICES[endpoint]} {PAYMENT_TOKEN})")
-                payload              = verifier.build_402_payload(endpoint)
+                payload  = verifier.build_402_payload(endpoint)
+                b64_payload = base64.b64encode(json.dumps(payload).encode("utf-8")).decode("ascii")
+
                 resp                 = jsonify(payload)
                 resp.status_code     = 402
-                resp.headers["WWW-Authenticate"] = "x402"
+                resp.headers["WWW-Authenticate"]  = "x402"
+                resp.headers["PAYMENT-REQUIRED"]  = b64_payload
                 resp.headers["X-ACCEPTS-PAYMENT"] = "x402"
                 return resp
 
@@ -634,14 +661,29 @@ def payment_required(endpoint: str):
                 payload              = verifier.build_402_payload(endpoint)
                 payload["error"]     = f"Pagamento inválido: {reason}"
                 payload["x402Debug"] = reason
+                b64_payload = base64.b64encode(json.dumps(payload).encode("utf-8")).decode("ascii")
+
                 resp                 = jsonify(payload)
                 resp.status_code     = 402
                 resp.headers["WWW-Authenticate"] = "x402"
+                resp.headers["PAYMENT-REQUIRED"] = b64_payload
                 return resp
 
             g.endpoint_price = price
             log.info(f"Pago ✓ {ip} {endpoint} → {PRICES[endpoint]} {PAYMENT_TOKEN}")
-            return fn(*args, **kwargs)
+
+            settle_info = base64.b64encode(json.dumps({
+                "success": True,
+                "network": f"eip155:{BSC_CHAIN_ID}",
+                "payer":   None,
+            }).encode("utf-8")).decode("ascii")
+
+            response_obj = fn(*args, **kwargs)
+            try:
+                response_obj.headers["PAYMENT-RESPONSE"] = settle_info
+            except Exception:
+                pass
+            return response_obj
 
         return wrapper
     return decorator
