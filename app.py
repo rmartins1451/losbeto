@@ -163,32 +163,54 @@ log = logging.getLogger("nexusai-x402")
 
 # ── CONFIG PRINCIPAL ──────────────────────────────────────────────────────────
 
-# PAYMENT_CHAIN escolhe a rede de liquidação: "solana" (recomendado — suportado
-# pelo x402scan) ou "bsc" (BNB Smart Chain — funciona via x402 mas não é
-# indexado pelo diretório x402scan, que hoje só reconhece Base e Solana).
-PAYMENT_CHAIN = os.getenv("PAYMENT_CHAIN", "solana").strip().lower()
+# PAYMENT_CHAIN escolhe a rede de liquidação:
+#   "base"   (RECOMENDADO) — única rede confirmada como suportada pelo probe
+#            oficial do x402scan (x402scan-mcp). Indexação automática funciona.
+#   "solana" — funciona via x402 e a Binance suporta o depósito, mas o probe
+#            oficial do x402scan (CAIP-2 eip155-only) não reconhece esta rede
+#            e a indexação automática falha (confirmado via teste real).
+#   "bsc"    — BNB Smart Chain. Mesma limitação de indexação que Solana.
+PAYMENT_CHAIN = os.getenv("PAYMENT_CHAIN", "base").strip().lower()
 
-# Carteira de destino: endereço Solana (Base58) OU EVM/BSC (0x...), conforme
-# PAYMENT_CHAIN. Mantemos os dois nomes de variável para clareza e para
-# permitir trocar de rede sem perder a configuração da outra.
+# Carteira de destino, conforme a chain ativa:
+#   Base/BSC → endereço EVM (0x...)   |   Solana → endereço Base58
+BASE_WALLET    = os.getenv("BASE_WALLET_ADDRESS", "").strip()
 SOLANA_WALLET  = os.getenv("SOLANA_WALLET_ADDRESS", "").strip()
 BINANCE_WALLET = os.getenv("BINANCE_WALLET_ADDRESS", "").strip()  # endereço BSC (0x...)
 
 # Endereço efetivo usado nos payloads, de acordo com a chain escolhida
-PAYOUT_ADDRESS = SOLANA_WALLET if PAYMENT_CHAIN == "solana" else BINANCE_WALLET
+PAYOUT_ADDRESS = {
+    "base":   BASE_WALLET,
+    "solana": SOLANA_WALLET,
+    "bsc":    BINANCE_WALLET,
+}.get(PAYMENT_CHAIN, BASE_WALLET)
 
 GROQ_API_KEY   = os.getenv("GROQ_API_KEY", "").strip()
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
 
 # Padrão agora é mainnet (modo real)
 NETWORK_MODE = os.getenv("NETWORK_MODE", "mainnet").strip().lower()
-BSC_CHAIN_ID = 56 if NETWORK_MODE == "mainnet" else 97
+
+BSC_CHAIN_ID  = 56 if NETWORK_MODE == "mainnet" else 97
+BASE_CHAIN_ID = 8453 if NETWORK_MODE == "mainnet" else 84532  # Base Sepolia
+
+# Chain ID EVM ativo (usado por _verify_onchain_evm / Web3), conforme PAYMENT_CHAIN
+EVM_CHAIN_ID = BASE_CHAIN_ID if PAYMENT_CHAIN == "base" else BSC_CHAIN_ID
 
 BSC_RPC = os.getenv(
     "BSC_RPC",
     "https://bsc-dataseed1.binance.org/" if NETWORK_MODE == "mainnet"
     else "https://data-seed-prebsc-1-s1.binance.org:8545/"
 ).strip()
+
+BASE_RPC = os.getenv(
+    "BASE_RPC",
+    "https://mainnet.base.org" if NETWORK_MODE == "mainnet"
+    else "https://sepolia.base.org"
+).strip()
+
+# RPC EVM ativo, conforme PAYMENT_CHAIN
+EVM_RPC = BASE_RPC if PAYMENT_CHAIN == "base" else BSC_RPC
 
 SOLANA_RPC = os.getenv(
     "SOLANA_RPC",
@@ -207,19 +229,22 @@ PORT         = int(os.getenv("PORT", "5050"))
 CACHE_TTL    = int(os.getenv("CACHE_TTL_SECONDS", "60"))
 RATE_LIMIT_RPM = int(os.getenv("RATE_LIMIT_RPM", "30"))
 
-# Token de pagamento: USDC é o padrão em ambas as chains (dominante no x402;
+# Token de pagamento: USDC é o padrão em todas as chains (dominante no x402;
 # suporta EIP-3009 gasless em EVM e é o SPL token de referência em Solana).
-PAYMENT_TOKEN = os.getenv("PAYMENT_TOKEN", "USDC" if PAYMENT_CHAIN == "solana" else "USDT").strip().upper()
+PAYMENT_TOKEN = os.getenv("PAYMENT_TOKEN", "USDT" if PAYMENT_CHAIN == "bsc" else "USDC").strip().upper()
 
-# Decimais por token e por chain (USDC tem 6 decimais em Solana/SPL,
-# mas 18 decimais nos tokens BEP-20 da BSC — isso é uma pegadinha comum)
+# Decimais por token e por chain (USDC tem 6 decimais em Base/Solana,
+# mas tokens BEP-20 da BSC usam 18 — pegadinha comum entre chains)
 TOKEN_DECIMALS_BSC    = {"USDT": 18, "USDC": 18, "BUSD": 18}
+TOKEN_DECIMALS_BASE   = {"USDC": 6}
 TOKEN_DECIMALS_SOLANA = {"USDC": 6, "USDT": 6}
 
-TOKEN_DEC = (
-    TOKEN_DECIMALS_SOLANA.get(PAYMENT_TOKEN, 6) if PAYMENT_CHAIN == "solana"
-    else TOKEN_DECIMALS_BSC.get(PAYMENT_TOKEN, 18)
-)
+if PAYMENT_CHAIN == "solana":
+    TOKEN_DEC = TOKEN_DECIMALS_SOLANA.get(PAYMENT_TOKEN, 6)
+elif PAYMENT_CHAIN == "base":
+    TOKEN_DEC = TOKEN_DECIMALS_BASE.get(PAYMENT_TOKEN, 6)
+else:
+    TOKEN_DEC = TOKEN_DECIMALS_BSC.get(PAYMENT_TOKEN, 18)
 
 # Endereço do contrato/mint do token, por chain
 PAYMENT_TOKEN_CA_BSC = {
@@ -228,6 +253,12 @@ PAYMENT_TOKEN_CA_BSC = {
     "BUSD": "0xe9e7CEA3DedcA5984780Bafc599bD69ADd087D56",
 }.get(PAYMENT_TOKEN, "0x55d398326f99059fF775485246999027B3197955")
 
+# USDC nativo em Base (contrato oficial Circle)
+PAYMENT_TOKEN_CA_BASE = {
+    "USDC": "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913" if NETWORK_MODE == "mainnet"
+            else "0x036CbD53842c5426634e7929541eC2318f3dCF7e",  # USDC Base Sepolia
+}.get(PAYMENT_TOKEN, "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913")
+
 # Mint address do USDC na Solana (mainnet — endereço oficial Circle)
 PAYMENT_TOKEN_MINT_SOLANA = {
     "USDC": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v" if NETWORK_MODE == "mainnet"
@@ -235,7 +266,12 @@ PAYMENT_TOKEN_MINT_SOLANA = {
     "USDT": "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB",
 }.get(PAYMENT_TOKEN, "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v")
 
-PAYMENT_TOKEN_CA = PAYMENT_TOKEN_MINT_SOLANA if PAYMENT_CHAIN == "solana" else PAYMENT_TOKEN_CA_BSC
+if PAYMENT_CHAIN == "solana":
+    PAYMENT_TOKEN_CA = PAYMENT_TOKEN_MINT_SOLANA
+elif PAYMENT_CHAIN == "base":
+    PAYMENT_TOKEN_CA = PAYMENT_TOKEN_CA_BASE
+else:
+    PAYMENT_TOKEN_CA = PAYMENT_TOKEN_CA_BSC
 
 PRICES = {
     "/fear-greed": os.getenv("PRICE_FEAR_GREED", "0.01"),
@@ -299,11 +335,36 @@ def _validate_solana_address(addr: str) -> bool:
     return all(c in base58_alphabet for c in addr)
 
 
+def _validate_evm_address(addr: str, var_name: str) -> list:
+    """Validação de endereço EVM (0x + 40 hex chars), com checksum EIP-55 best-effort."""
+    erros = []
+    if not addr or addr in ("0x", ""):
+        erros.append(f"{var_name} não configurado no .env")
+        return erros
+    if not addr.startswith("0x") or len(addr) != 42:
+        erros.append(f"{var_name} inválido — deve ser 0x + 40 hex chars")
+        return erros
+    try:
+        int(addr, 16)
+    except ValueError:
+        erros.append(f"{var_name} contém caracteres não-hexadecimais")
+    try:
+        from web3 import Web3
+        checksummed = Web3.to_checksum_address(addr)
+        if addr != addr.lower() and addr != checksummed:
+            log.warning(f"{var_name} tem checksum EIP-55 inválido. Confirme: {checksummed}")
+    except ImportError:
+        pass
+    except Exception:
+        pass
+    return erros
+
+
 def _validate_config():
     erros = []
 
-    if PAYMENT_CHAIN not in ("solana", "bsc"):
-        erros.append(f"PAYMENT_CHAIN inválido: '{PAYMENT_CHAIN}' (use 'solana' ou 'bsc')")
+    if PAYMENT_CHAIN not in ("base", "solana", "bsc"):
+        erros.append(f"PAYMENT_CHAIN inválido: '{PAYMENT_CHAIN}' (use 'base', 'solana' ou 'bsc')")
 
     if PAYMENT_CHAIN == "solana":
         if not SOLANA_WALLET:
@@ -313,28 +374,10 @@ def _validate_config():
                 "SOLANA_WALLET_ADDRESS inválido — deve ser Base58, 32-44 caracteres "
                 "(endereço Solana, não começa com '0x')"
             )
+    elif PAYMENT_CHAIN == "base":
+        erros.extend(_validate_evm_address(BASE_WALLET, "BASE_WALLET_ADDRESS"))
     else:  # bsc
-        if not BINANCE_WALLET or BINANCE_WALLET in ("0x", ""):
-            erros.append("BINANCE_WALLET_ADDRESS não configurado no .env")
-        elif not BINANCE_WALLET.startswith("0x") or len(BINANCE_WALLET) != 42:
-            erros.append("BINANCE_WALLET_ADDRESS inválido — deve ser 0x + 40 hex chars")
-        else:
-            try:
-                int(BINANCE_WALLET, 16)
-            except ValueError:
-                erros.append("BINANCE_WALLET_ADDRESS contém caracteres não-hexadecimais")
-            try:
-                from web3 import Web3
-                checksummed = Web3.to_checksum_address(BINANCE_WALLET)
-                if BINANCE_WALLET != BINANCE_WALLET.lower() and BINANCE_WALLET != checksummed:
-                    log.warning(
-                        f"BINANCE_WALLET_ADDRESS tem checksum EIP-55 inválido. "
-                        f"Confirme se o endereço está correto: {checksummed}"
-                    )
-            except ImportError:
-                pass
-            except Exception:
-                pass
+        erros.extend(_validate_evm_address(BINANCE_WALLET, "BINANCE_WALLET_ADDRESS"))
 
     if not GROQ_API_KEY and not GEMINI_API_KEY:
         erros.append("Configure pelo menos GROQ_API_KEY ou GEMINI_API_KEY no .env")
@@ -1463,6 +1506,43 @@ def version():
         "port_env":        os.getenv("PORT", "não definido pelo host"),
         "uptime_s":        int(time.time() - _stats["start_time"]),
     })
+
+
+@app.route("/llms.txt")
+def llms_txt():
+    """
+    Discovery alternativa via llms.txt — padrão lido por crawlers de LLM
+    e agentes autônomos, independente de diretórios como x402scan.
+    """
+    from flask import Response
+    base_url = _get_base_url()
+    chain_label = "Solana (USDC)" if PAYMENT_CHAIN == "solana" else "BNB Smart Chain (USDT)"
+    linhas = [
+        "# NexusAI Crypto Intelligence API",
+        "",
+        f"> Análise autônoma de mercado cripto via IA. Pagamento via protocolo x402 ({chain_label}).",
+        "",
+        "## Como usar",
+        f"- Faça GET em qualquer endpoint abaixo sem autenticação",
+        f"- Resposta HTTP 402 traz as instruções de pagamento x402 (header Payment-Required, base64)",
+        f"- Pague o valor exato via {chain_label} e reenvie com header Payment-Signature",
+        "",
+        "## Endpoints pagos",
+    ]
+    for ep in PRICES:
+        linhas.append(f"- GET {base_url}{ep} — {PRICES[ep]} {PAYMENT_TOKEN} — {ENDPOINT_DESC[ep]}")
+    linhas += [
+        "",
+        "## Discovery",
+        f"- OpenAPI: {base_url}/openapi.json",
+        f"- Manifesto x402: {base_url}/.well-known/x402.json",
+        f"- Info: {base_url}/info",
+        f"- Status: {base_url}/status",
+        "",
+        f"## Carteira de destino ({PAYMENT_CHAIN})",
+        f"{PAYOUT_ADDRESS}",
+    ]
+    return Response("\n".join(linhas), mimetype="text/plain")
 
 
 @app.route("/favicon.ico")
