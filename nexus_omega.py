@@ -27,7 +27,9 @@ DB_PATH = HOME_DIR / "omega.db"
 WALLET_PATH = HOME_DIR / "wallet.json"
 LOG_PATH = HOME_DIR / "omega.log"
 
-X402_PORT = int(os.getenv("OMEGA_X402_PORT", "8402"))
+# === NOVIDADE: usa a porta do Railway se disponível, senão usa 8402 ===
+PORT = int(os.getenv("PORT", "8402"))          # <-- variável para o servidor x402
+X402_PORT = PORT                               # agora X402_PORT recebe a porta dinâmica
 GOSSIP_PORT = int(os.getenv("OMEGA_GOSSIP_PORT", "8403"))
 DASHBOARD_PORT = int(os.getenv("OMEGA_DASH_PORT", "8080"))
 MCAST_GRP = "239.42.42.42"
@@ -140,7 +142,7 @@ if BINANCE_ADDRESS:
     log.info(f"🏦 Sweep → Binance: {BINANCE_ADDRESS}")
 
 # ============================================================================
-# LEDGER (SQLite com índice de reputação)
+# LEDGER (SQLite)
 # ============================================================================
 class Ledger:
     def __init__(self, path: Path):
@@ -554,7 +556,7 @@ class Market:
 # ============================================================================
 class AIBrain:
     def think(self, prompt, max_tokens=512, temperature=0.3):
-        # 1. Groq (primário, gratuito e rápido)
+        # 1. Groq
         if GROQ_KEY:
             try:
                 r = requests.post("https://api.groq.com/openai/v1/chat/completions",
@@ -568,7 +570,7 @@ class AIBrain:
             except Exception as e:
                 log.debug(f"Groq fail: {e}")
 
-        # 2. Gemini (fallback)
+        # 2. Gemini
         if GEMINI_KEY:
             try:
                 r = requests.post(
@@ -580,11 +582,10 @@ class AIBrain:
             except Exception as e:
                 log.debug(f"Gemini fail: {e}")
 
-        # 3. Heurística determinística (fallback)
+        # 3. Heurística
         return json.dumps({"mode": "heuristic", "note": "LLM offline", "timestamp": int(time.time())})
 
     def sentiment_analysis(self, symbol):
-        """Analisa sentimento de notícias usando IA."""
         news = []
         if NEWS_API_KEY:
             try:
@@ -617,18 +618,15 @@ class AIBrain:
 AIBRAIN = AIBrain()
 
 # ============================================================================
-# BRAIN — com IA, Q-learning para ajuste de pesos e preço dinâmico
+# BRAIN — com IA, Q-learning e preço dinâmico
 # ============================================================================
 class Brain:
-    # Q-learning: pesos para sinais (ajustados com base no win rate)
     _q_weights = {"BUY": 0.5, "SELL": 0.5}
 
     @classmethod
     def _dynamic_price(cls, base_price, endpoint):
-        """Ajusta preço com base na reputação do nó e demanda."""
         peers = LEDGER.active_peers()
         rep = sum(p.get("reputation", 1.0) for p in peers) / max(len(peers), 1)
-        # Preço base * (1 + reputação média * 0.2) * (1 + taxa de conversão * 0.1)
         conv = LEDGER.stats()["conv_rate"] / 100.0 if LEDGER.stats()["conv_rate"] else 0.1
         price = base_price * (1 + rep * 0.2) * (1 + conv * 0.1)
         return round(price, 4)
@@ -660,7 +658,6 @@ class Brain:
             ch1 = c.get("price_change_percentage_1h_in_currency", 0) or 0
             ch24 = c.get("price_change_percentage_24h", 0) or 0
             ch7 = c.get("price_change_percentage_7d_in_currency", 0) or 0
-            # Q-learning ajusta o peso de cada timeframe
             score = ch7 * cls._q_weights.get("BUY", 0.5) + ch24 * 0.3 + ch1 * 0.2
             vol_score = (c.get("total_volume", 0) / max(c.get("market_cap", 1), 1)) * 100
             if score > 8 and ch1 > -2:
@@ -716,7 +713,6 @@ class Brain:
                     votes.append({"node": p["node_id"], "vote": r.json(),
                                   "stake": p.get("stake",0)})
             except: pass
-        # Consenso ponderado por stake
         regimes = {}
         for v in votes:
             reg = v["vote"].get("regime")
@@ -770,7 +766,6 @@ class Brain:
             else:
                 pnl -= delta; wins += 1 if delta < 0 else 0; losses += 1 if delta >= 0 else 0
         total = wins + losses
-        # Atualiza Q-weights com base no win rate
         if total > 0:
             wr = wins / total
             Brain._q_weights["BUY"] = max(0.3, min(0.7, wr))
@@ -796,7 +791,6 @@ class Brain:
     def stake_info():
         active_stakes = LEDGER.get_stakes()
         total_staked = sum(s["amount"] for s in active_stakes)
-        # APR baseado na receita diária do nó
         today_earned = LEDGER.stats()["today_usdc"]
         apr = (today_earned / max(total_staked, 0.01)) * 365 * 100 if total_staked > 0 else 15.0
         return {"total_staked_usdc": total_staked, "active_stakes": active_stakes,
@@ -1122,7 +1116,7 @@ class Gossip:
 GOSSIP = Gossip()
 
 # ============================================================================
-# CLIENT AGENT (cross-trade real com simulação de assinatura)
+# CLIENT AGENT (cross-trade simulado)
 # ============================================================================
 class ClientAgent:
     def __init__(self, min_balance=0.10, max_per_hour=1.0):
@@ -1146,7 +1140,6 @@ class ClientAgent:
                 endpoint = random.choice(["/fear-greed", "/regime", "/sentiment"])
                 price = get_dynamic_price(endpoint)
                 if self._can_spend(price):
-                    # Simula envio de pagamento (na prática, usaria solana-py)
                     log.info(f"[CLIENT] Cross-trade executado: {peer.get('node_id')} {endpoint} ${price}")
                     # Aqui entraria a lógica de assinar e enviar transação SPL
                 time.sleep(180 + random.randint(0,120))
@@ -1180,7 +1173,7 @@ class Sweeper:
 SWEEPER = Sweeper()
 
 # ============================================================================
-# DASHBOARD (com indicadores de IA e staking)
+# DASHBOARD
 # ============================================================================
 DASHBOARD = r"""
 <!DOCTYPE html><html><head><meta charset="utf-8"><title>Nexus Omega Pro</title>
@@ -1286,13 +1279,23 @@ def stake_reward_loop():
                     c.execute("UPDATE staking SET status='completed', reward=? WHERE id=?", (reward, s["id"]))
 
 # ============================================================================
-# RUNTIME
+# RUNTIME (ajustado para usar a porta dinâmica)
 # ============================================================================
 def run_servers(solo=False):
-    threading.Thread(target=lambda: app.run(host="0.0.0.0", port=X402_PORT, threaded=True, use_reloader=False), daemon=True).start()
+    # O servidor x402 usará a porta definida pela variável PORT (ou 8402 por padrão)
+    threading.Thread(
+        target=lambda: app.run(host="0.0.0.0", port=X402_PORT, threaded=True, use_reloader=False),
+        daemon=True
+    ).start()
     log.info(f"💼 Servidor x402: http://0.0.0.0:{X402_PORT}")
-    threading.Thread(target=lambda: dash_app.run(host="0.0.0.0", port=DASHBOARD_PORT, threaded=True, use_reloader=False), daemon=True).start()
+
+    # O dashboard permanece na porta DASHBOARD_PORT (8080) – você pode acessar localmente
+    threading.Thread(
+        target=lambda: dash_app.run(host="0.0.0.0", port=DASHBOARD_PORT, threaded=True, use_reloader=False),
+        daemon=True
+    ).start()
     log.info(f"📊 Dashboard: http://localhost:{DASHBOARD_PORT}")
+
     if not solo:
         GOSSIP.start()
         threading.Thread(target=CLIENT.cross_trade_loop, daemon=True).start()
@@ -1308,7 +1311,7 @@ def main_loop():
     log.info(f"   Recebe:     {WALLET.solana_address}  (USDC-SPL Solana)")
     if BINANCE_ADDRESS: log.info(f"   Sweep →    {BINANCE_ADDRESS}")
     log.info(f"   Dashboard:  http://localhost:{DASHBOARD_PORT}")
-    log.info(f"   x402 API:   http://localhost:{X402_PORT}")
+    log.info(f"   x402 API:   http://localhost:{X402_PORT} (pública: via Railway)")
     log.info("="*72)
     try:
         while True:
@@ -1344,6 +1347,7 @@ def cli():
     if "--port" in args:
         idx = args.index("--port")
         if idx+1 < len(args):
+            # Se a porta for passada como argumento, sobrescreve a variável X402_PORT
             globals()["X402_PORT"] = int(args[idx+1])
 
 if __name__ == "__main__":
