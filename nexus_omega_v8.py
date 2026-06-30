@@ -1264,6 +1264,63 @@ def x402_manifest():
         "version_node": VERSION,
     })
 
+# ── Canal 2: MCP discovery — visível para Claude, GPT e demais agentes
+#    compatíveis com Model Context Protocol ──────────────────────────────────
+@app.route("/.well-known/mcp.json")
+def mcp_manifest():
+    base = _public_base()
+    tools = []
+    for p, price in PRICES.items():
+        schema = ENDPOINT_SCHEMAS.get(p, {"type": "object", "properties": {}, "required": []})
+        tools.append({
+            "name":        p.strip("/").replace("-", "_"),
+            "description": f"{ENDPOINT_DESC.get(p, p)} (custa ${price:.2f} USDC via x402)",
+            "inputSchema": schema,
+            "x402": {"resource": f"{base}{p}", "price_usdc": price,
+                     "network": "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp",
+                     "payTo": WALLET.solana_address},
+        })
+    return jsonify({
+        "schema_version": "2024-11-05",
+        "name": "nexus-omega",
+        "description": "Enxame autônomo x402 com sinais de mercado, análise on-chain e arbitragem. Pagamento via USDC-SPL Solana.",
+        "tools": tools,
+    })
+
+# ── Canal 3: A2A agent card — visível no ecossistema Agent-to-Agent (Google) ─
+@app.route("/.well-known/agent.json")
+def a2a_agent_card():
+    base = _public_base()
+    skills = []
+    for p, price in PRICES.items():
+        skills.append({
+            "id":          p.strip("/").replace("-", "_"),
+            "name":        ENDPOINT_DESC.get(p, p),
+            "description": f"{ENDPOINT_DESC.get(p, p)} — pago via x402, ${price:.2f} USDC por chamada",
+            "tags":        ["trading", "x402", "solana"],
+        })
+    return jsonify({
+        "name":        "NexusOmega",
+        "description": "Enxame autônomo x402 com 7 vetores de receita. Sinais de mercado, análise on-chain e arbitragem pagos via USDC-SPL na Solana.",
+        "url":         base,
+        "version":     VERSION,
+        "provider":    {"organization": "NexusOmega", "url": base},
+        "capabilities": {"streaming": False, "pushNotifications": False},
+        "defaultInputModes":  ["application/json"],
+        "defaultOutputModes": ["application/json"],
+        "skills": skills,
+    })
+
+# ── favicon — exigido pelo x402scan para exibir ícone na listagem ───────────
+@app.route("/favicon.ico")
+def favicon():
+    # SVG simples convertido para ico via Content-Type — funciona como ícone leve
+    svg = ('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32">'
+           '<rect width="32" height="32" rx="6" fill="#534AB7"/>'
+           '<text x="16" y="22" font-size="18" text-anchor="middle" '
+           'fill="white" font-family="sans-serif">N</text></svg>')
+    return app.response_class(svg, mimetype="image/svg+xml")
+
 @app.route("/health")
 def health():
     return jsonify({"ok": True, "ts": int(time.time()),
