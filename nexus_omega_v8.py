@@ -1312,6 +1312,33 @@ def a2a_agent_card():
     })
 
 # ── favicon — exigido pelo x402scan para exibir ícone na listagem ───────────
+@app.route("/llms.txt")
+def llms_txt():
+    base = _public_base()
+    lines = [
+        "# NexusOmega",
+        "> Enxame autônomo x402 com 7 vetores de receita. Sinais de mercado, ",
+        "> análise on-chain e arbitragem, pagos via USDC-SPL na Solana mainnet.",
+        "",
+        "## Como pagar",
+        "Protocolo: x402 v2. Envie GET sem header de pagamento para receber o",
+        "desafio 402 com o preço exato. Pague em USDC-SPL e reenvie a chamada",
+        f"com o comprovante. payTo: {WALLET.solana_address}",
+        "",
+        "## Endpoints",
+    ]
+    for p, price in PRICES.items():
+        lines.append(f"- {base}{p} — {ENDPOINT_DESC.get(p, p)} (${price:.2f} USDC)")
+    lines += [
+        "",
+        "## Discovery",
+        f"- OpenAPI: {base}/openapi.json",
+        f"- x402 manifest: {base}/.well-known/x402.json",
+        f"- MCP: {base}/.well-known/mcp.json",
+        f"- A2A agent card: {base}/.well-known/agent.json",
+    ]
+    return app.response_class("\n".join(lines), mimetype="text/plain")
+
 @app.route("/favicon.ico")
 def favicon():
     # SVG simples convertido para ico via Content-Type — funciona como ícone leve
