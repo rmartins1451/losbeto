@@ -1580,7 +1580,8 @@ function ago(ts){const d=Date.now()/1000-ts;if(d<60)return Math.floor(d)+'s';if(
 
 async function refresh(){
   try{
-    const r=await fetch('/api/stats').then(r=>r.json());
+    const _token = new URLSearchParams(window.location.search).get('token') || '';
+    const r=await fetch('/dash/api/stats?token='+encodeURIComponent(_token)).then(r=>r.json());
     total.textContent=fmt$(r.stats.total_usdc);
     today.textContent=fmt$(r.stats.today_usdc);
     hour.textContent=fmt$(r.stats.hour_usdc);
