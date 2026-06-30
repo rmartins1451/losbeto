@@ -2,11 +2,11 @@
 builder = "nixpacks"
 
 [deploy]
-startCommand = "python nexus_omega_v8.py"
+startCommand = "python nexus_omega_v11.py"
 healthcheckPath = "/ready"
 healthcheckTimeout = 30
 restartPolicyType = "on_failure"
 restartPolicyMaxRetries = 5
 
 [[services]]
-name = "nexus-omega"
+name = "nexus-omega-v11"
