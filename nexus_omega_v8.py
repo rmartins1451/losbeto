@@ -270,6 +270,19 @@ class Wallet:
         except Exception:
             return False
 
+def _restore_wallet_from_env_early():
+    """Restaura wallet de WALLET_SECRET_B58 ANTES de Wallet() ser instanciada."""
+    secret = os.environ.get("WALLET_SECRET_B58", "").strip()
+    if secret and not WALLET_PATH.exists():
+        data = {"secret_b58": secret, "created_at": datetime.now(timezone.utc).isoformat(), "version": VERSION}
+        WALLET_PATH.write_text(json.dumps(data, indent=2))
+        try:
+            os.chmod(WALLET_PATH, 0o600)
+        except Exception:
+            pass
+        log.info("✅ Wallet restaurada de WALLET_SECRET_B58 (early)")
+
+_restore_wallet_from_env_early()
 WALLET = Wallet()
 log.info(f"🆔 Node ID: {WALLET.node_id}")
 log.info(f"💰 Recebe USDC-SPL em: {WALLET.solana_address}")
@@ -1828,7 +1841,6 @@ def cli():
             globals()["X402_PORT"] = int(args[idx+1])
 
 if __name__ == "__main__":
-    _restore_wallet_from_env()
     cli()
     solo = "--solo" in sys.argv
     run_servers(solo=solo)
