@@ -1658,6 +1658,36 @@ def jwt_decode(token: str, secret: str = JWT_SECRET) -> Optional[dict]:
 # ============================================================================
 
 app = Flask(__name__)
+
+@app.after_request
+def _cors(resp):
+    """CORS global — obrigatório para agentes x402 chamando de outros domínios."""
+    resp.headers["Access-Control-Allow-Origin"]  = "*"
+    resp.headers["Access-Control-Allow-Headers"] = (
+        "X-PAYMENT,Payment-Signature,X-Payment,Authorization,"
+        "Content-Type,X-Session-Token"
+    )
+    resp.headers["Access-Control-Allow-Methods"] = "GET,POST,OPTIONS,HEAD"
+    resp.headers["Access-Control-Expose-Headers"] = (
+        "X-PAYMENT-REQUIRED,WWW-Authenticate,X-Session-Token,"
+        "X-Session-TTL,X-Payment-Response,X-PoI-Multiplier"
+    )
+    return resp
+
+@app.before_request
+def _handle_options():
+    """Responde preflight OPTIONS antes de qualquer verificação de pagamento."""
+    if request.method == "OPTIONS":
+        from flask import Response as _R
+        r = _R()
+        r.headers["Access-Control-Allow-Origin"]  = "*"
+        r.headers["Access-Control-Allow-Headers"] = (
+            "X-PAYMENT,Payment-Signature,X-Payment,Authorization,"
+            "Content-Type,X-Session-Token"
+        )
+        r.headers["Access-Control-Allow-Methods"] = "GET,POST,OPTIONS,HEAD"
+        r.headers["Access-Control-Max-Age"] = "86400"
+        return r, 204
 app.logger.disabled = True
 
 # Rate-limit por IP + por wallet (anti-Sybil)
