@@ -53,7 +53,7 @@ from typing import Any, Optional, Dict, List, Tuple
 # 0. CONFIGURAÇÃO E AUTO-SETUP
 # ============================================================================
 
-VERSION = "11.0.0-SOVEREIGN"
+VERSION = "10.0.0-SOVEREIGN"
 HOME_DIR = Path(os.environ.get("DATA_DIR", "")).expanduser() if os.environ.get("DATA_DIR") else Path("/data") if Path("/data").exists() else Path.home() / ".nexus_omega"
 HOME_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -138,15 +138,7 @@ TG_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
 TG_CHAT  = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
 
 # Binance sweep
-_raw_binance = os.environ.get("BINANCE_SOLANA_ADDRESS", "").strip()
-if _raw_binance.startswith("0x"):
-    import logging as _lg
-    _lg.getLogger("omega").error(
-        "⛔ BINANCE_SOLANA_ADDRESS começa com '0x' — endereço Ethereum! "
-        "Fundos enviados via Solana serão PERDIDOS. Sweep DESATIVADO."
-    )
-    _raw_binance = ""
-BINANCE_ADDRESS = _raw_binance
+BINANCE_ADDRESS  = os.environ.get("BINANCE_SOLANA_ADDRESS", "").strip()
 SWEEP_THRESHOLD  = float(os.environ.get("SWEEP_THRESHOLD_USDC", "0.5"))
 SWEEP_INTERVAL   = int(os.environ.get("SWEEP_INTERVAL_S", "3600"))
 
@@ -154,7 +146,7 @@ SWEEP_INTERVAL   = int(os.environ.get("SWEEP_INTERVAL_S", "3600"))
 BOOTSTRAP_SEEDS = [s.strip() for s in os.environ.get("OMEGA_SEEDS", "").split(",") if s.strip()]
 
 # Dynamic Pricing (PoI)
-DYNAMIC_PRICING = os.environ.get("DYNAMIC_PRICING", "false").lower() == "true"
+DYNAMIC_PRICING = os.environ.get("DYNAMIC_PRICING", "false").lower() == "true"  # false até ter histórico
 BASE_WIN_RATE   = 55.0
 
 # GeoIP — substitui filtro de IP-prefix burro do v9
@@ -349,20 +341,6 @@ class TONWallet:
 
 def _restore_wallets():
     secret = os.environ.get("WALLET_SECRET_B58", "").strip()
-    if secret:
-        try:
-            raw = base58.b58decode(secret)
-            # Endereço público Solana = 32 bytes; secret válido = 32 ou 64 bytes
-            # MAS: se o b58 decodificado for igual ao próprio input, é chave pública
-            test_w = SolanaWallet(secret)
-            if test_w.solana_address == secret:
-                log.error("⛔ WALLET_SECRET_B58 é um ENDEREÇO PÚBLICO, não um secret!")
-                log.error("   Abra wallet.json e copie o campo secret_b58.")
-                log.error("   O secret é DIFERENTE do endereço e geralmente tem 88+ chars.")
-                secret = ""
-        except Exception:
-            pass  # Se falhar a decodificação, tenta usar mesmo assim
-
     if not secret and WALLET_PATH.exists():
         try:
             secret = json.loads(WALLET_PATH.read_text()).get("secret_b58")
@@ -1653,36 +1631,6 @@ def jwt_decode(token: str, secret: str = JWT_SECRET) -> Optional[dict]:
 app = Flask(__name__)
 app.logger.disabled = True
 
-# ── CORS global — obrigatório para agentes x402 de outros domínios ─────────
-@app.after_request
-def _cors(resp):
-    resp.headers["Access-Control-Allow-Origin"]   = "*"
-    resp.headers["Access-Control-Allow-Headers"]  = (
-        "X-PAYMENT,Payment-Signature,X-Payment,Authorization,"
-        "Content-Type,X-Session-Token"
-    )
-    resp.headers["Access-Control-Allow-Methods"]  = "GET,POST,OPTIONS,HEAD"
-    resp.headers["Access-Control-Expose-Headers"] = (
-        "X-PAYMENT-REQUIRED,PAYMENT-REQUIRED,WWW-Authenticate,"
-        "X-Session-Token,X-Session-TTL"
-    )
-    return resp
-
-@app.before_request
-def _preflight():
-    if request.method == "OPTIONS":
-        from flask import Response as _R
-        r = _R()
-        r.headers["Access-Control-Allow-Origin"]  = "*"
-        r.headers["Access-Control-Allow-Headers"] = (
-            "X-PAYMENT,Payment-Signature,X-Payment,Authorization,"
-            "Content-Type,X-Session-Token"
-        )
-        r.headers["Access-Control-Allow-Methods"] = "GET,POST,OPTIONS,HEAD"
-        r.headers["Access-Control-Max-Age"]       = "86400"
-        return r, 204
-
-
 # Rate-limit por IP + por wallet (anti-Sybil)
 _rl_lock   = threading.Lock()
 _rl_ip     = defaultdict(deque)
@@ -1716,8 +1664,8 @@ def _build_402(endpoint: str):
     accepts = [
         {
             "scheme":             "exact",
-            "network":            f"solana:{SOL_GENESIS}",
-            "maxAmountRequired":  amount_atomic,
+            "network":           "solana",
+            "maxAmountRequired":  int(amount * 10 ** USDC_DECIMALS),
             "resource":           f"{base}{endpoint}",
             "description":        ENDPOINT_DESC.get(endpoint, "NexusOmega v10"),
             "mimeType":           "application/json",
@@ -1726,18 +1674,14 @@ def _build_402(endpoint: str):
             "asset":              USDC_MINT,
             "extra":              {"name": "USD Coin", "symbol": "USDC",
                                    "decimals": USDC_DECIMALS},
-            "outputSchema": {
-                "input":  {"type": "http", "method": "GET",
-                           "discoverable": True},
-                "output": {"type": "object"},
-            },
+
         }
     ]
     if ENABLE_BASE:
         accepts.append({
             "scheme":             "exact",
             "network":            BASE_CAIP2,
-            "maxAmountRequired":  amount_atomic,
+            "maxAmountRequired":  int(amount * 10 ** USDC_DECIMALS),
             "resource":           f"{base}{endpoint}",
             "description":        ENDPOINT_DESC.get(endpoint, "NexusOmega v10"),
             "mimeType":           "application/json",
@@ -1754,18 +1698,14 @@ def _build_402(endpoint: str):
         "error":           "X-PAYMENT header is required",
         "accepts":         accepts,
         "payer":           None,
-        "node_id":         WALLET.node_id,
-        "version":         VERSION,
-        "poi_multiplier":  LEDGER.get_poi_multiplier(),
     }
     resp = jsonify(payload)
     resp.status_code = 402
     b64 = base64.b64encode(json.dumps(payload).encode()).decode()
     resp.headers["X-PAYMENT-REQUIRED"] = b64
-    resp.headers["PAYMENT-REQUIRED"]   = b64   # compat v1
     resp.headers["WWW-Authenticate"]   = f'x402 challenge="{b64}"'
-    resp.headers["X-PoI-Multiplier"]   = str(LEDGER.get_poi_multiplier())
-    resp.headers["X-Node-Id"]          = WALLET.node_id
+    # Headers x402 v2: apenas os obrigatórios
+    # X-PAYMENT-REQUIRED e WWW-Authenticate já setados acima
     return resp
 
 
@@ -1983,8 +1923,11 @@ def info():
 
 @app.route("/.well-known/x402.json")
 def manifest_x402():
+    """Discovery document — formato exato que o x402scan valida.
+    CRÍTICO: network="solana" (string simples, não "networks" array CAIP-2).
+    CRÍTICO: usa BASE_PRICES sem multiplicador PoI.
+    """
     base = _public_base()
-    USDC_DECIMALS_LOCAL = 6
     resources = []
     for p, base_price in BASE_PRICES.items():
         resources.append({
@@ -1992,12 +1935,13 @@ def manifest_x402():
             "method":            "GET",
             "scheme":            "exact",
             "network":           "solana",
-            "maxAmountRequired": str(int(base_price * 10 ** USDC_DECIMALS_LOCAL)),
+            "maxAmountRequired": str(int(base_price * 10 ** USDC_DECIMALS)),
             "asset":             USDC_MINT,
             "payTo":             WALLET.solana_address,
             "maxTimeoutSeconds": 300,
             "description":       ENDPOINT_DESC.get(p, p),
             "mimeType":          "application/json",
+            "tags":              ENDPOINT_TAGS.get(p, []),
         })
     return jsonify({
         "version":         2,
@@ -2009,7 +1953,12 @@ def manifest_x402():
             "node_id": WALLET.node_id,
             "url":     base,
         },
+        "instructions": (
+            "x402 v2 exact scheme. USDC-SPL Solana mainnet. "
+            "GET sem header → 402 → pague USDC-SPL → reenvie com X-PAYMENT."
+        ),
     })
+
 @app.route("/.well-known/mcp.json")
 def manifest_mcp():
     base = _public_base()
@@ -2023,7 +1972,7 @@ def manifest_mcp():
                 "resource": f"{base}{p}",
                 "scheme":   "exact",
                 "price":    f"${get_dynamic_price(p):.4f}",
-                "network":  f"solana:{SOL_GENESIS}",
+                "network":           "solana",
                 "payTo":    WALLET.solana_address,
                 "asset":    USDC_MINT,
             },
@@ -2077,12 +2026,8 @@ def openapi_spec():
         }
     return jsonify({
         "openapi": "3.0.0",
-        "info": {
-            "title":       "NexusOmega v11",
-            "version":     VERSION,
-            "description": "Multi-chain x402 AI swarm — Solana. Pay-per-call USDC.",
-            "contact": {"email": os.environ.get("CONTACT_EMAIL", "")},
-        },
+        "info": {"title": "NexusOmega v10", "version": VERSION,
+                 "description": "Multi-chain x402 AI swarm — Solana+Base+TON"},
         "servers": [{"url": base}],
         "paths": paths,
     })
