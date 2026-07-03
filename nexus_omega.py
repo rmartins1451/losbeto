@@ -2052,29 +2052,139 @@ def manifest_agent():
 @app.route("/openapi.json")
 def openapi_spec():
     base = _public_base()
+    contact_email = os.environ.get("CONTACT_EMAIL", "").strip()
+
+    # Schemas de parâmetros por endpoint — x402scan exige pelo menos 1 param
+    ENDPOINT_PARAMS = {
+        "/fear-greed":    [{"name": "format", "in": "query", "required": False,
+                            "description": "Formato da resposta",
+                            "schema": {"type": "string", "enum": ["json"], "default": "json"}}],
+        "/regime":        [{"name": "symbol", "in": "query", "required": False,
+                            "description": "Par de trading (ex: BTC/USDC)",
+                            "schema": {"type": "string", "example": "BTC/USDC"}}],
+        "/mempool":       [{"name": "limit", "in": "query", "required": False,
+                            "description": "Número de transações a retornar",
+                            "schema": {"type": "integer", "example": 20}}],
+        "/anomalias":     [{"name": "threshold", "in": "query", "required": False,
+                            "description": "Limiar de detecção 0.0-1.0",
+                            "schema": {"type": "number", "example": 0.7}}],
+        "/sentiment":     [{"name": "symbol", "in": "query", "required": False,
+                            "description": "Ativo (ex: BTC, ETH, SOL)",
+                            "schema": {"type": "string", "example": "BTC"}}],
+        "/jupiter-swap":  [{"name": "pair", "in": "query", "required": False,
+                            "description": "Par a consultar (ex: SOL/USDC)",
+                            "schema": {"type": "string", "example": "SOL/USDC"}}],
+        "/analise":       [{"name": "symbol", "in": "query", "required": False,
+                            "description": "Ativo a analisar",
+                            "schema": {"type": "string", "example": "SOL/USDC"}}],
+        "/swarm-vote":    [{"name": "proposal", "in": "query", "required": False,
+                            "description": "ID da proposta",
+                            "schema": {"type": "string", "example": "prop-001"}}],
+        "/rugcheck":      [{"name": "token", "in": "query", "required": False,
+                            "description": "Endereço do token a verificar",
+                            "schema": {"type": "string", "example": "4k3D..."}}],
+        "/sinais":        [{"name": "timeframe", "in": "query", "required": False,
+                            "description": "Timeframe do sinal",
+                            "schema": {"type": "string", "enum": ["1h","4h","1d"], "example": "1h"}}],
+        "/defi-yield":    [{"name": "protocol", "in": "query", "required": False,
+                            "description": "Protocolo DeFi (ex: raydium, orca)",
+                            "schema": {"type": "string", "example": "raydium"}}],
+        "/deep-think":    [{"name": "question", "in": "query", "required": False,
+                            "description": "Pergunta para análise profunda de IA",
+                            "schema": {"type": "string", "example": "BTC vai subir nas próximas 24h?"}}],
+        "/pump-monitor":  [{"name": "limit", "in": "query", "required": False,
+                            "description": "Número de tokens a monitorar",
+                            "schema": {"type": "integer", "example": 10}}],
+        "/arbitrage":     [{"name": "pair", "in": "query", "required": False,
+                            "description": "Par a verificar arbitragem",
+                            "schema": {"type": "string", "example": "SOL/USDC"}}],
+        "/tg-premium":    [{"name": "format", "in": "query", "required": False,
+                            "description": "Formato do feed",
+                            "schema": {"type": "string", "enum": ["json","text"], "default": "json"}}],
+        "/relatorio":     [{"name": "period", "in": "query", "required": False,
+                            "description": "Período do relatório",
+                            "schema": {"type": "string", "enum": ["24h","7d","30d"], "example": "24h"}}],
+        "/backtest":      [{"name": "strategy", "in": "query", "required": False,
+                            "description": "ID da estratégia a testar",
+                            "schema": {"type": "string", "example": "momentum_v1"}},
+                           {"name": "days", "in": "query", "required": False,
+                            "description": "Dias de histórico",
+                            "schema": {"type": "integer", "example": 30}}],
+        "/agent-call":    [{"name": "target", "in": "query", "required": False,
+                            "description": "Endereço do nó alvo",
+                            "schema": {"type": "string", "example": "https://peer.example.com"}}],
+        "/onchain-credit":[{"name": "wallet", "in": "query", "required": False,
+                            "description": "Endereço Solana a avaliar",
+                            "schema": {"type": "string", "example": "7xKX..."}}],
+        "/cross-chain":   [{"name": "pair", "in": "query", "required": False,
+                            "description": "Par cross-chain (ex: SOL-ETH)",
+                            "schema": {"type": "string", "example": "SOL-ETH"}}],
+        "/whale-alert":   [{"name": "min_usd", "in": "query", "required": False,
+                            "description": "Valor mínimo em USD para alertar",
+                            "schema": {"type": "number", "example": 100000}}],
+        "/smart-money":   [{"name": "limit", "in": "query", "required": False,
+                            "description": "Número de wallets a rastrear",
+                            "schema": {"type": "integer", "example": 10}}],
+        "/copytrade":     [{"name": "wallet", "in": "query", "required": False,
+                            "description": "Wallet a copiar",
+                            "schema": {"type": "string", "example": "7xKX..."}}],
+        "/alpha-signal":  [{"name": "confidence", "in": "query", "required": False,
+                            "description": "Confiança mínima do sinal 0-100",
+                            "schema": {"type": "integer", "example": 75}}],
+        "/insider-track": [{"name": "limit", "in": "query", "required": False,
+                            "description": "Número de wallets insider a rastrear",
+                            "schema": {"type": "integer", "example": 5}}],
+        "/mev-flow":      [{"name": "limit", "in": "query", "required": False,
+                            "description": "Número de oportunidades MEV",
+                            "schema": {"type": "integer", "example": 5}}],
+    }
+
     paths = {}
     for p in BASE_PRICES:
+        price = BASE_PRICES[p]
+        params = ENDPOINT_PARAMS.get(p, [
+            {"name": "format", "in": "query", "required": False,
+             "description": "Formato da resposta",
+             "schema": {"type": "string", "enum": ["json"], "default": "json"}}
+        ])
         paths[p] = {
             "get": {
                 "summary":     ENDPOINT_DESC.get(p, p),
-                "description": f"x402 paid endpoint. Price: ${get_dynamic_price(p):.4f} USDC.",
-                "tags":        ENDPOINT_TAGS.get(p, []),
+                "description": f"{ENDPOINT_DESC.get(p, p)}. Preço: ${price:.4f} USDC via x402.",
+                "operationId": p.strip("/").replace("-", "_"),
+                "tags":        ENDPOINT_TAGS.get(p, ["Trading"]),
+                "parameters":  params,
+                "security":    [{"x402": []}],
                 "responses": {
-                    "200": {"description": "Success", "content": {
-                        "application/json": {"schema": {"type": "object"}}}},
-                    "402": {"description": "Payment Required (x402)"},
+                    "200": {"description": "Sucesso",
+                            "content": {"application/json": {"schema": {"type": "object"}}}},
+                    "402": {"description": "Payment Required — use protocolo x402"},
                 },
             }
         }
+
+    info = {
+        "title":       "NexusOmega v11",
+        "version":     VERSION,
+        "description": "Multi-chain x402 AI swarm — Solana. Pay-per-call USDC.",
+    }
+    if contact_email:
+        info["contact"] = {"email": contact_email}
+
     return jsonify({
         "openapi": "3.0.0",
-        "info": {
-            "title":       "NexusOmega v11",
-            "version":     VERSION,
-            "description": "Multi-chain x402 AI swarm — Solana. Pay-per-call USDC.",
-            "contact": {"email": os.environ.get("CONTACT_EMAIL", "")},
-        },
+        "info":    info,
         "servers": [{"url": base}],
+        "components": {
+            "securitySchemes": {
+                "x402": {
+                    "type":        "apiKey",
+                    "in":          "header",
+                    "name":        "PAYMENT-REQUIRED",
+                    "description": "x402 payment — base64 encoded PaymentRequired payload",
+                }
+            }
+        },
         "paths": paths,
     })
 
