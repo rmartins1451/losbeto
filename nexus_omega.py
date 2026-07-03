@@ -2155,6 +2155,14 @@ def openapi_spec():
                 "tags":        ENDPOINT_TAGS.get(p, ["Trading"]),
                 "parameters":  params,
                 "security":    [{"x402": []}],
+                # x-payment-info: convenção emergente usada por x402scan e 402 Index
+                "x-payment-info": {
+                    "scheme":  "exact",
+                    "network": f"solana:{SOL_GENESIS}",
+                    "asset":   USDC_MINT,
+                    "amount":  str(int(price * 10 ** USDC_DECIMALS)),
+                    "payTo":   WALLET.solana_address,
+                },
                 "responses": {
                     "200": {"description": "Sucesso",
                             "content": {"application/json": {"schema": {"type": "object"}}}},
