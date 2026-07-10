@@ -1,9 +1,0 @@
-[build]
-builder = "NIXPACKS"
-
-[deploy]
-startCommand = "python nexus_omega_v13.py"
-healthcheckPath = "/ready"
-healthcheckTimeout = 30
-restartPolicyType = "on_failure"
-restartPolicyMaxRetries = 5
