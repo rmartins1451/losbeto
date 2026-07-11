@@ -1,8 +1,0 @@
-# Losbeto — Lista de tx signatures para reconciliar
-# Uma signature por linha. Linhas com # são comentário.
-# Use: python losbeto_cli.py bulk tx_signatures.txt --token <DASH_TOKEN>
-#
-# Suas tx conhecidas (Julho/2026 — Phantom Cmjzr8VF...):
-4bRCoXn8x36v3X8bN4N8zQkLBgzJ7CcgLm9GGYPLeEDxJfC7awD6w9p3A9U6YjbvHp6B42K3GSurE1w73ZEQ4we6
-59Mn4RefaRf8ECRafYE7x4mTm2pkvJZGeekfVyzwyXLfA34eA1xdM7UzMq4RhNGv5pRXeuEG9B5mrt9tg9pviRvH
-3eqn2pATaqZ7kg34YYJujvgUwQxzmtpfKm5oXAS4BDciVPHHqRShoJipF3fhMBeuxA8PSx2yu7HcBeg3UrfDSsfy
