@@ -1,0 +1,32 @@
+[build]
+builder = "NIXPACKS"
+
+[deploy]
+startCommand = "gunicorn --worker-class gthread --workers 2 --threads 6 --timeout 120 --graceful-timeout 30 --keep-alive 30 --max-requests 1000 --max-requests-jitter 100 --bind 0.0.0.0:$PORT nexus_omega:app"
+healthcheckPath = "/ready"
+healthcheckTimeout = 60
+restartPolicyType = "on_failure"
+restartPolicyMaxRetries = 5
+
+# v17 REVENUE — variáveis recomendadas (defina na aba Variables do Railway):
+#
+#   Obrigatórias:
+#     SOLANA_WALLET_ADDRESS  = <sua Phantom em base58 — atualmente GEhr9HCFTRDjanMg435frSgCVwVZYpNoPrEkmNBnFHFE>
+#     DASH_TOKEN             = <token secreto para /dash e /reconcile-tx>
+#
+#   Multi-chain (RECOMENDADO — 90% do volume x402 é Base USDC):
+#     BASE_PAYTO_EVM         = 0xd5Ba9711a3D052846a3695C70e7fcb8b3168FE7d
+#
+#   Facilitator (v17 padrão: PayAI mainnet grátis). Para CDP:
+#     CDP_API_KEY_ID         = <seu CDP key id>
+#     CDP_API_KEY_SECRET     = <seu CDP key secret>
+#   OU force um endpoint manual:
+#     X402_FACILITATOR       = https://api.cdp.coinbase.com/platform/v2/x402
+#
+#   Opcionais (RPC premium — resolve latência e rate-limit):
+#     HELIUS_API_KEY         = <sua key Helius>
+#     SOLANA_RPC             = https://mainnet.helius-rpc.com/?api-key=xxx
+#
+#   Telegram (notificações de venda):
+#     TELEGRAM_BOT_TOKEN     = <bot token>
+#     TELEGRAM_CHAT_ID       = <chat id>
