@@ -31,3 +31,8 @@ omega_v10.log
 config_v10.json
 rag_v10.db
 .nixpacks/
+nixpacks.toml
+railway.toml
+Procfile
+runtime.txt
+.python-version
