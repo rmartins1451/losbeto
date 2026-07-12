@@ -1,11 +1,12 @@
-# Força Nixpacks a reconhecer como app Python
 providers = ["python"]
 
 [phases.setup]
 nixPkgs = ["python311", "gcc", "libffi"]
 
 [phases.install]
-cmds = ["pip install --upgrade pip", "pip install -r requirements.txt"]
+cmds = ["python3 -m pip install -r requirements.txt"]
 
+# Opcional: remova a seção [start] para usar o startCommand do railway.toml
+# ou mantenha se quiser sobrescrever.
 [start]
 cmd = "gunicorn --worker-class gthread --workers 2 --threads 6 --timeout 120 --graceful-timeout 30 --keep-alive 30 --max-requests 1000 --max-requests-jitter 100 --bind 0.0.0.0:$PORT nexus_omega:app"
