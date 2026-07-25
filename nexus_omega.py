@@ -79,7 +79,7 @@ from typing import Any, Optional, Dict, List, Tuple
 # 0. CONFIGURAÇÃO E AUTO-SETUP
 # ============================================================================
 
-VERSION = "25.2.0-DISCOVERY"
+VERSION = "25.3.0-DISCOVERY"
 BRAND_NAME = "Losbeto"
 BRAND_TAGLINE = "The Global Revenue Engine for Financial AI Agents"
 BRAND_EMOJI = "🧠"
@@ -362,8 +362,8 @@ PRICE_OVERRIDES = _load_price_overrides()
 ENDPOINT_DESC = {
     "/bootstrap-trust": "Trust bootstrap endpoint (self-payment para trust score inicial)",
     "/forex-rate":      "Live FX rate for major pairs (?pair=EUR/USD): EUR, GBP, JPY, CHF, AUD, CAD crosses via exchange-rate API.",
-    "/commodity-price": "Real futures prices via Yahoo (GC=F, CL=F, SI=F...): gold, silver, WTI, Brent, copper, natgas with daily change.",
-    "/stock-quote":     "Live equity quote (?symbol=AAPL): price, daily change, previous close, exchange — via Yahoo Finance.",
+    "/commodity-price": "Live commodity prices: gold, silver, WTI, Brent, copper, natural gas (?symbol=GOLD) with daily change. Multi-source with declared provenance in every response.",
+    "/stock-quote":     "Live equity quote (?symbol=AAPL): price, daily change, open/high/low. Multi-source with the provider named in every response.",
     "/macro-calendar":  "Upcoming macro events (FOMC, NFP, CPI, ECB) with impact rating, forecast and previous readings.",
     "/earnings-whisper": "Next earnings date, EPS/revenue estimates and whisper number for a given stock (?symbol=AAPL).",
     "/forex-arbitrage": "Triangular FX arbitrage scanner across major crosses with spread detection above 0.01%.",
@@ -4626,7 +4626,7 @@ class Premium:
                 "window": "90 daily returns", "assets": keys,
                 "matrix": matrix, "highlights": highlights,
                 "ai_reading": reading or "AI reading unavailable — matrix above is complete.",
-                "methodology": "Pearson correlation of daily returns, Yahoo Finance closes.",
+                "methodology": "Pearson correlation of daily returns on official daily closes; source named per series.",
                 "provider": "Losbeto/Premium", "version": VERSION,
                 "disclaimer": "Research, not financial advice."}
 
@@ -4683,7 +4683,7 @@ class Premium:
                                             "defensives_avg_1m": round(d_avg, 2),
                                             "signal": signal},
                 "ai_narrative": narrative or "AI narrative unavailable — rankings above.",
-                "methodology": "1M/3M price returns of sector ETFs + BTC + gold, Yahoo closes.",
+                "methodology": "1M/3M price returns of sector ETFs + BTC + gold on official daily closes.",
                 "provider": "Losbeto/Premium", "version": VERSION,
                 "disclaimer": "Research, not financial advice."}
 
@@ -5347,6 +5347,44 @@ TRY_MENU = [p.strip() for p in os.environ.get(
     "TRY_MENU",
     "/global-morning-brief,/equity-dossier,/forex-rate,/commodity-price,"
     "/fear-greed,/launch-risk").split(",") if p.strip()]
+
+@app.route("/health/providers")
+def health_providers():
+    """v25.3: autodiagnóstico público das fontes que sustentam as promessas do
+    catálogo. Existe porque a auditoria do x402-list reprovou o nó por vender
+    produtos cujas fontes estavam mudas. Agora qualquer um (inclusive um
+    revisor) confere em 1 request se dado e IA estão realmente vivos."""
+    out = {"version": VERSION, "ts": int(time.time())}
+    # 1) IA: os produtos premium prometem síntese — isto prova se ela funciona
+    probe = ""
+    try:
+        probe = LLM.ask("Reply with exactly: OK", max_tokens=8, temperature=0)
+    except Exception as e:
+        probe = f"error: {e}"
+    ai_live = bool(probe) and "LLM offline" not in probe and not probe.startswith("error")
+    out["ai"] = {"live": ai_live,
+                 "providers_configured": [n for n, k in
+                     (("deepseek", DEEPSEEK_KEY), ("claude", CLAUDE_KEY),
+                      ("groq", GROQ_KEY), ("gemini", GEMINI_KEY)) if k],
+                 "probe": (probe or "")[:60]}
+    # 2) mercados tradicionais: o que a auditoria reprovou
+    checks = {}
+    for path, fn in (("/stock-quote", Brain.stock_quote),
+                     ("/commodity-price", Brain.commodity_price),
+                     ("/forex-rate", Brain.forex_rate)):
+        try:
+            with app.test_request_context(path):
+                r = fn()
+            checks[path] = {"live": bool(isinstance(r, dict) and r.get("price")
+                                         and not r.get("status")),
+                            "source": r.get("source") or r.get("status")}
+        except Exception as e:
+            checks[path] = {"live": False, "source": f"error: {str(e)[:40]}"}
+    out["market_data"] = checks
+    out["premium_ready"] = ai_live and all(v["live"] for v in checks.values())
+    out["note"] = ("premium_ready=false means AI or market sources are down; "
+                   "premium endpoints return HTTP 503 and do not charge.")
+    return jsonify(out)
 
 @app.route("/try")
 def try_menu():
