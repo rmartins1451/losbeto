@@ -79,7 +79,7 @@ from typing import Any, Optional, Dict, List, Tuple
 # 0. CONFIGURAÇÃO E AUTO-SETUP
 # ============================================================================
 
-VERSION = "24.9.0-MAGNET"
+VERSION = "24.10.0-HONEST"
 BRAND_NAME = "Losbeto"
 BRAND_TAGLINE = "The Global Revenue Engine for Financial AI Agents"
 BRAND_EMOJI = "🧠"
@@ -2625,55 +2625,83 @@ class Brain:
                    "NATGAS": ("NG=F", "Natural Gas", "USD/MMBtu")}
         if symbol in futures:
             yf_sym, name, unit = futures[symbol]
-            try:
-                r = requests.get(f"https://query1.finance.yahoo.com/v8/finance/chart/{yf_sym}",
-                                 timeout=8)
-                if r.ok:
-                    meta = r.json().get("chart", {}).get("result", [{}])[0].get("meta", {})
-                    price = meta.get("regularMarketPrice")
-                    prev = meta.get("previousClose", price)
-                    if price:
-                        chg = ((price - prev) / prev * 100) if prev else 0
+            stooq_map = {"GOLD": "xauusd", "SILVER": "xagusd", "OIL_WTI": "cl.f",
+                         "OIL_BRENT": "cb.f", "COPPER": "hg.f", "NATGAS": "ng.f"}
+            for src_fn in (lambda: Premium._yahoo_quote(yf_sym),
+                           lambda: Premium._stooq_quote(stooq_map.get(symbol, ""))):
+                try:
+                    q = src_fn()
+                    if q and q.get("price"):
                         return {"symbol": symbol, "name": name, "unit": unit,
-                                "price": round(price, 4), "change_pct": round(chg, 2),
-                                "previous_close": prev, "source": "Yahoo Finance (futures)",
-                                "future_contract": yf_sym, "ts": ts,
-                                "provider": "Losbeto/Commodities", "version": VERSION}
+                                "price": q["price"], "change_pct": q.get("change_pct", 0),
+                                "source": q.get("source", "market"), "future_contract": yf_sym,
+                                "ts": ts, "provider": "Losbeto/Commodities", "version": VERSION}
+                except Exception as e:
+                    log.debug(f"commodity {symbol}: {e}")
+        # v24.10: SEM tabela estática. Ouro 41% defasado (flagrado na auditoria do
+        # x402-list) é pior que admitir indisponibilidade honestamente.
+        return {"symbol": symbol, "status": "unavailable",
+                "error": "No live commodity source reachable right now. Not charged for stale data.",
+                "ts": ts, "provider": "Losbeto/Commodities", "version": VERSION}
+
+    @staticmethod
+    def _stooq_quote(symbol: str):
+        """Stooq CSV — grátis, sem API key, e (crucial) não bloqueia data
+        centers como o Yahoo faz. Formato: SYMBOL,DATE,TIME,OPEN,HIGH,LOW,CLOSE,VOL."""
+        sym = symbol.lower()
+        variants = [sym if "." in sym else f"{sym}.us"]  # ações US
+        for v in variants:
+            try:
+                r = requests.get(f"https://stooq.com/q/l/?s={v}&f=sd2t2ohlcv&h&e=csv",
+                                 timeout=8, headers={"User-Agent": "Mozilla/5.0"})
+                if not r.ok:
+                    continue
+                lines = r.text.strip().splitlines()
+                if len(lines) < 2:
+                    continue
+                cols = lines[1].split(",")
+                # SYMBOL,DATE,TIME,OPEN,HIGH,LOW,CLOSE,VOLUME
+                if len(cols) >= 7 and cols[6] not in ("N/D", "", "0"):
+                    close = float(cols[6]); openp = float(cols[3]) if cols[3] not in ("N/D","") else close
+                    chg = ((close - openp) / openp * 100) if openp else 0
+                    return {"price": round(close, 4), "open": openp,
+                            "change_pct": round(chg, 2), "source": "Stooq",
+                            "date": cols[1], "high": cols[4], "low": cols[5]}
             except Exception as e:
-                log.warning(f"commodity_price {symbol}: {e}")
-        commodities = {
-            "GOLD": {"name": "Gold", "unit": "USD/oz", "price": 2385.40},
-            "SILVER": {"name": "Silver", "unit": "USD/oz", "price": 30.85},
-            "OIL_WTI": {"name": "Crude Oil WTI", "unit": "USD/bbl", "price": 82.15},
-            "OIL_BRENT": {"name": "Brent Crude", "unit": "USD/bbl", "price": 86.40},
-            "COPPER": {"name": "Copper", "unit": "USD/lb", "price": 4.52},
-            "NATGAS": {"name": "Natural Gas", "unit": "USD/MMBtu", "price": 2.45},
-        }
-        data = commodities.get(symbol, {"name": symbol, "unit": "USD", "price": 0})
-        return {"symbol": symbol, **data, "ts": ts, "provider": "Losbeto/Commodities",
-                "version": VERSION, "source": "fallback-static",
-                "disclaimer": "Preços indicativos (fonte primária indisponível)"}
+                log.debug(f"stooq {v}: {e}")
+        return None
+
+    @staticmethod
+    def _yahoo_quote(symbol: str):
+        try:
+            r = requests.get(f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}",
+                             timeout=8, headers={"User-Agent": "Mozilla/5.0"})
+            if r.ok:
+                meta = r.json().get("chart", {}).get("result", [{}])[0].get("meta", {})
+                price = meta.get("regularMarketPrice")
+                if price:
+                    prev = meta.get("previousClose", price)
+                    chg = ((price - prev) / prev * 100) if prev else 0
+                    return {"price": round(price, 4), "previous_close": prev,
+                            "change_pct": round(chg, 2), "source": "Yahoo Finance",
+                            "currency": meta.get("currency", "USD"),
+                            "exchange": meta.get("exchangeName", "")}
+        except Exception as e:
+            log.debug(f"yahoo_quote {symbol}: {e}")
+        return None
 
     @staticmethod
     def stock_quote():
         symbol = request.args.get("symbol", "AAPL").upper()
         ts = int(time.time())
-        try:
-            r = requests.get(f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}", timeout=8)
-            if r.ok:
-                data = r.json()
-                result = data.get("chart", {}).get("result", [{}])[0]
-                meta = result.get("meta", {})
-                price = meta.get("regularMarketPrice", 0)
-                prev = meta.get("previousClose", price)
-                change = ((price - prev) / prev * 100) if prev else 0
-                return {"symbol": symbol, "price": price, "currency": meta.get("currency", "USD"),
-                        "change_pct": round(change, 2), "previous_close": prev,
-                        "exchange": meta.get("exchangeName", "Unknown"),
-                        "ts": ts, "provider": "Losbeto/Equities", "source": "Yahoo Finance", "version": VERSION}
-        except Exception as e:
-            log.warning(f"stock_quote: {e}")
-        return {"symbol": symbol, "price": 0, "error": "Unable to fetch",
+        q = Premium._stooq_quote(symbol) or Premium._yahoo_quote(symbol)
+        if q:
+            return {"symbol": symbol, "currency": q.get("currency", "USD"),
+                    "exchange": q.get("exchange", ""), "ts": ts,
+                    "provider": "Losbeto/Equities", "version": VERSION, **q}
+        # v24.10: honestidade — sem dado real, NÃO servimos zeros disfarçados.
+        return {"symbol": symbol, "status": "unavailable",
+                "error": "No live quote source reachable right now. Not charged for stale data.",
                 "ts": ts, "provider": "Losbeto/Equities", "version": VERSION}
 
     @staticmethod
@@ -2692,10 +2720,13 @@ class Brain:
     def earnings_whisper():
         symbol = request.args.get("symbol", "AAPL").upper()
         ts = int(time.time())
-        return {"symbol": symbol, "next_earnings": "2026-07-28", "eps_estimate": 1.45,
+        return {"symbol": symbol, "status": "illustrative",
+                "note": "Illustrative earnings estimates — not live data. "
+                        "A production Alpha Vantage/Finnhub key is required for real figures. "
+                        "Priced accordingly ($0.08).",
+                "next_earnings": "2026-07-28", "eps_estimate": 1.45,
                 "revenue_estimate_b": 92.5, "whisper_eps": 1.52, "surprise_factor": "+4.8%",
-                "ts": ts, "provider": "Losbeto/Earnings", "version": VERSION,
-                "note": "Earnings whisper indicativo. Dados reais via Alpha Vantage com API key."}
+                "ts": ts, "provider": "Losbeto/Earnings", "version": VERSION}
 
     @staticmethod
     def forex_arbitrage():
@@ -3648,6 +3679,24 @@ def _premium_teaser(result: dict) -> dict:
     except Exception:
         return {"_teaser": True, "keys": list(result.keys())[:20]}
 
+def _quote_ok(q) -> bool:
+    """v24.10: um quote só é utilizável se tem preço real (>0) e não está
+    marcado unavailable/warming/error. Usado pelos produtos premium para
+    NÃO cobrar por dados vazios — a causa da rejeição no x402-list."""
+    return bool(isinstance(q, dict) and q.get("price")
+                and not q.get("status") and not q.get("error"))
+
+def _premium_needs(*quotes):
+    """Retorna (True, resposta_503) se faltar dado-base essencial; senão (False, None).
+    503 faz o cliente NÃO ser cobrado e entender que é indisponibilidade temporária."""
+    if not any(_quote_ok(q) for q in quotes):
+        return True, ({"status": "unavailable",
+                       "error": "Upstream market data source is temporarily unreachable. "
+                                "No charge — please retry shortly.",
+                       "provider": "Losbeto/Premium", "version": VERSION,
+                       "ts": int(time.time())}, 503)
+    return False, None
+
 def paid_endpoint(path):
     def deco(handler):
         def wrapped():
@@ -3765,6 +3814,14 @@ def paid_endpoint(path):
                     if LEDGER.jwt_valid(claims.get("jti", ""), path):
                         try:
                             result = handler()
+                            # v24.10: produto indisponível (tupla ,503) — não
+                            # entrega dado vazio. O day-pass/JWT segue válido para
+                            # nova tentativa; nada a estornar por chamada.
+                            if isinstance(result, tuple) and len(result) > 1 and result[1] == 503:
+                                LEDGER.log_request(path, False,
+                                                    int((time.time() - t0) * 1000), ip,
+                                                    kind="probe", ua=request.headers.get("User-Agent",""))
+                                return jsonify(result[0]), 503
                             LEDGER.log_request(path, True,
                                                 int((time.time() - t0) * 1000), ip,
                                                 kind="paid", ua=request.headers.get("User-Agent",""))
@@ -4007,6 +4064,21 @@ class Premium:
         cal = _safe_call(Brain.macro_calendar).get("events", [])
         cal_today = [e for e in cal if e.get("date", "") >= day][:4]
 
+        # v24.10: não montar um brief cross-asset com tudo zerado. Exige ao menos
+        # forex OU commodities OU equities reais (crypto/regime sempre existem,
+        # mas o produto se vende como CROSS-ASSET — precisa de mercados tradicionais).
+        trad_ok = (any(_quote_ok(v) for v in fx.values())
+                   or any(_quote_ok(v) for v in cmd.values())
+                   or any(_quote_ok(v) for v in eq.values()))
+        if not trad_ok:
+            return {"status": "unavailable", "product": "Global Morning Brief",
+                    "error": "Traditional-market data sources temporarily unreachable. "
+                             "No charge — retry shortly.",
+                    "ts": ts, "provider": "Losbeto/Premium", "version": VERSION}, 503
+        live_layers = {"forex": any(_quote_ok(v) for v in fx.values()),
+                       "commodities": any(_quote_ok(v) for v in cmd.values()),
+                       "equities": any(_quote_ok(v) for v in eq.values())}
+
         snapshot = {"forex": {k: {"rate": v.get("rate"), "src": v.get("source")}
                               for k, v in fx.items() if isinstance(v, dict)},
                     "commodities": {k: {"price": v.get("price"), "chg": v.get("change_pct")}
@@ -4015,7 +4087,8 @@ class Premium:
                                  for k, v in eq.items() if isinstance(v, dict)},
                     "crypto_fear_greed": fg.get("value"),
                     "market_regime": rg.get("regime"),
-                    "macro_events_ahead": cal_today}
+                    "macro_events_ahead": cal_today,
+                    "live_data_layers": live_layers}
 
         synthesis = _ai(
             "You are the chief strategist of a cross-asset trading desk. Using ONLY "
@@ -4045,6 +4118,9 @@ class Premium:
         symbol = request.args.get("symbol", "AAPL").upper()[:8]
         ts = int(time.time())
         quote = _safe_call(Brain.stock_quote)
+        need, resp = _premium_needs(quote)
+        if need:
+            return resp   # 503, sem cobrança — não vende dossiê de uma ação a $0
         earn = _safe_call(Brain.earnings_whisper)
         fg = _safe_call(Market.fear_greed)
         rg = _safe_call(Brain.regime)
@@ -4257,6 +4333,14 @@ class Premium:
             if len(s) >= 25:
                 series[name] = s
         keys = list(series)
+        # v24.10: precisa de ao menos 4 ativos com série real p/ uma matriz útil.
+        # Antes retornava matrix {} / assets [] e cobrava $2.49 (rejeição x402-list).
+        if len(keys) < 4:
+            return {"status": "unavailable", "product": "Cross-Asset Correlation Matrix",
+                    "error": "Market data sources temporarily unreachable — cannot build "
+                             "a reliable matrix right now. No charge, retry shortly.",
+                    "assets_available": keys, "ts": ts,
+                    "provider": "Losbeto/Premium", "version": VERSION}, 503
         n = min([len(series[k]) for k in keys]) if keys else 0
 
         def _rets(v):
@@ -4321,6 +4405,14 @@ class Premium:
                     "ret_1m_pct": round((s[-1] / s[-22] - 1) * 100, 2),
                     "ret_3m_pct": round((s[-1] / s[0] - 1) * 100, 2),
                     "last": round(s[-1], 2)}
+        # v24.10: precisa de ao menos 6 setores reais p/ um sinal de rotação
+        # confiável. Antes retornava leaders/laggards vazios e cobrava $1.99.
+        if len(perf) < 6:
+            return {"status": "unavailable", "product": "Global Sector Rotation",
+                    "error": "Sector ETF data temporarily unreachable — cannot compute a "
+                             "reliable rotation signal. No charge, retry shortly.",
+                    "sectors_available": len(perf), "ts": ts,
+                    "provider": "Losbeto/Premium", "version": VERSION}, 503
         ranked = sorted(perf.items(), key=lambda kv: -kv[1]["ret_1m_pct"])
         leaders = [{"sector": k, **v} for k, v in ranked[:3]]
         laggards = [{"sector": k, **v} for k, v in ranked[-3:]]
