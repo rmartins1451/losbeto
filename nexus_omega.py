@@ -79,7 +79,7 @@ from typing import Any, Optional, Dict, List, Tuple
 # 0. CONFIGURAÇÃO E AUTO-SETUP
 # ============================================================================
 
-VERSION = "25.1.0-DISCOVERY"
+VERSION = "25.2.0-DISCOVERY"
 BRAND_NAME = "Losbeto"
 BRAND_TAGLINE = "The Global Revenue Engine for Financial AI Agents"
 BRAND_EMOJI = "🧠"
@@ -4475,6 +4475,26 @@ class Premium:
     _YF_CACHE: dict = {}
     _YF_TTL = int(os.environ.get("YAHOO_SERIES_TTL", "3600"))  # 1h
 
+    _YF_FAILS = {"n": 0, "until": 0.0}
+    _YF_FAIL_LIMIT = int(os.environ.get("YAHOO_FAIL_LIMIT", "3"))
+    _YF_COOLDOWN = int(os.environ.get("YAHOO_COOLDOWN", "1800"))  # 30 min
+
+    @staticmethod
+    def _yahoo_down() -> bool:
+        return time.time() < Premium._YF_FAILS["until"]
+
+    @staticmethod
+    def _yahoo_mark(ok: bool):
+        f = Premium._YF_FAILS
+        if ok:
+            f["n"], f["until"] = 0, 0.0
+        else:
+            f["n"] += 1
+            if f["n"] >= Premium._YF_FAIL_LIMIT and not Premium._yahoo_down():
+                f["until"] = time.time() + Premium._YF_COOLDOWN
+                log.info(f"⏭ Yahoo indisponível ({f['n']} falhas) — usando Stooq "
+                         f"por {Premium._YF_COOLDOWN//60} min")
+
     @staticmethod
     def _stooq_series(ticker: str) -> list:
         """v25: histórico diário via Stooq CSV — fallback para o Yahoo, que
@@ -4518,17 +4538,23 @@ class Premium:
         if hit and (time.time() - hit[0]) < Premium._YF_TTL:
             return hit[1]
         out = []
-        try:
-            r = requests.get(
-                f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}"
-                f"?range={rng}&interval=1d", timeout=10,
-                headers={"User-Agent": "Mozilla/5.0"})
-            if r.ok:
-                res = r.json().get("chart", {}).get("result", [{}])[0]
-                closes = res.get("indicators", {}).get("quote", [{}])[0].get("close") or []
-                out = [c for c in closes if c is not None]
-        except Exception as e:
-            log.debug(f"yahoo_series {ticker}: {e}")
+        # v25.2: circuit breaker — os logs de rede mostram NO_SOCKET no Yahoo a
+        # partir do Railway (bloqueio de data center). Insistir custa ~10s de
+        # timeout por ticker × 22 tickers. Após 3 falhas, vai direto ao Stooq.
+        if not Premium._yahoo_down():
+            try:
+                r = requests.get(
+                    f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}"
+                    f"?range={rng}&interval=1d", timeout=6,
+                    headers={"User-Agent": "Mozilla/5.0"})
+                if r.ok:
+                    res = r.json().get("chart", {}).get("result", [{}])[0]
+                    closes = res.get("indicators", {}).get("quote", [{}])[0].get("close") or []
+                    out = [c for c in closes if c is not None]
+                Premium._yahoo_mark(bool(out))
+            except Exception as e:
+                Premium._yahoo_mark(False)
+                log.debug(f"yahoo_series {ticker}: {e}")
         # v25: Yahoo bloqueia data centers -> cai para Stooq (CSV livre)
         if not out:
             out = Premium._stooq_series(ticker)
