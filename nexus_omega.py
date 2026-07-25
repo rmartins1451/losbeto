@@ -79,7 +79,7 @@ from typing import Any, Optional, Dict, List, Tuple
 # 0. CONFIGURAÇÃO E AUTO-SETUP
 # ============================================================================
 
-VERSION = "24.11.0-HONEST"
+VERSION = "25.0.0-DISCOVERY"
 BRAND_NAME = "Losbeto"
 BRAND_TAGLINE = "The Global Revenue Engine for Financial AI Agents"
 BRAND_EMOJI = "🧠"
@@ -3353,30 +3353,120 @@ def _clean_tx(sdata: dict, fallback: str = "") -> str:
                 f"recibo será registrado sem link de explorer")
     return ""
 
+ENDPOINT_PARAM_HINTS = {
+    "/forex-rate":        {"pair": "EUR/USD"},
+    "/stock-quote":       {"symbol": "AAPL"},
+    "/commodity-price":   {"symbol": "GOLD"},
+    "/equity-dossier":    {"symbol": "AAPL"},
+    "/earnings-whisper":  {"symbol": "AAPL"},
+    "/event-playbook":    {"event": "FOMC"},
+    "/council":           {"symbol": "SOL"},
+    "/council-deep":      {"symbol": "SOL"},
+    "/analise":           {"symbol": "BTC"},
+    "/sentiment":         {"symbol": "BTC"},
+    "/rugcheck":          {"mint": "So11111111111111111111111111111111111111112"},
+    "/onchain-credit":    {"wallet": "GEhr9HCFTRDjanMg435frSgCVwVZYpNoPrEkmNBnFHFE"},
+    "/dex-screen":        {"query": "SOL"},
+    "/jupiter-swap":      {"pair": "SOL/USDC"},
+    "/sanctions":         {"name": "example"},
+    "/sec-filing":        {"query": "AAPL 10-K"},
+    "/web-search":        {"q": "bitcoin macro outlook"},
+    "/backtest":          {"symbol": "BTC", "strategy": "momentum"},
+}
+
+_PARAM_DESC = {
+    "pair": "Currency pair, e.g. EUR/USD, GBP/USD, USD/JPY",
+    "symbol": "Asset ticker, e.g. AAPL, TSLA, BTC, GOLD",
+    "event": "Macro event name, e.g. FOMC, NFP, CPI, ECB",
+    "mint": "Solana SPL token mint address",
+    "wallet": "Solana wallet address to score",
+    "query": "Free-text search query",
+    "q": "Free-text search query",
+    "name": "Entity name to screen against OFAC-SDN",
+    "strategy": "Strategy label, e.g. momentum, mean-reversion",
+    "format": "Response format (json)",
+}
+
+SERVICE_NAME = os.environ.get("SERVICE_NAME", "Losbeto Market Intel")[:32]
+
+def _service_tags(endpoint: str) -> list:
+    """v25: até 5 tags, cada uma <=32 chars ASCII imprimível (regra da spec).
+    Derivadas das categorias reais + termos que um agente buscaria."""
+    base_tags = [t.lower() for t in ENDPOINT_TAGS.get(endpoint, [])][:3]
+    extra = []
+    if endpoint in ("/forex-rate", "/forex-arbitrage"):
+        extra = ["forex", "fx-rates"]
+    elif endpoint in ("/stock-quote", "/equity-dossier", "/sector-rotation",
+                      "/earnings-whisper"):
+        extra = ["stocks", "equities"]
+    elif endpoint in ("/commodity-price",):
+        extra = ["commodities", "gold-oil"]
+    elif endpoint in ("/macro-calendar", "/event-playbook", "/global-macro",
+                      "/correlation-matrix"):
+        extra = ["macro", "cross-asset"]
+    else:
+        extra = ["crypto", "market-data"]
+    out, seen = [], set()
+    for t in base_tags + extra:
+        t = "".join(c for c in str(t) if 32 <= ord(c) <= 126)[:32]
+        if t and t not in seen:
+            seen.add(t)
+            out.append(t)
+    return out[:5]
+
 def _bazaar_blob(endpoint: str) -> dict:
-    """v21.16: blob de discovery no formato que o validador @agentcash/discovery
-    exige — extensions.bazaar.schema.properties.{input,output} — e que a CDP
-    cataloga no Bazaar. Usado no corpo do 402 E no settle."""
+    """v25: formato EXATO da spec oficial do Bazaar (docs/extensions/bazaar.mdx).
+    Três correções que os Seller Tools da agentic.market apontaram como faltantes:
+      1. info.input.queryParams  -> valores CONCRETOS (era só method/type)
+      2. info.output.example     -> amostra REAL do cache (era warning 'missing')
+      3. inputSchema             -> era 'Input schema present: no'
+    O schema legado (schema.properties.*) fica preservado para o validador
+    @agentcash/discovery, que usa outro shape."""
+    desc = ENDPOINT_DESC.get(endpoint, endpoint)
+    params = dict(ENDPOINT_PARAM_HINTS.get(endpoint, {"format": "json"}))
+
+    # exemplo de saída: dado real que o warmer já mantém quente (custo zero)
+    example_out = {}
+    try:
+        cached = _PREVIEW_CACHE.get(endpoint) or _preview_db_get(endpoint)
+        if cached:
+            data = cached.get("data")
+            if isinstance(data, dict):
+                blob = json.dumps(data, default=str)
+                if len(blob) <= 1200:
+                    example_out = data
+                else:  # recorta mantendo a forma
+                    example_out, used = {}, 0
+                    for k, v in data.items():
+                        piece = json.dumps({k: v}, default=str)
+                        if used + len(piece) > 1200:
+                            continue
+                        example_out[k] = v
+                        used += len(piece)
+    except Exception as e:
+        log.debug(f"bazaar example {endpoint}: {e}")
+
+    props = {k: {"type": "string", "description": _PARAM_DESC.get(k, f"{k} parameter")}
+             for k in params}
     return {
-        "info": {"input": {"type": "http", "method": "GET"},
-                 "output": {"type": "json"}},
-        # Shape exato extraído do validador @agentcash/discovery (extractSchemas2):
-        # input = schema.properties.input.properties.queryParams
-        # output = schema.properties.output.properties.example
+        "info": {
+            "input": {"type": "http", "method": "GET", "queryParams": params},
+            "output": ({"type": "json", "example": example_out} if example_out
+                       else {"type": "json"}),
+        },
+        "inputSchema": {"type": "object", "properties": props, "required": []},
+        # Shape legado exigido pelo validador @agentcash/discovery (extractSchemas2)
         "schema": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "type": "object",
             "properties": {
                 "input": {"type": "object", "properties": {
-                    "queryParams": {"type": "object", "properties": {
-                        "format": {"type": "string", "enum": ["json"],
-                                   "default": "json"}}}}},
+                    "queryParams": {"type": "object", "properties": props}}},
                 "output": {"type": "object", "properties": {
-                    "example": {"type": "object",
-                                "description": ENDPOINT_DESC.get(endpoint, endpoint)}}},
+                    "example": {"type": "object", "description": desc}}},
             },
             "required": ["input"]},
-        "description": ENDPOINT_DESC.get(endpoint, endpoint),
+        "description": desc,
     }
 
 def _build_402(endpoint: str):
@@ -3433,6 +3523,13 @@ def _build_402(endpoint: str):
             "url":         f"{base}{endpoint}",
             "description": desc,
             "mimeType":    "application/json",
+            # v25: Service Metadata da spec oficial do Bazaar — facilitators usam
+            # estes campos para enriquecer os resultados de BUSCA com nome legível,
+            # tags temáticas e ícone. Regras: serviceName/tags só ASCII imprimível
+            # (<=32 chars cada, máx 5 tags); iconUrl absoluto https.
+            "serviceName": SERVICE_NAME,
+            "tags":        _service_tags(endpoint),
+            "iconUrl":     f"{base}/favicon.png",
         },
         "accepts":    accepts,
         # v1 backward compat: alguns scanners (x402scan legacy) esperam paymentRequirements
@@ -3477,10 +3574,16 @@ def _build_402(endpoint: str):
                         "deal": "$1 -> $1.25 balance, zero settlement latency"},
             "docs": f"{base}/llms.txt"},
     }
-    # v21 FIX: base64 padrão (não URL-safe) — scanners usam b64decode padrão
+    # v21 FIX: base64 padrão (não URL-safe) — scanners usam b64decode padrão.
+    # v25 FIX CRÍTICO: NÃO remover o padding "=". A spec x402 v2 exige o payload
+    # PaymentRequired em base64 canônico no header PAYMENT-REQUIRED; sem padding,
+    # b64decode() estrito falha com "Incorrect padding" em ~75% dos endpoints
+    # (todo payload cujo tamanho não é múltiplo de 3). Isso quebrava a leitura
+    # do desafio por clientes/facilitators que seguem a spec à risca — e explica
+    # a extensão bazaar chegar VAZIA ({}) no catálogo da CDP.
     b64 = base64.b64encode(
         json.dumps(payload, separators=(",", ":")).encode()
-    ).decode().replace("=", "")
+    ).decode()
     resp = jsonify(payload)
     resp.status_code = 402
     # v21.1 FIX: além do blob base64 opaco (challenge="..."), expõe os campos reais
@@ -4358,6 +4461,39 @@ class Premium:
     _YF_TTL = int(os.environ.get("YAHOO_SERIES_TTL", "3600"))  # 1h
 
     @staticmethod
+    def _stooq_series(ticker: str) -> list:
+        """v25: histórico diário via Stooq CSV — fallback para o Yahoo, que
+        bloqueia IPs de data center. É o que destrava /correlation-matrix e
+        /sector-rotation (os 2 endpoints que seguiam falhando no warmer)."""
+        m = {"BTC-USD": "btcusd", "ETH-USD": "ethusd", "SOL-USD": "solusd",
+             "SPY": "spy.us", "QQQ": "qqq.us", "GC=F": "xauusd", "CL=F": "cl.f",
+             "DX-Y.NYB": "dx.f", "TLT": "tlt.us",
+             "XLK": "xlk.us", "XLF": "xlf.us", "XLE": "xle.us", "XLV": "xlv.us",
+             "XLY": "xly.us", "XLP": "xlp.us", "XLU": "xlu.us", "XLI": "xli.us",
+             "XLB": "xlb.us", "XLRE": "xlre.us", "XLC": "xlc.us"}
+        sym = m.get(ticker, ticker.lower().replace("-usd", "usd"))
+        try:
+            r = requests.get(f"https://stooq.com/q/d/l/?s={sym}&i=d", timeout=10,
+                             headers={"User-Agent": "Mozilla/5.0"})
+            if not r.ok:
+                return []
+            lines = r.text.strip().splitlines()
+            if len(lines) < 30:
+                return []
+            out = []
+            for row in lines[1:]:      # Date,Open,High,Low,Close,Volume
+                cols = row.split(",")
+                if len(cols) >= 5:
+                    try:
+                        out.append(float(cols[4]))
+                    except ValueError:
+                        continue
+            return out[-120:]
+        except Exception as e:
+            log.debug(f"stooq_series {ticker}: {e}")
+            return []
+
+    @staticmethod
     def _yahoo_series(ticker: str, rng: str = "3mo") -> list:
         """v24.8: com cache. Os produtos cross-asset buscam 22 tickers por
         ciclo; sem cache o warmer batia ~90x/hora no Yahoo, risco real de
@@ -4366,21 +4502,25 @@ class Premium:
         hit = Premium._YF_CACHE.get(key)
         if hit and (time.time() - hit[0]) < Premium._YF_TTL:
             return hit[1]
+        out = []
         try:
             r = requests.get(
                 f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}"
-                f"?range={rng}&interval=1d", timeout=10)
-            if not r.ok:
-                return hit[1] if hit else []
-            res = r.json().get("chart", {}).get("result", [{}])[0]
-            closes = res.get("indicators", {}).get("quote", [{}])[0].get("close") or []
-            out = [c for c in closes if c is not None]
-            if out:
-                Premium._YF_CACHE[key] = (time.time(), out)
-            return out
+                f"?range={rng}&interval=1d", timeout=10,
+                headers={"User-Agent": "Mozilla/5.0"})
+            if r.ok:
+                res = r.json().get("chart", {}).get("result", [{}])[0]
+                closes = res.get("indicators", {}).get("quote", [{}])[0].get("close") or []
+                out = [c for c in closes if c is not None]
         except Exception as e:
             log.debug(f"yahoo_series {ticker}: {e}")
-            return hit[1] if hit else []
+        # v25: Yahoo bloqueia data centers -> cai para Stooq (CSV livre)
+        if not out:
+            out = Premium._stooq_series(ticker)
+        if out:
+            Premium._YF_CACHE[key] = (time.time(), out)
+            return out
+        return hit[1] if hit else []
 
     @staticmethod
     def correlation_matrix():
