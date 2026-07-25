@@ -79,7 +79,7 @@ from typing import Any, Optional, Dict, List, Tuple
 # 0. CONFIGURAÇÃO E AUTO-SETUP
 # ============================================================================
 
-VERSION = "24.10.0-HONEST"
+VERSION = "24.11.0-HONEST"
 BRAND_NAME = "Losbeto"
 BRAND_TAGLINE = "The Global Revenue Engine for Financial AI Agents"
 BRAND_EMOJI = "🧠"
@@ -166,6 +166,10 @@ TON_TESTNET   = False
 # APIs externas
 GROQ_KEY     = os.environ.get("GROQ_API_KEY", "").strip()
 GEMINI_KEY   = os.environ.get("GEMINI_API_KEY", "").strip()
+# v24.11: provedores de mercado tradicional (qualquer UMA resolve; free tier)
+FINNHUB_KEY     = os.environ.get("FINNHUB_API_KEY", "").strip()      # 60 req/min
+TWELVEDATA_KEY  = os.environ.get("TWELVEDATA_API_KEY", "").strip()   # 800 req/dia
+ALPHAVANTAGE_KEY= os.environ.get("ALPHAVANTAGE_API_KEY", "").strip() # 25 req/dia
 DEEPSEEK_KEY = os.environ.get("DEEPSEEK_API_KEY", "").strip()
 CLAUDE_KEY   = os.environ.get("CLAUDE_API_KEY", "").strip()
 OLLAMA_URL   = os.environ.get("OLLAMA_URL", "http://127.0.0.1:11434")
@@ -2627,8 +2631,10 @@ class Brain:
             yf_sym, name, unit = futures[symbol]
             stooq_map = {"GOLD": "xauusd", "SILVER": "xagusd", "OIL_WTI": "cl.f",
                          "OIL_BRENT": "cb.f", "COPPER": "hg.f", "NATGAS": "ng.f"}
-            for src_fn in (lambda: Premium._yahoo_quote(yf_sym),
-                           lambda: Premium._stooq_quote(stooq_map.get(symbol, ""))):
+            td_map = {'GOLD': 'XAU/USD', 'SILVER': 'XAG/USD', 'OIL_WTI': 'WTI/USD', 'OIL_BRENT': 'BRENT/USD', 'COPPER': 'COPPER', 'NATGAS': 'NG'}
+            for src_fn in (lambda: Brain._keyed_quote(td_map.get(symbol, symbol)),
+                           lambda: Brain._yahoo_quote(yf_sym),
+                           lambda: Brain._stooq_quote(stooq_map.get(symbol, ""))):
                 try:
                     q = src_fn()
                     if q and q.get("price"):
@@ -2643,6 +2649,63 @@ class Brain:
         return {"symbol": symbol, "status": "unavailable",
                 "error": "No live commodity source reachable right now. Not charged for stale data.",
                 "ts": ts, "provider": "Losbeto/Commodities", "version": VERSION}
+
+    @staticmethod
+    def _keyed_quote(symbol: str):
+        """v24.11: provedores COM CHAVE — únicos que funcionam de forma confiável
+        a partir de data centers (Yahoo e Stooq bloqueiam IPs de nuvem, causa
+        raiz da rejeição no x402-list). Basta UMA chave grátis configurada."""
+        sym = symbol.upper()
+        # 1) Finnhub — free tier 60 req/min (finnhub.io/register)
+        if FINNHUB_KEY:
+            try:
+                r = requests.get("https://finnhub.io/api/v1/quote",
+                                 params={"symbol": sym, "token": FINNHUB_KEY}, timeout=8)
+                if r.ok:
+                    d = r.json()
+                    if d.get("c"):
+                        return {"price": round(float(d["c"]), 4),
+                                "previous_close": d.get("pc"),
+                                "change_pct": round(float(d.get("dp") or 0), 2),
+                                "high": d.get("h"), "low": d.get("l"),
+                                "source": "Finnhub"}
+            except Exception as e:
+                log.debug(f"finnhub {sym}: {e}")
+        # 2) Twelve Data — free tier 800 req/dia (twelvedata.com) — cobre ações,
+        #    forex e commodities (XAU/USD, WTI) no mesmo endpoint
+        if TWELVEDATA_KEY:
+            try:
+                r = requests.get("https://api.twelvedata.com/quote",
+                                 params={"symbol": sym, "apikey": TWELVEDATA_KEY}, timeout=8)
+                if r.ok:
+                    d = r.json()
+                    if d.get("close"):
+                        return {"price": round(float(d["close"]), 4),
+                                "previous_close": d.get("previous_close"),
+                                "change_pct": round(float(d.get("percent_change") or 0), 2),
+                                "high": d.get("high"), "low": d.get("low"),
+                                "exchange": d.get("exchange", ""),
+                                "source": "Twelve Data"}
+            except Exception as e:
+                log.debug(f"twelvedata {sym}: {e}")
+        # 3) Alpha Vantage — free tier 25 req/dia (alphavantage.co)
+        if ALPHAVANTAGE_KEY:
+            try:
+                r = requests.get("https://www.alphavantage.co/query",
+                                 params={"function": "GLOBAL_QUOTE", "symbol": sym,
+                                         "apikey": ALPHAVANTAGE_KEY}, timeout=10)
+                if r.ok:
+                    q = r.json().get("Global Quote", {})
+                    px = q.get("05. price")
+                    if px:
+                        return {"price": round(float(px), 4),
+                                "previous_close": q.get("08. previous close"),
+                                "change_pct": round(float((q.get("10. change percent") or "0")
+                                                          .replace("%", "")), 2),
+                                "source": "Alpha Vantage"}
+            except Exception as e:
+                log.debug(f"alphavantage {sym}: {e}")
+        return None
 
     @staticmethod
     def _stooq_quote(symbol: str):
@@ -2694,7 +2757,8 @@ class Brain:
     def stock_quote():
         symbol = request.args.get("symbol", "AAPL").upper()
         ts = int(time.time())
-        q = Premium._stooq_quote(symbol) or Premium._yahoo_quote(symbol)
+        q = (Brain._keyed_quote(symbol) or Brain._stooq_quote(symbol)
+             or Brain._yahoo_quote(symbol))
         if q:
             return {"symbol": symbol, "currency": q.get("currency", "USD"),
                     "exchange": q.get("exchange", ""), "ts": ts,
