@@ -79,7 +79,7 @@ from typing import Any, Optional, Dict, List, Tuple
 # 0. CONFIGURAÇÃO E AUTO-SETUP
 # ============================================================================
 
-VERSION = "25.0.0-DISCOVERY"
+VERSION = "25.1.0-DISCOVERY"
 BRAND_NAME = "Losbeto"
 BRAND_TAGLINE = "The Global Revenue Engine for Financial AI Agents"
 BRAND_EMOJI = "🧠"
@@ -146,6 +146,9 @@ BASE_USDC         = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"
 BASE_PAYTO_EVM    = os.environ.get("BASE_PAYTO_EVM", "").strip()
 BASE_CAIP2        = "eip155:8453"
 ENABLE_BASE       = bool(BASE_PAYTO_EVM)
+# v25.1: Base como 1ª opção de pagamento -> settles vão pela CDP -> indexação
+# automática no Bazaar (a camada de descoberta que os agentes consultam).
+PREFER_BASE       = os.environ.get("PREFER_BASE", "1") != "0"
 
 # Facilitator (padrão: PayAI – produção)
 # v21.15: wallets do operador — compras destas carteiras são marcadas como
@@ -3492,7 +3495,7 @@ def _build_402(endpoint: str):
     if fee_payer:
         svm_extra["feePayer"] = fee_payer
 
-    accepts = [{
+    _sol_accept = {
         "scheme":            "exact",
         "network":           f"solana:{SOL_GENESIS}",
         "asset":             USDC_MINT,
@@ -3500,7 +3503,17 @@ def _build_402(endpoint: str):
         "payTo":             RECEIVE_ADDRESS,
         "maxTimeoutSeconds": 300,
         "extra":             svm_extra,
-    }]
+    }
+    accepts = []
+    if PREFER_BASE and ENABLE_BASE and BASE_PAYTO_EVM:
+        # v25.1: ordem dos accepts DECIDE a descoberta. Clientes x402 escolhem
+        # tipicamente accepts[0]; com Solana em 1º, os settles iam para o PayAI
+        # e NUNCA passavam pela CDP — e só a CDP cataloga no Bazaar (por isso
+        # apenas 5 dos 67 endpoints estavam indexados). Base primeiro = cada
+        # venda vira uma entrada de catálogo. Solana continua aceita em 2º.
+        pass  # Base é inserida logo abaixo; Solana é anexada depois
+    else:
+        accepts.append(_sol_accept)
     if ENABLE_BASE and BASE_PAYTO_EVM:
         accepts.append({
             "scheme":            "exact",
@@ -3515,6 +3528,8 @@ def _build_402(endpoint: str):
             # "EIP-712 domain parameters (name, version) are required".
             "extra":             {"name": "USD Coin", "version": "2"},
         })
+    if PREFER_BASE and ENABLE_BASE and BASE_PAYTO_EVM:
+        accepts.append(_sol_accept)      # Solana segue disponível, em 2ª opção
     # v21 FIX: payload compatível com x402scan — campos da spec v2 + challenges
     payment_req = accepts[0] if accepts else {}
     payload = {
