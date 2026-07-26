@@ -79,7 +79,7 @@ from typing import Any, Optional, Dict, List, Tuple
 # 0. CONFIGURAÇÃO E AUTO-SETUP
 # ============================================================================
 
-VERSION = "25.4.0-DISCOVERY"
+VERSION = "25.5.0-DISCOVERY"
 BRAND_NAME = "Losbeto"
 BRAND_TAGLINE = "The Global Revenue Engine for Financial AI Agents"
 BRAND_EMOJI = "🧠"
@@ -4221,15 +4221,49 @@ class Premium:
 
     # ------------------------------------------------------------------ 1
     @staticmethod
+    def _brief_is_good(b) -> bool:
+        """v25.5: um brief só pode ser servido (pago OU como preview) se foi
+        gerado pela versão atual E tem dado real. Sem isso, o cache diário
+        perpetuava para sempre um snapshot ruim: era exatamente o brief da
+        v24.9 (ouro 2385 estático, SPY/QQQ/NVDA em 0) que a auditoria do
+        x402-list reprovou — servido meses depois pelo ?preview=1."""
+        try:
+            if not isinstance(b, dict) or b.get("version") != VERSION:
+                return False
+            snap = b.get("snapshot") or {}
+            eq = snap.get("equities") or {}
+            cm = snap.get("commodities") or {}
+            fx = snap.get("forex") or {}
+            def _layer(d, key):
+                """(presente, saudável) — 'presente com tudo zerado' é FALHA,
+                não é 'camada ausente'. Era assim que o brief com SPY/QQQ/NVDA
+                em 0 passava despercebido."""
+                if not d:
+                    return False, True
+                vals = [(v or {}).get(key) for v in d.values()]
+                return True, any(bool(x) for x in vals)
+            eq_present, eq_ok = _layer(eq, "price")
+            cm_present, cm_ok = _layer(cm, "price")
+            fx_present, fx_ok = _layer(fx, "rate")
+            # nenhuma camada declarada pode estar zerada
+            if not (eq_ok and cm_ok and fx_ok):
+                return False
+            # e ao menos 2 camadas tradicionais precisam existir de fato
+            return sum([eq_present, cm_present, fx_present]) >= 2
+        except Exception:
+            return False
+
+    @staticmethod
     def global_morning_brief():
         """Brief diário cross-asset (o ÚNICO no x402): forex + commodities +
         equities + crypto + macro do dia, fechado por síntese AI. Gerado 1x/dia
         e servido do cache — margem alta, latência mínima."""
         today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         cached = _premium_db_get(f"brief:{today}", max_age=90000)
-        if cached:
+        if cached and Premium._brief_is_good(cached):
             cached["served_from"] = "daily-cache"
             return cached
+        # cache ausente, velho ou de baixa qualidade -> regenera agora
         return Premium._generate_brief(today)
 
     @staticmethod
@@ -7653,13 +7687,19 @@ def premium_brief_loop():
             today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
             yesterday = (datetime.now(timezone.utc) - timedelta(days=1)).strftime("%Y-%m-%d")
             prev = _premium_db_get(f"brief:{yesterday}", max_age=200000)
-            if not _premium_db_get(f"brief:{today}", max_age=90000):
+            if not Premium._brief_is_good(prev):
+                prev = None          # v25.5: nunca publicar brief ruim/antigo
+            today_cached = _premium_db_get(f"brief:{today}", max_age=90000)
+            fresh = None
+            if not Premium._brief_is_good(today_cached):
                 with app.test_request_context("/global-morning-brief"):
                     fresh = Premium._generate_brief(today)
-                log.info("💎 Morning Brief gerado para " + today)
-                preview_payload = prev if prev else _premium_teaser(fresh)
-            else:
-                preview_payload = prev
+                if Premium._brief_is_good(fresh):
+                    log.info("💎 Morning Brief gerado para " + today)
+                else:
+                    log.warning("⚠️ Morning Brief sem dados suficientes — não publicado")
+                    fresh = None
+            preview_payload = prev or (_premium_teaser(fresh) if fresh else None)
             if preview_payload:
                 _PREVIEW_CACHE["/global-morning-brief"] = {"ts": time.time(),
                                                            "data": preview_payload}
