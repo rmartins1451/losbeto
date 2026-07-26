@@ -79,7 +79,7 @@ from typing import Any, Optional, Dict, List, Tuple
 # 0. CONFIGURAÇÃO E AUTO-SETUP
 # ============================================================================
 
-VERSION = "25.5.0-DISCOVERY"
+VERSION = "26.0.0-MCP"
 BRAND_NAME = "Losbeto"
 BRAND_TAGLINE = "The Global Revenue Engine for Financial AI Agents"
 BRAND_EMOJI = "🧠"
@@ -6098,6 +6098,128 @@ def manifest_x402():
         manifest["ownershipProofs"].append(BASE_PAYTO_EVM)
     return jsonify(manifest)
 
+# ============================================================================
+# 17. MCP STREAMABLE HTTP (v26) — servidor MCP de verdade, não só manifesto.
+#     Antes o /.well-known/mcp.json anunciava ferramentas mas NÃO havia endpoint
+#     MCP: clientes (Glama, Inspector) faziam POST na raiz e recebiam 405, o que
+#     marcava o servidor como "unhealthy" nos diretórios. Agora qualquer agente
+#     conecta direto por HTTP — sem npm, sem instalar nada.
+# ============================================================================
+
+MCP_PROTOCOL_VERSION = "2024-11-05"
+
+def _mcp_tools_list() -> list:
+    tools = []
+    for p in BASE_PRICES:
+        hints = ENDPOINT_PARAM_HINTS.get(p, {})
+        props, req = {}, []
+        for k, example in hints.items():
+            if k == "format":
+                continue
+            props[k] = {"type": "string",
+                        "description": _PARAM_DESC.get(k, f"{k} parameter"),
+                        "examples": [example]}
+        price = get_dynamic_price(p)
+        tools.append({
+            "name": p.strip("/").replace("-", "_"),
+            "description": (f"{ENDPOINT_DESC.get(p, p)} "
+                            f"[Free delayed sample via MCP; real-time costs "
+                            f"${price:.4f} USDC via x402 at {_public_base()}{p}]"),
+            "inputSchema": {"type": "object", "properties": props, "required": req},
+        })
+    return tools
+
+def _mcp_call_tool(name: str, args: dict) -> dict:
+    path = "/" + str(name).replace("_", "-")
+    handler = ENDPOINT_HANDLERS.get(path)
+    if not handler:
+        return {"isError": True, "content": [{"type": "text",
+                "text": f"Unknown tool: {name}"}]}
+    qs = "&".join(f"{k}={v}" for k, v in (args or {}).items() if v is not None)
+    try:
+        with app.test_request_context(f"{path}?{qs}"):
+            result = handler()
+        if isinstance(result, tuple):        # produto indisponível (503)
+            result = result[0]
+        payload = (_premium_teaser(result)
+                   if path in PREMIUM_TEASER_PATHS and isinstance(result, dict)
+                   else result)
+        note = {"_mcp_note": "Free delayed sample. For real-time data, pay via x402.",
+                "_realtime_endpoint": f"{_public_base()}{path}",
+                "_price_usdc": f"{get_dynamic_price(path):.4f}"}
+        if isinstance(payload, dict):
+            payload = {**payload, **note}
+        return {"content": [{"type": "text",
+                "text": json.dumps(payload, default=str, ensure_ascii=False)}]}
+    except Exception as e:
+        log.debug(f"mcp call {name}: {e}")
+        return {"isError": True, "content": [{"type": "text",
+                "text": f"Tool execution failed: {str(e)[:120]}"}]}
+
+def _jsonrpc_result(rid, result):
+    return {"jsonrpc": "2.0", "id": rid, "result": result}
+
+def _jsonrpc_error(rid, code, message):
+    return {"jsonrpc": "2.0", "id": rid, "error": {"code": code, "message": message}}
+
+def _mcp_handle(msg: dict):
+    """Retorna (resposta|None). None = notificação (sem resposta)."""
+    rid = msg.get("id")
+    method = msg.get("method", "")
+    params = msg.get("params") or {}
+    if method == "initialize":
+        return _jsonrpc_result(rid, {
+            "protocolVersion": MCP_PROTOCOL_VERSION,
+            "capabilities": {"tools": {"listChanged": False}},
+            "serverInfo": {"name": "losbeto", "version": VERSION},
+            "instructions": ("Cross-asset market intelligence over x402. Tools return "
+                             "free delayed samples; pay per call in USDC for real-time. "
+                             "See /try and /health/providers.")})
+    if method in ("notifications/initialized", "notifications/cancelled"):
+        return None
+    if method == "ping":
+        return _jsonrpc_result(rid, {})
+    if method == "tools/list":
+        return _jsonrpc_result(rid, {"tools": _mcp_tools_list()})
+    if method == "tools/call":
+        return _jsonrpc_result(rid, _mcp_call_tool(params.get("name", ""),
+                                                   params.get("arguments") or {}))
+    if method in ("resources/list", "prompts/list"):
+        key = "resources" if method.startswith("resources") else "prompts"
+        return _jsonrpc_result(rid, {key: []})
+    return _jsonrpc_error(rid, -32601, f"Method not found: {method}")
+
+@app.route("/mcp", methods=["POST", "GET", "DELETE", "OPTIONS"])
+def mcp_streamable():
+    if request.method == "OPTIONS":
+        return ("", 204)
+    if request.method == "DELETE":
+        return ("", 204)                     # encerra "sessão" (stateless aqui)
+    if request.method == "GET":
+        # Sem canal SSE server->client: a spec permite responder 405 aqui.
+        r = app.response_class(json.dumps({"jsonrpc": "2.0", "error": {
+            "code": -32000, "message": "SSE stream not supported; use POST"}}),
+            status=405, mimetype="application/json")
+        r.headers["Allow"] = "POST, DELETE, OPTIONS"
+        return r
+    try:
+        body = request.get_json(force=True, silent=True)
+    except Exception:
+        body = None
+    if body is None:
+        return jsonify(_jsonrpc_error(None, -32700, "Parse error")), 400
+    if isinstance(body, list):               # batch JSON-RPC
+        out = [r for r in (_mcp_handle(m) for m in body if isinstance(m, dict)) if r]
+        return (jsonify(out), 200) if out else ("", 202)
+    if not isinstance(body, dict):
+        return jsonify(_jsonrpc_error(None, -32600, "Invalid Request")), 400
+    resp = _mcp_handle(body)
+    if resp is None:
+        return ("", 202)
+    r = jsonify(resp)
+    r.headers["Mcp-Session-Id"] = WALLET.node_id
+    return r
+
 @app.route("/.well-known/mcp.json")
 def manifest_mcp():
     base = _public_base()
@@ -6119,9 +6241,24 @@ def manifest_mcp():
             "x402": x402_opts,
         })
     return jsonify({
-        "schema_version": "2024-11-05",
-        "name":           "losbeto-v23",
-        "description":    f"Multi-chain x402 AI swarm (Solana+Base+TON). {len(BASE_PRICES)} monetized resources.",
+        "schema_version": MCP_PROTOCOL_VERSION,
+        "name":           "losbeto",
+        "description":    (f"Cross-asset market intelligence over x402: forex, equities, "
+                           f"commodities, macro and crypto. {len(BASE_PRICES)} tools. "
+                           f"Free delayed samples; pay per call in USDC for real-time."),
+        # v26: transportes DECLARADOS — sem isto, clientes assumiam HTTP na raiz
+        # e recebiam 405 (o servidor aparecia como "unhealthy" nos diretórios).
+        "transport": {
+            "type": "streamable-http",
+            "url":  f"{base}/mcp",
+            "note": "POST JSON-RPC 2.0. No auth required for delayed samples.",
+        },
+        "transports": [
+            {"type": "streamable-http", "url": f"{base}/mcp"},
+            {"type": "stdio", "command": "npx", "args": ["-y", "losbeto-mcp"]},
+        ],
+        "endpoint":       f"{base}/mcp",
+        "protocolVersion": MCP_PROTOCOL_VERSION,
         "tools":          tools,
         "node": {
             "version": VERSION,
