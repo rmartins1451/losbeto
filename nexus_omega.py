@@ -79,7 +79,7 @@ from typing import Any, Optional, Dict, List, Tuple
 # 0. CONFIGURAÇÃO E AUTO-SETUP
 # ============================================================================
 
-VERSION = "25.3.0-DISCOVERY"
+VERSION = "25.4.0-DISCOVERY"
 BRAND_NAME = "Losbeto"
 BRAND_TAGLINE = "The Global Revenue Engine for Financial AI Agents"
 BRAND_EMOJI = "🧠"
@@ -5375,9 +5375,18 @@ def health_providers():
         try:
             with app.test_request_context(path):
                 r = fn()
-            checks[path] = {"live": bool(isinstance(r, dict) and r.get("price")
-                                         and not r.get("status")),
-                            "source": r.get("source") or r.get("status")}
+            # v25.4 FIX: cada handler nomeia o valor de forma diferente
+            # (/forex-rate usa "rate", os demais "price"). A checagem anterior só
+            # olhava "price" e marcava o forex como morto mesmo com dado real —
+            # falso negativo que travava premium_ready.
+            val = None
+            if isinstance(r, dict):
+                val = r.get("price") if r.get("price") is not None else r.get("rate")
+            stale = bool(isinstance(r, dict) and
+                         str(r.get("source", "")).startswith("fallback"))
+            checks[path] = {"live": bool(val and not (isinstance(r, dict) and r.get("status"))
+                                         and not stale),
+                            "source": (r.get("source") or r.get("status")) if isinstance(r, dict) else "n/a"}
         except Exception as e:
             checks[path] = {"live": False, "source": f"error: {str(e)[:40]}"}
     out["market_data"] = checks
