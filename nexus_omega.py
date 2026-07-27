@@ -87,7 +87,7 @@ from typing import Any, Optional, Dict, List, Tuple
 # 0. CONFIGURAÇÃO E AUTO-SETUP
 # ============================================================================
 
-VERSION = "27.1.0-MAGNET"
+VERSION = "28.0.0-FUNNEL"
 BRAND_NAME = "Losbeto"
 BRAND_TAGLINE = "The Global Revenue Engine for Financial AI Agents"
 BRAND_EMOJI = "🧠"
@@ -3802,6 +3802,31 @@ _PREVIEW_CACHE: dict = {}  # v24.1: última resposta paga por endpoint (modelo d
 PREVIEW_DB_PATH = HOME_DIR / "preview_cache.db"
 PREVIEW_MAX_AGE = int(os.environ.get("PREVIEW_MAX_AGE_SECS", "7200"))  # 2h
 
+# v28 — ATRASO MÍNIMO DA AMOSTRA GRÁTIS, proporcional à volatilidade do dado.
+# Diagnóstico: o preview vinha entregando dado com 0s de idade, ou seja,
+# IDÊNTICO ao pago. Para um índice diário (fear-greed) ou um calendário macro,
+# "15 minutos de atraso" não vale nada — o agente avalia de graça, obtém
+# exatamente o que precisa e nunca paga. Era o funil furado: 77 avaliadores,
+# 0 conversões. O modelo Bloomberg só funciona quando o atraso DÓI: 15 min num
+# preço que muda por segundo dói; 15 min num índice diário não dói nada.
+PREVIEW_MIN_AGE = {
+    # dado rápido (segundos/minutos importam) -> 15 min já cria valor no pago
+    "/pyth-price": 900, "/forex-rate": 900, "/stock-quote": 900,
+    "/commodity-price": 900, "/dex-screen": 900, "/jupiter-swap": 900,
+    "/mempool": 900, "/whale-flow": 900, "/arbitrage": 900,
+    # dado diário/lento -> a amostra grátis deve ser a de ONTEM
+    "/fear-greed": 86400, "/regime": 86400, "/global-macro": 86400,
+    "/macro-calendar": 86400, "/earnings-whisper": 86400,
+    "/sector-rotation": 86400, "/correlation-matrix": 86400,
+    # sinais e scores -> meio dia
+    "/alpha-signal": 43200, "/sinais": 43200, "/analise": 43200,
+    "/launch-risk": 43200, "/rugcheck": 43200, "/onchain-credit": 43200,
+}
+DEFAULT_PREVIEW_MIN_AGE = int(os.environ.get("PREVIEW_MIN_AGE_SECS", "1800"))  # 30 min
+
+def _preview_min_age(path: str) -> int:
+    return PREVIEW_MIN_AGE.get(path, DEFAULT_PREVIEW_MIN_AGE)
+
 def _preview_db(): 
     c = sqlite3.connect(PREVIEW_DB_PATH, timeout=10)
     c.execute("PRAGMA busy_timeout=8000")
@@ -3916,6 +3941,10 @@ def paid_endpoint(path):
                         pass
                     age = int(time.time() - cached["ts"])
                     return jsonify({"preview": True, "data_age_seconds": age,
+                        "sample_policy": {
+                            "min_delay_seconds": _preview_min_age(path),
+                            "why": ("Free sample is intentionally aged. Real-time "
+                                    "reflects the current market; this snapshot does not.")},
                         "delayed_data": cached["data"],
                         "fresh_version": {"endpoint": path,
                             "price_usd": f"{get_dynamic_price(path):.3f}",
@@ -3942,8 +3971,12 @@ def paid_endpoint(path):
                     fresh = handler()
                     if isinstance(fresh, dict) and "error" not in fresh:
                         _PREVIEW_SERVED[path] += 1
+                        # v28: sem histórico ainda. Se o dado é LENTO, servir a
+                        # versão fresca completa entregaria o produto de graça —
+                        # então serve teaser até existir uma amostra envelhecida.
+                        _slow = _preview_min_age(path) >= 3600
                         payload = (_premium_teaser(fresh)
-                                   if path in PREMIUM_TEASER_PATHS else fresh)
+                                   if (path in PREMIUM_TEASER_PATHS or _slow) else fresh)
                         _PREVIEW_CACHE[path] = {"ts": time.time(), "data": payload}
                         _preview_db_put(path, payload)
                         return jsonify({"preview": True, "data_age_seconds": 0,
@@ -4061,8 +4094,13 @@ def paid_endpoint(path):
                     if isinstance(result, dict):
                         prev_data = (_premium_teaser(result)
                                      if path in PREMIUM_TEASER_PATHS else result)
-                        _PREVIEW_CACHE[path] = {"ts": time.time(), "data": prev_data}
-                        _preview_db_put(path, prev_data)   # v24.3: persiste p/ workers/restarts
+                        # v28: não sobrescreve uma amostra que ainda não atingiu
+                        # a idade mínima — é o envelhecimento que dá valor ao pago.
+                        _cur = _PREVIEW_CACHE.get(path) or _preview_db_get(path)
+                        _age = (time.time() - _cur["ts"]) if _cur else 1e9
+                        if _age >= _preview_min_age(path):
+                            _PREVIEW_CACHE[path] = {"ts": time.time(), "data": prev_data}
+                            _preview_db_put(path, prev_data)
                 except Exception: pass
                 LEDGER.log_request(path, True, int((time.time() - t0) * 1000), ip,
                                     kind="paid", ua=request.headers.get("User-Agent",""))
@@ -7813,8 +7851,12 @@ def preview_warm_loop():
                 with app.test_request_context(path):
                     result = handler()
                 if isinstance(result, dict) and "error" not in result:
-                    _PREVIEW_CACHE[path] = {"ts": time.time(), "data": result}
-                    _preview_db_put(path, result)
+                    # v28: idem — a amostra só é renovada após envelhecer
+                    _cur = _PREVIEW_CACHE.get(path) or _preview_db_get(path)
+                    _age = (time.time() - _cur["ts"]) if _cur else 1e9
+                    if _age >= _preview_min_age(path):
+                        _PREVIEW_CACHE[path] = {"ts": time.time(), "data": result}
+                        _preview_db_put(path, result)
                     ok += 1
             except Exception as e:
                 log.debug(f"warm {path}: {str(e)[:60]}")
