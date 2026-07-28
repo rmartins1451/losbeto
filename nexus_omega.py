@@ -87,7 +87,7 @@ from typing import Any, Optional, Dict, List, Tuple
 # 0. CONFIGURAÇÃO E AUTO-SETUP
 # ============================================================================
 
-VERSION = "28.3.0-FUNNEL"
+VERSION = "29.1.0-DEMAND"
 BRAND_NAME = "Losbeto"
 BRAND_TAGLINE = "The Global Revenue Engine for Financial AI Agents"
 BRAND_EMOJI = "🧠"
@@ -939,6 +939,34 @@ class LedgerV10:
                                for r in preview_uas]
             except Exception:
                 preview_uas = []
+            # v29: O QUE AS MÁQUINAS PEDEM ------------------------------------
+            try:  # caminhos inexistentes = pedidos de produto
+                demand_404 = [{"path": r[0], "hits": r[1], "ips": r[2], "ua": (r[3] or "")[:40],
+                               **_demand_classify(r[0])}
+                    for r in c.execute(
+                    "SELECT endpoint, COUNT(*) n, COUNT(DISTINCT ip), "
+                    "COALESCE(NULLIF(ua,''),'?') FROM requests "
+                    "WHERE ts>? AND kind='notfound' GROUP BY endpoint "
+                    "ORDER BY n DESC LIMIT 10", (now - 604800,)).fetchall()]
+            except Exception:
+                demand_404 = []
+            try:  # parâmetros mais pedidos = quais ativos interessam
+                demand_params = [{"endpoint": r[0], "params": r[1], "hits": r[2],
+                                  "ips": r[3]} for r in c.execute(
+                    "SELECT endpoint, params, COUNT(*) n, COUNT(DISTINCT ip) "
+                    "FROM requests WHERE ts>? AND params<>'' "
+                    "GROUP BY endpoint, params ORDER BY n DESC LIMIT 12",
+                    (now - 604800,)).fetchall()]
+            except Exception:
+                demand_params = []
+            try:  # quais endpoints recebem mais SONDAGENS (não só vendas)
+                probe_targets = [{"endpoint": r[0], "probes": r[1], "ips": r[2]}
+                    for r in c.execute(
+                    "SELECT endpoint, COUNT(*) n, COUNT(DISTINCT ip) FROM requests "
+                    "WHERE ts>? AND kind IN ('probe','preview') "
+                    "GROUP BY endpoint ORDER BY n DESC LIMIT 12", (now - 86400,)).fetchall()]
+            except Exception:
+                probe_targets = []
         win = self.win_rate()
         return {
             "total_usdc":     round(total, 6),
@@ -956,6 +984,9 @@ class LedgerV10:
             "probes_24h":     probes,
             "top_uas":        top_uas,
             "preview_uas":    preview_uas,
+            "demand_404":     demand_404,
+            "demand_params":  demand_params,
+            "probe_targets":  probe_targets,
             "paid_total":     paid_total,
             "avg_ticket":     round((total / paid_total) if paid_total else 0, 4),
             "conv_evaluators": round((paid / (paid + previews) * 100)
@@ -964,23 +995,28 @@ class LedgerV10:
 
     _req_kind_ready = False
     def log_request(self, endpoint: str, ok: bool, latency_ms: int, ip: str,
-                    kind: str = "probe", ua: str = ""):
+                    kind: str = "probe", ua: str = "", params: str = ""):
         # v24.5: kind classifica o tráfego — 'probe' (scanner/402), 'preview'
         # (avaliador usando ?preview=1) ou 'paid' (venda liquidada/créditos/JWT).
         # ua identifica QUEM sonda (scanner conhecido × cliente novo).
         with self.lock, self._conn() as c:
             if not LedgerV10._req_kind_ready:
                 for ddl in ("ALTER TABLE requests ADD COLUMN kind TEXT DEFAULT ''",
-                            "ALTER TABLE requests ADD COLUMN ua TEXT DEFAULT ''"):
+                            "ALTER TABLE requests ADD COLUMN ua TEXT DEFAULT ''",
+                            # v29: o QUE a máquina pediu — parâmetros e caminhos
+                            # inexistentes. Sem isto sabíamos QUEM sondava, mas
+                            # não o que procurava. É a diferença entre contar
+                            # visitantes e entender demanda.
+                            "ALTER TABLE requests ADD COLUMN params TEXT DEFAULT ''"):
                     try:
                         c.execute(ddl)
                     except Exception:
                         pass
                 LedgerV10._req_kind_ready = True
-            c.execute("INSERT INTO requests(ts,endpoint,ok,latency_ms,ip,kind,ua) "
-                      "VALUES(?,?,?,?,?,?,?)",
+            c.execute("INSERT INTO requests(ts,endpoint,ok,latency_ms,ip,kind,ua,params) "
+                      "VALUES(?,?,?,?,?,?,?,?)",
                       (int(time.time()), endpoint, 1 if ok else 0, latency_ms, ip,
-                       kind, (ua or "")[:120]))
+                       kind, (ua or "")[:120], (params or "")[:160]))
 
     def replay_check(self, h: str) -> bool:
         with self.lock, self._conn() as c:
@@ -3985,6 +4021,18 @@ def _premium_needs(*quotes):
                        "ts": int(time.time())}, 503)
     return False, None
 
+def _clean_params() -> str:
+    """v29: parâmetros que a máquina enviou, sem o ruído de controle.
+    É o sinal de demanda mais direto que existe: se todos pedem
+    ?symbol=TSLA ou ?pair=USD/BRL, isso é o mercado falando."""
+    try:
+        skip = {"preview", "format", "token", "t", "_", "cb", "nocache"}
+        pares = [f"{k}={v}" for k, v in request.args.items()
+                 if k not in skip and v][:6]
+        return "&".join(pares)[:160]
+    except Exception:
+        return ""
+
 def paid_endpoint(path):
     def deco(handler):
         def wrapped():
@@ -4009,7 +4057,7 @@ def paid_endpoint(path):
                     try:
                         LEDGER.log_request(path, True, int((time.time() - t0) * 1000),
                                             request.headers.get("X-Forwarded-For",
-                                            request.remote_addr or ""), kind="preview", ua=request.headers.get("User-Agent",""))
+                                            request.remote_addr or ""), kind="preview", ua=request.headers.get("User-Agent",""), params=_clean_params())
                     except Exception:
                         pass
                     age = int(time.time() - cached["ts"])
@@ -4030,7 +4078,8 @@ def paid_endpoint(path):
                 try:
                     LEDGER.log_request(path, True, int((time.time() - t0) * 1000), ip,
                                        kind="preview",
-                                       ua=request.headers.get("User-Agent", ""))
+                                       ua=request.headers.get("User-Agent", ""),
+                                       params=_clean_params())
                 except Exception:
                     pass
                 # blindagem: um scanner não pode forçar geração repetida (os
@@ -4082,7 +4131,7 @@ def paid_endpoint(path):
                         _g.losbeto_payment = {"payer": "credits", "tx": "", "via": "credits"}
                         result = handler()
                         LEDGER.log_request(path, True, int((time.time() - t0) * 1000), ip,
-                                            kind="paid", ua=request.headers.get("User-Agent",""))
+                                            kind="paid", ua=request.headers.get("User-Agent",""), params=_clean_params())
                         if isinstance(result, Response):
                             resp = result
                         elif isinstance(result, tuple) and result and isinstance(result[0], Response):
@@ -4118,11 +4167,11 @@ def paid_endpoint(path):
                             if isinstance(result, tuple) and len(result) > 1 and result[1] == 503:
                                 LEDGER.log_request(path, False,
                                                     int((time.time() - t0) * 1000), ip,
-                                                    kind="probe", ua=request.headers.get("User-Agent",""))
+                                                    kind="probe", ua=request.headers.get("User-Agent",""), params=_clean_params())
                                 return jsonify(result[0]), 503
                             LEDGER.log_request(path, True,
                                                 int((time.time() - t0) * 1000), ip,
-                                                kind="paid", ua=request.headers.get("User-Agent",""))
+                                                kind="paid", ua=request.headers.get("User-Agent",""), params=_clean_params())
                             return jsonify(result)
                         except Exception as e:
                             log.error(f"handler {path}: {e}")
@@ -4138,14 +4187,14 @@ def paid_endpoint(path):
 
             if not sig:
                 LEDGER.log_request(path, False, int((time.time() - t0) * 1000), ip,
-                                    kind="probe", ua=request.headers.get("User-Agent",""))
+                                    kind="probe", ua=request.headers.get("User-Agent",""), params=_clean_params())
                 return _build_402(path)
 
             # ====== CORREÇÃO APLICADA (HEADERS PRESERVADOS) ======
             ok, reason, info = _verify_payment(path, sig)
             if not ok:
                 LEDGER.log_request(path, False, int((time.time() - t0) * 1000), ip,
-                                    kind="probe", ua=request.headers.get("User-Agent",""))
+                                    kind="probe", ua=request.headers.get("User-Agent",""), params=_clean_params())
                 r = _build_402(path)
                 body = r.get_json()
                 body["error"] = f"Payment invalid: {reason}"
@@ -4178,7 +4227,7 @@ def paid_endpoint(path):
                             _preview_db_put(path, prev_data)
                 except Exception: pass
                 LEDGER.log_request(path, True, int((time.time() - t0) * 1000), ip,
-                                    kind="paid", ua=request.headers.get("User-Agent",""))
+                                    kind="paid", ua=request.headers.get("User-Agent",""), params=_clean_params())
                 # v21.12 FIX: handlers que retornam flask.Response (jsonify
                 # interno) quebravam aqui com "Response is not JSON serializable"
                 # — 500 pago em /win-rate-verified. Response passa direto;
@@ -5574,7 +5623,8 @@ def try_menu():
     try:
         LEDGER.log_request("/try", True, 0,
                            (request.headers.get("X-Forwarded-For", request.remote_addr) or ""),
-                           kind="preview", ua=request.headers.get("User-Agent", ""))
+                           kind="preview", ua=request.headers.get("User-Agent", ""),
+                                       params=_clean_params())
     except Exception:
         pass
     return jsonify({
@@ -6341,6 +6391,123 @@ def mcp_streamable():
     r = jsonify(resp)
     r.headers["Mcp-Session-Id"] = WALLET.node_id
     return r
+
+# ============================================================================
+# 18. MACHINE DEMAND INTELLIGENCE (v29) — o que as máquinas PEDEM e não temos.
+#     Registrávamos QUEM sondava (user-agent) mas nunca O QUE procurava. Um 404
+#     não é erro: é uma máquina declarando uma necessidade que o catálogo não
+#     atende. Cada caminho inexistente pedido por um agente real é um pedido de
+#     produto — de graça, direto da demanda.
+# ============================================================================
+
+# Caminhos que scanners hostis varrem: ruído, não demanda.
+_SCAN_NOISE = re.compile(
+    r"(\.env|\.git|\.aws|\.ssh|credentials|id_rsa|wp-|wordpress|phpmyadmin|"
+    r"\.php|admin|backup|dump|\.sql|\.bak|serviceaccount|firebase|"
+    r"secrets?\.|config\.(json|yml|yaml)|actuator|/api/v1/(pods|namespaces)|"
+    r"\.well-known/(acme|security)|favicon|robots|sitemap|apple-touch|"
+    r"\.map$|\.asp|cgi-bin|xmlrpc|\.svn|docker|kube)", re.I)
+
+def _is_scan_noise(path: str) -> bool:
+    return bool(_SCAN_NOISE.search(path or ""))
+
+def _demand_classify(path: str) -> dict:
+    """v29.1: separa pedido que já dá para atender AGORA de pedido que exige
+    fonte de dados nova. A primeira categoria é ganho barato — um apelido de
+    rota, zero dado novo. A segunda é decisão de produto."""
+    sug = _suggest_paths(path, n=2)
+    if sug:
+        # existe endpoint parecido -> provavelmente é questão de NOME
+        return {"kind": "alias_candidate",
+                "action": "Rota equivalente já existe — criar apelido resolve",
+                "closest": sug}
+    return {"kind": "new_product",
+            "action": "Nada equivalente no catálogo — exige fonte de dados nova",
+            "closest": []}
+
+def demand_watch_loop():
+    """v29.1: vigia os pedidos fora do catálogo. Quando um mesmo caminho é
+    pedido por N IPs distintos, avisa o operador no Telegram. É o ciclo
+    fechado: a máquina pede -> o sistema conta -> o humano decide.
+    NÃO cria endpoint sozinho de propósito: servir dado que não se tem é
+    exatamente o erro que nos custou a rejeição no x402-list."""
+    time.sleep(300)
+    avisados = set()
+    limiar = int(os.environ.get("DEMAND_ALERT_IPS", "3"))
+    while True:
+        try:
+            with LEDGER._conn() as c:
+                linhas = c.execute(
+                    "SELECT endpoint, COUNT(*) n, COUNT(DISTINCT ip) ips "
+                    "FROM requests WHERE ts>? AND kind='notfound' "
+                    "GROUP BY endpoint HAVING ips >= ? ORDER BY ips DESC LIMIT 5",
+                    (int(time.time()) - 7 * 86400, limiar)).fetchall()
+            for path, n, ips in linhas:
+                if path in avisados:
+                    continue
+                avisados.add(path)
+                cls = _demand_classify(path)
+                _notify_telegram(
+                    f"🎯 *DEMANDA DETECTADA*\n\n"
+                    f"Caminho pedido: `{path}`\n"
+                    f"{n} pedidos de {ips} IPs distintos (7d)\n\n"
+                    f"Classificação: *{cls['kind']}*\n{cls['action']}\n"
+                    + (f"Mais próximo: {', '.join(cls['closest'])}\n" if cls['closest'] else "")
+                    + f"\nPainel: {_public_base()}/dash")
+                log.info(f"🎯 demanda: {path} ({ips} IPs) -> {cls['kind']}")
+        except Exception as e:
+            log.debug(f"demand_watch: {e}")
+        time.sleep(3600)
+
+@app.errorhandler(404)
+def _capture_demand(e):
+    """Registra todo caminho inexistente. O painel separa ruído de scanner
+    de pedido genuíno — este último é a lista de produtos que o mercado
+    está pedindo e nós não oferecemos."""
+    path = (request.path or "")[:120]
+    try:
+        if not _is_scan_noise(path):
+            LEDGER.log_request(path, False, 0,
+                               request.headers.get("X-Forwarded-For", request.remote_addr) or "",
+                               kind="notfound",
+                               ua=request.headers.get("User-Agent", ""),
+                               params=_clean_params())
+    except Exception:
+        pass
+    base = _public_base()
+    return jsonify({
+        "error": "not_found",
+        "requested": path,
+        # v29: 404 que ENSINA. Em vez de beco sem saída, o agente recebe o
+        # caminho para se autoatender — e nós recebemos o sinal de demanda.
+        "did_you_mean": _suggest_paths(path),
+        "catalog": f"{base}/llms.txt",
+        "free_samples": f"{base}/try",
+        "all_endpoints": f"{base}/get-pricing",
+        "request_this_endpoint": {
+            "note": "If your agent needs this and it doesn't exist, tell me — "
+                    "I add endpoints on request.",
+            "github_issues": FEEDBACK_GITHUB,
+        },
+    }), 404
+
+def _suggest_paths(path: str, n: int = 3) -> list:
+    """Sugestão por similaridade de tokens — ajuda o agente a achar o
+    endpoint certo quando errou o nome."""
+    try:
+        alvo = set(re.split(r"[^a-z0-9]+", (path or "").lower()) ) - {""}
+        if not alvo:
+            return []
+        pontos = []
+        for ep in BASE_PRICES:
+            toks = set(re.split(r"[^a-z0-9]+", ep.lower())) - {""}
+            inter = len(alvo & toks)
+            if inter:
+                pontos.append((inter / max(1, len(alvo | toks)), ep))
+        pontos.sort(reverse=True)
+        return [f"{_public_base()}{ep}" for _, ep in pontos[:n]]
+    except Exception:
+        return []
 
 @app.route("/.well-known/mcp.json")
 def manifest_mcp():
@@ -7446,6 +7613,15 @@ code{background:var(--bg2);padding:2px 6px;border-radius:3px;font-size:11px;colo
 <div class="section-label">🔍 Quem AVALIOU (previews · 24h) — o funil de verdade</div>
 <table id="tbl_pv"><thead><tr><th>User-Agent</th><th>Previews</th><th>IPs</th><th>Leitura</th></tr></thead><tbody></tbody></table>
 
+<div class="section-label">🎯 O QUE AS MÁQUINAS PEDIRAM E NÃO TEMOS (7d) — pedidos de produto</div>
+<table id="tbl_404"><thead><tr><th>Caminho pedido</th><th>Pedidos</th><th>IPs</th><th>Diagnóstico</th></tr></thead><tbody></tbody></table>
+
+<div class="section-label">🔎 PARÂMETROS mais pedidos (7d) — quais ativos interessam</div>
+<table id="tbl_par"><thead><tr><th>Endpoint</th><th>Parâmetros</th><th>Pedidos</th><th>IPs</th></tr></thead><tbody></tbody></table>
+
+<div class="section-label">📡 Endpoints mais SONDADOS (24h) — onde a atenção está</div>
+<table id="tbl_prb"><thead><tr><th>Endpoint</th><th>Sondagens</th><th>IPs</th><th>Preço</th></tr></thead><tbody></tbody></table>
+
 <div class="section-label">Ações Rápidas</div>
 <div class="grid" style="grid-template-columns:repeat(auto-fit,minmax(230px,1fr))">
   <div class="actioncard">
@@ -7614,6 +7790,38 @@ async function reload(){
              `<td>${u.ips}</td><td style="color:${color}">${label}</td></tr>`;
     }).join("")
     : '<tr><td colspan=4 style="text-align:center;color:var(--muted)">Nenhum preview ainda nas últimas 24h</td></tr>';
+
+  // v29: DEMANDA — o que pediram e não existe
+  const d404 = (j.stats.demand_404||[]);
+  document.getElementById("tbl_404").querySelector("tbody").innerHTML =
+    d404.length ? d404.map(d=>{
+      // v29.1: alias = atendível hoje (só falta o nome da rota).
+      //        novo produto = exige fonte de dados nova.
+      const alias = d.kind === "alias_candidate";
+      const tag = alias
+        ? `<span style="color:var(--neon)">🔗 apelido resolve</span><br>`+
+          `<span style="font-size:10px;color:var(--muted)">${(d.closest||[]).map(u=>u.split('/').pop()).join(', ')}</span>`
+        : `<span style="color:var(--amber)">🆕 produto novo</span>`;
+      const forte = d.ips >= 3 ? ' style="background:rgba(255,181,69,.07)"' : '';
+      return `<tr${forte}><td><code style="color:var(--amber)">${d.path.replace(/</g,"&lt;")}</code></td>`+
+             `<td>${d.hits}</td><td><b>${d.ips}</b></td><td>${tag}</td></tr>`;
+    }).join("")
+    : '<tr><td colspan=4 style="text-align:center;color:var(--muted)">Nenhum pedido fora do catálogo ainda — bom sinal de cobertura</td></tr>';
+
+  const dpar = (j.stats.demand_params||[]);
+  document.getElementById("tbl_par").querySelector("tbody").innerHTML =
+    dpar.length ? dpar.map(d=>
+      `<tr><td><code>${d.endpoint}</code></td>`+
+      `<td><code style="color:var(--neon)">${(d.params||"").replace(/</g,"&lt;")}</code></td>`+
+      `<td>${d.hits}</td><td>${d.ips}</td></tr>`).join("")
+    : '<tr><td colspan=4 style="text-align:center;color:var(--muted)">Coletando… (a partir do deploy da v29)</td></tr>';
+
+  const prb = (j.stats.probe_targets||[]);
+  document.getElementById("tbl_prb").querySelector("tbody").innerHTML =
+    prb.length ? prb.map(d=>
+      `<tr><td><code>${d.endpoint}</code></td><td>${d.probes}</td><td>${d.ips}</td>`+
+      `<td>${(d.endpoint in j.prices)?('$'+j.prices[d.endpoint].toFixed(4)):'—'}</td></tr>`).join("")
+    : '<tr><td colspan=4 style="text-align:center;color:var(--muted)">Coletando…</td></tr>';
 }
 reload(); setInterval(reload, 30000);
 </script></body></html>"""
@@ -8057,6 +8265,7 @@ def _start_background_once():
     threading.Thread(target=autoregister_x402scan, daemon=True).start()
     threading.Thread(target=preview_warm_loop, daemon=True).start()
     threading.Thread(target=premium_brief_loop, daemon=True).start()
+    threading.Thread(target=demand_watch_loop, daemon=True).start()
     threading.Thread(target=autopilot_report_loop, daemon=True).start()
     log.info("✅ Autopilot: loops de background ativos neste worker")
 
