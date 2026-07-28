@@ -87,7 +87,7 @@ from typing import Any, Optional, Dict, List, Tuple
 # 0. CONFIGURAÇÃO E AUTO-SETUP
 # ============================================================================
 
-VERSION = "31.0.0-CONSENSUS"
+VERSION = "31.0.1-CONSENSUS"
 BRAND_NAME = "Losbeto"
 BRAND_TAGLINE = "The Global Revenue Engine for Financial AI Agents"
 BRAND_EMOJI = "🧠"
@@ -8162,6 +8162,7 @@ code{background:var(--bg2);padding:2px 6px;border-radius:3px;font-size:11px;colo
 <div class="footer">refresh 30s · amostra embutida no 402 · degustação grátis em /try · Losbeto v__DASHV__</div>
 <script>
 const CATEGORY_MAP = {
+  "oracle-consensus":"Crypto","sentiment-consensus":"Crypto",
   "global-morning-brief":"Premium","equity-dossier":"Premium","event-playbook":"Premium",
   "portfolio-stress":"Premium","council-deep":"Premium","correlation-matrix":"Premium",
   "sector-rotation":"Premium","forex-rate":"GlobalMarkets","commodity-price":"GlobalMarkets",
