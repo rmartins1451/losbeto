@@ -87,7 +87,7 @@ from typing import Any, Optional, Dict, List, Tuple
 # 0. CONFIGURAÇÃO E AUTO-SETUP
 # ============================================================================
 
-VERSION = "30.1.0-CONSENSUS"
+VERSION = "30.2.0-CONSENSUS"
 BRAND_NAME = "Losbeto"
 BRAND_TAGLINE = "The Global Revenue Engine for Financial AI Agents"
 BRAND_EMOJI = "🧠"
@@ -6169,6 +6169,72 @@ def info():
         "facilitator":     FACILITATOR_URL if FACILITATOR else None,
         "base_enabled":    ENABLE_BASE,
     })
+
+# v30.2 — DESCOBERTA CAPTURADA PELA TELEMETRIA.
+# O painel de demanda registrou um cliente real pedindo /x402-resources e
+# /.well-known/x402-resources. Não era pedido de produto: era uma convenção de
+# DESCOBERTA que não servíamos — provavelmente um crawler acostumado ao formato
+# paginado do CDP (GET /v2/x402/discovery/resources) procurando o equivalente
+# self-hosted. Quem pediu não conseguiu nos indexar e foi embora.
+# O dado já existia no /.well-known/x402.json; faltava o caminho.
+@app.route("/x402-resources")
+@app.route("/.well-known/x402-resources")
+@app.route("/x402/resources")
+@app.route("/discovery/resources")
+def x402_resources():
+    base = _public_base()
+    try:
+        limit = max(1, min(int(request.args.get("limit", "100")), 500))
+        offset = max(0, int(request.args.get("offset", "0")))
+    except Exception:
+        limit, offset = 100, 0
+    todos = [_resource_entry(ep) for ep in BASE_PRICES]
+    page = todos[offset:offset + limit]
+    return jsonify({
+        "x402Version": 2,
+        "resources": page,
+        "pagination": {"limit": limit, "offset": offset,
+                       "total": len(todos),
+                       "next": (f"{base}/x402-resources?limit={limit}&offset={offset+limit}"
+                                if offset + limit < len(todos) else None)},
+        "service": {"name": SERVICE_NAME, "url": base,
+                    "manifest": f"{base}/.well-known/x402.json",
+                    "catalog": f"{base}/llms.txt",
+                    "free_samples": f"{base}/try",
+                    "mcp": f"{base}/mcp"},
+        "generated_at": int(time.time()),
+        "version": VERSION,
+    })
+
+def _resource_entry(ep: str) -> dict:
+    """Entrada de recurso no formato que os catálogos esperam."""
+    base = _public_base()
+    price = get_dynamic_price(ep)
+    return {
+        "resource": f"{base}{ep}",
+        "type": "http",
+        "method": "GET",
+        "description": ENDPOINT_DESC.get(ep, ep),
+        "price_usdc": f"{price:.4f}",
+        "amount_atomic": str(int(round(price * 1_000_000))),
+        "accepts": [
+            {"scheme": "exact", "network": BASE_CAIP2,
+             "asset": BASE_USDC, "payTo": BASE_PAYTO_EVM,
+             "maxAmountRequired": str(int(round(price * 1_000_000))),
+             "maxTimeoutSeconds": 300},
+            {"scheme": "exact", "network": f"solana:{SOL_GENESIS}",
+             "asset": USDC_MINT, "payTo": RECEIVE_ADDRESS,
+             "maxAmountRequired": str(int(round(price * 1_000_000))),
+             "maxTimeoutSeconds": 300},
+        ] if (ENABLE_BASE and BASE_PAYTO_EVM) else [
+            {"scheme": "exact", "network": f"solana:{SOL_GENESIS}",
+             "asset": USDC_MINT, "payTo": RECEIVE_ADDRESS,
+             "maxAmountRequired": str(int(round(price * 1_000_000))),
+             "maxTimeoutSeconds": 300}],
+        "tags": _service_tags(ep),
+        "free_preview": f"{base}{ep}?preview=1",
+        "lastUpdated": int(time.time()),
+    }
 
 @app.route("/.well-known/x402")
 def manifest_x402_alias():
