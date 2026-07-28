@@ -87,7 +87,7 @@ from typing import Any, Optional, Dict, List, Tuple
 # 0. CONFIGURAÇÃO E AUTO-SETUP
 # ============================================================================
 
-VERSION = "28.0.0-FUNNEL"
+VERSION = "28.1.0-FUNNEL"
 BRAND_NAME = "Losbeto"
 BRAND_TAGLINE = "The Global Revenue Engine for Financial AI Agents"
 BRAND_EMOJI = "🧠"
@@ -3604,16 +3604,45 @@ def _build_402(endpoint: str):
     # (todo payload cujo tamanho não é múltiplo de 3). Isso quebrava a leitura
     # do desafio por clientes/facilitators que seguem a spec à risca — e explica
     # a extensão bazaar chegar VAZIA ({}) no catálogo da CDP.
+    # v28.1 FIX CRÍTICO: o CORPO leva tudo; o HEADER leva uma versão enxuta.
+    # Diagnóstico: a resposta 402 chegou a 19.627 bytes de cabeçalhos
+    # (WWW-Authenticate 6.2k + PAYMENT-REQUIRED 6k + X-PAYMENT-REQUIRED 6k
+    # duplicado). Node.js aborta acima de 16 KB e proxies cortam em 8 KB —
+    # por isso clientes Node (AgentCash) recebiam NETWORK_ERROR em TODO
+    # endpoint pago, enquanto os gratuitos funcionavam. Zero pagamentos em 24h.
+    # Solução: amostra embutida e exemplos do bazaar ficam só no corpo.
+    def _slim(p: dict) -> dict:
+        """Versão do desafio para o CABEÇALHO: só o que um cliente precisa
+        para pagar. Marketing, amostras e duplicatas ficam no corpo."""
+        import copy
+        ext = copy.deepcopy((p.get("extensions") or {}).get("bazaar") or {})
+        info_out = (ext.get("info") or {}).get("output") or {}
+        info_out.pop("example", None)   # exemplo de saída: grande, vai no corpo
+        ext.pop("schema", None)         # schema legado: idem
+        return {
+            "x402Version": p.get("x402Version", 2),
+            "resource":    p.get("resource"),
+            "accepts":     p.get("accepts"),
+            # compat v1: alguns scanners antigos leem este campo
+            "paymentRequirements": p.get("paymentRequirements"),
+            "extensions":  {"bazaar": ext},
+            # "challenges" (cópia de accepts) e "upsell" (amostra, try_free,
+            # créditos, docs) permanecem apenas no CORPO — não são necessários
+            # para executar o pagamento e custavam ~2 KB de cabeçalho.
+        }
+    payload_hdr = _slim(payload)
     b64 = base64.b64encode(
-        json.dumps(payload, separators=(",", ":")).encode()
+        json.dumps(payload_hdr, separators=(",", ":")).encode()
     ).decode()
-    resp = jsonify(payload)
+    resp = jsonify(payload)            # corpo: payload COMPLETO
     resp.status_code = 402
     # v21.1 FIX: além do blob base64 opaco (challenge="..."), expõe os campos reais
     # do desafio de pagamento como auth-params legíveis (RFC 9110 §11.3), no formato
     # que scanners como o x402scan procuram ("no Payment challenges" era esse warning).
     primary = accepts[0] if accepts else {}
-    auth_params = [f'challenge="{b64}"']
+    # v28.1: o challenge base64 NÃO vai aqui — ele já está em PAYMENT-REQUIRED.
+    # Repetir o blob triplicava o tamanho dos cabeçalhos.
+    auth_params = [f'realm="x402"']
     if primary:
         for k in ("scheme", "network", "asset", "amount", "payTo", "maxTimeoutSeconds"):
             v = primary.get(k)
@@ -3621,7 +3650,12 @@ def _build_402(endpoint: str):
                 auth_params.append(f'{k}="{v}"')
     resp.headers["WWW-Authenticate"] = "x402 " + ", ".join(auth_params)
     resp.headers["PAYMENT-REQUIRED"]   = b64
-    resp.headers["X-PAYMENT-REQUIRED"] = b64
+    # v28.1: era uma cópia byte a byte de PAYMENT-REQUIRED (+6 KB à toa).
+    # Mantido só se couber no orçamento total de cabeçalhos.
+    if len(b64) <= 2048:
+        resp.headers["X-PAYMENT-REQUIRED"] = b64
+    else:
+        resp.headers["X-Payment-Required-Ref"] = "see PAYMENT-REQUIRED header"
     # v24.5: cliente que só lê headers (muitos agentes) também descobre o preview
     resp.headers["X-Free-Preview"] = f"{base}{endpoint}?preview=1"
     resp.headers["X-402-Version"]      = "1,2"
