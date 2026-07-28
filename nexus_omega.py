@@ -87,7 +87,7 @@ from typing import Any, Optional, Dict, List, Tuple
 # 0. CONFIGURAÇÃO E AUTO-SETUP
 # ============================================================================
 
-VERSION = "28.2.0-FUNNEL"
+VERSION = "28.3.0-FUNNEL"
 BRAND_NAME = "Losbeto"
 BRAND_TAGLINE = "The Global Revenue Engine for Financial AI Agents"
 BRAND_EMOJI = "🧠"
@@ -3873,6 +3873,30 @@ PREVIEW_MIN_AGE = {
 }
 DEFAULT_PREVIEW_MIN_AGE = int(os.environ.get("PREVIEW_MIN_AGE_SECS", "1800"))  # 30 min
 
+# v28.3 — CONVITE À CONVERSA. Telemetria mostrou ~57 IPs distintos avaliando
+# previews em 24h (curl de 7 origens, axios de 15, navegadores de 3 plataformas,
+# Slackbot expandindo links) e ZERO deles vira conversa: olham e somem. Este
+# bloco converte avaliação anônima em contato. Não é marketing — é a pergunta
+# que o operador não consegue fazer de outro jeito.
+FEEDBACK_GITHUB = os.environ.get(
+    "FEEDBACK_GITHUB", "https://github.com/rmartins1451/losbeto/issues")
+FEEDBACK_SLACK = os.environ.get("FEEDBACK_SLACK", "")   # ex.: link do perfil no Slack x402
+
+def _building_block() -> dict:
+    out = {
+        "ask": ("What does your agent need that isn't here? Tell me — I add "
+                "endpoints on request, and I answer every message."),
+        "operator": "Roberto Martins",
+    }
+    if FEEDBACK_GITHUB:
+        out["github_issues"] = FEEDBACK_GITHUB
+    _mail = os.environ.get("CONTACT_EMAIL", "").strip()
+    if _mail:
+        out["email"] = _mail
+    if FEEDBACK_SLACK:
+        out["slack"] = FEEDBACK_SLACK
+    return out
+
 def _preview_min_age(path: str) -> int:
     return PREVIEW_MIN_AGE.get(path, DEFAULT_PREVIEW_MIN_AGE)
 
@@ -3995,6 +4019,7 @@ def paid_endpoint(path):
                             "why": ("Free sample is intentionally aged. Real-time "
                                     "reflects the current market; this snapshot does not.")},
                         "delayed_data": cached["data"],
+                        "building_something": _building_block(),
                         "fresh_version": {"endpoint": path,
                             "price_usd": f"{get_dynamic_price(path):.3f}",
                             "how": "same URL without preview=1, pay via x402"},
@@ -4030,6 +4055,7 @@ def paid_endpoint(path):
                         _preview_db_put(path, payload)
                         return jsonify({"preview": True, "data_age_seconds": 0,
                             "delayed_data": payload,
+                            "building_something": _building_block(),
                             "fresh_version": {"endpoint": path,
                                 "price_usd": f"{get_dynamic_price(path):.3f}",
                                 "how": "same URL without preview=1, pay via x402"},
@@ -5563,6 +5589,7 @@ def try_menu():
         "credits": {"endpoint": f"{base}/buy-credits",
                     "deal": "$1 -> $1.25 balance, zero settlement latency"},
         "transparency": f"{base}/receipts",
+        "building_something": _building_block(),
         "version": VERSION,
     })
 
@@ -6782,6 +6809,10 @@ def llms_txt():
     lines = [
         f"# Losbeto v{VERSION}",
         f"> Multi-chain AI swarm. Solana + Base + TON. {len(BASE_PRICES)} endpoints. Pay-per-call via x402.",
+        "",
+        "## TALK TO THE OPERATOR",
+        f"Missing an endpoint your agent needs? Open an issue: {FEEDBACK_GITHUB}",
+        "Custom endpoints are considered on request. Every message is read.",
         "",
         "## TRY BEFORE YOU PAY (zero cost, no signup)",
         f"GET {_public_base()}/try  -> live samples from 6 endpoints in ONE free call",
