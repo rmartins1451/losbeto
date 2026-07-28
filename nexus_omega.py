@@ -87,7 +87,7 @@ from typing import Any, Optional, Dict, List, Tuple
 # 0. CONFIGURAÇÃO E AUTO-SETUP
 # ============================================================================
 
-VERSION = "29.1.0-DEMAND"
+VERSION = "30.0.0-CONSENSUS"
 BRAND_NAME = "Losbeto"
 BRAND_TAGLINE = "The Global Revenue Engine for Financial AI Agents"
 BRAND_EMOJI = "🧠"
@@ -6391,6 +6391,217 @@ def mcp_streamable():
     r = jsonify(resp)
     r.headers["Mcp-Session-Id"] = WALLET.node_id
     return r
+
+# ============================================================================
+# 19. ORACLE CONSENSUS (v30) — o primeiro produto deste projeto nascido de
+#     DEMANDA MEDIDA, não de intuição.
+#
+#     Telemetria: 113 IPs distintos sondam /pyth-price e 77 o /fear-greed —
+#     de longe o maior interesse seletivo do catálogo. Mas ambos vendem dado
+#     que é GRÁTIS na fonte (Pyth é oráculo público), então o agente compara
+#     e vai buscar de graça. Zero conversão.
+#
+#     A lacuna real: cada oráculo publica só o PRÓPRIO número. Ninguém publica
+#     o CONSENSO entre eles. Um agente que vai executar uma ordem precisa saber
+#     se o preço que está vendo é confiável — e essa resposta não existe de
+#     graça em lugar nenhum.
+#
+#     Preço na faixa validada pelo mercado ($0,01–$0,05; 76% dos serviços x402
+#     cobram <= $0,10), não na faixa aspiracional dos premium.
+# ============================================================================
+
+ORACLE_SYMBOLS = {
+    # símbolo: (pyth_feed_id, binance_pair, coinbase_pair, kraken_pair, coingecko_id)
+    "SOL": ("0xef0d8b6fda2ceba41da15d4095d1da392a0d2f8ed0c6c7bc0f4cfac8c280b56d",
+            "SOLUSDT", "SOL-USD", "SOLUSD", "solana"),
+    "BTC": ("0xe62df6c8b4a85fe1a67db44dc12de5db330f7ac66b72dc658afedf0f4a415b43",
+            "BTCUSDT", "BTC-USD", "XBTUSD", "bitcoin"),
+    "ETH": ("0xff61491a931112ddf1bd8147cd1b641375f79f5825126d665480874634fd0ace",
+            "ETHUSDT", "ETH-USD", "ETHUSD", "ethereum"),
+}
+
+def _oracle_pyth(feed_id):
+    r = requests.get(f"https://hermes.pyth.network/v2/updates/price/latest?ids[]={feed_id}",
+                     timeout=6)
+    p = r.json().get("parsed", [{}])[0].get("price", {})
+    px = float(p.get("price", 0)) * (10 ** float(p.get("expo", 0)))
+    conf = float(p.get("conf", 0)) * (10 ** float(p.get("expo", 0)))
+    if px <= 0:
+        raise ValueError("pyth zero")
+    return {"price": px, "confidence_interval": round(conf, 6)}
+
+def _oracle_binance(pair):
+    r = requests.get("https://api.binance.com/api/v3/ticker/price",
+                     params={"symbol": pair}, timeout=6)
+    px = float(r.json().get("price", 0))
+    if px <= 0:
+        raise ValueError("binance zero")
+    return {"price": px}
+
+def _oracle_coinbase(pair):
+    r = requests.get(f"https://api.coinbase.com/v2/prices/{pair}/spot", timeout=6)
+    px = float(r.json().get("data", {}).get("amount", 0))
+    if px <= 0:
+        raise ValueError("coinbase zero")
+    return {"price": px}
+
+def _oracle_kraken(pair):
+    r = requests.get("https://api.kraken.com/0/public/Ticker",
+                     params={"pair": pair}, timeout=6)
+    res = r.json().get("result", {})
+    first = next(iter(res.values()), {})
+    px = float((first.get("c") or [0])[0])
+    if px <= 0:
+        raise ValueError("kraken zero")
+    return {"price": px}
+
+def _oracle_coingecko(cg_id):
+    r = requests.get("https://api.coingecko.com/api/v3/simple/price",
+                     params={"ids": cg_id, "vs_currencies": "usd"}, timeout=6)
+    px = float(r.json().get(cg_id, {}).get("usd", 0))
+    if px <= 0:
+        raise ValueError("coingecko zero")
+    return {"price": px}
+
+def _collect_oracles(symbol: str) -> list:
+    """Consulta todas as fontes EM PARALELO. Latência total = a da mais lenta,
+    não a soma. Cada fonte reporta seu próprio tempo de resposta."""
+    feed, bi, cb, kr, cg = ORACLE_SYMBOLS[symbol]
+    tarefas = [("Pyth Network", "oracle", lambda: _oracle_pyth(feed)),
+               ("Binance",      "cex",    lambda: _oracle_binance(bi)),
+               ("Coinbase",     "cex",    lambda: _oracle_coinbase(cb)),
+               ("Kraken",       "cex",    lambda: _oracle_kraken(kr)),
+               ("CoinGecko",    "index",  lambda: _oracle_coingecko(cg))]
+    out, lock = [], threading.Lock()
+
+    def _run(nome, tipo, fn):
+        t0 = time.time()
+        try:
+            d = fn()
+            reg = {"source": nome, "type": tipo, "price": round(d["price"], 6),
+                   "latency_ms": int((time.time() - t0) * 1000), "ok": True}
+            if "confidence_interval" in d:
+                reg["confidence_interval"] = d["confidence_interval"]
+        except Exception as e:
+            reg = {"source": nome, "type": tipo, "ok": False,
+                   "error": str(e)[:60],
+                   "latency_ms": int((time.time() - t0) * 1000)}
+        with lock:
+            out.append(reg)
+
+    ths = [threading.Thread(target=_run, args=t, daemon=True) for t in tarefas]
+    for t in ths:
+        t.start()
+    for t in ths:
+        t.join(timeout=8)
+    return out
+
+def _median(v: list) -> float:
+    v = sorted(v)
+    n = len(v)
+    return v[n // 2] if n % 2 else (v[n // 2 - 1] + v[n // 2]) / 2
+
+def _oracle_consensus_handler():
+    """Consenso multi-oráculo com detecção de divergência.
+
+    O que a fonte gratuita NÃO dá:
+      - preço mediano robusto (resistente a uma fonte manipulada)
+      - divergência máxima em basis points
+      - desvio absoluto mediano (MAD) — dispersão real, não média enganosa
+      - qual fonte está fora da curva e por quanto
+      - veredito de execução: seguro / cautela / não execute
+      - latência por fonte (útil para escolher rota de execução)
+    """
+    symbol = (request.args.get("symbol", "SOL") or "SOL").upper()[:8]
+    if symbol not in ORACLE_SYMBOLS:
+        return {"error": "unsupported_symbol", "symbol": symbol,
+                "supported": sorted(ORACLE_SYMBOLS),
+                "note": "Ask for more symbols — endpoints are added on request.",
+                "ts": int(time.time())}, 400
+
+    t0 = time.time()
+    fontes = _collect_oracles(symbol)
+    vivas = [f for f in fontes if f.get("ok")]
+    precos = [f["price"] for f in vivas]
+
+    # v30: com menos de 2 fontes não existe consenso — e não se cobra por isso.
+    if len(precos) < 2:
+        return {"status": "unavailable", "symbol": symbol,
+                "error": "Fewer than 2 oracle sources responded — no consensus "
+                         "can be formed. No charge.",
+                "sources": fontes, "ts": int(time.time()),
+                "provider": "Losbeto/OracleConsensus", "version": VERSION}, 503
+
+    mediana = _median(precos)
+    desvios = [abs(p - mediana) for p in precos]
+    mad = _median(desvios)                       # desvio absoluto mediano
+    spread_bps = ((max(precos) - min(precos)) / mediana * 10000) if mediana else 0
+    mad_bps = (mad / mediana * 10000) if mediana else 0
+
+    for f in vivas:
+        d = f["price"] - mediana
+        f["deviation_bps"] = round((d / mediana * 10000) if mediana else 0, 2)
+        f["deviation_usd"] = round(d, 6)
+    outlier = max(vivas, key=lambda f: abs(f["deviation_bps"]))
+    tem_outlier = abs(outlier["deviation_bps"]) > max(30.0, mad_bps * 3)
+
+    # veredito de execução — o que o agente realmente quer saber
+    if spread_bps <= 10:
+        verdict, action = "tight", "Safe to execute at consensus price."
+    elif spread_bps <= 50:
+        verdict, action = "normal", "Normal dispersion. Execute with usual slippage."
+    elif spread_bps <= 200:
+        verdict, action = "wide", ("Sources disagree materially. Widen slippage "
+                                   "or split the order.")
+    else:
+        verdict, action = "divergent", ("Do not execute on a single feed. One "
+                                        "source may be stale or manipulated.")
+
+    return {
+        "product": "Oracle Consensus",
+        "symbol": symbol,
+        "consensus_price_usd": round(mediana, 6),
+        "sources_ok": len(vivas), "sources_queried": len(fontes),
+        "dispersion": {
+            "spread_bps": round(spread_bps, 2),
+            "mad_bps": round(mad_bps, 2),
+            "high": round(max(precos), 6), "low": round(min(precos), 6),
+        },
+        "outlier": ({"source": outlier["source"],
+                     "deviation_bps": outlier["deviation_bps"],
+                     "flag": "stale_or_manipulated"} if tem_outlier else None),
+        "execution": {"verdict": verdict, "action": action,
+                      "recommended_slippage_bps": round(max(10.0, spread_bps * 1.5), 1)},
+        "sources": sorted(fontes, key=lambda f: (not f.get("ok"), f.get("latency_ms", 9999))),
+        "fastest_source": (min(vivas, key=lambda f: f["latency_ms"])["source"]
+                           if vivas else None),
+        "methodology": ("Median across independent oracles and exchanges; MAD for "
+                        "dispersion; outlier flagged at >3x MAD or >30bps. All "
+                        "sources queried in parallel."),
+        "why_not_free": ("Each oracle publishes only its own number. This is the "
+                         "agreement between them — and the disagreement."),
+        "latency_ms": int((time.time() - t0) * 1000),
+        "ts": int(time.time()),
+        "provider": "Losbeto/OracleConsensus", "version": VERSION,
+    }
+
+# registro do endpoint
+BASE_PRICES["/oracle-consensus"] = 0.03
+ENDPOINT_DESC["/oracle-consensus"] = (
+    "Multi-oracle price consensus (?symbol=SOL|BTC|ETH): median across Pyth, "
+    "Binance, Coinbase, Kraken and CoinGecko queried in parallel, with spread in "
+    "basis points, outlier detection for stale or manipulated feeds, per-source "
+    "latency and an execution verdict. Each oracle publishes only its own price; "
+    "this is the agreement between them.")
+ENDPOINT_TAGS["/oracle-consensus"] = ["Crypto", "Trading", "Oracle"]
+ENDPOINT_PARAM_HINTS["/oracle-consensus"] = {"symbol": "SOL"}
+ENDPOINT_HANDLERS["/oracle-consensus"] = _oracle_consensus_handler
+app.add_url_rule("/oracle-consensus", "oracle_consensus",
+                 paid_endpoint("/oracle-consensus")(_oracle_consensus_handler))
+if "/oracle-consensus" in FEATURED_ENDPOINTS:
+    FEATURED_ENDPOINTS.remove("/oracle-consensus")
+FEATURED_ENDPOINTS.insert(0, "/oracle-consensus")
+log.info("🔮 Oracle Consensus registrado ($0.03) — 5 fontes em paralelo")
 
 # ============================================================================
 # 18. MACHINE DEMAND INTELLIGENCE (v29) — o que as máquinas PEDEM e não temos.
