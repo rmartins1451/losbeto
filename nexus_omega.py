@@ -87,7 +87,7 @@ from typing import Any, Optional, Dict, List, Tuple
 # 0. CONFIGURAÇÃO E AUTO-SETUP
 # ============================================================================
 
-VERSION = "30.0.0-CONSENSUS"
+VERSION = "30.1.0-CONSENSUS"
 BRAND_NAME = "Losbeto"
 BRAND_TAGLINE = "The Global Revenue Engine for Financial AI Agents"
 BRAND_EMOJI = "🧠"
@@ -6410,19 +6410,23 @@ def mcp_streamable():
 #     cobram <= $0,10), não na faixa aspiracional dos premium.
 # ============================================================================
 
+# v30.1: o Binance GLOBAL bloqueia IPs de data center dos EUA (o Railway roda em
+# us-west), e por isso retornava sempre "binance zero" gastando 1s de latência.
+# Trocado por Binance.US e Bitstamp, ambos acessíveis a partir dos EUA.
 ORACLE_SYMBOLS = {
-    # símbolo: (pyth_feed_id, binance_pair, coinbase_pair, kraken_pair, coingecko_id)
+    # símbolo: (pyth_feed, binanceus_pair, coinbase_pair, kraken_pair,
+    #           coingecko_id, bitstamp_pair)
     "SOL": ("0xef0d8b6fda2ceba41da15d4095d1da392a0d2f8ed0c6c7bc0f4cfac8c280b56d",
-            "SOLUSDT", "SOL-USD", "SOLUSD", "solana"),
+            "SOLUSD", "SOL-USD", "SOLUSD", "solana", "solusd"),
     "BTC": ("0xe62df6c8b4a85fe1a67db44dc12de5db330f7ac66b72dc658afedf0f4a415b43",
-            "BTCUSDT", "BTC-USD", "XBTUSD", "bitcoin"),
+            "BTCUSD", "BTC-USD", "XBTUSD", "bitcoin", "btcusd"),
     "ETH": ("0xff61491a931112ddf1bd8147cd1b641375f79f5825126d665480874634fd0ace",
-            "ETHUSDT", "ETH-USD", "ETHUSD", "ethereum"),
+            "ETHUSD", "ETH-USD", "ETHUSD", "ethereum", "ethusd"),
 }
 
 def _oracle_pyth(feed_id):
     r = requests.get(f"https://hermes.pyth.network/v2/updates/price/latest?ids[]={feed_id}",
-                     timeout=6)
+                     timeout=4)
     p = r.json().get("parsed", [{}])[0].get("price", {})
     px = float(p.get("price", 0)) * (10 ** float(p.get("expo", 0)))
     conf = float(p.get("conf", 0)) * (10 ** float(p.get("expo", 0)))
@@ -6430,16 +6434,23 @@ def _oracle_pyth(feed_id):
         raise ValueError("pyth zero")
     return {"price": px, "confidence_interval": round(conf, 6)}
 
-def _oracle_binance(pair):
-    r = requests.get("https://api.binance.com/api/v3/ticker/price",
-                     params={"symbol": pair}, timeout=6)
+def _oracle_binanceus(pair):
+    r = requests.get("https://api.binance.us/api/v3/ticker/price",
+                     params={"symbol": pair}, timeout=4)
     px = float(r.json().get("price", 0))
     if px <= 0:
-        raise ValueError("binance zero")
+        raise ValueError("binance.us no price")
+    return {"price": px}
+
+def _oracle_bitstamp(pair):
+    r = requests.get(f"https://www.bitstamp.net/api/v2/ticker/{pair}/", timeout=4)
+    px = float(r.json().get("last", 0))
+    if px <= 0:
+        raise ValueError("bitstamp no price")
     return {"price": px}
 
 def _oracle_coinbase(pair):
-    r = requests.get(f"https://api.coinbase.com/v2/prices/{pair}/spot", timeout=6)
+    r = requests.get(f"https://api.coinbase.com/v2/prices/{pair}/spot", timeout=4)
     px = float(r.json().get("data", {}).get("amount", 0))
     if px <= 0:
         raise ValueError("coinbase zero")
@@ -6447,7 +6458,7 @@ def _oracle_coinbase(pair):
 
 def _oracle_kraken(pair):
     r = requests.get("https://api.kraken.com/0/public/Ticker",
-                     params={"pair": pair}, timeout=6)
+                     params={"pair": pair}, timeout=4)
     res = r.json().get("result", {})
     first = next(iter(res.values()), {})
     px = float((first.get("c") or [0])[0])
@@ -6457,7 +6468,7 @@ def _oracle_kraken(pair):
 
 def _oracle_coingecko(cg_id):
     r = requests.get("https://api.coingecko.com/api/v3/simple/price",
-                     params={"ids": cg_id, "vs_currencies": "usd"}, timeout=6)
+                     params={"ids": cg_id, "vs_currencies": "usd"}, timeout=4)
     px = float(r.json().get(cg_id, {}).get("usd", 0))
     if px <= 0:
         raise ValueError("coingecko zero")
@@ -6466,11 +6477,12 @@ def _oracle_coingecko(cg_id):
 def _collect_oracles(symbol: str) -> list:
     """Consulta todas as fontes EM PARALELO. Latência total = a da mais lenta,
     não a soma. Cada fonte reporta seu próprio tempo de resposta."""
-    feed, bi, cb, kr, cg = ORACLE_SYMBOLS[symbol]
+    feed, bi, cb, kr, cg, bs = ORACLE_SYMBOLS[symbol]
     tarefas = [("Pyth Network", "oracle", lambda: _oracle_pyth(feed)),
-               ("Binance",      "cex",    lambda: _oracle_binance(bi)),
                ("Coinbase",     "cex",    lambda: _oracle_coinbase(cb)),
                ("Kraken",       "cex",    lambda: _oracle_kraken(kr)),
+               ("Binance.US",   "cex",    lambda: _oracle_binanceus(bi)),
+               ("Bitstamp",     "cex",    lambda: _oracle_bitstamp(bs)),
                ("CoinGecko",    "index",  lambda: _oracle_coingecko(cg))]
     out, lock = [], threading.Lock()
 
@@ -6493,7 +6505,7 @@ def _collect_oracles(symbol: str) -> list:
     for t in ths:
         t.start()
     for t in ths:
-        t.join(timeout=8)
+        t.join(timeout=5)
     return out
 
 def _median(v: list) -> float:
@@ -6532,18 +6544,35 @@ def _oracle_consensus_handler():
                 "sources": fontes, "ts": int(time.time()),
                 "provider": "Losbeto/OracleConsensus", "version": VERSION}, 503
 
-    mediana = _median(precos)
-    desvios = [abs(p - mediana) for p in precos]
-    mad = _median(desvios)                       # desvio absoluto mediano
-    spread_bps = ((max(precos) - min(precos)) / mediana * 10000) if mediana else 0
+    # v30.1 METODOLOGIA: o consenso sai das fontes PRIMÁRIAS (oráculo + bolsas).
+    # Índices agregados (CoinGecko) derivam das mesmas bolsas e chegam com atraso;
+    # incluí-los na mediana seria contar a mesma informação duas vezes. Ficam
+    # como referência cruzada, e é justamente aí que o atraso deles vira sinal.
+    primarias = [f for f in vivas if f.get("type") in ("oracle", "cex")]
+    base = [f["price"] for f in primarias] or precos
+    mediana = _median(base)
+    desvios = [abs(p - mediana) for p in base]
+    mad = _median(desvios)
+    spread_bps = ((max(base) - min(base)) / mediana * 10000) if mediana else 0
     mad_bps = (mad / mediana * 10000) if mediana else 0
 
     for f in vivas:
         d = f["price"] - mediana
         f["deviation_bps"] = round((d / mediana * 10000) if mediana else 0, 2)
         f["deviation_usd"] = round(d, 6)
-    outlier = max(vivas, key=lambda f: abs(f["deviation_bps"]))
-    tem_outlier = abs(outlier["deviation_bps"]) > max(30.0, mad_bps * 3)
+        # Z-score modificado (Iglewicz & Hoaglin) — teste robusto padrão para
+        # outlier com MAD. O limiar fixo anterior (30bps) deixava passar uma
+        # fonte 20bps fora quando as outras concordavam em 0,5bps: em termos
+        # estatísticos era um outlier gritante.
+        f["modified_z"] = (round(0.6745 * d / mad, 2) if mad > 0
+                           else (0.0 if abs(d) < 1e-9 else 999.0))
+    def _e_outlier(f):
+        # exige as duas coisas: significância estatística E relevância prática
+        return abs(f.get("modified_z", 0)) > 3.5 and abs(f["deviation_bps"]) >= 5.0
+    fora = [f for f in vivas if _e_outlier(f)]
+    outlier = max(fora, key=lambda f: abs(f["deviation_bps"])) if fora else \
+              max(vivas, key=lambda f: abs(f["deviation_bps"]))
+    tem_outlier = bool(fora)
 
     # veredito de execução — o que o agente realmente quer saber
     if spread_bps <= 10:
@@ -6567,17 +6596,32 @@ def _oracle_consensus_handler():
             "mad_bps": round(mad_bps, 2),
             "high": round(max(precos), 6), "low": round(min(precos), 6),
         },
+        "outliers": [{"source": f["source"], "deviation_bps": f["deviation_bps"],
+                      "modified_z": f["modified_z"],
+                      "flag": ("lagging_index" if f.get("type") == "index"
+                               else "stale_or_manipulated")} for f in fora] or None,
         "outlier": ({"source": outlier["source"],
                      "deviation_bps": outlier["deviation_bps"],
-                     "flag": "stale_or_manipulated"} if tem_outlier else None),
+                     "modified_z": outlier.get("modified_z"),
+                     "flag": ("lagging_index" if outlier.get("type") == "index"
+                              else "stale_or_manipulated")} if tem_outlier else None),
         "execution": {"verdict": verdict, "action": action,
                       "recommended_slippage_bps": round(max(10.0, spread_bps * 1.5), 1)},
         "sources": sorted(fontes, key=lambda f: (not f.get("ok"), f.get("latency_ms", 9999))),
         "fastest_source": (min(vivas, key=lambda f: f["latency_ms"])["source"]
                            if vivas else None),
-        "methodology": ("Median across independent oracles and exchanges; MAD for "
-                        "dispersion; outlier flagged at >3x MAD or >30bps. All "
-                        "sources queried in parallel."),
+        "consensus_basis": {
+            "primary_sources": [f["source"] for f in primarias],
+            "reference_only": [f["source"] for f in vivas
+                               if f.get("type") == "index"],
+            "note": "Aggregated indices are cross-checked, not averaged in — "
+                    "they derive from the same exchanges and lag them.",
+        },
+        "methodology": ("Median of independent oracles and exchanges (aggregated "
+                        "indices excluded from the median to avoid double-counting). "
+                        "Dispersion via MAD. Outliers flagged by modified Z-score "
+                        "(Iglewicz & Hoaglin, |Z|>3.5) with a 5bps practical floor. "
+                        "All sources queried in parallel."),
         "why_not_free": ("Each oracle publishes only its own number. This is the "
                          "agreement between them — and the disagreement."),
         "latency_ms": int((time.time() - t0) * 1000),

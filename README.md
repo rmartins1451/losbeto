@@ -26,11 +26,27 @@ Most x402 services are crypto-only. This one covers **traditional markets too**:
 | Equities | live quotes, AI single-stock dossiers, sector rotation |
 | Commodities | gold, silver, WTI, Brent, copper, natural gas |
 | Macro | FOMC / NFP / CPI / ECB calendar, event playbooks, regime |
-| Crypto | Pyth oracle prices, fear & greed, DEX screening, rug checks |
+| Crypto | multi-oracle price consensus, Pyth feeds, fear & greed, DEX screening, rug checks |
 | Research | daily cross-asset brief, 90-day correlation matrix, 5-agent council |
 
-67 monetized endpoints, $0.003–$4.16 USDC, settling on Base (Coinbase CDP) and
+68 monetized endpoints, $0.003–$4.16 USDC, settling on Base (Coinbase CDP) and
 Solana (PayAI).
+
+### Oracle Consensus — `/oracle-consensus?symbol=SOL` · $0.03
+
+Every oracle publishes its own number. None publishes the *agreement between
+them*. This queries Pyth, Coinbase, Kraken, Binance.US, Bitstamp and CoinGecko
+**in parallel** and returns:
+
+- median across primary sources (aggregated indices are cross-checked, not
+  averaged in — they derive from the same exchanges and lag them)
+- spread and MAD in basis points
+- outliers by modified Z-score (Iglewicz & Hoaglin, |Z|>3.5), distinguishing a
+  *lagging index* from a *stale or manipulated feed*
+- per-source latency, so an agent can pick its execution route
+- an execution verdict: tight / normal / wide / divergent, with suggested slippage
+
+If fewer than two sources respond, it returns 503 and does not charge.
 
 ## Design decisions worth stealing
 
@@ -61,6 +77,11 @@ you reconcile by `tx.from`, you attribute every sale to the relayer.
 **A free sample must actually be delayed.** Ours served data with ~0s of age —
 identical to the paid response. For a daily index, a 15-minute delay creates no
 reason to pay. The delay is now proportional to each feed's volatility.
+
+**Build from measured demand, not intuition.** The dashboard tracks probes,
+evaluations and 404s per endpoint and user-agent. `/oracle-consensus` exists
+because 112 distinct IPs were probing `/pyth-price` — data that is free at the
+source. The consensus between oracles is not.
 
 **Publish honest receipts.** Every settlement at `/receipts` is labelled
 operator-test vs organic. It costs nothing, and it's the only reason anyone in
