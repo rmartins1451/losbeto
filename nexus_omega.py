@@ -87,7 +87,7 @@ from typing import Any, Optional, Dict, List, Tuple
 # 0. CONFIGURAÇÃO E AUTO-SETUP
 # ============================================================================
 
-VERSION = "30.2.0-CONSENSUS"
+VERSION = "31.0.0-CONSENSUS"
 BRAND_NAME = "Losbeto"
 BRAND_TAGLINE = "The Global Revenue Engine for Financial AI Agents"
 BRAND_EMOJI = "🧠"
@@ -6457,6 +6457,186 @@ def mcp_streamable():
     r = jsonify(resp)
     r.headers["Mcp-Session-Id"] = WALLET.node_id
     return r
+
+# ============================================================================
+# 20. SENTIMENT CONSENSUS (v31) — mesmo padrão que funcionou no oráculo,
+#     aplicado ao segundo endpoint mais sondado (/fear-greed, 80 IPs distintos).
+#
+#     Problema idêntico: o índice de medo e ganância é GRÁTIS no alternative.me,
+#     então o agente sonda, compara e busca na fonte. O que NÃO existe de graça
+#     é a leitura conjunta de várias medidas independentes de sentimento — e,
+#     principalmente, a DIVERGÊNCIA entre elas. Quando o índice diz "medo" mas a
+#     amplitude do mercado está positiva, isso é sinal contrário; nenhuma fonte
+#     isolada consegue mostrar.
+# ============================================================================
+
+def _sent_feargreed():
+    r = requests.get("https://api.alternative.me/fng/?limit=2", timeout=4)
+    d = r.json().get("data", [])
+    if not d:
+        raise ValueError("fng vazio")
+    atual = int(d[0]["value"])
+    anterior = int(d[1]["value"]) if len(d) > 1 else atual
+    return {"score": atual, "label": d[0].get("value_classification"),
+            "delta_24h": atual - anterior}
+
+def _sent_global():
+    r = requests.get("https://api.coingecko.com/api/v3/global", timeout=5)
+    d = r.json().get("data", {})
+    chg = float(d.get("market_cap_change_percentage_24h_usd") or 0)
+    dom = float((d.get("market_cap_percentage") or {}).get("btc") or 0)
+    # variação de capitalização mapeada para 0-100 (±5% satura)
+    score = max(0.0, min(100.0, 50 + (chg / 5.0) * 50))
+    return {"score": round(score, 1), "mcap_change_24h_pct": round(chg, 2),
+            "btc_dominance_pct": round(dom, 2)}
+
+def _sent_breadth():
+    r = requests.get("https://api.coingecko.com/api/v3/coins/markets",
+                     params={"vs_currency": "usd", "order": "market_cap_desc",
+                             "per_page": 50, "page": 1}, timeout=6)
+    moedas = r.json()
+    if not isinstance(moedas, list) or not moedas:
+        raise ValueError("markets vazio")
+    subiu = sum(1 for c in moedas
+                if (c.get("price_change_percentage_24h") or 0) > 0)
+    pct = subiu / len(moedas) * 100
+    return {"score": round(pct, 1), "advancing": subiu, "universe": len(moedas),
+            "note": "share of top-50 assets up in 24h"}
+
+def _sent_volatility():
+    r = requests.get("https://api.coingecko.com/api/v3/coins/bitcoin/market_chart",
+                     params={"vs_currency": "usd", "days": 14, "interval": "daily"},
+                     timeout=6)
+    precos = [p[1] for p in r.json().get("prices", []) if p and len(p) > 1]
+    if len(precos) < 8:
+        raise ValueError("série curta")
+    rets = [(precos[i] / precos[i-1] - 1) for i in range(1, len(precos)) if precos[i-1]]
+    media = sum(rets) / len(rets)
+    dp = (sum((x - media) ** 2 for x in rets) / len(rets)) ** 0.5
+    vol_anual = dp * (365 ** 0.5) * 100
+    # vol baixa = complacência (score alto); vol alta = estresse (score baixo)
+    score = max(0.0, min(100.0, 100 - (vol_anual - 20) * 2))
+    return {"score": round(score, 1), "annualized_vol_pct": round(vol_anual, 1),
+            "note": "low volatility reads as complacency, high as stress"}
+
+def _collect_sentiment() -> list:
+    tarefas = [("Fear & Greed Index", "survey",     _sent_feargreed),
+               ("Market Cap Momentum", "price",     _sent_global),
+               ("Breadth (top-50)",    "breadth",   _sent_breadth),
+               ("Realized Volatility", "volatility", _sent_volatility)]
+    out, lock = [], threading.Lock()
+
+    def _run(nome, tipo, fn):
+        t0 = time.time()
+        try:
+            d = fn()
+            reg = {"indicator": nome, "type": tipo, "ok": True,
+                   "latency_ms": int((time.time() - t0) * 1000), **d}
+        except Exception as e:
+            reg = {"indicator": nome, "type": tipo, "ok": False,
+                   "error": str(e)[:60],
+                   "latency_ms": int((time.time() - t0) * 1000)}
+        with lock:
+            out.append(reg)
+
+    ths = [threading.Thread(target=_run, args=t, daemon=True) for t in tarefas]
+    for t in ths:
+        t.start()
+    for t in ths:
+        t.join(timeout=7)
+    return out
+
+def _sentiment_consensus_handler():
+    """Consenso de sentimento com detecção de divergência.
+
+    O que a fonte gratuita NÃO dá: a leitura conjunta de quatro medidas
+    independentes, o desacordo entre elas, e o que esse desacordo significa
+    para posicionamento.
+    """
+    t0 = time.time()
+    ind = _collect_sentiment()
+    vivos = [i for i in ind if i.get("ok")]
+    if len(vivos) < 2:
+        return {"status": "unavailable",
+                "error": "Fewer than 2 sentiment sources responded — no consensus. "
+                         "No charge.",
+                "indicators": ind, "ts": int(time.time()),
+                "provider": "Losbeto/SentimentConsensus", "version": VERSION}, 503
+
+    scores = [i["score"] for i in vivos]
+    composto = sum(scores) / len(scores)
+    spread = max(scores) - min(scores)
+    for i in vivos:
+        i["divergence_from_composite"] = round(i["score"] - composto, 1)
+
+    if composto < 25:   zona, viés = "extreme_fear", "contrarian_long"
+    elif composto < 45: zona, viés = "fear", "accumulate_cautiously"
+    elif composto < 55: zona, viés = "neutral", "no_edge"
+    elif composto < 75: zona, viés = "greed", "trim_into_strength"
+    else:               zona, viés = "extreme_greed", "contrarian_short"
+
+    # A divergência é o produto: quando as medidas discordam, uma delas está
+    # antecipando o movimento — e é isso que o agente precisa saber.
+    if spread >= 40:
+        conf, leitura = "low", ("Indicators strongly disagree. Survey sentiment and "
+                                "actual market behaviour are telling different "
+                                "stories — treat the headline index as unreliable "
+                                "right now.")
+    elif spread >= 20:
+        conf, leitura = "medium", ("Moderate disagreement between indicators. "
+                                   "Confirm with price action before sizing up.")
+    else:
+        conf, leitura = "high", "Indicators agree. The headline reading is confirmed."
+
+    fg = next((i for i in vivos if i["type"] == "survey"), None)
+    br = next((i for i in vivos if i["type"] == "breadth"), None)
+    sinal_contrario = None
+    if fg and br:
+        if fg["score"] < 40 and br["score"] > 60:
+            sinal_contrario = ("Survey says fear while most of the top-50 is up — "
+                               "classic capitulation-bottom signature.")
+        elif fg["score"] > 60 and br["score"] < 40:
+            sinal_contrario = ("Survey says greed while breadth is negative — "
+                               "narrow rally, distribution risk.")
+
+    return {
+        "product": "Sentiment Consensus",
+        "composite_score": round(composto, 1),
+        "zone": zona, "positioning_bias": viés,
+        "agreement": {"spread": round(spread, 1), "confidence": conf,
+                      "reading": leitura},
+        "divergence_signal": sinal_contrario,
+        "indicators": sorted(ind, key=lambda i: (not i.get("ok"), i.get("latency_ms", 9999))),
+        "indicators_ok": len(vivos), "indicators_queried": len(ind),
+        "methodology": ("Equal-weight composite of independent sentiment measures: "
+                        "survey index, market-cap momentum, breadth of the top-50 and "
+                        "realized volatility. Spread between them is the confidence "
+                        "signal — agreement confirms, disagreement warns."),
+        "why_not_free": ("The headline fear & greed index is free. The agreement "
+                         "between four independent measures — and what their "
+                         "disagreement implies — is not published anywhere."),
+        "latency_ms": int((time.time() - t0) * 1000),
+        "ts": int(time.time()),
+        "provider": "Losbeto/SentimentConsensus", "version": VERSION,
+    }
+
+BASE_PRICES["/sentiment-consensus"] = 0.03
+ENDPOINT_DESC["/sentiment-consensus"] = (
+    "Multi-indicator sentiment consensus: composite of the fear & greed survey, "
+    "market-cap momentum, breadth of the top-50 and realized volatility, queried "
+    "in parallel. Returns the composite score, the spread between indicators as a "
+    "confidence signal, and contrarian divergence detection — for example survey "
+    "fear against positive breadth, the classic capitulation-bottom signature. The "
+    "headline index is free; the agreement between four measures is not.")
+ENDPOINT_TAGS["/sentiment-consensus"] = ["Crypto", "Sentiment", "Trading"]
+ENDPOINT_PARAM_HINTS["/sentiment-consensus"] = {"format": "json"}
+ENDPOINT_HANDLERS["/sentiment-consensus"] = _sentiment_consensus_handler
+app.add_url_rule("/sentiment-consensus", "sentiment_consensus",
+                 paid_endpoint("/sentiment-consensus")(_sentiment_consensus_handler))
+if "/sentiment-consensus" in FEATURED_ENDPOINTS:
+    FEATURED_ENDPOINTS.remove("/sentiment-consensus")
+FEATURED_ENDPOINTS.insert(0, "/sentiment-consensus")
+log.info("🌡 Sentiment Consensus registrado ($0.03) — 4 indicadores em paralelo")
 
 # ============================================================================
 # 19. ORACLE CONSENSUS (v30) — o primeiro produto deste projeto nascido de
