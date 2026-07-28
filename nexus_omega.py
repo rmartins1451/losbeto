@@ -87,7 +87,7 @@ from typing import Any, Optional, Dict, List, Tuple
 # 0. CONFIGURAÇÃO E AUTO-SETUP
 # ============================================================================
 
-VERSION = "28.1.0-FUNNEL"
+VERSION = "28.2.0-FUNNEL"
 BRAND_NAME = "Losbeto"
 BRAND_TAGLINE = "The Global Revenue Engine for Financial AI Agents"
 BRAND_EMOJI = "🧠"
@@ -925,6 +925,20 @@ class LedgerV10:
                 top_uas = [{"ua": r[0][:60], "hits": r[1], "ips": r[2]} for r in top_uas]
             except Exception:
                 top_uas = []
+            # v28.2: QUEM são os "avaliadores"? Sem isto não dá para saber se os
+            # previews vêm de agentes de verdade avaliando antes de comprar, ou
+            # do mesmo poller que já domina as sondagens. É a diferença entre
+            # "temos prospectos" e "temos um robô curioso".
+            try:
+                preview_uas = c.execute(
+                    "SELECT COALESCE(NULLIF(ua,''),'(sem user-agent)') u, COUNT(*) n, "
+                    "COUNT(DISTINCT ip) ips FROM requests "
+                    "WHERE ts>? AND kind='preview' "
+                    "GROUP BY u ORDER BY n DESC LIMIT 8", (now - 86400,)).fetchall()
+                preview_uas = [{"ua": r[0][:60], "hits": r[1], "ips": r[2]}
+                               for r in preview_uas]
+            except Exception:
+                preview_uas = []
         win = self.win_rate()
         return {
             "total_usdc":     round(total, 6),
@@ -941,6 +955,7 @@ class LedgerV10:
             "previews_24h":   previews,
             "probes_24h":     probes,
             "top_uas":        top_uas,
+            "preview_uas":    preview_uas,
             "paid_total":     paid_total,
             "avg_ticket":     round((total / paid_total) if paid_total else 0, 4),
             "conv_evaluators": round((paid / (paid + previews) * 100)
@@ -7397,6 +7412,9 @@ code{background:var(--bg2);padding:2px 6px;border-radius:3px;font-size:11px;colo
 <div class="section-label">Quem está batendo no nó (24h) — scanner × cliente</div>
 <table id="tbl_ua"><thead><tr><th>User-Agent</th><th>Hits</th><th>IPs</th><th>Leitura</th></tr></thead><tbody></tbody></table>
 
+<div class="section-label">🔍 Quem AVALIOU (previews · 24h) — o funil de verdade</div>
+<table id="tbl_pv"><thead><tr><th>User-Agent</th><th>Previews</th><th>IPs</th><th>Leitura</th></tr></thead><tbody></tbody></table>
+
 <div class="section-label">Ações Rápidas</div>
 <div class="grid" style="grid-template-columns:repeat(auto-fit,minmax(230px,1fr))">
   <div class="actioncard">
@@ -7545,6 +7563,26 @@ async function reload(){
              `<td style="color:${color}">${label}</td></tr>`;
     }).join("")
     : '<tr><td colspan=4 style="text-align:center;color:var(--muted)">Coletando… (dados a partir do deploy da v24.5)</td></tr>';
+
+  // v28.2: avaliadores por user-agent. Se os previews vierem do MESMO agente
+  // que domina as sondagens, não são prospectos — é o poller sendo curioso.
+  const pvs = (j.stats.preview_uas||[]);
+  const totalPv = pvs.reduce((a,u)=>a+u.hits,0);
+  document.getElementById("tbl_pv").querySelector("tbody").innerHTML =
+    pvs.length ? pvs.map(u=>{
+      let label="❓ desconhecido", cls="amber";
+      for (const [re,txt,c] of KNOWN) if (re.test(u.ua)) { label=txt; cls=c; break; }
+      if (/sem user-agent/i.test(u.ua)) {
+        label = (u.ips >= 8) ? "🤖 varredura distribuída" : "🟡 sem UA, poucos IPs";
+        cls   = (u.ips >= 8) ? "muted" : "amber";
+      }
+      const share = totalPv ? Math.round(u.hits*100/totalPv) : 0;
+      const color = cls==="green" ? "var(--neon)" : cls==="amber" ? "var(--amber)" : "var(--muted)";
+      return `<tr><td><code style="font-size:10px">${u.ua.replace(/</g,"&lt;")}</code></td>`+
+             `<td>${u.hits} <span style="color:var(--muted)">(${share}%)</span></td>`+
+             `<td>${u.ips}</td><td style="color:${color}">${label}</td></tr>`;
+    }).join("")
+    : '<tr><td colspan=4 style="text-align:center;color:var(--muted)">Nenhum preview ainda nas últimas 24h</td></tr>';
 }
 reload(); setInterval(reload, 30000);
 </script></body></html>"""
