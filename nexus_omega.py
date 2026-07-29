@@ -87,7 +87,7 @@ from typing import Any, Optional, Dict, List, Tuple
 # 0. CONFIGURAÇÃO E AUTO-SETUP
 # ============================================================================
 
-VERSION = "35.0.0-AUDIT"
+VERSION = "36.0.0-CONCIERGE"
 BRAND_NAME = "Losbeto"
 BRAND_TAGLINE = "The Global Revenue Engine for Financial AI Agents"
 BRAND_EMOJI = "🧠"
@@ -6252,7 +6252,127 @@ function mode(m){
   if(!q){try{m=localStorage.getItem('losbeto_mode')||'h'}catch(e){}}
   if(m==='a'||m==='agent')mode('a');
 })();
-</script></body></html>"""
+</script>
+<!-- v36: atendimento. Os avaliadores são majoritariamente humanos em
+     navegador — e não tinham como perguntar nada. -->
+<style>
+#cw{position:fixed;right:20px;bottom:20px;z-index:99;font:14px/1.5 -apple-system,BlinkMacSystemFont,'Segoe UI',Inter,sans-serif}
+#cwb{background:var(--acc,#4ade80);color:#06210f;border:0;border-radius:999px;padding:12px 18px;
+     font:600 14px inherit;cursor:pointer;box-shadow:0 6px 24px rgba(0,0,0,.4);display:flex;
+     align-items:center;gap:8px}
+#cwb:hover{filter:brightness(1.07)}
+#cwb .dot{width:7px;height:7px;border-radius:50%;background:#06210f;animation:cwp 2s infinite}
+@keyframes cwp{0%,100%{opacity:.35}50%{opacity:1}}
+#cwp{display:none;flex-direction:column;width:340px;max-width:calc(100vw - 40px);height:440px;
+     max-height:70vh;background:var(--card,#111318);border:1px solid var(--line,#1e2126);
+     border-radius:14px;overflow:hidden;box-shadow:0 20px 60px rgba(0,0,0,.6)}
+#cwp.on{display:flex}
+#cwh{padding:13px 15px;border-bottom:1px solid var(--line,#1e2126);display:flex;
+     justify-content:space-between;align-items:center}
+#cwh b{font-size:14px}
+#cwh small{color:var(--dim,#8b9199);font-size:11.5px;display:block;margin-top:1px}
+#cwx{background:none;border:0;color:var(--dim,#8b9199);font-size:20px;cursor:pointer;line-height:1}
+#cwm{flex:1;overflow-y:auto;padding:14px;display:flex;flex-direction:column;gap:9px}
+.cwmsg{max-width:85%;padding:9px 12px;border-radius:11px;font-size:13.5px;word-wrap:break-word}
+.cwmsg.v{align-self:flex-end;background:var(--acc,#4ade80);color:#06210f}
+.cwmsg.o{align-self:flex-start;background:rgba(255,255,255,.06);border:1px solid var(--line,#1e2126)}
+.cwmsg.s{align-self:center;color:var(--dim,#8b9199);font-size:11.5px;text-align:center;
+         background:none;border:0;max-width:100%;padding:4px}
+#cwf{border-top:1px solid var(--line,#1e2126);padding:10px;display:flex;gap:8px}
+#cwi{flex:1;background:rgba(255,255,255,.04);border:1px solid var(--line,#1e2126);
+     border-radius:8px;color:inherit;font:inherit;font-size:13.5px;padding:9px 11px;resize:none;
+     max-height:70px}
+#cwi:focus{outline:0;border-color:var(--acc,#4ade80)}
+#cws{background:var(--acc,#4ade80);color:#06210f;border:0;border-radius:8px;padding:0 15px;
+     font:600 13px inherit;cursor:pointer}
+#cws:disabled{opacity:.45;cursor:default}
+</style>
+<div id="cw">
+  <div id="cwp">
+    <div id="cwh">
+      <div><b>Talk to the operator</b>
+        <small>Roberto reads every message · replies via Telegram</small></div>
+      <button id="cwx" aria-label="close">&times;</button>
+    </div>
+    <div id="cwm"></div>
+    <div id="cwf">
+      <textarea id="cwi" rows="1" maxlength="900"
+        placeholder="What does your agent need? Ask anything."></textarea>
+      <button id="cws">Send</button>
+    </div>
+  </div>
+  <button id="cwb"><span class="dot"></span> Ask the operator</button>
+</div>
+<script>
+(function(){
+  var K='losbeto_chat_sid', S=null, since=0, timer=null, opened=false;
+  try{S=localStorage.getItem(K)}catch(e){}
+  var pane=document.getElementById('cwp'), btn=document.getElementById('cwb'),
+      msgs=document.getElementById('cwm'), inp=document.getElementById('cwi'),
+      snd=document.getElementById('cws'), cls=document.getElementById('cwx');
+
+  function add(who,txt){
+    var d=document.createElement('div');
+    d.className='cwmsg '+(who==='visitor'?'v':who==='system'?'s':'o');
+    d.textContent=txt; msgs.appendChild(d); msgs.scrollTop=msgs.scrollHeight;
+  }
+  function open(){
+    pane.classList.add('on'); btn.style.display='none'; opened=true; inp.focus();
+    if(!msgs.children.length){
+      add('system','No signup, no email. Ask about an endpoint, request a new one, '
+        +'or just check if a human is here. Replies land in this window.');
+    }
+    poll(); if(!timer)timer=setInterval(poll,6000);
+  }
+  function close(){
+    pane.classList.remove('on'); btn.style.display='flex'; opened=false;
+    if(timer){clearInterval(timer);timer=null}
+  }
+  btn.onclick=open; cls.onclick=close;
+
+  async function poll(){
+    if(!S)return;
+    try{
+      var r=await fetch('/chat/poll?sid='+encodeURIComponent(S)+'&since='+since,
+                        {cache:'no-store'});
+      var j=await r.json();
+      (j.messages||[]).forEach(function(m){
+        if(m.id>since)since=m.id;
+        if(m.who==='operator')add('operator',m.text);
+      });
+    }catch(e){}
+  }
+
+  async function send(){
+    var t=inp.value.trim(); if(!t)return;
+    snd.disabled=true; inp.value=''; add('visitor',t);
+    try{
+      var r=await fetch('/chat/send',{method:'POST',
+        headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({text:t,sid:S||''})});
+      var j=await r.json();
+      if(j.sid){S=j.sid; try{localStorage.setItem(K,S)}catch(e){}}
+      if(j.error==='rate_limited'){add('system',j.note||'Rate limited.');}
+      else if(msgs.querySelectorAll('.cwmsg.v').length===1){
+        add('system','Delivered. The operator is notified on Telegram — a reply '
+          +'usually lands within minutes, and this window remembers your thread.');
+      }
+      if(!timer)timer=setInterval(poll,6000);
+    }catch(e){ add('system','Could not send. Try again or open an issue on GitHub.'); }
+    snd.disabled=false; inp.focus();
+  }
+  snd.onclick=send;
+  inp.addEventListener('keydown',function(e){
+    if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();send()}
+  });
+  inp.addEventListener('input',function(){
+    inp.style.height='auto'; inp.style.height=Math.min(inp.scrollHeight,70)+'px';
+  });
+  // se já existe conversa, checa respostas em segundo plano
+  if(S){poll(); timer=setInterval(poll,20000);}
+})();
+</script>
+</body></html>"""
 
 def _render_clean_landing() -> str:
     base = _public_base()
@@ -7840,6 +7960,177 @@ def _audit_one(path: str) -> dict:
                        (idx.get("active") if isinstance(idx, dict) else False))
                        else "not_indexed")}
 
+# ============================================================================
+# 22. LIVE CHAT (v36) — atendimento humano no meio de um mercado de máquinas.
+#
+#     A telemetria mostrou o que ninguém esperava: os avaliadores são
+#     majoritariamente NAVEGADORES HUMANOS (iPhone, Android, Windows), e alguém
+#     pediu /about, /contact e /team. São pessoas avaliando se confiam no
+#     serviço — e iam embora sem poder perguntar nada.
+#
+#     Fluxo: visitante escreve na página -> chega no Telegram do operador ->
+#     operador responde com /r <id> <texto> -> resposta aparece na página.
+#     Sem cadastro, sem e-mail, sem terceiros.
+# ============================================================================
+
+CHAT_DB_PATH = HOME_DIR / "chat.db"
+CHAT_RETENTION_DAYS = int(os.environ.get("CHAT_RETENTION_DAYS", "30"))
+CHAT_MAX_LEN = 900
+CHAT_RATE_MAX = int(os.environ.get("CHAT_RATE_MAX", "8"))   # msgs/hora por sessão
+
+def _chat_db():
+    c = sqlite3.connect(CHAT_DB_PATH, timeout=10)
+    c.execute("PRAGMA busy_timeout=8000")
+    c.execute("""CREATE TABLE IF NOT EXISTS chat(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        sid TEXT NOT NULL, ts INTEGER NOT NULL,
+        who TEXT NOT NULL, text TEXT NOT NULL,
+        ip TEXT, ua TEXT, delivered INTEGER DEFAULT 0)""")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_chat_sid ON chat(sid, id)")
+    return c
+
+def _chat_short(sid: str) -> str:
+    return sid[:6]
+
+def _chat_sid_from_short(short: str) -> Optional[str]:
+    try:
+        c = _chat_db()
+        try:
+            row = c.execute("SELECT sid FROM chat WHERE sid LIKE ? "
+                            "ORDER BY id DESC LIMIT 1", (short + "%",)).fetchone()
+        finally:
+            c.close()
+        return row[0] if row else None
+    except Exception:
+        return None
+
+def _chat_add(sid: str, who: str, text: str, ip: str = "", ua: str = "") -> int:
+    c = _chat_db()
+    try:
+        cur = c.execute("INSERT INTO chat(sid,ts,who,text,ip,ua) VALUES(?,?,?,?,?,?)",
+                        (sid, int(time.time()), who, text[:CHAT_MAX_LEN],
+                         (ip or "")[:60], (ua or "")[:120]))
+        c.execute("DELETE FROM chat WHERE ts < ?",
+                  (int(time.time()) - CHAT_RETENTION_DAYS * 86400,))
+        c.commit()
+        return cur.lastrowid
+    finally:
+        c.close()
+
+def _chat_rate_ok(sid: str, ip: str) -> bool:
+    try:
+        c = _chat_db()
+        try:
+            n = c.execute("SELECT COUNT(*) FROM chat WHERE who='visitor' "
+                          "AND (sid=? OR ip=?) AND ts > ?",
+                          (sid, ip, int(time.time()) - 3600)).fetchone()[0]
+        finally:
+            c.close()
+        return n < CHAT_RATE_MAX
+    except Exception:
+        return True
+
+@app.route("/chat/send", methods=["POST"])
+def chat_send():
+    """Visitante manda mensagem. Vai direto para o Telegram do operador."""
+    try:
+        body = request.get_json(silent=True) or {}
+    except Exception:
+        body = {}
+    texto = (body.get("text") or "").strip()
+    sid = (body.get("sid") or "").strip()[:40]
+    if not texto:
+        return jsonify({"error": "empty"}), 400
+    if not re.fullmatch(r"[a-zA-Z0-9_-]{8,40}", sid or ""):
+        sid = secrets.token_urlsafe(12)
+    ip = (request.headers.get("X-Forwarded-For", request.remote_addr) or "").split(",")[0].strip()
+    ua = request.headers.get("User-Agent", "")
+
+    if not _chat_rate_ok(sid, ip):
+        return jsonify({"sid": sid, "queued": False,
+                        "error": "rate_limited",
+                        "note": "Too many messages this hour. Try again later or "
+                                "open an issue: " + FEEDBACK_GITHUB}), 429
+
+    _chat_add(sid, "visitor", texto, ip, ua)
+    curto = _chat_short(sid)
+    # contexto útil para o operador decidir como responder
+    try:
+        hist = 0
+        c = _chat_db()
+        try:
+            hist = c.execute("SELECT COUNT(*) FROM chat WHERE sid=? AND who='visitor'",
+                             (sid,)).fetchone()[0]
+        finally:
+            c.close()
+    except Exception:
+        hist = 1
+    _notify_telegram(
+        f"💬 *Visitante no site* `[{curto}]`\n\n"
+        f"{texto[:700]}\n\n"
+        f"— mensagem #{hist} desta sessão\n"
+        f"— {('agente/SDK' if _is_bot(ua) else 'navegador')} · {ua[:44]}\n\n"
+        f"*Para responder:*\n`/r {curto} sua resposta aqui`")
+    return jsonify({"sid": sid, "queued": True,
+                    "note": "The operator reads every message. Replies appear here."})
+
+@app.route("/chat/poll")
+def chat_poll():
+    """A página busca as respostas do operador."""
+    sid = (request.args.get("sid") or "").strip()[:40]
+    if not re.fullmatch(r"[a-zA-Z0-9_-]{8,40}", sid or ""):
+        return jsonify({"messages": []})
+    try:
+        desde = int(request.args.get("since", "0"))
+    except Exception:
+        desde = 0
+    try:
+        c = _chat_db()
+        try:
+            rows = c.execute("SELECT id, ts, who, text FROM chat "
+                             "WHERE sid=? AND id > ? ORDER BY id LIMIT 60",
+                             (sid, desde)).fetchall()
+        finally:
+            c.close()
+    except Exception:
+        rows = []
+    return jsonify({"messages": [{"id": r[0], "ts": r[1], "who": r[2], "text": r[3]}
+                                 for r in rows]})
+
+def _chat_operator_reply(short: str, texto: str) -> bool:
+    """Chamado pelo bot do Telegram quando o operador usa /r."""
+    sid = _chat_sid_from_short(short)
+    if not sid:
+        return False
+    _chat_add(sid, "operator", texto)
+    return True
+
+@app.route("/chat/history")
+def chat_history():
+    """Painel do operador: todas as conversas. Protegido por token."""
+    if not _dash_token_ok(request.args.get("token", "")):
+        return jsonify({"error": "unauthorized"}), 401
+    try:
+        c = _chat_db()
+        try:
+            rows = c.execute(
+                "SELECT sid, MIN(ts), MAX(ts), COUNT(*), "
+                "SUM(CASE WHEN who='visitor' THEN 1 ELSE 0 END) "
+                "FROM chat GROUP BY sid ORDER BY MAX(ts) DESC LIMIT 40").fetchall()
+            out = []
+            for sid, t0, t1, n, nv in rows:
+                msgs = c.execute("SELECT ts, who, text FROM chat WHERE sid=? "
+                                 "ORDER BY id", (sid,)).fetchall()
+                out.append({"sid": _chat_short(sid), "started": t0, "last": t1,
+                            "messages": n, "from_visitor": nv,
+                            "thread": [{"ts": m[0], "who": m[1], "text": m[2]}
+                                       for m in msgs]})
+        finally:
+            c.close()
+    except Exception as e:
+        return jsonify({"error": str(e)[:120]}), 500
+    return jsonify({"conversations": out, "ts": int(time.time())})
+
 @app.route("/bazaar-audit")
 def bazaar_audit():
     """Auditoria de indexação no Bazaar — protegida por token do painel,
@@ -9309,6 +9600,44 @@ class TelegramBot:
     def _handle(self, msg):
         chat_id = msg["chat"]["id"]
         text = msg["text"].strip()
+        # v36: /r <id> <texto> responde a um visitante do site.
+        if text.startswith("/r "):
+            partes = text[3:].strip().split(None, 1)
+            if len(partes) < 2:
+                self.send(chat_id, "Uso: `/r <id> sua resposta`")
+                return
+            curto, resposta = partes[0], partes[1]
+            try:
+                ok = _chat_operator_reply(curto, resposta)
+            except Exception as e:
+                log.warning(f"chat reply: {e}")
+                ok = False
+            self.send(chat_id, (f"✅ Enviado para `[{curto}]` — aparece no site em "
+                                f"segundos." if ok else
+                                f"❌ Sessão `[{curto}]` não encontrada. Confira o id."))
+            return
+        if text == "/chats":
+            try:
+                c = _chat_db()
+                try:
+                    rows = c.execute(
+                        "SELECT sid, MAX(ts), COUNT(*) FROM chat "
+                        "WHERE ts > ? GROUP BY sid ORDER BY MAX(ts) DESC LIMIT 8",
+                        (int(time.time()) - 7 * 86400,)).fetchall()
+                finally:
+                    c.close()
+                if not rows:
+                    self.send(chat_id, "Nenhuma conversa nos últimos 7 dias.")
+                    return
+                linhas = []
+                for sid, ts, n in rows:
+                    quando = datetime.fromtimestamp(ts, timezone.utc).strftime("%d/%m %H:%M")
+                    linhas.append(f"`[{_chat_short(sid)}]` {n} msgs · {quando} UTC")
+                self.send(chat_id, "💬 *Conversas recentes*\n\n" + "\n".join(linhas)
+                          + "\n\nResponda com `/r <id> texto`")
+            except Exception as e:
+                self.send(chat_id, f"erro: {str(e)[:80]}")
+            return
         if text == "/start":
             self.send(chat_id, (
                 f"⚡ *Losbeto v{VERSION}*\n\n"
@@ -9318,6 +9647,8 @@ class TelegramBot:
                 f"/whale - whale alerts 24h\n"
                 f"/sentiment BTC - sentimento de um símbolo\n"
                 f"/pump - novos tokens Pump.fun\n"
+                f"/chats - conversas do site\n"
+                f"/r <id> texto - responder um visitante\n"
                 f"/status - status do nó\n"
                 f"/wallet - endereços para pagamento\n"
                 f"/referral - gera seu código de referência\n"
