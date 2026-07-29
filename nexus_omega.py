@@ -87,7 +87,7 @@ from typing import Any, Optional, Dict, List, Tuple
 # 0. CONFIGURAÇÃO E AUTO-SETUP
 # ============================================================================
 
-VERSION = "36.0.0-CONCIERGE"
+VERSION = "37.0.0-BRASIL"
 BRAND_NAME = "Losbeto"
 BRAND_TAGLINE = "The Global Revenue Engine for Financial AI Agents"
 BRAND_EMOJI = "🧠"
@@ -939,6 +939,12 @@ class LedgerV10:
                                for r in preview_uas]
             except Exception:
                 preview_uas = []
+            try:  # v37: quantas avaliações foram recusadas pelo experimento
+                preview_blocked = c.execute(
+                    "SELECT COUNT(*) FROM requests WHERE ts>? AND kind='preview_blocked'",
+                    (now - 86400,)).fetchone()[0]
+            except Exception:
+                preview_blocked = 0
             # v29: O QUE AS MÁQUINAS PEDEM ------------------------------------
             try:  # caminhos inexistentes = pedidos de produto
                 demand_404 = [{"path": r[0], "hits": r[1], "ips": r[2], "ua": (r[3] or "")[:40],
@@ -984,6 +990,8 @@ class LedgerV10:
             "probes_24h":     probes,
             "top_uas":        top_uas,
             "preview_uas":    preview_uas,
+            "preview_blocked_24h": preview_blocked,
+            "paywall_active":  sorted(PREVIEW_PAYWALL),
             "demand_404":     demand_404,
             "demand_params":  demand_params,
             "probe_targets":  probe_targets,
@@ -3963,6 +3971,35 @@ def _building_block() -> dict:
         out["slack"] = FEEDBACK_SLACK
     return out
 
+# v37 EXPERIMENTO A/B DO PREVIEW — hipótese testável, não palpite.
+# Hipótese: a amostra grátis satisfaz o avaliador e remove a razão de pagar.
+# Teste: suspender o preview APENAS nos endpoints mais sondados, por 7 dias,
+# e comparar a razão avaliação->compra. Se as sondagens virarem receita, a
+# hipótese se confirma; se nada mudar, ela morre e paramos de especular.
+# Liga e desliga por variável de ambiente, sem deploy.
+PREVIEW_PAYWALL = {e.strip() for e in os.environ.get(
+    "PREVIEW_PAYWALL", "").split(",") if e.strip()}
+
+def _preview_blocked(path: str) -> bool:
+    return path in PREVIEW_PAYWALL
+
+def _preview_paywall_body(path: str) -> dict:
+    """Recusa honesta: diz que é experimento, diz o preço, e oferece as
+    alternativas gratuitas que continuam abertas."""
+    base = _public_base()
+    return {"preview": False,
+            "status": "preview_paused",
+            "reason": ("Free sampling is paused on this endpoint while we measure "
+                       "whether it removes the reason to buy. It is an experiment, "
+                       "not a policy — and it is time-boxed."),
+            "price_usd": f"{get_dynamic_price(path):.4f}",
+            "buy": f"{base}{path}",
+            "still_free": {"tasting_menu": f"{base}/try",
+                           "node_health": f"{base}/health/providers",
+                           "full_catalog": f"{base}/x402-resources"},
+            "talk_to_us": _building_block(),
+            "ts": int(time.time()), "version": VERSION}
+
 def _preview_min_age(path: str) -> int:
     return PREVIEW_MIN_AGE.get(path, DEFAULT_PREVIEW_MIN_AGE)
 
@@ -4076,6 +4113,17 @@ def paid_endpoint(path):
             # v24.1 PREVIEW UNIVERSAL — mata a "fricção de avaliação": agente vê
             # a estrutura REAL com dados atrasados de graça, e paga pelo fresco.
             if request.args.get("preview") == "1":
+                # v37: endpoint sob experimento — registra como avaliação
+                # bloqueada, para medirmos o efeito depois.
+                if _preview_blocked(path):
+                    try:
+                        LEDGER.log_request(path, True, int((time.time() - t0) * 1000), ip,
+                                           kind="preview_blocked",
+                                           ua=request.headers.get("User-Agent", ""),
+                                           params=_clean_params())
+                    except Exception:
+                        pass
+                    return jsonify(_preview_paywall_body(path)), 402
                 cached = _PREVIEW_CACHE.get(path)
                 if not cached or (time.time() - cached["ts"]) > PREVIEW_MAX_AGE:
                     db_hit = _preview_db_get(path)   # v24.3: outro worker / pós-restart
@@ -7959,6 +8007,256 @@ def _audit_one(path: str) -> dict:
             "status": ("indexed" if (d.get("valid") and
                        (idx.get("active") if isinstance(idx, dict) else False))
                        else "not_indexed")}
+
+# ============================================================================
+# 23. BRASIL (v37) — o único diferencial estrutural que ninguém pode copiar
+#     rápido: nenhum serviço x402 cobre o mercado brasileiro.
+#
+#     Fonte primária: API pública do Banco Central (SGS + PTAX). Grátis, sem
+#     chave, sem limite prático — e um banco central não bloqueia data center,
+#     ao contrário do Yahoo e do Binance global que já nos morderam.
+#     Equities B3 via Yahoo (.SA), comprovadamente funcionando neste nó.
+# ============================================================================
+
+# Séries do Sistema Gerenciador de Séries Temporais do BCB
+BCB_SERIES = {
+    "selic_meta_pct":        (432,   "Meta Selic definida pelo Copom (% a.a.)"),
+    "cdi_pct":               (12,    "CDI diário anualizado (% a.a.)"),
+    "ipca_12m_pct":          (13522, "IPCA acumulado em 12 meses (%)"),
+    "igpm_month_pct":        (189,   "IGP-M no mês (%)"),
+    "usd_brl_ptax":          (1,     "Dólar PTAX venda (BRL)"),
+    "eur_brl":               (21619, "Euro (BRL)"),
+}
+
+def _bcb_last(code: int, n: int = 2) -> Optional[dict]:
+    """Último valor de uma série do BCB, com variação em relação ao anterior."""
+    try:
+        r = requests.get(
+            f"https://api.bcb.gov.br/dados/serie/bcdata.sgs.{code}/dados/ultimos/{n}",
+            params={"formato": "json"}, timeout=8,
+            headers={"User-Agent": "Losbeto/x402 (+https://api.losbeto.xyz)"})
+        if not r.ok:
+            return None
+        d = r.json()
+        if not isinstance(d, list) or not d:
+            return None
+        def _f(x):
+            try:
+                return float(str(x.get("valor", "")).replace(",", "."))
+            except Exception:
+                return None
+        def _dt(x):
+            # BCB usa dd/mm/aaaa. Ordenar pela DATA em vez de confiar na ordem
+            # do array: se a API algum dia inverter, pegaríamos o valor velho
+            # sem nenhum erro aparente — o pior tipo de bug.
+            try:
+                p = str(x.get("data", "")).split("/")
+                return (int(p[2]), int(p[1]), int(p[0])) if len(p) == 3 else (0, 0, 0)
+            except Exception:
+                return (0, 0, 0)
+        d = sorted([x for x in d if _f(x) is not None], key=_dt)
+        if not d:
+            return None
+        atual, ant = _f(d[-1]), (_f(d[-2]) if len(d) > 1 else None)
+        if atual is None:
+            return None
+        out = {"value": atual, "date": d[-1].get("data")}
+        if ant is not None:
+            out["previous"] = ant
+            out["change"] = round(atual - ant, 4)
+        return out
+    except Exception as e:
+        log.debug(f"bcb {code}: {e}")
+        return None
+
+def _collect_br_macro() -> dict:
+    """Busca as séries do BCB EM PARALELO."""
+    out, lock = {}, threading.Lock()
+
+    def _run(chave, code, desc):
+        d = _bcb_last(code)
+        with lock:
+            out[chave] = ({**d, "description": desc, "source": "BCB/SGS", "ok": True}
+                          if d else {"ok": False, "description": desc,
+                                     "source": "BCB/SGS", "error": "unavailable"})
+
+    ths = [threading.Thread(target=_run, args=(k, c, d), daemon=True)
+           for k, (c, d) in BCB_SERIES.items()]
+    for t in ths: t.start()
+    for t in ths: t.join(timeout=9)
+    return out
+
+def _br_equity_quote(symbol: str) -> Optional[dict]:
+    """Cotação B3. Yahoo com sufixo .SA é a fonte comprovada neste nó;
+    Stooq entra como reserva."""
+    sym = symbol.upper().strip()
+    if sym in ("IBOV", "IBOVESPA", "^BVSP"):
+        yh, st, nome = "^BVSP", "^bvsp", "Ibovespa"
+    else:
+        yh = sym if sym.endswith(".SA") else f"{sym}.SA"
+        st, nome = sym.lower().replace(".sa", "") + ".br", sym.replace(".SA", "")
+    q = Brain._yahoo_quote(yh)
+    if q and q.get("price"):
+        return {**q, "symbol": nome, "yahoo_symbol": yh}
+    q = Brain._stooq_quote(st)
+    if q and q.get("price"):
+        return {**q, "symbol": nome, "stooq_symbol": st}
+    return None
+
+def _br_macro_handler():
+    """Macro Brasil numa chamada: Selic, CDI, IPCA 12m, IGP-M, PTAX e euro."""
+    ts = int(time.time())
+    m = _collect_br_macro()
+    vivos = {k: v for k, v in m.items() if v.get("ok")}
+    if len(vivos) < 2:
+        return {"status": "unavailable", "product": "Brazil Macro",
+                "error": "BCB series unavailable right now. No charge.",
+                "series": m, "ts": ts, "provider": "Losbeto/Brasil",
+                "version": VERSION}, 503
+
+    # leitura de juro real — o número que todo alocador olha primeiro no Brasil
+    selic = (vivos.get("selic_meta_pct") or {}).get("value")
+    ipca = (vivos.get("ipca_12m_pct") or {}).get("value")
+    juro_real = (round(((1 + selic / 100) / (1 + ipca / 100) - 1) * 100, 2)
+                 if (selic is not None and ipca is not None) else None)
+    leitura = None
+    if juro_real is not None:
+        if juro_real >= 8:
+            leitura = ("Very high real rate — historically punishing for equities "
+                       "and supportive for the currency; carry trade is attractive.")
+        elif juro_real >= 5:
+            leitura = ("High real rate — fixed income competes hard with equities; "
+                       "BRL tends to find support.")
+        elif juro_real >= 2:
+            leitura = "Moderate real rate — neutral for risk assets."
+        else:
+            leitura = ("Low or negative real rate — historically supportive for "
+                       "equities and hard assets, pressuring the currency.")
+    return {"product": "Brazil Macro",
+            "series": m,
+            "derived": {"real_interest_rate_pct": juro_real,
+                        "formula": "((1+Selic)/(1+IPCA12m)-1)*100",
+                        "reading": leitura},
+            "coverage": ("Selic, CDI, IPCA 12m, IGP-M, USD/BRL PTAX and EUR/BRL "
+                         "— straight from the Brazilian Central Bank."),
+            "why_not_free": ("Each series is a separate BCB endpoint with its own "
+                             "code and comma decimals. This is the assembled read, "
+                             "with the real interest rate computed."),
+            "series_ok": len(vivos), "series_queried": len(m),
+            "ts": ts, "provider": "Losbeto/Brasil", "version": VERSION}
+
+def _br_equity_handler():
+    """Cotação de ação da B3 ou do Ibovespa (?symbol=PETR4)."""
+    symbol = (request.args.get("symbol", "PETR4") or "PETR4").upper()[:12]
+    ts = int(time.time())
+    q = _br_equity_quote(symbol)
+    if not q:
+        return {"status": "unavailable", "symbol": symbol,
+                "error": "No live B3 source reachable right now. No charge.",
+                "hint": "Try PETR4, VALE3, ITUB4, BBAS3, WEGE3 or IBOV.",
+                "ts": ts, "provider": "Losbeto/Brasil", "version": VERSION}, 503
+    ptax = _bcb_last(1)
+    usd = (ptax or {}).get("value")
+    return {"product": "B3 Equity Quote", "exchange": "B3 (Brazil)",
+            **q,
+            "usd_reference": ({"usd_brl_ptax": usd,
+                               "price_usd": round(q["price"] / usd, 4)}
+                              if usd else None),
+            "note": "Prices in BRL. USD conversion uses the official BCB PTAX rate.",
+            "ts": ts, "provider": "Losbeto/Brasil", "version": VERSION}
+
+def _br_brief_handler():
+    """O brief que ninguém no x402 tem: Brasil no contexto global."""
+    ts = int(time.time())
+    m = _collect_br_macro()
+    vivos = {k: v for k, v in m.items() if v.get("ok")}
+    ibov = _br_equity_quote("IBOV")
+    blue = {}
+    for s in ("PETR4", "VALE3", "ITUB4"):
+        q = _br_equity_quote(s)
+        if q:
+            blue[s] = {"price": q.get("price"), "change_pct": q.get("change_pct")}
+    if len(vivos) < 2 and not ibov:
+        return {"status": "unavailable", "product": "Brazil Brief",
+                "error": "Brazilian data sources unavailable. No charge.",
+                "ts": ts, "provider": "Losbeto/Brasil", "version": VERSION}, 503
+
+    selic = (vivos.get("selic_meta_pct") or {}).get("value")
+    ipca = (vivos.get("ipca_12m_pct") or {}).get("value")
+    juro_real = (round(((1 + selic / 100) / (1 + ipca / 100) - 1) * 100, 2)
+                 if (selic is not None and ipca is not None) else None)
+    # contexto global para posicionar o Brasil
+    glob = {}
+    try:
+        for nome, fn in (("dxy_proxy_eurusd", lambda: _brain_with_args(
+                              Brain.forex_rate, {"pair": "EUR/USD"})),
+                         ("gold", lambda: _brain_with_args(
+                              Brain.commodity_price, {"symbol": "GOLD"})),
+                         ("oil_wti", lambda: _brain_with_args(
+                              Brain.commodity_price, {"symbol": "OIL_WTI"}))):
+            d = fn()
+            if isinstance(d, dict):
+                glob[nome] = d.get("rate") or d.get("price")
+    except Exception:
+        pass
+
+    snapshot = {"macro": {k: v.get("value") for k, v in vivos.items()},
+                "real_interest_rate_pct": juro_real,
+                "ibovespa": ({"points": ibov.get("price"),
+                              "change_pct": ibov.get("change_pct")} if ibov else None),
+                "blue_chips": blue, "global_context": glob}
+    sintese = _ai(
+        "You are the chief strategist of a Brazilian macro desk writing for an "
+        "international audience. Using ONLY this snapshot:\n"
+        f"{json.dumps(snapshot, default=str)[:1700]}\n"
+        "Write in English: (1) one-line read of Brazil right now; (2) what the real "
+        "interest rate implies for equities vs fixed income vs the currency; "
+        "(3) two risks and two opportunities; (4) how global commodities and the "
+        "dollar are feeding into it. Max 230 words. No investment advice framing.",
+        max_tokens=800)
+    return {"product": "Brazil Brief",
+            "snapshot": snapshot,
+            "synthesis": sintese or ("AI synthesis unavailable — the snapshot above "
+                                     "is complete."),
+            "coverage": ("Brazilian macro (BCB), Ibovespa, B3 blue chips and global "
+                         "cross-asset context. No other x402 service covers Brazil."),
+            "ts": ts, "provider": "Losbeto/Brasil", "version": VERSION,
+            "disclaimer": "Research, not financial advice."}
+
+BRASIL_SUITE = {
+    "/br-macro": (_br_macro_handler, 0.03,
+        "Brazil macro in one call, straight from the Central Bank (BCB/SGS): Selic "
+        "target, CDI, IPCA 12-month inflation, IGP-M, official USD/BRL PTAX and "
+        "EUR/BRL — plus the real interest rate computed from Selic and IPCA, with a "
+        "positioning read. Each series is a separate BCB endpoint with comma "
+        "decimals; this is the assembled version. No other x402 service covers Brazil.",
+        ["Brazil", "Macro", "GlobalMarkets"], {"format": "json"}),
+    "/br-equity": (_br_equity_handler, 0.02,
+        "B3 equity or Ibovespa quote (?symbol=PETR4|VALE3|ITUB4|IBOV): price in BRL "
+        "with daily change, plus the USD equivalent converted at the official BCB "
+        "PTAX rate. Brazilian equities are absent from every other x402 catalog.",
+        ["Brazil", "Equities", "GlobalMarkets"], {"symbol": "PETR4"}),
+    "/br-brief": (_br_brief_handler, 0.15,
+        "Brazil in global context, written for an international desk: BCB macro, the "
+        "real interest rate, Ibovespa, B3 blue chips (PETR4, VALE3, ITUB4) and how "
+        "the dollar and commodities are feeding in — closed by an AI strategist "
+        "synthesis. The only Brazil-focused product on x402.",
+        ["Brazil", "Premium", "Macro"], {"format": "json"}),
+}
+
+for _p, (_h, _pr, _d, _t, _hint) in BRASIL_SUITE.items():
+    BASE_PRICES[_p] = _pr
+    ENDPOINT_DESC[_p] = _d
+    ENDPOINT_TAGS[_p] = _t
+    ENDPOINT_PARAM_HINTS[_p] = _hint
+    ENDPOINT_HANDLERS[_p] = _h
+    app.add_url_rule(_p, _p.strip("/").replace("-", "_"), paid_endpoint(_p)(_h))
+for _p in ("/br-brief", "/br-equity", "/br-macro"):
+    if _p in FEATURED_ENDPOINTS:
+        FEATURED_ENDPOINTS.remove(_p)
+    FEATURED_ENDPOINTS.insert(0, _p)
+log.info(f"🇧🇷 Brasil Suite registrada: {len(BRASIL_SUITE)} endpoints "
+         f"(BCB + B3) — inédito no x402")
 
 # ============================================================================
 # 22. LIVE CHAT (v36) — atendimento humano no meio de um mercado de máquinas.
