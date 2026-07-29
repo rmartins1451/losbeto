@@ -87,7 +87,7 @@ from typing import Any, Optional, Dict, List, Tuple
 # 0. CONFIGURAÇÃO E AUTO-SETUP
 # ============================================================================
 
-VERSION = "32.0.0-MARKETFIT"
+VERSION = "33.0.0-PROVENANCE"
 BRAND_NAME = "Losbeto"
 BRAND_TAGLINE = "The Global Revenue Engine for Financial AI Agents"
 BRAND_EMOJI = "🧠"
@@ -7580,6 +7580,61 @@ def manifest_mcp():
         },
     })
 
+# v33: 2 IPs distintos pediram /.well-known/agent-card.json e receberam 404.
+# É o nome CANÔNICO atual do Agent Card no A2A — servíamos só o nome antigo
+# (agent.json). Quem procurava pelo padrão vigente não nos encontrava.
+@app.route("/about")
+@app.route("/contact")
+@app.route("/team")
+def about_operator():
+    """v33: /about, /contact e /team foram pedidos por 2 IPs distintos cada e
+    devolviam 404. Não são pedidos de dado — são de PROCEDÊNCIA. Alguém avaliando
+    se integra quer saber quem opera, como falar, e como auditar. Num mercado que
+    se recupera de wash trading, essa é exatamente a pergunta certa."""
+    base = _public_base()
+    return jsonify({
+        "service": SERVICE_NAME,
+        "operator": {
+            "name": "Roberto Martins",
+            "contact": _building_block(),
+            "responds": "Every message is read. Endpoints are added on request.",
+        },
+        "what_this_is": ("Pay-per-call market data for AI agents over x402: "
+                         "multi-oracle price consensus, sentiment consensus, forex, "
+                         "equities, commodities, macro and crypto. No API keys, "
+                         "no accounts."),
+        "audit_us": {
+            "labelled_receipts": f"{base}/receipts",
+            "note": ("Every settlement is labelled operator-test vs organic. "
+                     "Most of ours are operator tests — we say so rather than "
+                     "let a transaction count imply demand."),
+            "live_source_health": f"{base}/health/providers",
+            "full_catalog": f"{base}/x402-resources",
+            "signed_metrics": f"{base}/win-rate-verified",
+        },
+        "evaluate_before_paying": {
+            "tasting_menu": f"{base}/try",
+            "any_endpoint": f"{base}/<endpoint>?preview=1",
+            "cost": "0.00 USDC",
+        },
+        "settlement": {
+            "networks": ["eip155:8453 (Base, Coinbase CDP)", "solana (PayAI)"],
+            "asset": "USDC", "price_range": "$0.003 - $0.30",
+        },
+        "open_source": FEEDBACK_GITHUB,
+        "version": VERSION, "ts": int(time.time()),
+    })
+
+@app.route("/v1")
+@app.route("/api")
+@app.route("/resources")
+@app.route("/resource")
+def _resources_alias():
+    """v33: convenções de raiz de API pedidas por clientes reais (/v1, /resources,
+    /resource). Apontam para o catálogo em vez de devolver 404."""
+    return x402_resources()
+
+@app.route("/.well-known/agent-card.json")
 @app.route("/.well-known/agent.json")
 def manifest_agent():
     base = _public_base()
