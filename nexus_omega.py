@@ -87,7 +87,7 @@ from typing import Any, Optional, Dict, List, Tuple
 # 0. CONFIGURAÇÃO E AUTO-SETUP
 # ============================================================================
 
-VERSION = "31.0.1-CONSENSUS"
+VERSION = "32.0.0-MARKETFIT"
 BRAND_NAME = "Losbeto"
 BRAND_TAGLINE = "The Global Revenue Engine for Financial AI Agents"
 BRAND_EMOJI = "🧠"
@@ -6024,6 +6024,221 @@ def _is_bot(ua: str) -> bool:
     ua = (ua or "").lower()
     return any(x in ua for x in ("bot", "agent", "curl", "python-requests", "httpx", "axios", "claude", "gpt", "anthropic", "openai"))
 
+CLEAN_LANDING = r"""<!doctype html><html lang="en"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Losbeto — cross-asset market data for AI agents</title>
+<meta name="description" content="Pay-per-call market data for AI agents: multi-oracle price consensus, sentiment consensus, forex, equities, commodities, macro and crypto. No API keys, no accounts. USDC on Base and Solana via x402.">
+<style>
+:root{--bg:#0a0b0d;--fg:#e8eaed;--dim:#8b9199;--line:#1e2126;--card:#111318;
+      --acc:#4ade80;--acc2:#60a5fa;--mono:ui-monospace,'SF Mono',Menlo,monospace}
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:var(--bg);color:var(--fg);font:15px/1.65 -apple-system,BlinkMacSystemFont,'Segoe UI',Inter,sans-serif;-webkit-font-smoothing:antialiased}
+.wrap{max-width:900px;margin:0 auto;padding:0 24px}
+header{border-bottom:1px solid var(--line);padding:18px 0;position:sticky;top:0;background:rgba(10,11,13,.9);backdrop-filter:blur(8px);z-index:9}
+.hrow{display:flex;align-items:center;justify-content:space-between;gap:16px;flex-wrap:wrap}
+.logo{font-weight:600;letter-spacing:-.02em}
+.logo span{color:var(--acc)}
+nav a{color:var(--dim);text-decoration:none;margin-left:18px;font-size:14px}
+nav a:hover{color:var(--fg)}
+.toggle{display:flex;border:1px solid var(--line);border-radius:8px;overflow:hidden}
+.toggle button{background:transparent;border:0;color:var(--dim);padding:6px 14px;font:inherit;font-size:13px;cursor:pointer}
+.toggle button.on{background:var(--card);color:var(--fg)}
+h1{font-size:clamp(30px,5vw,46px);line-height:1.1;letter-spacing:-.03em;margin:56px 0 18px;font-weight:600}
+h1 em{font-style:normal;color:var(--acc)}
+.lede{color:var(--dim);font-size:17px;max-width:640px;margin-bottom:28px}
+.cta{display:flex;gap:12px;flex-wrap:wrap;margin-bottom:56px}
+.btn{display:inline-block;padding:11px 20px;border-radius:8px;text-decoration:none;font-size:14px;font-weight:500;border:1px solid var(--line)}
+.btn.p{background:var(--acc);color:#06210f;border-color:var(--acc)}
+.btn.s{color:var(--fg)}
+.btn:hover{opacity:.9}
+h2{font-size:13px;text-transform:uppercase;letter-spacing:.1em;color:var(--dim);font-weight:600;margin:48px 0 18px}
+.grid{display:grid;gap:12px;grid-template-columns:repeat(auto-fit,minmax(260px,1fr))}
+.card{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:18px;text-decoration:none;color:inherit;display:block}
+.card:hover{border-color:#2a2f36}
+.card .p{color:var(--acc);font:600 13px var(--mono);float:right}
+.card h3{font-size:15px;font-weight:600;margin-bottom:6px}
+.card p{color:var(--dim);font-size:13.5px}
+.card code{font:12px var(--mono);color:var(--acc2)}
+pre{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:16px;overflow-x:auto;font:13px/1.7 var(--mono);color:#c8cdd4}
+pre .c{color:#5f6672}
+pre .g{color:var(--acc)}
+table{width:100%;border-collapse:collapse;font-size:14px}
+td{padding:9px 0;border-bottom:1px solid var(--line);color:var(--dim)}
+td:first-child{color:var(--fg)}
+td:last-child{text-align:right;font:13px var(--mono);color:var(--acc)}
+footer{border-top:1px solid var(--line);margin-top:64px;padding:26px 0 48px;color:var(--dim);font-size:13px}
+footer a{color:var(--dim)}
+.hide{display:none}
+</style></head><body>
+<header><div class="wrap hrow">
+  <div class="logo">los<span>beto</span></div>
+  <nav>
+    <a href="#top">Top</a><a href="#start">Start</a>
+    <a href="/get-pricing">Pricing</a><a href="/openapi.json">API</a>
+    <a href="/receipts">Receipts</a>
+  </nav>
+  <div class="toggle">
+    <button id="bh" class="on" onclick="mode('h')">◐ Human</button>
+    <button id="ba" onclick="mode('a')">▦ Agent</button>
+  </div>
+</div></header>
+
+<div class="wrap">
+<h1>Market data <em>agents pay for</em>, one call at a time.</h1>
+<p class="lede">Multi-oracle price consensus, sentiment consensus, forex, equities,
+commodities, macro and crypto. No API keys, no accounts — your agent pays a few
+cents in USDC per request and gets clean JSON back.</p>
+<div class="cta">
+  <a class="btn p" href="/try">Try free — 6 live samples</a>
+  <a class="btn s" href="#start">Quick start</a>
+  <a class="btn s" href="/health/providers">Node status</a>
+</div>
+
+<div id="human">
+<h2 id="top">Flagships</h2>
+<div class="grid">
+  <a class="card" href="/oracle-consensus?preview=1"><span class="p">__P_ORACLE__</span>
+    <h3>Oracle Consensus</h3>
+    <p>Six price sources in parallel — median, spread in bps, outlier detection for
+    stale or manipulated feeds, and an execution verdict. Each oracle publishes its
+    own number; this is the agreement between them.</p>
+    <code>GET /oracle-consensus?symbol=SOL</code></a>
+  <a class="card" href="/sentiment-consensus?preview=1"><span class="p">__P_SENT__</span>
+    <h3>Sentiment Consensus</h3>
+    <p>Four independent sentiment measures with divergence detection — survey fear
+    against positive breadth is the classic capitulation signature. The headline
+    index is free; the agreement is not.</p>
+    <code>GET /sentiment-consensus</code></a>
+  <a class="card" href="/global-morning-brief?preview=1"><span class="p">__P_BRIEF__</span>
+    <h3>Global Morning Brief</h3>
+    <p>Daily cross-asset read: forex, commodities, equities, crypto and the macro
+    calendar, closed by an AI strategist synthesis.</p>
+    <code>GET /global-morning-brief</code></a>
+  <a class="card" href="/equity-dossier?preview=1"><span class="p">__P_EQ__</span>
+    <h3>Equity Dossier</h3>
+    <p>Live quote, earnings, macro context and an analyst verdict with levels —
+    for any ticker, in one call.</p>
+    <code>GET /equity-dossier?symbol=AAPL</code></a>
+  <a class="card" href="/correlation-matrix?preview=1"><span class="p">__P_CORR__</span>
+    <h3>Correlation Matrix</h3>
+    <p>90-day cross-asset correlations: crypto against S&amp;P, Nasdaq, gold, oil,
+    the dollar and 20Y bonds, with the best diversifier flagged.</p>
+    <code>GET /correlation-matrix</code></a>
+  <a class="card" href="/launch-risk?preview=1"><span class="p">__P_RISK__</span>
+    <h3>Launch Risk Brief</h3>
+    <p>On-chain checks, DEX liquidity and an AI verdict (avoid / watch / size)
+    before your agent touches a new token.</p>
+    <code>GET /launch-risk</code></a>
+</div>
+
+<h2 id="start">Quick start</h2>
+<pre><span class="c"># free — no wallet needed</span>
+curl __BASE__/try
+
+<span class="c"># any endpoint, free delayed sample</span>
+curl '__BASE__/oracle-consensus?preview=1'
+
+<span class="c"># pay per call with any x402 wallet</span>
+npx agentcash fetch __BASE__/oracle-consensus
+<span class="c"># save it so your agent reuses it</span>
+npx agentcash add __BASE__</pre>
+
+<h2>Use it from an agent</h2>
+<pre><span class="c">// MCP — any client, no install</span>
+{"mcpServers": {"losbeto": {"url": "__BASE__/mcp"}}}
+
+<span class="c"># LangChain / CrewAI</span>
+pip install losbeto-tools[langchain]
+<span class="g">from</span> losbeto_tools <span class="g">import</span> get_langchain_tools
+tools = get_langchain_tools()   <span class="c"># free delayed data</span></pre>
+
+<h2>Honest by default</h2>
+<table>
+<tr><td>Free delayed sample on every endpoint</td><td>?preview=1</td></tr>
+<tr><td>Six endpoints sampled in one free call</td><td>/try</td></tr>
+<tr><td>Per-source liveness before you integrate</td><td>/health/providers</td></tr>
+<tr><td>Operator test purchases labelled on-chain</td><td>/receipts</td></tr>
+<tr><td>If a source is down, premium returns 503 and does not charge</td><td>—</td></tr>
+</table>
+</div>
+
+<div id="agent" class="hide">
+<h2>Machine surfaces</h2>
+<pre><span class="c"># catalog, priced, paginated</span>
+GET __BASE__/x402-resources
+
+<span class="c"># manifests</span>
+GET __BASE__/.well-known/x402.json
+GET __BASE__/.well-known/mcp.json
+GET __BASE__/.well-known/agent.json
+GET __BASE__/openapi.json
+GET __BASE__/llms.txt
+
+<span class="c"># MCP streamable http — 69 tools, no install</span>
+POST __BASE__/mcp
+{"jsonrpc":"2.0","id":1,"method":"tools/list"}
+
+<span class="c"># evaluate before paying, zero cost</span>
+GET __BASE__/try
+GET __BASE__/&lt;endpoint&gt;?preview=1
+GET __BASE__/health/providers</pre>
+
+<h2>Payment</h2>
+<pre><span class="c"># 1 request with no payment header</span>
+GET __BASE__/oracle-consensus
+<span class="c"># 2 server replies 402 with asset, amount, payTo</span>
+<span class="c">#   plus an inline sample of the real output</span>
+<span class="c"># 3 wallet signs a gasless USDC transfer and retries</span>
+<span class="c"># 4 facilitator settles on Base or Solana; JSON returned</span>
+
+Networks: eip155:8453 (Base, Coinbase CDP) · solana (PayAI)
+Asset:    USDC · Prices: $0.003 – $0.30</pre>
+
+<h2>Missing something?</h2>
+<pre><span class="c"># tell the operator what your agent needs</span>
+__FEEDBACK__
+<span class="c"># endpoints are added on request</span></pre>
+</div>
+
+<footer><div class="hrow">
+  <div>Losbeto · <span id="ep">__N__</span> endpoints · USDC on Base + Solana</div>
+  <div><a href="/receipts">receipts</a> · <a href="/x402-resources">resources</a> ·
+       <a href="/llms.txt">llms.txt</a></div>
+</div></footer>
+</div>
+<script>
+function mode(m){
+  var h=m==='h';
+  document.getElementById('human').classList.toggle('hide',!h);
+  document.getElementById('agent').classList.toggle('hide',h);
+  document.getElementById('bh').classList.toggle('on',h);
+  document.getElementById('ba').classList.toggle('on',!h);
+  try{localStorage.setItem('losbeto_mode',m)}catch(e){}
+}
+(function(){
+  var q=new URLSearchParams(location.search).get('view');
+  var m=q||'h';
+  if(!q){try{m=localStorage.getItem('losbeto_mode')||'h'}catch(e){}}
+  if(m==='a'||m==='agent')mode('a');
+})();
+</script></body></html>"""
+
+def _render_clean_landing() -> str:
+    base = _public_base()
+    fb = FEEDBACK_GITHUB or (os.environ.get("CONTACT_EMAIL", "") or "")
+    html = (CLEAN_LANDING
+            .replace("__BASE__", base)
+            .replace("__N__", str(len(BASE_PRICES)))
+            .replace("__FEEDBACK__", fb))
+    for tag, ep in (("__P_ORACLE__", "/oracle-consensus"),
+                    ("__P_SENT__", "/sentiment-consensus"),
+                    ("__P_BRIEF__", "/global-morning-brief"),
+                    ("__P_EQ__", "/equity-dossier"),
+                    ("__P_CORR__", "/correlation-matrix"),
+                    ("__P_RISK__", "/launch-risk")):
+        html = html.replace(tag, f"${get_dynamic_price(ep):.2f}")
+    return html
+
 @app.route("/")
 def root():
     prices = {ep: get_dynamic_price(ep) for ep in BASE_PRICES}
@@ -6031,6 +6246,10 @@ def root():
     wants_json = ("application/json" in request.headers.get("Accept", "").lower()
                   or _is_bot(ua)
                   or request.args.get("format") == "json")
+    # v32: landing limpa. O caminho JSON para máquinas continua idêntico;
+    # só a página humana foi trocada. ?legacy=1 mantém a antiga acessível.
+    if not wants_json and request.args.get("legacy") != "1":
+        return app.response_class(_render_clean_landing(), mimetype="text/html")
     if wants_json:
         return jsonify({
             "name":             "Losbeto",
@@ -6457,6 +6676,310 @@ def mcp_streamable():
     r = jsonify(resp)
     r.headers["Mcp-Session-Id"] = WALLET.node_id
     return r
+
+# ============================================================================
+# 21. X402 AUDIT (v32) — verificação de serviços x402 como produto.
+#
+#     O FATO: o paper "Five Attacks on x402" (2026) mostra que a descoberta
+#     está ligada ao pagamento — "o atacante só precisa vencer a etapa de
+#     seleção com frequência suficiente" — e que o facilitator não é
+#     verificável pelo cliente. Com 22.000 endpoints (Apify + Coinbase, jun/26),
+#     escolher errado ficou barato para o atacante e caro para o agente.
+#
+#     NINGUÉM vende verificação. O scanner do x402-trust é gratuito e mede só
+#     uptime. Este endpoint audita CONFORMIDADE e SANIDADE de qualquer serviço
+#     x402 — incluindo os quatro modos de falha que descobrimos operando este
+#     nó e que não constam de nenhuma documentação:
+#       1. cabeçalhos acima do limite derrubam clientes Node (16 KB)
+#       2. base64 sem padding quebra o desafio para clientes estritos
+#       3. ordem de accepts decide a chain e a indexação no Bazaar
+#       4. amostra grátis idêntica à paga elimina a razão de pagar
+# ============================================================================
+
+import ipaddress as _ipaddr
+from urllib.parse import urlparse as _urlparse
+
+_AUDIT_BLOCKED_HOSTS = {"localhost", "metadata.google.internal", "instance-data"}
+
+def _audit_url_safe(url: str):
+    """Bloqueia SSRF: sem alvos internos, sem esquemas exóticos, sem portas
+    estranhas. Um endpoint que busca URL arbitrária é porta de entrada — esta
+    função é a fechadura."""
+    try:
+        u = _urlparse(url)
+    except Exception:
+        return False, "URL malformada"
+    if u.scheme not in ("http", "https"):
+        return False, "apenas http/https"
+    host = (u.hostname or "").lower()
+    if not host or host in _AUDIT_BLOCKED_HOSTS:
+        return False, "host bloqueado"
+    if u.port and u.port not in (80, 443, 8080, 8443):
+        return False, "porta não permitida"
+    try:
+        infos = socket.getaddrinfo(host, None)
+    except Exception as e:
+        return False, f"DNS falhou: {str(e)[:40]}"
+    for info in infos:
+        ip = _ipaddr.ip_address(info[4][0])
+        if (ip.is_private or ip.is_loopback or ip.is_link_local
+                or ip.is_reserved or ip.is_multicast or ip.is_unspecified):
+            return False, "endereço interno bloqueado"
+    return True, ""
+
+def _audit_probe(url: str) -> dict:
+    t0 = time.time()
+    r = requests.get(url, timeout=10, allow_redirects=True,
+                     headers={"User-Agent": f"Losbeto-x402-Audit/1.0 (+{_public_base()})",
+                              "Accept": "application/json"})
+    return {"status_code": r.status_code,
+            "latency_ms": int((time.time() - t0) * 1000),
+            "headers": dict(r.headers), "text": r.text[:20000],
+            "final_url": r.url}
+
+def _x402_audit_handler():
+    """Audita um serviço x402: conformidade com a spec v2, sanidade de
+    pagamento e os modos de falha silenciosos que derrubam vendedores."""
+    url = (request.args.get("url") or "").strip()
+    if not url:
+        return {"error": "missing_url",
+                "usage": f"{_public_base()}/x402-audit?url=https://target/endpoint",
+                "note": "Audits any x402 endpoint for spec compliance and the "
+                        "silent failure modes that break sellers.",
+                "ts": int(time.time())}, 400
+    ok, motivo = _audit_url_safe(url)
+    if not ok:
+        return {"error": "url_rejected", "reason": motivo,
+                "ts": int(time.time())}, 400
+
+    achados, criticos, avisos = [], 0, 0
+    def add(nivel, chave, msg, detalhe=None):
+        nonlocal criticos, avisos
+        achados.append({"severity": nivel, "check": chave, "finding": msg,
+                        **({"detail": detalhe} if detalhe is not None else {})})
+        if nivel == "critical":
+            criticos += 1
+        elif nivel == "warning":
+            avisos += 1
+
+    try:
+        p = _audit_probe(url)
+    except Exception as e:
+        return {"product": "x402 Audit", "target": url,
+                "reachable": False, "error": str(e)[:120],
+                "verdict": "unreachable",
+                "ts": int(time.time()), "provider": "Losbeto/Audit",
+                "version": VERSION}
+
+    hdrs = p["headers"]
+    hdr_bytes = sum(len(k) + len(str(v)) + 4 for k, v in hdrs.items())
+
+    # ---- 1. responde 402? ---------------------------------------------------
+    if p["status_code"] != 402:
+        add("critical", "returns_402",
+            f"Endpoint returned HTTP {p['status_code']} instead of 402 — agents "
+            f"cannot discover the price and will not pay.")
+    else:
+        add("pass", "returns_402", "Returns HTTP 402 as required.")
+
+    # ---- 2. tamanho dos cabeçalhos (modo de falha nº1) ----------------------
+    if hdr_bytes > 16384:
+        add("critical", "header_size",
+            f"Response headers total {hdr_bytes} bytes. Node's default limit is "
+            f"16384 — Node-based x402 clients abort the connection and the sale "
+            f"never happens. Free endpoints keep working, so this looks like "
+            f"lack of demand.", hdr_bytes)
+    elif hdr_bytes > 8192:
+        add("warning", "header_size",
+            f"Response headers total {hdr_bytes} bytes. Many proxies cap at 8192.",
+            hdr_bytes)
+    else:
+        add("pass", "header_size", f"Headers within safe limits ({hdr_bytes} bytes).")
+
+    # ---- 3. desafio no header e padding base64 (modo de falha nº2) ----------
+    b64 = hdrs.get("PAYMENT-REQUIRED") or hdrs.get("X-PAYMENT-REQUIRED") or ""
+    challenge = None
+    if p["status_code"] == 402 and not b64:
+        add("warning", "payment_required_header",
+            "No PAYMENT-REQUIRED header. The v2 transport expects the challenge "
+            "base64-encoded there; clients that only read headers will miss it.")
+    elif b64:
+        try:
+            challenge = json.loads(base64.b64decode(b64))
+            add("pass", "payment_required_header",
+                "PAYMENT-REQUIRED header present and strictly decodable.")
+        except Exception:
+            try:
+                challenge = json.loads(base64.b64decode(b64 + "=" * (-len(b64) % 4)))
+                add("critical", "base64_padding",
+                    "PAYMENT-REQUIRED decodes only after re-adding '=' padding. "
+                    "Strict b64decode fails, so compliant clients and the CDP "
+                    "Bazaar cannot read the challenge or the discovery extension.")
+            except Exception:
+                add("critical", "payment_required_header",
+                    "PAYMENT-REQUIRED header present but not decodable at all.")
+
+    # corpo como fonte alternativa do desafio
+    body = None
+    try:
+        body = json.loads(p["text"])
+    except Exception:
+        pass
+    ch = challenge or body or {}
+
+    # ---- 4. estrutura do desafio -------------------------------------------
+    accepts = ch.get("accepts") or []
+    if p["status_code"] == 402:
+        if ch.get("x402Version") != 2:
+            add("warning", "x402_version",
+                f"x402Version is {ch.get('x402Version')!r}; v2 is current.")
+        else:
+            add("pass", "x402_version", "Declares x402Version 2.")
+        if not accepts:
+            add("critical", "accepts",
+                "No accepts[] array — the agent has no payment instructions.")
+        else:
+            a0 = accepts[0] or {}
+            faltando = [k for k in ("scheme", "network", "asset", "payTo")
+                        if not a0.get(k)]
+            if faltando:
+                add("critical", "accepts_fields",
+                    f"accepts[0] missing required fields: {', '.join(faltando)}")
+            else:
+                add("pass", "accepts_fields", "accepts[0] has scheme/network/asset/payTo.")
+            valor = a0.get("amount") or a0.get("maxAmountRequired")
+            try:
+                if valor is not None and int(valor) < 1000:
+                    add("warning", "price_floor",
+                        f"Price {valor} atomic units is below the $0.001 USDC "
+                        f"minimum most facilitators enforce.")
+            except Exception:
+                pass
+            # ---- modo de falha nº3: ordem dos accepts -----------------------
+            redes = [str(x.get("network", "")) for x in accepts]
+            if len(accepts) > 1 and not redes[0].startswith("eip155"):
+                add("warning", "accepts_order",
+                    f"accepts[0] is {redes[0]}. Most clients take accepts[0], so "
+                    f"settlements avoid the CDP facilitator — and the Bazaar only "
+                    f"indexes on CDP settles. Putting an EVM rail first is what "
+                    f"unblocks discovery.", redes)
+            else:
+                add("pass", "accepts_order", f"Payment rails: {redes}")
+
+    # ---- 5. extensão de descoberta -----------------------------------------
+    bz = ((ch.get("extensions") or {}).get("bazaar")) or {}
+    if p["status_code"] == 402:
+        if not bz:
+            add("warning", "bazaar_extension",
+                "No extensions.bazaar — the service will be indexed without "
+                "input/output schema, ranking lower in semantic search.")
+        else:
+            faltantes = [k for k in ("info", "inputSchema") if k not in bz]
+            if faltantes:
+                add("warning", "bazaar_extension",
+                    f"extensions.bazaar present but missing: {', '.join(faltantes)}")
+            else:
+                add("pass", "bazaar_extension", "Discovery extension complete.")
+
+    # ---- 6. modo de falha nº4: amostra grátis canibalizando ----------------
+    prev_url = url + ("&" if "?" in url else "?") + "preview=1"
+    try:
+        pv = _audit_probe(prev_url)
+        if pv["status_code"] == 200:
+            try:
+                j = json.loads(pv["text"])
+                idade = j.get("data_age_seconds")
+                if isinstance(idade, (int, float)) and idade < 60:
+                    add("warning", "free_sample_cannibalisation",
+                        f"Free preview returns data aged {idade}s — effectively "
+                        f"identical to the paid response. Agents evaluate, get the "
+                        f"product, and never pay.", idade)
+                else:
+                    add("pass", "free_sample",
+                        f"Free preview available, aged {idade}s.")
+            except Exception:
+                add("pass", "free_sample", "Free preview endpoint responds.")
+    except Exception:
+        pass
+
+    # ---- 7. latência --------------------------------------------------------
+    if p["latency_ms"] > 3000:
+        add("warning", "latency",
+            f"402 challenge took {p['latency_ms']}ms. Reputation monitors score "
+            f"latency; slow challenges lower ranking.", p["latency_ms"])
+    else:
+        add("pass", "latency", f"Challenge served in {p['latency_ms']}ms.")
+
+    # ---- veredito -----------------------------------------------------------
+    if criticos:
+        veredito, acao = "unsafe_to_integrate", (
+            "Critical spec violations. An agent may be unable to pay at all, or "
+            "may pay and receive nothing. Do not wire this into an autonomous "
+            "budget until fixed.")
+    elif avisos >= 3:
+        veredito, acao = "caution", (
+            "Payable, but several issues will hurt discovery, conversion or "
+            "reliability. Review before depending on it.")
+    elif avisos:
+        veredito, acao = "acceptable", "Payable and compliant, with minor issues."
+    else:
+        veredito, acao = "sound", "Fully compliant on every check performed."
+
+    return {
+        "product": "x402 Audit",
+        "target": p["final_url"], "reachable": True,
+        "http_status": p["status_code"], "latency_ms": p["latency_ms"],
+        "verdict": veredito, "action": acao,
+        "score": {"critical": criticos, "warnings": avisos,
+                  "passed": sum(1 for a in achados if a["severity"] == "pass"),
+                  "checks_run": len(achados)},
+        "findings": achados,
+        "why_this_exists": (
+            "In x402 the discovery step is directly connected to payment: once an "
+            "agent selects a server, that server can immediately issue charges, and "
+            "the facilitator's correctness is not verifiable by the client. With "
+            "22,000+ endpoints on the protocol, picking wrong is cheap for an "
+            "attacker and expensive for the agent."),
+        "methodology": (
+            "Spec-compliance checks against x402 v2 plus four silent failure modes "
+            "observed operating a live node: oversized headers aborting Node "
+            "clients, unpadded base64 breaking strict decoders, accepts ordering "
+            "diverting settlement away from the indexing facilitator, and free "
+            "samples served with no delay."),
+        "ts": int(time.time()), "provider": "Losbeto/Audit", "version": VERSION,
+    }
+
+BASE_PRICES["/x402-audit"] = 0.05
+ENDPOINT_DESC["/x402-audit"] = (
+    "Audit any x402 endpoint before your agent trusts it (?url=https://target/path). "
+    "Checks x402 v2 spec compliance — 402 status, challenge structure, accepts "
+    "fields, price floor, discovery extension — plus four silent failure modes "
+    "observed operating a live node: oversized headers that abort Node clients, "
+    "unpadded base64 that breaks strict decoders, accepts ordering that diverts "
+    "settlement away from the indexing facilitator, and free samples served with "
+    "no delay. Returns a verdict: sound, acceptable, caution or unsafe to integrate.")
+ENDPOINT_TAGS["/x402-audit"] = ["Verification", "Trust", "Infrastructure"]
+ENDPOINT_PARAM_HINTS["/x402-audit"] = {"url": "https://api.example.com/endpoint"}
+ENDPOINT_HANDLERS["/x402-audit"] = _x402_audit_handler
+app.add_url_rule("/x402-audit", "x402_audit",
+                 paid_endpoint("/x402-audit")(_x402_audit_handler))
+if "/x402-audit" in FEATURED_ENDPOINTS:
+    FEATURED_ENDPOINTS.remove("/x402-audit")
+FEATURED_ENDPOINTS.insert(0, "/x402-audit")
+log.info("🔍 x402 Audit registrado ($0.05) — verificação de serviços do ecossistema")
+
+
+# v32 REPRECIFICAÇÃO — alinhada ao que o mercado efetivamente transaciona.
+# Dado decisivo: o líder da categoria (x402stock, 139 endpoints) faturou
+# US$79 em 30 dias com ticket médio de $0,028 — praticamente igual ao
+# nosso ($0,024). Preço nunca foi o gargalo; o teto dele é $0,75 e nós
+# tínhamos produtos a $4,16. Nenhum item nosso justifica preço acima do
+# líder, então o topo passa a ser $0,30.
+for _ep, _p in {'/global-morning-brief': 0.15, '/equity-dossier': 0.15, '/event-playbook': 0.2, '/correlation-matrix': 0.15, '/sector-rotation': 0.12, '/portfolio-stress': 0.25, '/council-deep': 0.25, '/thesis-engine': 0.2, '/whale-dossier': 0.2, '/council': 0.15, '/launch-sniper': 0.15, '/relatorio': 0.1, '/forex-arbitrage': 0.08, '/portfolio-copilot': 0.12, '/launch-risk': 0.1, '/mev-flow': 0.08, '/alpha-signal': 0.08, '/insider-track': 0.08, '/arbitrage': 0.06, '/cross-chain': 0.06, '/copytrade': 0.06, '/market-brief': 0.06, '/multi-chain-arbitrage': 0.06, '/agent-composable': 0.08, '/sinais': 0.05, '/deep-think': 0.05, '/agent-call': 0.05, '/whale-alert': 0.05, '/smart-money': 0.05, '/sanctions': 0.05, '/enterprise': 9.99}.items():
+    if _ep in BASE_PRICES:
+        BASE_PRICES[_ep] = _p
+log.info(f"💲 v32: {len({'/global-morning-brief': 0.15, '/equity-dossier': 0.15, '/event-playbook': 0.2, '/correlation-matrix': 0.15, '/sector-rotation': 0.12, '/portfolio-stress': 0.25, '/council-deep': 0.25, '/thesis-engine': 0.2, '/whale-dossier': 0.2, '/council': 0.15, '/launch-sniper': 0.15, '/relatorio': 0.1, '/forex-arbitrage': 0.08, '/portfolio-copilot': 0.12, '/launch-risk': 0.1, '/mev-flow': 0.08, '/alpha-signal': 0.08, '/insider-track': 0.08, '/arbitrage': 0.06, '/cross-chain': 0.06, '/copytrade': 0.06, '/market-brief': 0.06, '/multi-chain-arbitrage': 0.06, '/agent-composable': 0.08, '/sinais': 0.05, '/deep-think': 0.05, '/agent-call': 0.05, '/whale-alert': 0.05, '/smart-money': 0.05, '/sanctions': 0.05, '/enterprise': 9.99})} preços realinhados "
+         f"(topo agora ${max({'/global-morning-brief': 0.15, '/equity-dossier': 0.15, '/event-playbook': 0.2, '/correlation-matrix': 0.15, '/sector-rotation': 0.12, '/portfolio-stress': 0.25, '/council-deep': 0.25, '/thesis-engine': 0.2, '/whale-dossier': 0.2, '/council': 0.15, '/launch-sniper': 0.15, '/relatorio': 0.1, '/forex-arbitrage': 0.08, '/portfolio-copilot': 0.12, '/launch-risk': 0.1, '/mev-flow': 0.08, '/alpha-signal': 0.08, '/insider-track': 0.08, '/arbitrage': 0.06, '/cross-chain': 0.06, '/copytrade': 0.06, '/market-brief': 0.06, '/multi-chain-arbitrage': 0.06, '/agent-composable': 0.08, '/sinais': 0.05, '/deep-think': 0.05, '/agent-call': 0.05, '/whale-alert': 0.05, '/smart-money': 0.05, '/sanctions': 0.05, '/enterprise': 9.99}.values()):.2f})")
 
 # ============================================================================
 # 20. SENTIMENT CONSENSUS (v31) — mesmo padrão que funcionou no oráculo,
