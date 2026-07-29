@@ -87,7 +87,7 @@ from typing import Any, Optional, Dict, List, Tuple
 # 0. CONFIGURAÇÃO E AUTO-SETUP
 # ============================================================================
 
-VERSION = "34.0.0-MATRIX"
+VERSION = "35.0.0-AUDIT"
 BRAND_NAME = "Losbeto"
 BRAND_TAGLINE = "The Global Revenue Engine for Financial AI Agents"
 BRAND_EMOJI = "🧠"
@@ -7773,6 +7773,119 @@ async function tick(){
 }
 tick();setInterval(tick,15000);
 </script></body></html>"""
+
+# ============================================================================
+# 21. BAZAAR INDEX AUDIT (v35) — descoberto no Slack oficial do x402.
+#
+#     Um membro do #wg-domain-discovery relatou que POST /v2/x402/validate da
+#     CDP é uma sonda SEM PAGAMENTO que devolve, por recurso: `valid`,
+#     `index.active` e um preflight de 25 checagens. Ele rodou nos 19 endpoints
+#     dele: 19/19 válidos e indexados.
+#
+#     Isso responde de forma DEFINITIVA a pergunta que só conseguíamos inferir
+#     por correlação: os 61 endpoints que liquidamos estão realmente ativos no
+#     índice do Bazaar? Antes olhávamos IPs sondando e supunhamos. Agora dá
+#     para perguntar à fonte.
+#
+#     ARMADILHA relatada e evitada aqui: o campo do corpo é `resource`, NÃO
+#     `url` — enviar `url` retorna 400 com erro de schema.
+# ============================================================================
+
+CDP_API_BASE = os.environ.get("CDP_API_BASE",
+                              "https://api.cdp.coinbase.com/platform/v2/x402")
+
+def _cdp_validate(resource_url: str) -> dict:
+    """Sonda um recurso no Bazaar sem pagar nada."""
+    if not (CDP_API_KEY_ID and CDP_API_KEY_SECRET):
+        return {"error": "CDP keys not configured"}
+    try:
+        # is_cdp é derivado da URL no construtor, não é parâmetro
+        fac = CDP_FAC or FacilitatorClient(CDP_API_BASE)
+        hdrs = fac._headers("POST", "/validate")
+        r = requests.post(f"{CDP_API_BASE}/validate",
+                          json={"resource": resource_url},   # NÃO "url"
+                          headers=hdrs, timeout=12)
+        if not r.ok:
+            return {"error": f"http_{r.status_code}", "detail": r.text[:200]}
+        return r.json() or {}
+    except Exception as e:
+        return {"error": str(e)[:120]}
+
+def _audit_one(path: str) -> dict:
+    base = _public_base()
+    d = _cdp_validate(f"{base}{path}")
+    if "error" in d:
+        return {"endpoint": path, "status": "unknown", "error": d["error"]}
+    idx = d.get("index") or {}
+    checks = d.get("preflight") or d.get("checks") or []
+    if isinstance(checks, dict):
+        passed = sum(1 for v in checks.values() if v in (True, "pass", "ok"))
+        total = len(checks)
+        falhas = [k for k, v in checks.items() if v not in (True, "pass", "ok")]
+    elif isinstance(checks, list):
+        passed = sum(1 for c in checks if (c.get("passed") or c.get("ok")
+                                           or c.get("status") == "pass"))
+        total = len(checks)
+        falhas = [c.get("name") or c.get("check") or "?" for c in checks
+                  if not (c.get("passed") or c.get("ok") or c.get("status") == "pass")]
+    else:
+        passed, total, falhas = 0, 0, []
+    return {"endpoint": path,
+            "valid": bool(d.get("valid")),
+            "index_active": bool(idx.get("active") if isinstance(idx, dict)
+                                 else d.get("indexActive")),
+            "preflight": f"{passed}/{total}" if total else "n/a",
+            "failed_checks": falhas[:6],
+            "status": ("indexed" if (d.get("valid") and
+                       (idx.get("active") if isinstance(idx, dict) else False))
+                       else "not_indexed")}
+
+@app.route("/bazaar-audit")
+def bazaar_audit():
+    """Auditoria de indexação no Bazaar — protegida por token do painel,
+    porque faz N chamadas autenticadas à CDP.
+      /bazaar-audit?token=...            -> amostra dos 12 principais
+      /bazaar-audit?token=...&all=1      -> catálogo inteiro (lento)
+      /bazaar-audit?token=...&ep=/x      -> um endpoint específico
+    """
+    if not _dash_token_ok(request.args.get("token", "")):
+        return jsonify({"error": "unauthorized"}), 401
+    um = request.args.get("ep")
+    if um:
+        return jsonify({"result": _audit_one(um if um.startswith("/") else "/" + um),
+                        "ts": int(time.time())})
+    alvo = (list(BASE_PRICES) if request.args.get("all") == "1"
+            else [e for e in FEATURED_ENDPOINTS[:8] if e in BASE_PRICES]
+                 + ["/pyth-price", "/fear-greed", "/trust-hash", "/portfolio-copilot"])
+    alvo = list(dict.fromkeys(alvo))
+    out, lock = [], threading.Lock()
+
+    def _run(p):
+        r = _audit_one(p)
+        with lock:
+            out.append(r)
+
+    # 6 por vez: a API da CDP tem limite e não queremos ser rudes
+    for i in range(0, len(alvo), 6):
+        ths = [threading.Thread(target=_run, args=(p,), daemon=True)
+               for p in alvo[i:i + 6]]
+        for t in ths: t.start()
+        for t in ths: t.join(timeout=15)
+
+    indexados = [r for r in out if r.get("status") == "indexed"]
+    fora = [r for r in out if r.get("status") == "not_indexed"]
+    desconhecidos = [r for r in out if r.get("status") == "unknown"]
+    return jsonify({
+        "summary": {"checked": len(out), "indexed": len(indexados),
+                    "not_indexed": len(fora), "unknown": len(desconhecidos)},
+        "indexed": sorted(r["endpoint"] for r in indexados),
+        "not_indexed": fora,
+        "unknown": desconhecidos[:5],
+        "method": ("CDP POST /v2/x402/validate — no-payment probe. Field is "
+                   "'resource', not 'url'."),
+        "source": "x402 Slack #wg-domain-discovery, 2026-07-29",
+        "ts": int(time.time()), "version": VERSION,
+    })
 
 @app.route("/live")
 def live_page():
