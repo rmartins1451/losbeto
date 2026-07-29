@@ -87,7 +87,7 @@ from typing import Any, Optional, Dict, List, Tuple
 # 0. CONFIGURAÇÃO E AUTO-SETUP
 # ============================================================================
 
-VERSION = "33.0.0-PROVENANCE"
+VERSION = "34.0.0-MATRIX"
 BRAND_NAME = "Losbeto"
 BRAND_TAGLINE = "The Global Revenue Engine for Financial AI Agents"
 BRAND_EMOJI = "🧠"
@@ -3416,6 +3416,12 @@ def _clean_tx(sdata: dict, fallback: str = "") -> str:
     return ""
 
 ENDPOINT_PARAM_HINTS = {
+    # v34: o registro no x402scan avisou "Paid endpoint is missing an input
+    # schema" em /bootstrap-trust e /week-pass — os dois que não tinham nenhum
+    # parâmetro declarado. Todo endpoint pago precisa declarar algo.
+    "/bootstrap-trust":   {"format": "json"},
+    "/week-pass":         {"format": "json"},
+    "/enterprise":        {"format": "json"},
     "/forex-rate":        {"pair": "EUR/USD"},
     "/stock-quote":       {"symbol": "AAPL"},
     "/commodity-price":   {"symbol": "GOLD"},
@@ -3670,9 +3676,19 @@ def _build_402(endpoint: str):
         info_out = (ext.get("info") or {}).get("output") or {}
         info_out.pop("example", None)   # exemplo de saída: grande, vai no corpo
         ext.pop("schema", None)         # schema legado: idem
+        # v34: descrição TRUNCADA no cabeçalho. O pior caso chegou a 7.373 bytes
+        # (90% do limite de 8 KB) por causa de descrições longas. O texto integral
+        # continua no corpo e nos manifests; no header basta o suficiente para o
+        # cliente saber o que está comprando.
+        _res = dict(p.get("resource") or {})
+        if isinstance(_res.get("description"), str) and len(_res["description"]) > 220:
+            _res["description"] = _res["description"][:217].rstrip() + "..."
+        _ext_desc = ext.get("description")
+        if isinstance(_ext_desc, str) and len(_ext_desc) > 220:
+            ext["description"] = _ext_desc[:217].rstrip() + "..."
         return {
             "x402Version": p.get("x402Version", 2),
-            "resource":    p.get("resource"),
+            "resource":    _res,
             "accepts":     p.get("accepts"),
             # compat v1: alguns scanners antigos leem este campo
             "paymentRequirements": p.get("paymentRequirements"),
@@ -3693,7 +3709,21 @@ def _build_402(endpoint: str):
     primary = accepts[0] if accepts else {}
     # v28.1: o challenge base64 NÃO vai aqui — ele já está em PAYMENT-REQUIRED.
     # Repetir o blob triplicava o tamanho dos cabeçalhos.
-    auth_params = [f'realm="x402"']
+    # v34 FIX — REGRESSÃO INTRODUZIDA NA v28.1.
+    # Ao enxugar os cabeçalhos de 19,6 KB, removi o `challenge="<b64>"` do
+    # WWW-Authenticate. Resultado: o registro no x402scan passou a avisar
+    # "WWW-Authenticate header contains no Payment challenges" em 70 dos 79
+    # recursos — exatamente o aviso que a v21.1 havia eliminado.
+    # Correção: challenge volta, mas COMPACTO. O blob completo (~4,8 KB) fica
+    # só em PAYMENT-REQUIRED; aqui vai o mínimo que um cliente precisa para
+    # pagar: versão + accepts essenciais. ~500 bytes em vez de 6 KB.
+    _min_accepts = [{k: a[k] for k in
+                     ("scheme", "network", "asset", "amount", "payTo", "maxTimeoutSeconds")
+                     if k in a} for a in accepts]
+    _chal = base64.b64encode(json.dumps(
+        {"x402Version": 2, "accepts": _min_accepts},
+        separators=(",", ":")).encode()).decode()
+    auth_params = [f'realm="x402"', f'challenge="{_chal}"']
     if primary:
         for k in ("scheme", "network", "asset", "amount", "payTo", "maxTimeoutSeconds"):
             v = primary.get(k)
@@ -6091,6 +6121,7 @@ cents in USDC per request and gets clean JSON back.</p>
 <div class="cta">
   <a class="btn p" href="/try">Try free — 6 live samples</a>
   <a class="btn s" href="#start">Quick start</a>
+  <a class="btn s" href="/live">◉ Live telemetry</a>
   <a class="btn s" href="/health/providers">Node status</a>
 </div>
 
@@ -7583,6 +7614,199 @@ def manifest_mcp():
 # v33: 2 IPs distintos pediram /.well-known/agent-card.json e receberam 404.
 # É o nome CANÔNICO atual do Agent Card no A2A — servíamos só o nome antigo
 # (agent.json). Quem procurava pelo padrão vigente não nos encontrava.
+LIVE_HTML = r"""<!doctype html><html lang="en"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Losbeto — live node telemetry</title>
+<meta name="description" content="Live x402 node telemetry: real settlements, evaluations and probes as they happen. No mock data.">
+<style>
+:root{--bg:#000;--g:#00ff41;--g2:#008f11;--dim:#0a5c1f;--warn:#ffb000;--mono:'SF Mono',Menlo,Consolas,monospace}
+*{box-sizing:border-box;margin:0;padding:0}
+html,body{height:100%}
+body{background:var(--bg);color:var(--g);font:13px/1.5 var(--mono);overflow-x:hidden}
+#rain{position:fixed;inset:0;z-index:0;opacity:.28}
+.ui{position:relative;z-index:1;max-width:960px;margin:0 auto;padding:22px 18px 60px}
+.bar{display:flex;justify-content:space-between;align-items:baseline;gap:14px;flex-wrap:wrap;
+     border-bottom:1px solid var(--dim);padding-bottom:10px;margin-bottom:22px}
+.bar h1{font-size:15px;font-weight:600;letter-spacing:.14em;text-transform:uppercase}
+.bar a{color:var(--g2);text-decoration:none;margin-left:14px;font-size:12px}
+.bar a:hover{color:var(--g)}
+.blink{animation:b 1.1s steps(2) infinite}@keyframes b{50%{opacity:.15}}
+.grid{display:grid;gap:10px;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));margin-bottom:24px}
+.kpi{border:1px solid var(--dim);padding:12px;background:rgba(0,255,65,.03)}
+.kpi .l{color:var(--g2);font-size:10px;letter-spacing:.12em;text-transform:uppercase}
+.kpi .v{font-size:24px;font-weight:600;margin-top:4px;letter-spacing:-.02em}
+.kpi .s{color:var(--g2);font-size:10.5px;margin-top:2px}
+h2{font-size:10px;letter-spacing:.16em;text-transform:uppercase;color:var(--g2);
+   margin:26px 0 10px;border-bottom:1px solid var(--dim);padding-bottom:5px}
+table{width:100%;border-collapse:collapse;font-size:12px}
+td{padding:5px 0;border-bottom:1px solid rgba(10,92,31,.4)}
+td:last-child{text-align:right;color:var(--g2)}
+.bars{display:flex;align-items:flex-end;gap:3px;height:56px;margin-bottom:6px}
+.bars i{flex:1;background:linear-gradient(180deg,var(--g),var(--g2));min-height:2px;display:block}
+.note{color:var(--g2);font-size:11px;margin-top:8px}
+.warn{color:var(--warn)}
+footer{color:var(--g2);font-size:11px;margin-top:30px;border-top:1px solid var(--dim);padding-top:12px}
+footer a{color:var(--g2)}
+</style></head><body>
+<canvas id="rain"></canvas>
+<div class="ui">
+  <div class="bar">
+    <h1>losbeto :: live<span class="blink">_</span></h1>
+    <div>
+      <a href="/">home</a><a href="/try">try free</a>
+      <a href="/receipts">receipts</a><a href="/health/providers">health</a>
+      <a href="/x402-resources">catalog</a>
+    </div>
+  </div>
+
+  <div class="grid" id="kpi"></div>
+
+  <h2>traffic composition · 24h</h2>
+  <div class="bars" id="bars"></div>
+  <div class="note" id="barsnote"></div>
+
+  <h2>evaluators — who tested before paying</h2>
+  <table id="pv"><tbody></tbody></table>
+
+  <h2>demand — asked for, not served (7d)</h2>
+  <table id="dm"><tbody></tbody></table>
+
+  <h2>source health</h2>
+  <table id="hp"><tbody></tbody></table>
+
+  <footer>
+    Every number here is read from this node's own ledger — no mock data, no
+    projections. Operator test purchases are labelled as such at
+    <a href="/receipts">/receipts</a>.
+    <span id="ts"></span>
+  </footer>
+</div>
+<script>
+// ---- matrix rain: cada glifo é um evento real do nó (ver pushEvents) -------
+(function(){
+  var cv=document.getElementById('rain'),cx=cv.getContext('2d'),W,H,cols,drops,queue=[];
+  var CH='0123456789ABCDEF$402x'.split('');
+  function size(){W=cv.width=innerWidth;H=cv.height=innerHeight;
+    cols=Math.floor(W/14);drops=Array(cols).fill(0).map(()=>Math.random()*-H);}
+  size();addEventListener('resize',size);
+  window.pushEvents=function(n){for(var i=0;i<n;i++)queue.push(1);};
+  function draw(){
+    cx.fillStyle='rgba(0,0,0,.075)';cx.fillRect(0,0,W,H);
+    cx.font='13px monospace';
+    for(var i=0;i<cols;i++){
+      var hot=queue.length>0&&Math.random()<.06;
+      if(hot)queue.pop();
+      cx.fillStyle=hot?'#c9ffd8':'#00ff41';
+      cx.fillText(CH[Math.floor(Math.random()*CH.length)],i*14,drops[i]);
+      drops[i]+=hot?26:14;
+      if(drops[i]>H&&Math.random()>.975)drops[i]=0;
+    }
+    requestAnimationFrame(draw);
+  }
+  draw();
+})();
+
+var prev=null;
+function n(x){return (x===undefined||x===null)?'—':x;}
+function esc(s){return String(s).replace(/</g,'&lt;');}
+
+async function tick(){
+  try{
+    var r=await fetch('/live/api',{cache:'no-store'});
+    var j=await r.json();
+    var s=j.stats||{};
+    // KPIs — só o que o ledger sabe
+    document.getElementById('kpi').innerHTML=[
+      ['settlements 24h',s.paid_24h,'real payments'],
+      ['revenue 24h','$'+(s.revenue_24h||0).toFixed(4),'USDC'],
+      ['evaluators 24h',s.previews_24h,'free preview calls'],
+      ['probes 24h',s.probes_24h,'scanners · do not buy'],
+      ['unique buyers',s.buyers,'distinct payers'],
+      ['endpoints',j.endpoints,'monetized']
+    ].map(function(k){return '<div class="kpi"><div class="l">'+k[0]+
+      '</div><div class="v">'+n(k[1])+'</div><div class="s">'+k[2]+'</div></div>';}).join('');
+
+    // composição do tráfego
+    var pr=s.probes_24h||0,pv=s.previews_24h||0,pd=s.paid_24h||0,tot=pr+pv+pd||1;
+    var seg=[['probes',pr],['evaluations',pv],['settlements',pd]];
+    document.getElementById('bars').innerHTML=seg.map(function(x){
+      var h=Math.max(2,Math.round(x[1]/tot*56));
+      return '<i style="height:'+h+'px" title="'+x[0]+': '+x[1]+'"></i>';}).join('')
+      + Array(30).fill('<i style="height:2px;opacity:.25"></i>').join('');
+    document.getElementById('barsnote').innerHTML=
+      seg.map(function(x){return x[0]+' '+x[1]+' ('+(x[1]/tot*100).toFixed(1)+'%)';}).join(' · ')
+      + ' — probes are catalog scanners and QoS monitors; they never buy.';
+
+    // avaliadores
+    document.getElementById('pv').querySelector('tbody').innerHTML=
+      (s.preview_uas||[]).slice(0,6).map(function(u){
+        return '<tr><td>'+esc(u.ua.slice(0,54))+'</td><td>'+u.hits+' · '+u.ips+' ip</td></tr>';
+      }).join('')||'<tr><td>no evaluations in the window</td><td></td></tr>';
+
+    // demanda não atendida
+    document.getElementById('dm').querySelector('tbody').innerHTML=
+      (s.demand_404||[]).slice(0,6).map(function(d){
+        var tag=d.kind==='alias_candidate'?'alias exists':'not built';
+        return '<tr><td>'+esc(d.path)+'</td><td>'+d.ips+' ip · '+tag+'</td></tr>';
+      }).join('')||'<tr><td>nothing requested outside the catalog</td><td></td></tr>';
+
+    // saúde das fontes
+    var md=(j.health&&j.health.market_data)||{};
+    var rows=Object.keys(md).map(function(k){
+      var v=md[k];
+      return '<tr><td>'+esc(k)+'</td><td>'+(v.live?'live · '+esc(v.source):'<span class="warn">down</span>')+'</td></tr>';
+    });
+    rows.push('<tr><td>ai synthesis</td><td>'+(j.health&&j.health.ai&&j.health.ai.live?
+      'live':'<span class="warn">down</span>')+'</td></tr>');
+    rows.push('<tr><td>premium_ready</td><td>'+(j.health&&j.health.premium_ready?'true':
+      '<span class="warn">false — premium returns 503, no charge</span>')+'</td></tr>');
+    document.getElementById('hp').querySelector('tbody').innerHTML=rows.join('');
+
+    // chuva reage a atividade nova
+    if(prev!==null){
+      var d=(pr-prev.pr)+(pv-prev.pv)*6+(pd-prev.pd)*40;
+      if(d>0)pushEvents(Math.min(d,140));
+    }
+    prev={pr:pr,pv:pv,pd:pd};
+    document.getElementById('ts').textContent=' · updated '+new Date().toLocaleTimeString();
+  }catch(e){}
+}
+tick();setInterval(tick,15000);
+</script></body></html>"""
+
+@app.route("/live")
+def live_page():
+    """v34: telemetria pública em tempo real. A estética é matrix, mas cada
+    número vem do ledger deste nó — nenhum dado simulado. A chuva de glifos
+    acelera com atividade REAL: sondagem pesa 1, avaliação 6, liquidação 40.
+    Existe porque a transparência já é o nosso diferencial reconhecido; isto
+    a torna visível em movimento, não só num JSON."""
+    return app.response_class(LIVE_HTML, mimetype="text/html")
+
+@app.route("/live/api")
+def live_api():
+    """Alimenta /live. Público e sem token — expõe apenas agregados que já
+    são públicos em /receipts e /health/providers. Nada sensível."""
+    try:
+        st = LEDGER.stats() or {}
+    except Exception:
+        st = {}
+    publico = {k: st.get(k) for k in
+               ("paid_24h", "revenue_24h", "previews_24h", "probes_24h",
+                "buyers", "conv_evaluators", "avg_ticket")}
+    publico["preview_uas"] = (st.get("preview_uas") or [])[:8]
+    publico["demand_404"] = [{"path": d.get("path"), "ips": d.get("ips"),
+                              "kind": d.get("kind")}
+                             for d in (st.get("demand_404") or [])[:8]]
+    try:
+        with app.test_request_context("/health/providers"):
+            saude = health_providers().get_json()
+    except Exception:
+        saude = {}
+    return jsonify({"stats": publico, "health": saude,
+                    "endpoints": len(BASE_PRICES),
+                    "version": VERSION, "ts": int(time.time())})
+
 @app.route("/about")
 @app.route("/contact")
 @app.route("/team")
@@ -8062,6 +8286,8 @@ def llms_txt():
         "",
         "## TRY BEFORE YOU PAY (zero cost, no signup)",
         f"GET {_public_base()}/try  -> live samples from 6 endpoints in ONE free call",
+        f"GET {_public_base()}/live -> public real-time node telemetry (no auth)",
+        f"GET {_public_base()}/about -> who operates this and how to audit it",
         f"GET {_public_base()}/<any-endpoint>?preview=1  -> real delayed data, free",
         "Every 402 response also carries an inline `upsell.sample` with real output.",
         "",
