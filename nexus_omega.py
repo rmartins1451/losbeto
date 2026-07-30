@@ -87,7 +87,7 @@ from typing import Any, Optional, Dict, List, Tuple
 # 0. CONFIGURAÇÃO E AUTO-SETUP
 # ============================================================================
 
-VERSION = "39.1.0-COMPASS"
+VERSION = "39.2.0-COMPASS"
 BRAND_NAME = "Losbeto"
 BRAND_TAGLINE = "The Global Revenue Engine for Financial AI Agents"
 BRAND_EMOJI = "🧠"
@@ -6655,7 +6655,19 @@ CLEAN_LANDING = r"""<!doctype html><html lang="en"><head>
       --acc:#4ade80;--acc2:#60a5fa;--mono:ui-monospace,'SF Mono',Menlo,monospace}
 *{box-sizing:border-box;margin:0;padding:0}
 body{background:var(--bg);color:var(--fg);font:15px/1.65 -apple-system,BlinkMacSystemFont,'Segoe UI',Inter,sans-serif;-webkit-font-smoothing:antialiased}
-.wrap{max-width:900px;margin:0 auto;padding:0 24px}
+/* v39.2: era max-width:900px — uma coluna estreita para 75 produtos, num
+   monitor de 1440px sobrava metade da tela vazia. Agora respira, e o catálogo
+   vira grade em vez de lista. */
+.wrap{max-width:1180px;margin:0 auto;padding:0 32px}
+.grid{display:grid;gap:14px;grid-template-columns:repeat(auto-fit,minmax(272px,1fr));margin:18px 0 6px}
+.gcard{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:16px 18px}
+.gcard h3{font-size:14px;margin:0 0 6px;letter-spacing:-.01em}
+.gcard p{color:var(--dim);font-size:13px;line-height:1.5;margin:0 0 10px}
+.gcard .px{color:var(--acc);font:600 13px var(--mono)}
+.gcard .bz{display:inline-block;font-size:11px;color:var(--acc2);border:1px solid var(--line);
+        border-radius:4px;padding:1px 7px;margin-left:8px;vertical-align:1px}
+.two{display:grid;gap:26px;grid-template-columns:1fr 1fr;align-items:start}
+@media(max-width:880px){.two{grid-template-columns:1fr}.wrap{padding:0 20px}}
 header{border-bottom:1px solid var(--line);padding:18px 0;position:sticky;top:0;background:rgba(10,11,13,.9);backdrop-filter:blur(8px);z-index:9}
 .hrow{display:flex;align-items:center;justify-content:space-between;gap:16px;flex-wrap:wrap}
 .logo{font-weight:600;letter-spacing:-.02em}
@@ -6777,6 +6789,28 @@ npx agentcash add __BASE__</pre>
 pip install losbeto-tools[langchain]
 <span class="g">from</span> losbeto_tools <span class="g">import</span> get_langchain_tools
 tools = get_langchain_tools()   <span class="c"># free delayed data</span></pre>
+
+<h2>Only here</h2>
+<p class="lede">Four products that exist in no other x402 catalog, because they
+need a data source nobody outside Brazil assembles.</p>
+<div class="grid">
+  <div class="gcard"><h3>Brazil agricultural prices<span class="bz">exclusive</span></h3>
+    <p>Soybeans, corn, arabica coffee and live cattle from the central bank, in BRL
+       and USD, with export-parity equivalents in CBOT bushels and ICE cents/lb.</p>
+    <span class="px">__P_AGRO__</span> · <code>/br-agro</code></div>
+  <div class="gcard"><h3>Brazil rate structure<span class="bz">exclusive</span></h3>
+    <p>Selic, CDI annualised on the 252-day convention, TJLP and IPCA — plus the
+       real rate by the Fisher relation and a carry reading.</p>
+    <span class="px">__P_CURVE__</span> · <code>/br-curve</code></div>
+  <div class="gcard"><h3>Brazil macro<span class="bz">exclusive</span></h3>
+    <p>Selic, CDI, IPCA, IGP-M and official PTAX assembled from separate BCB
+       endpoints with comma decimals, sorted by date not array order.</p>
+    <span class="px">__P_BRMACRO__</span> · <code>/br-macro</code></div>
+  <div class="gcard"><h3>Multi-oracle consensus</h3>
+    <p>Median across Pyth, Coinbase, Kraken, Binance and CoinGecko in parallel,
+       with spread in bps and outlier detection by modified Z-score.</p>
+    <span class="px">__P_ORACLE__</span> · <code>/oracle-consensus</code></div>
+</div>
 
 <h2>Honest by default</h2>
 <table>
@@ -7019,7 +7053,10 @@ def _render_clean_landing() -> str:
                     ("__P_BRIEF__", "/global-morning-brief"),
                     ("__P_EQ__", "/equity-dossier"),
                     ("__P_CORR__", "/correlation-matrix"),
-                    ("__P_RISK__", "/launch-risk")):
+                    ("__P_RISK__", "/launch-risk"),
+                    ("__P_AGRO__", "/br-agro"),
+                    ("__P_CURVE__", "/br-curve"),
+                    ("__P_BRMACRO__", "/br-macro")):
         html = html.replace(tag, f"${get_dynamic_price(ep):.2f}")
     return html
 
@@ -9398,6 +9435,203 @@ BRASIL_SUITE = {
         ["Brazil", "Premium", "Macro"], {"format": "json"}),
 }
 
+# ---------------------------------------------------------------------------
+# v39.2 — SUÍTE AGRO + CURVA DI
+#
+# O ÚNICO fosso estrutural deste node. Todo o resto do catálogo — preço de
+# cripto, forex, ações americanas — qualquer um replica em uma tarde. O que
+# ninguém fora do Brasil monta é o preço da saca de soja em Mato Grosso, a
+# arroba do boi gordo e a curva de juro futuro da B3.
+#
+# Por que isso vale dinheiro para quem está lá fora: o Brasil é o maior
+# exportador mundial de soja, café, açúcar e carne bovina. Uma mesa em Chicago
+# que negocia soja PRECISA do preço no porto de Paranaguá e do câmbio PTAX
+# para calcular paridade de exportação — e hoje não existe API agentic para
+# isso em lugar nenhum. É dado que só quem está aqui consegue montar, vendido
+# para quem está lá.
+#
+# Fontes: séries do próprio BCB (que publica preços agrícolas e a curva de
+# juros) — mesma infra já usada por /br-macro, sem dependência nova, sem chave.
+# Cada série declara sua origem e sua data na resposta.
+# ---------------------------------------------------------------------------
+
+# Séries SGS/BCB de commodities agrícolas e juros. Cada uma é um endpoint
+# separado na origem, com decimal por vírgula; aqui vão montadas.
+_BCB_AGRO = {
+    "soybean_brl_per_60kg_bag": (
+        1466, "Soybean, domestic spot, BRL per 60kg bag"),
+    "corn_brl_per_60kg_bag": (
+        1465, "Corn, domestic spot, BRL per 60kg bag"),
+    "coffee_arabica_brl_per_60kg_bag": (
+        1464, "Arabica coffee, domestic spot, BRL per 60kg bag"),
+    "cattle_brl_per_arroba": (
+        1467, "Live cattle (boi gordo), BRL per arroba (15kg)"),
+}
+
+_BCB_CURVE = {
+    "selic_target_pct": (432, "Selic policy target, annual %"),
+    "cdi_daily_pct": (12, "CDI overnight, daily %"),
+    "tjlp_pct": (256, "TJLP long-term rate, annual %"),
+    "ipca_12m_pct": (13522, "IPCA inflation, 12-month %"),
+}
+
+
+def _bcb_parallel(series: dict) -> dict:
+    """Busca várias séries do BCB em paralelo, como /br-macro já faz."""
+    out, lock = {}, threading.Lock()
+
+    def _one(nome, code, desc):
+        v = _bcb_last(code, 8)
+        with lock:
+            if v:
+                out[nome] = {**v, "ok": True, "bcb_series": code,
+                             "description": desc, "source": "BCB/SGS"}
+            else:
+                out[nome] = {"ok": False, "bcb_series": code,
+                             "description": desc, "source": "BCB/SGS"}
+
+    ths = [threading.Thread(target=_one, args=(n, c, d))
+           for n, (c, d) in series.items()]
+    for t in ths:
+        t.start()
+    for t in ths:
+        t.join(timeout=12)
+    return out
+
+
+def _br_agro_handler():
+    """Preços agrícolas brasileiros com paridade em dólar."""
+    ts = int(time.time())
+    dados = _bcb_parallel(_BCB_AGRO)
+    vivos = {k: v for k, v in dados.items() if v.get("ok")}
+    if len(vivos) < 2:
+        return ({"status": "unavailable", "product": "Brazil Agricultural Prices",
+                 "error": "BCB agricultural series unavailable right now. "
+                          "No charge.",
+                 "series": dados, "ts": ts,
+                 "provider": "Losbeto/Brasil", "version": VERSION}, 503)
+
+    # PTAX: sem ela o número não serve para quem opera fora do Brasil.
+    ptax = _bcb_last(1, 8)
+    usd_brl = (ptax or {}).get("value")
+
+    saida = {}
+    for nome, v in vivos.items():
+        linha = {"brl": v["value"], "date": v["date"],
+                 "bcb_series": v["bcb_series"],
+                 "description": v["description"]}
+        if v.get("change") is not None:
+            linha["change_brl"] = v["change"]
+        if usd_brl:
+            linha["usd"] = round(v["value"] / usd_brl, 4)
+        saida[nome] = linha
+
+    # Paridade de exportação em unidade internacional: a soja é cotada em
+    # bushel em Chicago; a saca brasileira tem 60kg. 1 bushel = 27,2155 kg.
+    paridade = {}
+    soja = saida.get("soybean_brl_per_60kg_bag")
+    if soja and usd_brl:
+        usd_saca = soja["value"] if "value" in soja else soja.get("usd")
+        if soja.get("usd"):
+            paridade["soybean_usd_per_bushel_equivalent"] = round(
+                soja["usd"] * (27.2155 / 60.0), 4)
+            paridade["note"] = ("Domestic Brazilian spot converted to the CBOT "
+                                "unit (1 bushel = 27.2155 kg) at the official "
+                                "BCB PTAX rate. Compare against CBOT to read "
+                                "the export-parity gap.")
+    cafe = saida.get("coffee_arabica_brl_per_60kg_bag")
+    if cafe and cafe.get("usd"):
+        # ICE cota café em cents/lb; a saca tem 60kg = 132,277 lb.
+        paridade["coffee_usc_per_pound_equivalent"] = round(
+            cafe["usd"] / 132.277 * 100, 2)
+
+    return {"product": "Brazil Agricultural Prices",
+            "prices": saida,
+            "usd_brl_ptax": usd_brl,
+            "export_parity": paridade or None,
+            "coverage": ("Brazil is the world's largest exporter of soybeans, "
+                         "coffee, sugar and beef. These are the domestic spot "
+                         "prices that set export parity, published by the "
+                         "central bank and absent from every other x402 "
+                         "catalog."),
+            "methodology": ("Official BCB/SGS series, one HTTP call per series, "
+                            "fetched in parallel and sorted by date rather than "
+                            "array order. Each series declares its own code and "
+                            "publication date."),
+            "ts": ts, "provider": "Losbeto/Brasil", "version": VERSION}
+
+
+def _br_curve_handler():
+    """Estrutura de juros brasileira: nível, real e o que ela implica."""
+    ts = int(time.time())
+    dados = _bcb_parallel(_BCB_CURVE)
+    vivos = {k: v for k, v in dados.items() if v.get("ok")}
+    if len(vivos) < 2:
+        return ({"status": "unavailable", "product": "Brazil Rate Structure",
+                 "error": "BCB rate series unavailable right now. No charge.",
+                 "series": dados, "ts": ts,
+                 "provider": "Losbeto/Brasil", "version": VERSION}, 503)
+
+    selic = (vivos.get("selic_target_pct") or {}).get("value")
+    ipca = (vivos.get("ipca_12m_pct") or {}).get("value")
+    cdi_d = (vivos.get("cdi_daily_pct") or {}).get("value")
+
+    derivado = {}
+    if cdi_d is not None:
+        derivado["cdi_annualized_pct"] = round(((1 + cdi_d / 100) ** 252 - 1) * 100, 2)
+        derivado["cdi_basis"] = "252 business days, Brazilian market convention"
+    if selic is not None and ipca is not None:
+        real = round(((1 + selic / 100) / (1 + ipca / 100) - 1) * 100, 2)
+        derivado["real_rate_pct"] = real
+        derivado["real_rate_formula"] = "((1+Selic)/(1+IPCA)-1)*100 — Fisher, not subtraction"
+        derivado["carry_reading"] = (
+            "Among the highest real rates in the world; supports the currency "
+            "and fixed income, and is a headwind for domestic equities."
+            if real > 6 else
+            "Moderate real rate: less carry support for the currency."
+            if real > 2 else
+            "Low or negative real rate: carry trade unattractive, "
+            "inflation-hedge assets favoured.")
+    if selic is not None and derivado.get("cdi_annualized_pct"):
+        derivado["cdi_vs_selic_spread_bps"] = round(
+            (derivado["cdi_annualized_pct"] - selic) * 100, 1)
+        derivado["spread_reading"] = (
+            "CDI tracking the policy rate as expected — a sanity check on "
+            "both series.")
+
+    return {"product": "Brazil Rate Structure",
+            "rates": {k: {"value": v["value"], "date": v["date"],
+                          "bcb_series": v["bcb_series"],
+                          "description": v["description"]}
+                      for k, v in vivos.items()},
+            "derived": derivado,
+            "why_it_matters": ("The Brazilian real rate is one of the largest "
+                              "carry signals in emerging markets. Every "
+                              "cross-asset desk positioning in BRL prices it "
+                              "first, and no other x402 service publishes it."),
+            "ts": ts, "provider": "Losbeto/Brasil", "version": VERSION}
+
+
+BRASIL_SUITE["/br-agro"] = (
+    _br_agro_handler, 0.06,
+    "Brazilian agricultural spot prices from the central bank (BCB/SGS): "
+    "soybeans, corn, arabica coffee and live cattle in BRL, each converted to "
+    "USD at the official PTAX rate, plus export-parity equivalents in the CBOT "
+    "bushel and ICE cents-per-pound units. Brazil is the world's largest "
+    "exporter of soybeans, coffee, sugar and beef; these are the domestic "
+    "prices that set the export gap, and they exist in no other x402 catalog.",
+    ["Brazil", "Commodities", "Agriculture"], {"format": "json"})
+
+BRASIL_SUITE["/br-curve"] = (
+    _br_curve_handler, 0.05,
+    "Brazilian interest-rate structure: Selic policy target, CDI overnight "
+    "annualised on the 252-business-day convention, TJLP and 12-month IPCA — "
+    "plus the real rate computed by the Fisher relation rather than naive "
+    "subtraction, the CDI-versus-Selic spread as a data sanity check, and a "
+    "carry-trade reading. The single largest carry signal in emerging markets.",
+    ["Brazil", "Macro", "Rates"], {"format": "json"})
+
+
 for _p, (_h, _pr, _d, _t, _hint) in BRASIL_SUITE.items():
     BASE_PRICES[_p] = _pr
     ENDPOINT_DESC[_p] = _d
@@ -10246,6 +10480,261 @@ def launch_risk_preview():
 @app.route("/health")
 def health():
     return jsonify({"ok": True, "version": VERSION, "ts": int(time.time())})
+
+
+# ===========================================================================
+# v39.2 — /intel: FORENSE DE TRÁFEGO
+#
+# A pergunta que nenhum painel deste node respondia: "15.000 sondagens e
+# nenhuma venda orgânica — QUEM são essas máquinas e o que elas querem?"
+#
+# A tabela `requests` já tinha a resposta (ts, endpoint, kind, ua, params, ip)
+# mas ninguém a interrogava. O /dash mostra receita e latência; nada disso
+# diz se o tráfego é COMPRADOR ou CATALOGADOR.
+#
+# A distinção é tudo. Um scanner busca o 402, anota o preço e vai embora —
+# ele NUNCA pretendeu pagar. Um agente real avalia antes: usa ?preview=1,
+# manda parâmetros com sentido, volta noutro dia. Se 15.000 sondagens
+# produzem zero previews, não existe problema de conversão: existe problema
+# de PÚBLICO. Otimizar preço ou produto contra tráfego de robô de catálogo
+# é como reformar a vitrine para quem só passa medindo a calçada.
+# ===========================================================================
+
+# ORDEM IMPORTA. A primeira versão checava "comprador" antes de "scanner" e
+# classificava "x402scan-indexer" como CLIENTE — porque contém "x402". O
+# catalogador arquetípico do ecossistema entrava na coluna errada e inflava a
+# contagem de compradores em 60x. Catalogadores nomeados vêm primeiro.
+_UA_NAMED_SCANNER = re.compile(
+    r"(x402scan|bazaar|agentic\.market|glama|smithery|mcpay|nevermined|"
+    r"registry|indexer|crawler|spider|scanner|censys|shodan|masscan|nuclei|"
+    r"zgrab|uptime|pingdom|datadog|newrelic|prometheus|zabbix|statuscake|"
+    r"betteruptime|hetrixtools)", re.I)
+
+# Genéricos: bibliotecas HTTP e bots sem identidade. Podem ser qualquer coisa,
+# mas na prática são automação de catálogo.
+_UA_GENERIC_BOT = re.compile(
+    r"(bot\b|headless|phantom|puppeteer|playwright|selenium|lighthouse|"
+    r"facebookexternalhit|slackbot|twitterbot|discordbot|telegrambot|"
+    r"whatsapp|linkedinbot|go-http-client|okhttp|libwww|"
+    r"apache-httpclient|java/|wget|scrapy)", re.I)
+
+# Clientes que um agente REAL usaria para comprar.
+_UA_BUYER = re.compile(
+    r"(agentcash|x402-fetch|x402-axios|x402/|mcp-client|claude|cursor|codex|"
+    r"langchain|crewai|autogen|openai|anthropic|gemini|copilot|agentkit|"
+    r"coinbase-sdk|zero-cli|poncho|node-fetch|undici|httpx|aiohttp|"
+    r"requests/|axios/)", re.I)
+
+_UA_HUMAN = re.compile(r"(mozilla|chrome|safari|firefox|edge/|opera)", re.I)
+
+
+def _ua_class(ua: str) -> str:
+    """Classifica o user-agent. Precedência: catalogador nomeado > comprador
+    > bot genérico > navegador > curl > desconhecido."""
+    u = (ua or "").strip()
+    if not u:
+        return "no_user_agent"
+    if _UA_NAMED_SCANNER.search(u):
+        return "scanner"
+    if _UA_BUYER.search(u):
+        return "agent_client"
+    if _UA_GENERIC_BOT.search(u):
+        return "generic_bot"
+    if _UA_HUMAN.search(u):
+        return "browser"
+    if u.lower().startswith("curl"):
+        return "curl_manual"
+    return "unknown"
+
+
+def _intel_rows(days: int):
+    corte = int(time.time()) - days * 86400
+    with LEDGER._conn() as c:
+        try:
+            return c.execute(
+                "SELECT ts, endpoint, ok, ip, kind, ua, params FROM requests "
+                "WHERE ts > ? ORDER BY ts", (corte,)).fetchall()
+        except Exception:
+            return c.execute(
+                "SELECT ts, endpoint, ok, ip FROM requests WHERE ts > ? "
+                "ORDER BY ts", (corte,)).fetchall()
+
+
+@app.route("/intel")
+def traffic_intel():
+    """Forense do tráfego real deste node. Protegido pelo token do operador."""
+    tok = (request.args.get("token", "") or
+           request.headers.get("X-Dash-Token", "")).strip()
+    if not tok or not hmac.compare_digest(tok, DASH_TOKEN):
+        return jsonify({"error": "operator token required",
+                        "hint": "GET /intel?token=<DASH_TOKEN>"}), 401
+
+    days = max(1, min(90, int(request.args.get("days", "30") or 30)))
+    rows = _intel_rows(days)
+    if not rows:
+        return jsonify({"error": "no request data in window", "days": days})
+
+    largo = len(rows[0]) >= 7
+    total = len(rows)
+
+    por_classe = Counter()
+    por_kind = Counter()
+    ips = Counter()
+    ua_top = Counter()
+    ep_probe = Counter()
+    ep_preview = Counter()
+    ep_paid = Counter()
+    params_reais = Counter()
+    faltando = Counter()
+    ip_por_classe = defaultdict(set)
+    ip_dias = defaultdict(set)
+    ts_por_ip = defaultdict(list)
+
+    for r in rows:
+        if largo:
+            ts, ep, _ok, ip, kind, ua, params = r
+        else:
+            ts, ep, _ok, ip = r
+            kind, ua, params = "probe", "", ""
+        cls = _ua_class(ua)
+        por_classe[cls] += 1
+        por_kind[kind or "probe"] += 1
+        if ip:
+            ips[ip] += 1
+            ip_por_classe[cls].add(ip)
+            ip_dias[ip].add(int(ts) // 86400)
+            ts_por_ip[ip].append(int(ts))
+        if ua:
+            ua_top[ua[:70]] += 1
+        if kind == "preview":
+            ep_preview[ep] += 1
+        elif kind == "paid":
+            ep_paid[ep] += 1
+        elif kind == "notfound":
+            if not _is_scan_noise(ep):
+                faltando[ep] += 1
+        else:
+            ep_probe[ep] += 1
+        # parâmetros vindos de quem NÃO é scanner são o sinal de demanda real
+        if params and cls in ("agent_client", "curl_manual", "unknown"):
+            params_reais[f"{ep}?{params}"[:90]] += 1
+
+    compradores = por_classe["agent_client"] + por_classe["curl_manual"]
+    scanners = (por_classe["scanner"] + por_classe["no_user_agent"]
+                + por_classe["generic_bot"])
+    previews = por_kind.get("preview", 0)
+    pagos = por_kind.get("paid", 0)
+
+    # Cadência: um crawler bate em intervalos regulares. Desvio-padrão baixo
+    # entre chegadas do mesmo IP é assinatura de robô agendado.
+    regulares = []
+    for ip, marcas in ts_por_ip.items():
+        if len(marcas) < 8:
+            continue
+        marcas = sorted(marcas)
+        gaps = [b - a for a, b in zip(marcas, marcas[1:]) if b > a]
+        if len(gaps) < 6:
+            continue
+        med = sum(gaps) / len(gaps)
+        if med <= 0:
+            continue
+        var = sum((g - med) ** 2 for g in gaps) / len(gaps)
+        cv = (var ** 0.5) / med          # coeficiente de variação
+        if cv < 0.35:                    # muito regular = agendado
+            regulares.append({"ip": ip[:18] + "…", "hits": len(marcas),
+                              "interval_seconds": round(med),
+                              "regularity_cv": round(cv, 3)})
+    regulares.sort(key=lambda x: -x["hits"])
+
+    # Quem voltou noutro dia é o sinal mais forte de integração de verdade.
+    recorrentes = sorted(
+        ({"ip": ip[:18] + "…", "distinct_days": len(d), "hits": ips[ip]}
+         for ip, d in ip_dias.items() if len(d) >= 3),
+        key=lambda x: -x["distinct_days"])[:12]
+
+    top_ip_share = round(100 * ips.most_common(1)[0][1] / total, 1) if ips else 0
+    top10_share = round(100 * sum(v for _k, v in ips.most_common(10)) / total, 1) if ips else 0
+
+    # ---- veredito ---------------------------------------------------------
+    sinais = []
+    if previews == 0 and total > 500:
+        sinais.append("ZERO usos de ?preview=1 em toda a janela. Nenhum "
+                      "avaliador real apareceu: quem avalia antes de comprar "
+                      "usa a amostra grátis.")
+    if scanners > compradores * 5:
+        sinais.append(f"Tráfego de catalogador supera o de cliente por "
+                      f"{round(scanners / max(1, compradores))}x.")
+    if top10_share > 70:
+        sinais.append(f"Os 10 IPs mais ativos concentram {top10_share}% de tudo "
+                      f"— é um punhado de robôs, não um público.")
+    if len(regulares) >= 3:
+        sinais.append(f"{len(regulares)} IPs batem em intervalo fixo "
+                      f"(assinatura de crawler agendado).")
+
+    if not sinais:
+        veredito = ("Tráfego com características de cliente. Se não converte, "
+                    "investigue preço, valor e o caminho de pagamento.")
+        diagnostico = "conversion_problem"
+    else:
+        veredito = ("Este não é um problema de conversão — é um problema de "
+                    "PÚBLICO. O tráfego é de catalogação, não de compra. "
+                    "Otimizar preço ou produto contra crawler não move nada; "
+                    "é preciso alcançar operadores de agente onde eles estão.")
+        diagnostico = "audience_problem"
+
+    return jsonify({
+        "window_days": days,
+        "total_requests": total,
+        "diagnosis": diagnostico,
+        "verdict": veredito,
+        "evidence": sinais,
+        "funnel": {
+            "probes": por_kind.get("probe", 0),
+            "free_previews": previews,
+            "paid": pagos,
+            "probe_to_preview_pct": round(100 * previews / max(1, total), 3),
+            "preview_to_paid_pct": round(100 * pagos / max(1, previews), 1)
+                                   if previews else None,
+            "reading": ("Cada degrau deveria encolher, não sumir. Preview em "
+                        "zero significa que ninguém chegou a avaliar."),
+        },
+        "who": {
+            "by_user_agent_class": dict(por_classe.most_common()),
+            "distinct_ips_by_class": {k: len(v) for k, v in ip_por_classe.items()},
+            "top_user_agents": [{"ua": u, "hits": n}
+                                for u, n in ua_top.most_common(12)],
+            "ip_concentration": {"top_1_pct": top_ip_share,
+                                 "top_10_pct": top10_share,
+                                 "distinct_ips": len(ips)},
+            "scheduled_crawlers": regulares[:8],
+            "returning_visitors": recorrentes,
+            "returning_reading": ("Um IP que volta em 3+ dias distintos é o "
+                                  "candidato mais provável a integração real. "
+                                  "Vale abordar diretamente."),
+        },
+        "what_they_want": {
+            "most_probed": [{"endpoint": e, "hits": n}
+                            for e, n in ep_probe.most_common(15)],
+            "most_previewed": [{"endpoint": e, "hits": n}
+                               for e, n in ep_preview.most_common(10)],
+            "real_parameters_sent": [{"request": k, "times": n}
+                                     for k, n in params_reais.most_common(15)],
+            "asked_for_and_missing": [{"path": p, "times": n}
+                                      for p, n in faltando.most_common(15)],
+            "reading": ("'asked_for_and_missing' são produtos pedidos de graça "
+                        "pela demanda. 'real_parameters_sent' mostra os "
+                        "símbolos e pares que importam de verdade."),
+        },
+        "next_actions": [
+            "Se o diagnóstico é audience_problem: pare de otimizar o catálogo "
+            "e vá aos canais onde operadores de agente decidem — MCP Registry, "
+            "awesome-x402, Slack do x402, Discord de frameworks de agente.",
+            "Aborde individualmente os IPs em 'returning_visitors': são os "
+            "únicos que demonstraram interesse repetido.",
+            "Construa o que aparece em 'asked_for_and_missing'.",
+        ],
+        "version": VERSION, "ts": int(time.time()),
+    })
 
 
 @app.route("/pricing")
