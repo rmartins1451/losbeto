@@ -87,7 +87,7 @@ from typing import Any, Optional, Dict, List, Tuple
 # 0. CONFIGURAÇÃO E AUTO-SETUP
 # ============================================================================
 
-VERSION = "37.0.0-BRASIL"
+VERSION = "38.0.0-BRASIL"
 BRAND_NAME = "Losbeto"
 BRAND_TAGLINE = "The Global Revenue Engine for Financial AI Agents"
 BRAND_EMOJI = "🧠"
@@ -1771,6 +1771,7 @@ class LLM:
                     timeout=20)
                 if r.ok:
                     return r.json()["choices"][0]["message"]["content"].strip()
+                log.warning(f"LLM DeepSeek HTTP {r.status_code}: {r.text[:180]}")
             except Exception as e:
                 log.warning(f"DeepSeek: {e}")
         # Claude
@@ -1800,6 +1801,8 @@ class LLM:
                     timeout=20)
                 if r.ok:
                     return r.json()["choices"][0]["message"]["content"].strip()
+                # v38: 429 (rate limit) e 400 (payload) eram invisíveis
+                log.warning(f"LLM Groq HTTP {r.status_code}: {r.text[:180]}")
             except Exception as e:
                 log.warning(f"Groq: {e}")
         # Gemini
@@ -1815,6 +1818,7 @@ class LLM:
                 if r.ok:
                     j = r.json()
                     return j["candidates"][0]["content"]["parts"][0]["text"].strip()
+                log.warning(f"LLM Gemini HTTP {r.status_code}: {r.text[:180]}")
             except Exception as e:
                 log.warning(f"Gemini: {e}")
         # Ollama
@@ -8021,7 +8025,7 @@ def _audit_one(path: str) -> dict:
 # Séries do Sistema Gerenciador de Séries Temporais do BCB
 BCB_SERIES = {
     "selic_meta_pct":        (432,   "Meta Selic definida pelo Copom (% a.a.)"),
-    "cdi_pct":               (12,    "CDI diário anualizado (% a.a.)"),
+    "cdi_daily_pct":         (12,    "CDI taxa DIÁRIA (% ao dia) — série 12 do SGS"),
     "ipca_12m_pct":          (13522, "IPCA acumulado em 12 meses (%)"),
     "igpm_month_pct":        (189,   "IGP-M no mês (%)"),
     "usd_brl_ptax":          (1,     "Dólar PTAX venda (BRL)"),
@@ -8119,6 +8123,20 @@ def _br_macro_handler():
     ipca = (vivos.get("ipca_12m_pct") or {}).get("value")
     juro_real = (round(((1 + selic / 100) / (1 + ipca / 100) - 1) * 100, 2)
                  if (selic is not None and ipca is not None) else None)
+    # v38: a série 12 é DIÁRIA. Anualizar por 252 dias úteis é o padrão do
+    # mercado brasileiro — e o resultado deve ficar próximo da Selic, o que
+    # serve de checagem de sanidade do próprio dado.
+    cdi_d = (vivos.get("cdi_daily_pct") or {}).get("value")
+    if cdi_d is not None:
+        try:
+            cdi_a = round(((1 + cdi_d / 100) ** 252 - 1) * 100, 2)
+            m["cdi_annualized_pct"] = {
+                "value": cdi_a, "ok": True, "source": "computed",
+                "description": "CDI anualizado (252 dias úteis, padrão do mercado)",
+                "formula": "((1+CDI_dia)^252-1)*100", "from_daily": cdi_d}
+            vivos["cdi_annualized_pct"] = m["cdi_annualized_pct"]
+        except Exception:
+            pass
     leitura = None
     if juro_real is not None:
         if juro_real >= 8:
@@ -8224,7 +8242,7 @@ def _br_brief_handler():
             "disclaimer": "Research, not financial advice."}
 
 BRASIL_SUITE = {
-    "/br-macro": (_br_macro_handler, 0.03,
+    "/br-macro": (_br_macro_handler, 0.05,
         "Brazil macro in one call, straight from the Central Bank (BCB/SGS): Selic "
         "target, CDI, IPCA 12-month inflation, IGP-M, official USD/BRL PTAX and "
         "EUR/BRL — plus the real interest rate computed from Selic and IPCA, with a "
@@ -8236,7 +8254,7 @@ BRASIL_SUITE = {
         "with daily change, plus the USD equivalent converted at the official BCB "
         "PTAX rate. Brazilian equities are absent from every other x402 catalog.",
         ["Brazil", "Equities", "GlobalMarkets"], {"symbol": "PETR4"}),
-    "/br-brief": (_br_brief_handler, 0.15,
+    "/br-brief": (_br_brief_handler, 0.25,
         "Brazil in global context, written for an international desk: BCB macro, the "
         "real interest rate, Ibovespa, B3 blue chips (PETR4, VALE3, ITUB4) and how "
         "the dollar and commodities are feeding in — closed by an AI strategist "
