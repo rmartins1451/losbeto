@@ -87,7 +87,7 @@ from typing import Any, Optional, Dict, List, Tuple
 # 0. CONFIGURAÇÃO E AUTO-SETUP
 # ============================================================================
 
-VERSION = "39.2.0-COMPASS"
+VERSION = "39.3.0-FRESH"
 BRAND_NAME = "Losbeto"
 BRAND_TAGLINE = "The Global Revenue Engine for Financial AI Agents"
 BRAND_EMOJI = "🧠"
@@ -9476,6 +9476,75 @@ _BCB_CURVE = {
 }
 
 
+# ---------------------------------------------------------------------------
+# v39.3 — GUARDA DE FRESCOR (nasceu de um erro meu, em produção)
+#
+# A v39.2 publicou /br-agro usando as séries BCB 1464-1467. Elas EXISTEM, a API
+# responde 200 e devolve números plausíveis — mas foram DESCONTINUADAS: o
+# último dado é de 01/12/2022. O endpoint vendeu preço de soja de quatro anos
+# atrás como cotação corrente, por $0.06, e houve liquidação real.
+#
+# É o mesmo erro do /earnings-whisper que esta base já tinha: dado que não é o
+# que diz ser. A diferença é que aqui não havia nem disclaimer — a resposta
+# trazia "date" no meio de cada série e mais nada gritava.
+#
+# Lição generalizada: uma fonte que responde 200 não está viva. Toda série
+# datada passa por aqui, e o que estiver velho demais para o seu tipo NÃO É
+# VENDIDO. Prefira não faturar a faturar mentira.
+# ---------------------------------------------------------------------------
+
+# Idade máxima aceitável por tipo de série, em dias.
+MAX_AGE_DAYS = {
+    "daily":     10,     # CDI, PTAX — publicação diária útil
+    "commodity": 21,     # preço agrícola precisa ser recente para valer algo
+    "monthly":   75,     # IPCA, IGP-M saem com defasagem de ~1 mês
+    "policy":    400,    # Selic/TJLP mudam raramente; datas futuras são normais
+}
+
+
+def _parse_bcb_date(d: str):
+    """BCB usa dd/mm/aaaa."""
+    try:
+        p = str(d).split("/")
+        return datetime(int(p[2]), int(p[1]), int(p[0]), tzinfo=timezone.utc)
+    except Exception:
+        return None
+
+
+def _series_age_days(d: str):
+    dt = _parse_bcb_date(d)
+    if not dt:
+        return None
+    return (datetime.now(timezone.utc) - dt).days
+
+
+def _check_freshness(series: dict, kind: str) -> tuple:
+    """Devolve (frescas, obsoletas). Obsoleta = velha demais para o tipo."""
+    limite = MAX_AGE_DAYS.get(kind, 30)
+    frescas, obsoletas = {}, {}
+    for nome, v in series.items():
+        if not v.get("ok"):
+            continue
+        idade = _series_age_days(v.get("date", ""))
+        v = {**v, "age_days": idade}
+        # Idade negativa = data futura (Selic da próxima reunião, TJLP do
+        # próximo trimestre). Legítimo para séries de política, suspeito no resto.
+        if idade is None:
+            obsoletas[nome] = {**v, "reason": "unparseable date"}
+        elif idade < 0:
+            if kind == "policy":
+                frescas[nome] = {**v, "forward_dated": True,
+                                 "note": "Effective from a future date — normal "
+                                         "for scheduled policy rates."}
+            else:
+                obsoletas[nome] = {**v, "reason": "date in the future"}
+        elif idade > limite:
+            obsoletas[nome] = {**v, "reason": f"{idade} days old, limit is {limite}"}
+        else:
+            frescas[nome] = v
+    return frescas, obsoletas
+
+
 def _bcb_parallel(series: dict) -> dict:
     """Busca várias séries do BCB em paralelo, como /br-macro já faz."""
     out, lock = {}, threading.Lock()
@@ -9503,13 +9572,24 @@ def _br_agro_handler():
     """Preços agrícolas brasileiros com paridade em dólar."""
     ts = int(time.time())
     dados = _bcb_parallel(_BCB_AGRO)
-    vivos = {k: v for k, v in dados.items() if v.get("ok")}
+    vivos, obsoletas = _check_freshness(dados, "commodity")
     if len(vivos) < 2:
+        # v39.3: a v39.2 vendia estas séries sem olhar a data. Todas as quatro
+        # estão paradas em 01/12/2022 — descontinuadas pelo BCB. A API responde
+        # 200 alegremente; só a data denuncia. Não vendemos mais.
         return ({"status": "unavailable", "product": "Brazil Agricultural Prices",
-                 "error": "BCB agricultural series unavailable right now. "
-                          "No charge.",
-                 "series": dados, "ts": ts,
-                 "provider": "Losbeto/Brasil", "version": VERSION}, 503)
+                 "charged": False,
+                 "error": "The BCB agricultural series this product relied on "
+                          "have been discontinued and no longer publish current "
+                          "prices. This endpoint refuses to serve stale data as "
+                          "if it were live, and is not being sold until a "
+                          "current source (CEPEA/ESALQ or CONAB) is wired in.",
+                 "stale_series": {k: {"last_published": v.get("date"),
+                                      "age_days": v.get("age_days"),
+                                      "bcb_series": v.get("bcb_series")}
+                                  for k, v in obsoletas.items()},
+                 "freshness_limit_days": MAX_AGE_DAYS["commodity"],
+                 "ts": ts, "provider": "Losbeto/Brasil", "version": VERSION}, 503)
 
     # PTAX: sem ela o número não serve para quem opera fora do Brasil.
     ptax = _bcb_last(1, 8)
@@ -9565,7 +9645,9 @@ def _br_curve_handler():
     """Estrutura de juros brasileira: nível, real e o que ela implica."""
     ts = int(time.time())
     dados = _bcb_parallel(_BCB_CURVE)
-    vivos = {k: v for k, v in dados.items() if v.get("ok")}
+    # Selic e TJLP têm data de VIGÊNCIA futura por natureza (a meta definida
+    # pelo Copom vale a partir da próxima reunião). Por isso "policy".
+    vivos, obsoletas = _check_freshness(dados, "policy")
     if len(vivos) < 2:
         return ({"status": "unavailable", "product": "Brazil Rate Structure",
                  "error": "BCB rate series unavailable right now. No charge.",
@@ -9601,9 +9683,12 @@ def _br_curve_handler():
 
     return {"product": "Brazil Rate Structure",
             "rates": {k: {"value": v["value"], "date": v["date"],
+                          "age_days": v.get("age_days"),
+                          "forward_dated": v.get("forward_dated", False),
                           "bcb_series": v["bcb_series"],
                           "description": v["description"]}
                       for k, v in vivos.items()},
+            "excluded_stale": {k: v.get("reason") for k, v in obsoletas.items()} or None,
             "derived": derivado,
             "why_it_matters": ("The Brazilian real rate is one of the largest "
                               "carry signals in emerging markets. Every "
