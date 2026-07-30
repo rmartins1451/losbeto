@@ -87,7 +87,7 @@ from typing import Any, Optional, Dict, List, Tuple
 # 0. CONFIGURAÇÃO E AUTO-SETUP
 # ============================================================================
 
-VERSION = "38.0.0-BRASIL"
+VERSION = "39.1.0-COMPASS"
 BRAND_NAME = "Losbeto"
 BRAND_TAGLINE = "The Global Revenue Engine for Financial AI Agents"
 BRAND_EMOJI = "🧠"
@@ -2127,11 +2127,11 @@ class Brain:
     def fear_greed():
         d = Market.fear_greed()
         v = d.get("value", 50)
-        interp = ("Medo extremo - possível oportunidade de compra" if v < 25 else
-                  "Medo - cautela aumentada"                          if v < 45 else
-                  "Neutro - mercado equilibrado"                       if v < 55 else
-                  "Ganância - cuidado com correções"                   if v < 75 else
-                  "Ganância extrema - risco alto de top local")
+        interp = ("Extreme fear \u2014 historically a contrarian buy zone" if v < 25 else
+                  "Fear — elevated caution; contrarian buy zone historically"                          if v < 45 else
+                  "Neutral — balanced market, no strong contrarian edge"                       if v < 55 else
+                  "Greed \u2014 correction risk rising"                   if v < 75 else
+                  "Extreme greed \u2014 elevated risk of a local top")
         return {"value": v, "classification": d.get("classification"),
                 "interpretation": interp, "version": VERSION}
 
@@ -3032,15 +3032,73 @@ class Brain:
 
     @staticmethod
     def earnings_whisper():
+        """v39.1 — DADOS FICTÍCIOS REMOVIDOS.
+
+        A v39 devolvia eps_estimate=1.45, whisper_eps=1.52 e
+        next_earnings="2026-07-28" — números INVENTADOS, fixos, iguais para
+        qualquer símbolo, e com a data no passado. Iam para dentro de uma
+        resposta paga de $0.08 e também para dentro do /equity-dossier ($0.20).
+        O campo status="illustrative" não protege ninguém: um agente que lê
+        eps_estimate e dimensiona posição não inspeciona metadados.
+
+        Vender número inventado é o caminho mais curto para ser removido dos
+        diretórios e queimar a reputação do node de forma irreversível. Agora:
+        com chave de provedor, dado real; sem chave, 503 e NÃO cobra.
+        """
         symbol = request.args.get("symbol", "AAPL").upper()
         ts = int(time.time())
-        return {"symbol": symbol, "status": "illustrative",
-                "note": "Illustrative earnings estimates — not live data. "
-                        "A production Alpha Vantage/Finnhub key is required for real figures. "
-                        "Priced accordingly ($0.08).",
-                "next_earnings": "2026-07-28", "eps_estimate": 1.45,
-                "revenue_estimate_b": 92.5, "whisper_eps": 1.52, "surprise_factor": "+4.8%",
-                "ts": ts, "provider": "Losbeto/Earnings", "version": VERSION}
+
+        if FINNHUB_KEY:
+            try:
+                r = requests.get("https://finnhub.io/api/v1/stock/earnings",
+                                 params={"symbol": symbol, "token": FINNHUB_KEY},
+                                 timeout=10)
+                if r.ok and isinstance(r.json(), list) and r.json():
+                    rows = r.json()[:4]
+                    return {"symbol": symbol, "status": "live",
+                            "source": "Finnhub",
+                            "recent_quarters": [
+                                {"period": x.get("period"),
+                                 "eps_actual": x.get("actual"),
+                                 "eps_estimate": x.get("estimate"),
+                                 "surprise_pct": x.get("surprisePercent")}
+                                for x in rows],
+                            "ts": ts, "provider": "Losbeto/Earnings",
+                            "version": VERSION}
+                log.warning(f"earnings Finnhub HTTP {r.status_code}")
+            except Exception as e:
+                log.warning(f"earnings_whisper: {e}")
+
+        if ALPHAVANTAGE_KEY:
+            try:
+                r = requests.get("https://www.alphavantage.co/query",
+                                 params={"function": "EARNINGS", "symbol": symbol,
+                                         "apikey": ALPHAVANTAGE_KEY}, timeout=10)
+                j = r.json() if r.ok else {}
+                q = (j.get("quarterlyEarnings") or [])[:4]
+                if q:
+                    return {"symbol": symbol, "status": "live",
+                            "source": "Alpha Vantage",
+                            "recent_quarters": [
+                                {"period": x.get("fiscalDateEnding"),
+                                 "eps_actual": x.get("reportedEPS"),
+                                 "eps_estimate": x.get("estimatedEPS"),
+                                 "surprise_pct": x.get("surprisePercentage")}
+                                for x in q],
+                            "ts": ts, "provider": "Losbeto/Earnings",
+                            "version": VERSION}
+            except Exception as e:
+                log.warning(f"earnings_whisper AV: {e}")
+
+        # Sem provedor real: recusa a venda em vez de inventar.
+        return ({"status": "unavailable", "charged": False,
+                 "error": "Earnings data requires a live provider (Finnhub or "
+                          "Alpha Vantage) and none is configured on this node. "
+                          "This endpoint does not serve estimated or placeholder "
+                          "figures.",
+                 "symbol": symbol,
+                 "retry_after_seconds": 3600,
+                 "ts": ts, "provider": "Losbeto/Earnings", "version": VERSION}, 503)
 
     @staticmethod
     def forex_arbitrage():
@@ -3085,7 +3143,7 @@ class Brain:
                 "ai_status": "ok" if report else "unavailable",
                 "fear_greed": fg, "regime": regime, "forex_sample": forex,
                 "ts": ts, "provider": "Losbeto/GlobalMacro", "version": VERSION,
-                "disclaimer": "Análise heurística + IA. Não é aconselhamento financeiro."}
+                "disclaimer": "Heuristic analysis plus AI synthesis. Not financial advice."}
 
 
     # --- Flagship bundles ---
@@ -3278,7 +3336,7 @@ class Brain:
                 "checks": checks,
                 "pair": pair_info,
                 "other_fresh_launches": [c.get("tokenAddress") for c in candidates[1:6]],
-                "methodology": "on-chain (Helius) + DEX (DexScreener) + LLM synthesis; heurístico, não é aconselhamento financeiro",
+                "methodology": "On-chain checks (Helius) + DEX liquidity (DexScreener) + LLM synthesis. Heuristic, not financial advice.",
                 "ts": ts, "version": VERSION}
 
     @staticmethod
@@ -3343,7 +3401,7 @@ class Brain:
                 "verdict": verdict, "tally": tally,
                 "chairman_brief": chairman,
                 "agents": results,
-                "methodology": "5 agentes especializados com dados reais + votos heurísticos + síntese LLM; não é aconselhamento financeiro",
+                "methodology": "Five specialised agents over live data, heuristic votes plus an LLM chairman synthesis. Not financial advice.",
                 "ts": ts, "version": VERSION}
 
     @staticmethod
@@ -3929,6 +3987,22 @@ def _build_402(endpoint: str):
             # créditos, docs) permanecem apenas no CORPO — não são necessários
             # para executar o pagamento e custavam ~2 KB de cabeçalho.
         }
+    # v39.1: o registro no x402scan avisou "Paid endpoint is missing an input
+    # schema" em todos os endpoints com parâmetro. O schema alimenta a busca
+    # semântica dos diretórios e diz ao agente COMO chamar sem tentativa e erro.
+    _hints = ENDPOINT_PARAM_HINTS.get(endpoint, {})
+    _props = {k: {"type": "string",
+                  "description": _PARAM_DESC.get(k, f"{k} parameter"),
+                  "example": v}
+              for k, v in _hints.items() if k != "format"}
+    payload["inputSchema"] = {
+        "type": "object",
+        "properties": _props,
+        "required": [],
+        "additionalProperties": False,
+    }
+    payload["outputSchema"] = {"type": "object", "mimeType": "application/json"}
+
     payload_hdr = _slim(payload)
     b64 = base64.b64encode(
         json.dumps(payload_hdr, separators=(",", ":")).encode()
@@ -4241,6 +4315,45 @@ def _preview_paywall_body(path: str) -> dict:
             "talk_to_us": _building_block(),
             "ts": int(time.time()), "version": VERSION}
 
+# ---------------------------------------------------------------------------
+# v39.1 — UMA AMOSTRA DEFEITUOSA NUNCA VIRA VITRINE
+#
+# Observado em produção: o preview de /equity-dossier ficou 4.600s servindo
+#   "ai_verdict": "AI synthesis unavailable — raw components above."
+# e o de /global-morning-brief servia {"status":"warming"}. São os DOIS
+# produtos mais caros do catálogo, e a amostra grátis é todo o funil de
+# avaliação. O warmer da v39 preservava a amostra antiga quando a IA falhava —
+# prudente na intenção, desastroso no efeito: congelou um cartão de visitas
+# quebrado. Agora o cache rejeita explicitamente o que não presta.
+# ---------------------------------------------------------------------------
+_BAD_SAMPLE_MARKERS = (
+    "unavailable", "synthesis unavailable", "warming", "llm offline",
+    "not live data", "illustrative", "error", "no data",
+)
+
+
+def _sample_is_good(data) -> bool:
+    """False se a amostra denuncia um produto quebrado."""
+    if not isinstance(data, dict) or not data:
+        return False
+    if data.get("status") in ("warming", "unavailable", "error"):
+        return False
+    if data.get("error"):
+        return False
+    # Campos de síntese vazios ou com texto de falha invalidam a amostra.
+    for k, v in data.items():
+        if not isinstance(v, str):
+            continue
+        kl = k.lower()
+        if any(t in kl for t in ("ai_", "synthesis", "verdict", "narrative",
+                                 "reading", "brief", "report", "analysis",
+                                 "commentary", "sintese")):
+            low = v.strip().lower()
+            if not low or any(mk in low for mk in _BAD_SAMPLE_MARKERS):
+                return False
+    return True
+
+
 def _preview_min_age(path: str) -> int:
     return PREVIEW_MIN_AGE.get(path, DEFAULT_PREVIEW_MIN_AGE)
 
@@ -4383,8 +4496,23 @@ def _unavailable_body(reason: str, retry_after: int = 300):
              "ts": int(time.time())}, 503)
 
 
+# v39.1: endpoints que dependem de um provedor externo pago. Sem chave, o
+# produto não existe — e a v39 vendia números inventados no lugar.
+PROVIDER_REQUIRED_ENDPOINTS = {
+    "/earnings-whisper": lambda: bool(FINNHUB_KEY or ALPHAVANTAGE_KEY),
+}
+
+
 def _preflight_unavailable(path: str):
     """Roda ANTES de qualquer 402 ou verificação de pagamento."""
+    _need = PROVIDER_REQUIRED_ENDPOINTS.get(path)
+    if _need and not _need():
+        log.warning(f"⛔ pré-gate: {path} recusado sem cobrança — "
+                    f"sem provedor de dados configurado")
+        return _unavailable_body(
+            "This product requires a live third-party data provider that is not "
+            "configured on this node. It is not being sold, and this endpoint "
+            "does not serve estimated or placeholder figures.", 3600)
     if path in AI_REQUIRED_ENDPOINTS and not llm_healthy():
         log.warning(f"⛔ pré-gate: {path} recusado sem cobrança — LLM indisponível")
         return _unavailable_body(
@@ -4652,7 +4780,8 @@ def paid_endpoint(path):
                         # a idade mínima — é o envelhecimento que dá valor ao pago.
                         _cur = _PREVIEW_CACHE.get(path) or _preview_db_get(path)
                         _age = (time.time() - _cur["ts"]) if _cur else 1e9
-                        if _age >= _preview_min_age(path):
+                        # v39.1: só promove a amostra se ela for apresentável.
+                        if _age >= _preview_min_age(path) and _sample_is_good(prev_data):
                             _PREVIEW_CACHE[path] = {"ts": time.time(), "data": prev_data}
                             _preview_db_put(path, prev_data)
                 except Exception: pass
@@ -4952,7 +5081,15 @@ class Premium:
         need, resp = _premium_needs(quote)
         if need:
             return resp   # 503, sem cobrança — não vende dossiê de uma ação a $0
+        # v39.1: earnings_whisper agora devolve (dict, 503) quando não há
+        # provedor real. O dossiê segue sendo vendável (cotação + macro + AI
+        # verdict têm valor), mas declara honestamente o que faltou em vez de
+        # embutir números inventados como fazia a v39.
         earn = _safe_call(Brain.earnings_whisper)
+        if isinstance(earn, tuple):
+            earn = {"status": "unavailable",
+                    "note": "No live earnings provider configured on this node; "
+                            "earnings are omitted rather than estimated."}
         fg = _safe_call(Market.fear_greed)
         rg = _safe_call(Brain.regime)
         cal = _safe_call(Brain.macro_calendar).get("events", [])[:3]
@@ -5713,9 +5850,9 @@ def _win_rate_signed():
     canonical = json.dumps(payload, separators=(",", ":"), sort_keys=True)
     sig = base64.b64encode(WALLET.sign(canonical.encode())).decode()
     return jsonify({
-        "service":   "Losbeto — Signed Win Rate (heurístico)",
+        "service":   "Losbeto — Signed Win Rate (heuristic)",
         "honesty_note": "A assinatura Ed25519 garante a INTEGRIDADE do dado, "
-                        "não sua metodologia: o win_rate é um sinal heurístico "
+                        "not the methodology: win_rate is a heuristic signal, "
                         "baseado em regras, NÃO é P&L auditado.",
         "version":   VERSION,
         "data":      payload,
@@ -6116,11 +6253,11 @@ def sample_free():
     try:
         fg = Market.fear_greed()
         fng_val = fg.get("value", 50)
-        fng_interp = ("Medo extremo - possível oportunidade de compra" if fng_val < 25 else
-                      "Medo - cautela aumentada"                          if fng_val < 45 else
-                      "Neutro - mercado equilibrado"                       if fng_val < 55 else
-                      "Ganância - cuidado com correções"                   if fng_val < 75 else
-                      "Ganância extrema - risco alto de top local")
+        fng_interp = ("Extreme fear \u2014 historically a contrarian buy zone" if fng_val < 25 else
+                      "Fear — elevated caution; contrarian buy zone historically"                          if fng_val < 45 else
+                      "Neutral — balanced market, no strong contrarian edge"                       if fng_val < 55 else
+                      "Greed \u2014 correction risk rising"                   if fng_val < 75 else
+                      "Extreme greed \u2014 elevated risk of a local top")
         all_sigs = Brain.sinais().get("signals", [])
         top_signal = all_sigs[0] if all_sigs else None
         anom = Brain.anomalias()
@@ -7166,6 +7303,8 @@ def manifest_x402():
             "serviceName":       SERVICE_NAME,
             "tags":              _service_tags(path),
             "iconUrl":           f"{base}/favicon.png",
+            "inputSchema":       ch.get("inputSchema"),
+            "outputSchema":      ch.get("outputSchema"),
         }
 
     for p in BASE_PRICES:
@@ -7226,11 +7365,39 @@ def manifest_x402():
 
 MCP_PROTOCOL_VERSION = "2024-11-05"
 
-def _mcp_tools_list() -> list:
+# ---------------------------------------------------------------------------
+# v39.1 — MCP REDESENHADO: WRAPPER PATTERN (73 tools -> 5)
+#
+# ACHADO QUE MOTIVOU A MUDANÇA
+# A v39 expunha UMA TOOL POR ENDPOINT: 73 definições. Cada definição de tool
+# custa ~100-500 tokens de contexto e fica no prompt A CADA TURNO. Nossos 73
+# consumiam ~20-25 mil tokens antes do agente ler a primeira mensagem do
+# usuário — mais de 10% de uma janela de 200k, gasta só em metadados.
+#
+# Pior que o custo: a PRECISÃO DE SELEÇÃO cai conforme o conjunto cresce. Com
+# 73 nomes parecidos (sentiment, sentiment_consensus, fear_greed, regime,
+# alpha_signal...), o planejador erra a escolha ou desiste. A orientação
+# consolidada em 2026 é 5-15 tools por servidor; o líder da categoria expõe 4
+# para um catálogo de 139 endpoints.
+#
+# SOLUÇÃO — Wrapper Pattern (o mesmo princípio do Tool Search da Anthropic):
+# o servidor esconde o catálogo e expõe um punhado de tools de descoberta. O
+# agente PERGUNTA o que existe, recebe só o que interessa, e então busca.
+#
+# Custo de contexto: ~25.000 -> ~1.500 tokens. Redução de ~94%.
+#
+# MCP_LEGACY_TOOLS=1 volta ao modo 73-tools se algum cliente antigo quebrar.
+# ---------------------------------------------------------------------------
+
+MCP_LEGACY_TOOLS = os.environ.get("MCP_LEGACY_TOOLS", "").strip() in ("1", "true")
+
+
+def _mcp_legacy_tools_list() -> list:
+    """Modo antigo: uma tool por endpoint. Mantido atrás de env var."""
     tools = []
     for p in BASE_PRICES:
         hints = ENDPOINT_PARAM_HINTS.get(p, {})
-        props, req = {}, []
+        props = {}
         for k, example in hints.items():
             if k == "format":
                 continue
@@ -7243,36 +7410,468 @@ def _mcp_tools_list() -> list:
             "description": (f"{ENDPOINT_DESC.get(p, p)} "
                             f"[Free delayed sample via MCP; real-time costs "
                             f"${price:.4f} USDC via x402 at {_public_base()}{p}]"),
-            "inputSchema": {"type": "object", "properties": props, "required": req},
+            "inputSchema": {"type": "object", "properties": props, "required": []},
         })
     return tools
 
-def _mcp_call_tool(name: str, args: dict) -> dict:
-    path = "/" + str(name).replace("_", "-")
+
+# Agrupamento do catálogo por assunto — é o que search_market_data devolve.
+MCP_CATEGORIES = {
+    "brazil": ("Brazil: BCB central-bank macro (Selic, CDI, IPCA, PTAX), B3 "
+               "equities and Ibovespa, and a strategist brief. Not available "
+               "from any other x402 service."),
+    "equities": "US equities: live quotes, AI dossiers, earnings, sector rotation.",
+    "forex": "Foreign exchange: major pairs, crosses, triangular arbitrage.",
+    "commodities": "Gold, silver, WTI, Brent, copper, natural gas.",
+    "macro": "Macro calendar, regime, event playbooks, cross-asset correlation.",
+    "crypto": "Prices, oracle consensus, sentiment, on-chain flow, DEX, rug checks.",
+    "research": "AI-written analysis: briefs, theses, multi-agent council.",
+    "infrastructure": "x402 endpoint auditing, proof-of-data hashes, node trust.",
+}
+
+# Palavras que mapeiam a consulta do agente para endpoints. Deliberadamente
+# amplo: é melhor devolver 8 candidatos com preço do que zero.
+_MCP_SEARCH_INDEX = None
+
+
+def _mcp_build_index():
+    """Índice leve endpoint -> texto pesquisável, montado uma vez."""
+    global _MCP_SEARCH_INDEX
+    if _MCP_SEARCH_INDEX is not None:
+        return _MCP_SEARCH_INDEX
+    idx = {}
+    for p in BASE_PRICES:
+        desc = ENDPOINT_DESC.get(p, "")
+        tags = " ".join(_service_tags(p))
+        idx[p] = f"{p} {desc} {tags}".lower()
+    _MCP_SEARCH_INDEX = idx
+    return idx
+
+
+def _mcp_category_of(path: str) -> str:
+    tags = " ".join(_service_tags(path)).lower() + " " + path.lower()
+    if "brazil" in tags or path.startswith("/br-"):        return "brazil"
+    if "forex" in tags or "fx" in tags:                    return "forex"
+    if "commodit" in tags:                                 return "commodities"
+    if "equit" in tags or "stock" in tags:                 return "equities"
+    if "macro" in tags or "cross-asset" in tags:           return "macro"
+    if any(k in tags for k in ("research", "ai", "premium")): return "research"
+    if any(k in tags for k in ("verification", "trust", "infrastructure")):
+        return "infrastructure"
+    return "crypto"
+
+
+# Termos ruidosos: aparecem em quase toda descrição e não discriminam nada.
+_MCP_STOPWORDS = {
+    "the", "and", "for", "with", "from", "that", "this", "what", "how", "are",
+    "was", "get", "give", "show", "tell", "need", "want", "find", "data",
+    "market", "markets", "price", "prices", "current", "latest", "live",
+    "real", "time", "now", "today", "call", "calls", "usdc", "agent", "agents",
+    "endpoint", "api", "please", "about", "into", "over", "per",
+}
+
+# Sinônimos do domínio: o agente pergunta em linguagem natural, o catálogo usa
+# termos técnicos. Sem esta ponte, "interest rate" não encontra "Selic".
+_MCP_SYNONYMS = {
+    "brazil": ["brazil", "brazilian", "br", "selic", "ipca", "ibovespa", "b3",
+               "bcb", "ptax", "real", "brl", "petr4", "vale3", "itub4"],
+    "inflation": ["inflation", "ipca", "cpi", "igpm", "igp"],
+    "interest": ["interest", "selic", "rate", "yield", "cdi", "fed", "policy"],
+    "stock": ["stock", "stocks", "equity", "equities", "share", "shares", "ticker"],
+    "gold": ["gold", "silver", "commodity", "commodities", "metal"],
+    "oil": ["oil", "wti", "brent", "crude", "energy"],
+    "fx": ["fx", "forex", "currency", "currencies", "pair", "exchange"],
+    "rug": ["rug", "rugpull", "scam", "honeypot", "safety", "risk"],
+    "whale": ["whale", "whales", "large", "holder", "holders", "concentration"],
+    "correlation": ["correlation", "correlated", "diversif", "hedge"],
+    "sentiment": ["sentiment", "fear", "greed", "mood", "bullish", "bearish"],
+    "oracle": ["oracle", "consensus", "median", "pyth", "feed", "feeds"],
+}
+
+
+def _mcp_expand(terms: list) -> set:
+    """Acrescenta sinônimos do domínio aos termos da consulta."""
+    out = set(terms)
+    for t in terms:
+        for _grupo, palavras in _MCP_SYNONYMS.items():
+            if t in palavras:
+                out.update(palavras)
+    return out
+
+
+def _mcp_search(query: str, limit: int = 8) -> list:
+    """Busca por termos com sinônimos de domínio e pontuação normalizada.
+
+    v39.1 — a primeira versão somava ocorrências brutas, e 'interest rate'
+    trazia /win-rate-verified em primeiro lugar (casava em 'rate' dentro do
+    path) à frente de /br-macro, que é a resposta certa. Agora: stopwords
+    fora, sinônimos dentro, e a pontuação é a FRAÇÃO dos termos originais
+    atendidos — casar 2 de 2 vale mais que casar 1 de 5.
+    """
+    idx = _mcp_build_index()
+    brutos = [t for t in re.split(r"[^a-z0-9]+", (query or "").lower())
+              if len(t) > 2 and t not in _MCP_STOPWORDS]
+    if not brutos:
+        return [{"endpoint": p, "description": ENDPOINT_DESC.get(p, ""),
+                 "category": _mcp_category_of(p),
+                 "price_usdc": round(get_dynamic_price(p), 4),
+                 "parameters": {k: v for k, v in
+                                ENDPOINT_PARAM_HINTS.get(p, {}).items()
+                                if k != "format"} or None,
+                 "free_sample": True}
+                for p in FEATURED_ENDPOINTS[:limit] if p in BASE_PRICES]
+
+    expandidos = _mcp_expand(brutos)
+    scored = []
+    for path, blob in idx.items():
+        path_txt = path.lower()
+        atendidos = 0
+        pontos = 0.0
+        for t in brutos:
+            grupo = {t} | {w for _g, ws in _MCP_SYNONYMS.items()
+                           if t in ws for w in ws}
+            if any(w in path_txt for w in grupo):
+                pontos += 3.0; atendidos += 1
+            elif any(w in blob for w in grupo):
+                pontos += 1.0; atendidos += 1
+        if not atendidos:
+            continue
+        # cobertura domina: atender todos os termos vale mais que muitas
+        # ocorrências de um só.
+        cobertura = atendidos / len(brutos)
+        score = cobertura * 10 + pontos
+        # desempate: termo do domínio no path é sinal forte
+        if any(t in path_txt for t in expandidos):
+            score += 2
+        scored.append((score, path))
+
+    scored.sort(key=lambda x: (-x[0], BASE_PRICES.get(x[1], 0)))
+    out = []
+    for _score, path in scored[:limit]:
+        hints = ENDPOINT_PARAM_HINTS.get(path, {})
+        out.append({
+            "endpoint": path,
+            "description": ENDPOINT_DESC.get(path, ""),
+            "category": _mcp_category_of(path),
+            "price_usdc": round(get_dynamic_price(path), 4),
+            "parameters": {k: v for k, v in hints.items() if k != "format"} or None,
+            "free_sample": True,
+        })
+    return out
+
+
+def _mcp_tools_list() -> list:
+    """Cinco tools em vez de setenta e três."""
+    if MCP_LEGACY_TOOLS:
+        return _mcp_legacy_tools_list()
+    base = _public_base()
+    return [
+        {
+            "name": "search_market_data",
+            "description": (
+                "FIRST STEP for any market-data question. Describe what you need in "
+                "plain language and get back the endpoints that cover it, with their "
+                "price and parameters. Covers Brazil (central bank, B3), US equities, "
+                "forex, commodities, macro, crypto and AI research. "
+                "Examples: 'Brazilian interest rate and inflation', 'gold price', "
+                "'is this Solana token a rug pull', 'correlation between bitcoin and "
+                "the S&P', 'what is the Ibovespa doing'."),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string",
+                              "description": "What you are looking for, in plain language."},
+                    "limit": {"type": "integer",
+                              "description": "Max results (default 8).", "default": 8},
+                },
+                "required": ["query"],
+            },
+        },
+        {
+            "name": "get_market_data",
+            "description": (
+                "Fetch data from an endpoint returned by search_market_data. "
+                "Without a subscription this returns a REAL but delayed sample at no "
+                "cost — enough to see the exact response shape and judge the data. "
+                "With an active subscription key it returns live data. "
+                f"Live data is also purchasable per call in USDC over x402 at {base}."),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "endpoint": {"type": "string",
+                                 "description": "Endpoint path, e.g. '/br-macro' or '/oracle-consensus'.",
+                                 "examples": ["/br-macro", "/oracle-consensus", "/commodity-price"]},
+                    "params": {"type": "object",
+                               "description": "Query parameters, e.g. {\"symbol\": \"PETR4\"}."},
+                },
+                "required": ["endpoint"],
+            },
+        },
+        {
+            "name": "market_snapshot",
+            "description": (
+                "One call for a whole area instead of several. 'brazil' returns central-bank "
+                "macro, the real interest rate, Ibovespa and B3 blue chips together; "
+                "'global' returns forex, commodities, equities and macro regime; "
+                "'crypto' returns oracle consensus, sentiment and market regime. "
+                "Use this when the question is broad rather than about one number."),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "scope": {"type": "string", "enum": ["brazil", "global", "crypto"],
+                              "description": "Which area to snapshot."},
+                },
+                "required": ["scope"],
+            },
+        },
+        {
+            "name": "list_categories",
+            "description": (
+                "The catalog at a glance: every category, how many endpoints it holds "
+                "and the cheapest price in it. Use when you want to know what this "
+                "service covers before searching."),
+            "inputSchema": {"type": "object", "properties": {}},
+        },
+        {
+            "name": "account_status",
+            "description": (
+                "Check whether this connection has an active subscription, how much "
+                "credit is left and when it expires. Also returns how to subscribe. "
+                "Call this if a request returned delayed data and you need live."),
+            "inputSchema": {"type": "object", "properties": {}},
+        },
+    ]
+
+
+def _mcp_subscription_key() -> str:
+    """Chave do assinante: Authorization: Bearer <key> ou X-API-Key."""
+    try:
+        auth = request.headers.get("Authorization", "")
+        if auth.lower().startswith("bearer "):
+            return auth[7:].strip()
+        return request.headers.get("X-API-Key", "").strip()
+    except Exception:
+        return ""
+
+
+def _mcp_live_allowed(key: str):
+    """(permitido, info). Assinatura ativa libera dado ao vivo pelo MCP."""
+    if not key:
+        return False, None
+    try:
+        row = LEDGER.api_key_get(key)
+    except Exception:
+        return False, None
+    if not row:
+        return False, None
+    if row.get("expires", 0) < int(time.time()):
+        return False, {"status": "expired", "expires": row.get("expires")}
+    bal = row.get("balance_usd", 0)
+    if bal == -1 or bal > 0:
+        return True, row
+    return False, {"status": "exhausted", "balance_usd": bal}
+
+
+def _mcp_wrap(payload, extra: dict = None) -> dict:
+    body = payload if isinstance(payload, dict) else {"result": payload}
+    if extra:
+        body = {**body, **extra}
+    return {"content": [{"type": "text",
+            "text": json.dumps(body, default=str, ensure_ascii=False)}]}
+
+
+def _mcp_fetch(path: str, params: dict, key: str) -> dict:
+    """Executa um endpoint. Ao vivo se assinante; amostra atrasada se não."""
     handler = ENDPOINT_HANDLERS.get(path)
     if not handler:
-        return {"isError": True, "content": [{"type": "text",
-                "text": f"Unknown tool: {name}"}]}
-    qs = "&".join(f"{k}={v}" for k, v in (args or {}).items() if v is not None)
+        sug = [x["endpoint"] for x in _mcp_search(path.strip("/"), 3)]
+        return {"isError": True, "content": [{"type": "text", "text": json.dumps({
+            "error": "unknown_endpoint", "requested": path,
+            "did_you_mean": sug,
+            "hint": "Call search_market_data first to find the right endpoint.",
+        })}]}
+
+    live, sub = _mcp_live_allowed(key)
+    price = get_dynamic_price(path)
+
+    # Sem assinatura: serve a amostra atrasada do cache (custo zero, dado real).
+    if not live:
+        cached = _PREVIEW_CACHE.get(path) or _preview_db_get(path)
+        if cached and _sample_is_good(cached.get("data")):
+            return _mcp_wrap(cached["data"], {
+                "_data_status": "delayed_sample",
+                "_age_seconds": int(time.time() - cached["ts"]),
+                "_live_price_usdc": round(price, 4),
+                "_how_to_get_live": (
+                    "Subscribe once and pass Authorization: Bearer <key> on this MCP "
+                    f"connection, or pay ${price:.4f} per call over x402 at "
+                    f"{_public_base()}{path}. See account_status."),
+            })
+
+    # Assinante, ou sem amostra disponível: executa de verdade.
+    qs = "&".join(f"{k}={v}" for k, v in (params or {}).items() if v is not None)
     try:
         with app.test_request_context(f"{path}?{qs}"):
             result = handler()
-        if isinstance(result, tuple):        # produto indisponível (503)
-            result = result[0]
-        payload = (_premium_teaser(result)
-                   if path in PREMIUM_TEASER_PATHS and isinstance(result, dict)
-                   else result)
-        note = {"_mcp_note": "Free delayed sample. For real-time data, pay via x402.",
-                "_realtime_endpoint": f"{_public_base()}{path}",
-                "_price_usdc": f"{get_dynamic_price(path):.4f}"}
-        if isinstance(payload, dict):
-            payload = {**payload, **note}
-        return {"content": [{"type": "text",
-                "text": json.dumps(payload, default=str, ensure_ascii=False)}]}
+    except LLMUnavailable:
+        return _mcp_wrap({
+            "status": "unavailable",
+            "error": "The AI synthesis behind this product is temporarily down. "
+                     "Nothing was charged.",
+            "retry_after_seconds": 300,
+        })
     except Exception as e:
-        log.debug(f"mcp call {name}: {e}")
+        log.debug(f"mcp fetch {path}: {e}")
         return {"isError": True, "content": [{"type": "text",
-                "text": f"Tool execution failed: {str(e)[:120]}"}]}
+                "text": f"Execution failed: {str(e)[:140]}"}]}
+
+    if isinstance(result, tuple):
+        result = result[0]
+
+    if live:
+        try:
+            if isinstance(sub, dict) and sub.get("balance_usd") != -1:
+                LEDGER.api_key_use(key, price)
+        except Exception as e:
+            log.debug(f"mcp meter {path}: {e}")
+        return _mcp_wrap(result, {"_data_status": "live", "_billed_usdc": round(price, 4)})
+
+    payload = (_premium_teaser(result)
+               if path in PREMIUM_TEASER_PATHS and isinstance(result, dict) else result)
+    return _mcp_wrap(payload, {
+        "_data_status": "delayed_sample",
+        "_live_price_usdc": round(price, 4),
+        "_how_to_get_live": f"Pay over x402 at {_public_base()}{path}, or subscribe.",
+    })
+
+
+def _mcp_snapshot(scope: str, key: str) -> dict:
+    groups = {
+        "brazil":  ["/br-macro", "/br-equity"],
+        "global":  ["/forex-rate", "/commodity-price", "/stock-quote", "/regime"],
+        "crypto":  ["/oracle-consensus", "/sentiment-consensus", "/regime"],
+    }
+    paths = groups.get(str(scope).lower())
+    if not paths:
+        return _mcp_wrap({"error": "unknown_scope",
+                          "valid": list(groups)})
+    out, live_any = {}, False
+    for p in paths:
+        r = _mcp_fetch(p, {}, key)
+        try:
+            data = json.loads(r["content"][0]["text"])
+            live_any = live_any or data.get("_data_status") == "live"
+            out[p] = data
+        except Exception:
+            out[p] = {"error": "unavailable"}
+    return _mcp_wrap({
+        "scope": scope, "components": out,
+        "_data_status": "live" if live_any else "delayed_sample",
+        "_note": ("Composite view. For the AI-written strategist synthesis, "
+                  "fetch /br-brief (Brazil) or /global-morning-brief (global)."),
+    })
+
+
+def _mcp_categories() -> dict:
+    out = {}
+    for p in BASE_PRICES:
+        c = _mcp_category_of(p)
+        e = out.setdefault(c, {"description": MCP_CATEGORIES.get(c, ""),
+                               "endpoints": 0, "cheapest_usdc": 999.0})
+        e["endpoints"] += 1
+        e["cheapest_usdc"] = min(e["cheapest_usdc"], round(get_dynamic_price(p), 4))
+    return _mcp_wrap({
+        "categories": out,
+        "total_endpoints": len(BASE_PRICES),
+        "next_step": "Call search_market_data with what you need.",
+    })
+
+
+def _mcp_account(key: str) -> dict:
+    base = _public_base()
+    plans = {ep: {"price_usdc": BASE_PRICES.get(ep),
+                  "grants": ("unlimited calls" if p["balance_usd"] == -1
+                             else f"${p['balance_usd']:.2f} of call credit"),
+                  "duration_days": p["ttl_days"],
+                  "buy": f"{base}{ep}"}
+             for ep, p in CREDIT_PLANS.items() if ep in BASE_PRICES}
+    if not key:
+        return _mcp_wrap({
+            "subscribed": False,
+            "reason": "No key presented on this connection.",
+            "how_to_subscribe": {
+                "step_1": f"Pay one of the plans over x402, e.g. {base}/subscribe-pro",
+                "step_2": "The response contains your key.",
+                "step_3": "Reconnect this MCP server with "
+                          "Authorization: Bearer <key> to get live data.",
+            },
+            "plans": plans,
+            "note": "Without a subscription every tool still returns real delayed "
+                    "samples at no cost.",
+        })
+    live, sub = _mcp_live_allowed(key)
+    if not live:
+        return _mcp_wrap({"subscribed": False, "detail": sub or "key not recognised",
+                          "plans": plans})
+    return _mcp_wrap({
+        "subscribed": True,
+        "plan": sub.get("plan"),
+        "balance_usd": ("unlimited" if sub.get("balance_usd") == -1
+                        else sub.get("balance_usd")),
+        "expires_utc": datetime.fromtimestamp(sub.get("expires", 0),
+                                              timezone.utc).isoformat(),
+        "calls_used": sub.get("calls_used", 0),
+        "note": "Live data is enabled on this connection.",
+    })
+
+
+def _mcp_call_tool(name: str, args: dict) -> dict:
+    args = args or {}
+    key = _mcp_subscription_key()
+
+    if MCP_LEGACY_TOOLS and name not in (
+            "search_market_data", "get_market_data", "market_snapshot",
+            "list_categories", "account_status"):
+        return _mcp_fetch("/" + str(name).replace("_", "-"), args, key)
+
+    if name == "search_market_data":
+        results = _mcp_search(args.get("query", ""), int(args.get("limit", 8) or 8))
+        return _mcp_wrap({
+            "query": args.get("query", ""),
+            "results": results,
+            "next_step": "Call get_market_data with one of the endpoint values above.",
+            "note": "Every endpoint returns a real delayed sample at no cost.",
+        } if results else {
+            "query": args.get("query", ""), "results": [],
+            "suggestion": "Nothing matched. Call list_categories to see the coverage, "
+                          "or tell the operator what is missing — endpoints are added "
+                          "on request.",
+        })
+
+    if name == "get_market_data":
+        ep = str(args.get("endpoint", "")).strip()
+        if ep and not ep.startswith("/"):
+            ep = "/" + ep
+        if not ep:
+            return _mcp_wrap({"error": "endpoint is required",
+                              "hint": "Call search_market_data first."})
+        return _mcp_fetch(ep, args.get("params") or {}, key)
+
+    if name == "market_snapshot":
+        return _mcp_snapshot(args.get("scope", ""), key)
+
+    if name == "list_categories":
+        return _mcp_categories()
+
+    if name == "account_status":
+        return _mcp_account(key)
+
+    return {"isError": True, "content": [{"type": "text", "text": json.dumps({
+        "error": "unknown_tool", "requested": name,
+        "available": ["search_market_data", "get_market_data", "market_snapshot",
+                      "list_categories", "account_status"],
+    })}]}
+
 
 def _jsonrpc_result(rid, result):
     return {"jsonrpc": "2.0", "id": rid, "result": result}
@@ -7290,9 +7889,17 @@ def _mcp_handle(msg: dict):
             "protocolVersion": MCP_PROTOCOL_VERSION,
             "capabilities": {"tools": {"listChanged": False}},
             "serverInfo": {"name": "losbeto", "version": VERSION},
-            "instructions": ("Cross-asset market intelligence over x402. Tools return "
-                             "free delayed samples; pay per call in USDC for real-time. "
-                             "See /try and /health/providers.")})
+            "instructions": (
+                "Cross-asset market data: Brazil (central bank, B3), US equities, "
+                "forex, commodities, macro and crypto.\n\n"
+                "Workflow: call search_market_data with the question in plain "
+                "language, then get_market_data with the endpoint it returns. "
+                "For broad questions use market_snapshot instead.\n\n"
+                "Without a subscription every tool returns a REAL but delayed "
+                "sample at no cost — enough to judge the data before paying. "
+                "Live data needs either a subscription key "
+                "(Authorization: Bearer <key>) or a per-call x402 payment. "
+                "Call account_status to see which applies.")})
     if method in ("notifications/initialized", "notifications/cancelled"):
         return None
     if method == "ping":
@@ -9632,13 +10239,174 @@ def launch_risk_preview():
             "price_usdc": f"{get_dynamic_price('/launch-risk'):.2f}",
             "how": "GET com pagamento x402 (o 402 traz as instruções) — ou ?token=<mint> para alvo específico",
         },
-        "honesty": "preview e versão completa usam a mesma metodologia declarada — heurística + IA, não é aconselhamento financeiro",
+        "honesty": "The preview and the paid version use the same declared methodology \u2014 heuristics plus AI. Not financial advice.",
         "ts": ts, "version": VERSION,
     })
 
 @app.route("/health")
 def health():
     return jsonify({"ok": True, "version": VERSION, "ts": int(time.time())})
+
+
+@app.route("/pricing")
+def pricing_page():
+    """v39.1 — a página que faltava.
+
+    O catálogo por chamada é a porta de entrada; a assinatura é onde está a
+    receita recorrente. O x402 resolve pagamento por request e explicitamente
+    NÃO resolve assinatura, cobrança recorrente ou gestão de cliente — isso
+    fica com quem opera o node. Aqui: as três faixas, o que cada uma libera,
+    e o comando exato para conectar o MCP com a chave.
+    """
+    base = _public_base()
+    planos = []
+    for ep, cfg in CREDIT_PLANS.items():
+        if ep not in BASE_PRICES:
+            continue
+        planos.append({
+            "plan": cfg["plan"],
+            "endpoint": ep,
+            "price_usdc": round(BASE_PRICES[ep], 2),
+            "duration_days": cfg["ttl_days"],
+            "grants": ("unlimited calls" if cfg["balance_usd"] == -1
+                       else f"${cfg['balance_usd']:.2f} of call credit"),
+            "includes_mcp": True,
+            "buy": f"{base}{ep}",
+        })
+    planos.sort(key=lambda x: x["price_usdc"])
+
+    pagos = [p for p in BASE_PRICES if p not in CREDIT_PLANS]
+    corpo = {
+        "node": SERVICE_NAME,
+        "version": VERSION,
+        "per_call": {
+            "endpoints": len(pagos),
+            "from_usdc": round(min(get_dynamic_price(p) for p in pagos), 4),
+            "to_usdc": round(max(get_dynamic_price(p) for p in pagos), 4),
+            "how": "Call any endpoint, settle the 402 challenge in USDC on Base "
+                   "or Solana, retry. No signup, no API key.",
+            "catalog": f"{base}/get-pricing",
+        },
+        "free": {
+            "every_endpoint": "Append ?preview=1 for a real delayed sample.",
+            "six_at_once": f"{base}/try",
+            "mcp": "All MCP tools return delayed samples with no subscription.",
+        },
+        "subscriptions": planos,
+        "what_a_subscription_adds": [
+            "Live data through MCP — connect once, no payment per tool call.",
+            "No settlement latency: the key is checked in about a millisecond.",
+            "Priority routing over free traffic.",
+        ],
+        "connect_mcp": {
+            "claude_code": ("claude mcp add --transport http losbeto "
+                            f"{base}/mcp --header \"Authorization: Bearer <key>\""),
+            "any_client": {"mcpServers": {"losbeto": {
+                "url": f"{base}/mcp",
+                "headers": {"Authorization": "Bearer <key>"}}}},
+            "without_key": f"{{\"mcpServers\":{{\"losbeto\":{{\"url\":\"{base}/mcp\"}}}}}}",
+        },
+        "check_your_key": f"{base}/subscribe-status  (header X-API-Key)",
+        "ts": int(time.time()),
+    }
+
+    ua = request.headers.get("User-Agent", "")
+    if ("application/json" in request.headers.get("Accept", "").lower()
+            or _is_bot(ua) or request.args.get("format") == "json"):
+        return jsonify(corpo)
+
+    linhas = "".join(
+        f"<tr><td><b>{p['plan']}</b></td><td>${p['price_usdc']:.2f}</td>"
+        f"<td>{p['duration_days']}d</td><td>{p['grants']}</td>"
+        f"<td><code>{p['endpoint']}</code></td></tr>"
+        for p in planos)
+    html = f"""<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Pricing — {SERVICE_NAME}</title>
+<meta name="agent:pricing" content="{base}/.well-known/x402.json">
+<style>
+body{{background:#0a0b0d;color:#e8eaed;font:15px/1.6 -apple-system,Segoe UI,Inter,sans-serif;
+     max-width:820px;margin:0 auto;padding:40px 24px}}
+h1{{font-size:32px;letter-spacing:-.02em;margin:0 0 8px}}
+h2{{font-size:19px;margin:38px 0 12px;color:#4ade80}}
+p.l{{color:#8b9199;margin:0 0 28px}}
+table{{width:100%;border-collapse:collapse;margin:12px 0}}
+td,th{{padding:9px 10px;border-bottom:1px solid #1e2126;text-align:left;font-size:14px}}
+code,pre{{background:#111318;border:1px solid #1e2126;border-radius:6px;
+        font:13px ui-monospace,Menlo,monospace}}
+code{{padding:2px 6px}} pre{{padding:14px;overflow-x:auto;color:#9ecbff}}
+a{{color:#60a5fa}} .m{{color:#8b9199;font-size:13px}}
+</style></head><body>
+<h1>Pricing</h1>
+<p class="l">Pay per call with no account, or subscribe once and connect the whole
+catalog to your agent.</p>
+
+<h2>Per call</h2>
+<p>{len(pagos)} endpoints, ${min(get_dynamic_price(p) for p in pagos):.3f} to
+${max(get_dynamic_price(p) for p in pagos):.2f} in USDC, settled on Base or Solana.
+No signup, no API key — your wallet answers the 402 challenge and retries.</p>
+<pre>npx agentcash fetch {base}/br-macro</pre>
+
+<h2>Free, always</h2>
+<p>Every paid endpoint has a real delayed sample. Nothing to sign up for.</p>
+<pre>curl {base}/try
+curl '{base}/br-macro?preview=1'</pre>
+
+<h2>Subscriptions</h2>
+<table><tr><th>Plan</th><th>Price</th><th>Term</th><th>Grants</th><th>Endpoint</th></tr>
+{linhas}</table>
+<p class="m">A subscription is what turns the catalog into an MCP server your agent
+can use continuously — live data, no per-call payment, no settlement latency.</p>
+
+<h2>Connect it to Claude Code or Cursor</h2>
+<pre>claude mcp add --transport http losbeto {base}/mcp \\
+  --header "Authorization: Bearer &lt;your-key&gt;"</pre>
+<p class="m">Without a key the same command still works and returns delayed samples,
+so you can evaluate the whole catalog before paying anything.</p>
+
+<p style="margin-top:40px"><a href="/">&larr; back</a> ·
+<a href="/get-pricing">full price list</a> ·
+<a href="/.well-known/x402.json">x402 manifest</a> ·
+<a href="/server.json">MCP registry</a></p>
+</body></html>"""
+    return app.response_class(html, mimetype="text/html")
+
+
+@app.route("/subscribe-status")
+def subscribe_status():
+    """Estado da assinatura para o agente consultar sozinho."""
+    key = (request.headers.get("X-API-Key", "").strip()
+           or request.args.get("key", "").strip())
+    if not key:
+        auth = request.headers.get("Authorization", "")
+        if auth.lower().startswith("bearer "):
+            key = auth[7:].strip()
+    if not key:
+        return jsonify({"subscribed": False,
+                        "error": "no key presented",
+                        "how": "Send X-API-Key or Authorization: Bearer <key>",
+                        "pricing": f"{_public_base()}/pricing"}), 401
+    try:
+        row = LEDGER.api_key_get(key)
+    except Exception:
+        row = None
+    if not row:
+        return jsonify({"subscribed": False, "error": "key not recognised",
+                        "pricing": f"{_public_base()}/pricing"}), 404
+    expirada = row.get("expires", 0) < int(time.time())
+    return jsonify({
+        "subscribed": not expirada,
+        "plan": row.get("plan"),
+        "balance_usd": ("unlimited" if row.get("balance_usd") == -1
+                        else row.get("balance_usd")),
+        "calls_used": row.get("calls_used", 0),
+        "expires_utc": datetime.fromtimestamp(row.get("expires", 0),
+                                              timezone.utc).isoformat(),
+        "expired": expirada,
+        "mcp": {"url": f"{_public_base()}/mcp",
+                "header": "Authorization: Bearer <key>"},
+        "ts": int(time.time()),
+    }), (200 if not expirada else 402)
 
 
 @app.route("/health/storage")
@@ -11076,7 +11844,7 @@ def _warm_once(paths: List[str], label: str) -> int:
         try:
             with app.test_request_context(path):
                 result = handler()
-            if isinstance(result, dict) and "error" not in result:
+            if isinstance(result, dict) and _sample_is_good(result):
                 # v28: a amostra só é renovada após envelhecer — é o
                 # envelhecimento que dá valor à versão paga.
                 _cur = _PREVIEW_CACHE.get(path) or _preview_db_get(path)
