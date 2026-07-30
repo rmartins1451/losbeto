@@ -9640,6 +9640,71 @@ def launch_risk_preview():
 def health():
     return jsonify({"ok": True, "version": VERSION, "ts": int(time.time())})
 
+
+@app.route("/health/storage")
+def health_storage():
+    """v39: responde a pergunta que decide se o node pode vender plano —
+    'o disco onde ficam créditos, API keys e o ledger sobrevive ao deploy?'
+
+    Sem volume montado, HOME_DIR cai num diretório efêmero do container e
+    TODO redeploy apaga créditos comprados, chaves ativas, referrals e
+    receipts. Alguém compra um week-pass de $9.99, você faz deploy, a chave
+    dele evapora. Isto existe para você conferir em dois segundos."""
+    vol_path = os.environ.get("RAILWAY_VOLUME_MOUNT_PATH", "").strip()
+    vol_name = os.environ.get("RAILWAY_VOLUME_NAME", "").strip()
+    home = str(HOME_DIR)
+    # Persistente se HOME_DIR está dentro do ponto de montagem do volume.
+    persistente = bool(vol_path) and (home == vol_path or home.startswith(vol_path.rstrip("/") + "/"))
+
+    escrita_ok, erro_escrita = False, None
+    try:
+        probe = HOME_DIR / ".write_probe"
+        probe.write_text(str(time.time()))
+        probe.unlink()
+        escrita_ok = True
+    except Exception as e:
+        erro_escrita = str(e)[:120]
+
+    dbs = {}
+    for rotulo, caminho in (("ledger", DB_PATH), ("preview", PREVIEW_DB_PATH),
+                            ("rag", RAG_DB_PATH), ("referrals", REFERRAL_DB)):
+        try:
+            dbs[rotulo] = {"path": str(caminho), "exists": Path(caminho).exists(),
+                           "bytes": Path(caminho).stat().st_size
+                                    if Path(caminho).exists() else 0}
+        except Exception:
+            dbs[rotulo] = {"path": str(caminho), "exists": False, "bytes": 0}
+
+    contas = {}
+    try:
+        contas["api_keys"] = LEDGER.api_key_stats()
+    except Exception as e:
+        contas["api_keys_error"] = str(e)[:100]
+
+    body = {
+        "persistent": persistente,
+        "home_dir": home,
+        "writable": escrita_ok,
+        "write_error": erro_escrita,
+        "railway_volume": {"name": vol_name or None, "mount_path": vol_path or None},
+        "databases": dbs,
+        "counts": contas,
+        "verdict": (
+            "OK — dados sobrevivem a redeploy."
+            if persistente and escrita_ok else
+            "EFÊMERO — monte um volume no Railway e aponte DATA_DIR para ele. "
+            "Créditos, API keys e receipts serão APAGADOS no próximo deploy."
+        ),
+        "how_to_fix": None if persistente else {
+            "1": "Railway: Ctrl+K (ou Cmd+K) > 'volume' > escolha este serviço",
+            "2": "Mount path: /data",
+            "3": "Variables: DATA_DIR=/data",
+            "4": "Redeploy e chame este endpoint de novo",
+        },
+        "version": VERSION, "ts": int(time.time()),
+    }
+    return jsonify(body), (200 if persistente and escrita_ok else 503)
+
 @app.route("/ready")
 def ready():
     return jsonify({"ready": True, "version": VERSION,

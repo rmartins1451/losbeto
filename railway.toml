@@ -32,5 +32,14 @@ restartPolicyMaxRetries = 5
 # créditos comprados, API keys ativas, referrals, receipts e o ledger inteiro.
 # Alguém compra um week-pass de $9.99, você faz deploy, a chave dele evapora.
 #
-# No painel do Railway: Service → Settings → Volumes → Mount path: /data
-# Depois confirme com:  curl https://api.losbeto.xyz/health/storage
+# COMO FAZER:
+#   1. No projeto, tecle Ctrl+K (Cmd+K no Mac) e digite "volume"
+#      — ou clique com o botão direito no canvas do projeto.
+#   2. Escolha ESTE serviço e defina Mount path: /data
+#   3. Em Variables, adicione: DATA_DIR=/data
+#   4. Redeploy.
+#
+# CONFIRME depois com:
+#   curl https://api.losbeto.xyz/health/storage
+#   → {"persistent": true, "writable": true, "verdict": "OK — dados sobrevivem..."}
+#   Enquanto devolver 503 com "EFÊMERO", ainda não está resolvido.
