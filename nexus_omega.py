@@ -87,7 +87,7 @@ from typing import Any, Optional, Dict, List, Tuple
 # 0. CONFIGURAÇÃO E AUTO-SETUP
 # ============================================================================
 
-VERSION = "39.4.0-FRESH"
+VERSION = "39.5.0-FRESH"
 BRAND_NAME = "Losbeto"
 BRAND_TAGLINE = "The Global Revenue Engine for Financial AI Agents"
 BRAND_EMOJI = "🧠"
@@ -1826,6 +1826,24 @@ _BILLING_COOLDOWN = int(os.environ.get("LLM_BILLING_COOLDOWN", "21600"))  # 6 h
 _BILLING_ALERTED: Dict[str, float] = {}
 
 
+# v39.5: três tipos de falha, três tempos de espera. Num node de tier
+# gratuito essa distinção é o que separa "usa a cota inteira" de "queima a
+# cota em retries".
+#   transitória  — timeout, 500, rate limit POR MINUTO. Volta em minutos.
+#   cota diária  — TPD do Groq, RPD do Gemini. Só volta na virada do dia.
+#   cobrança     — 402/401. Só volta se um humano agir.
+_DAILY_COOLDOWN = int(os.environ.get("LLM_DAILY_COOLDOWN", "14400"))  # 4 h
+
+
+def _is_daily_quota(detail: str) -> bool:
+    d = (detail or "").lower()
+    if "429" not in d and "resource_exhausted" not in d:
+        return False
+    return any(t in d for t in ("per day", "tpd", "rpd", "daily",
+                                "requests per day", "tokens per day",
+                                "quota", "resource_exhausted"))
+
+
 def _is_billing_error(detail: str) -> bool:
     d = (detail or "").lower()
     return ("http 402" in d or "http 401" in d
@@ -1836,15 +1854,24 @@ def _is_billing_error(detail: str) -> bool:
 
 def _llm_mark(provider: str, ok: bool, detail: str = "") -> None:
     cobranca = (not ok) and _is_billing_error(detail)
+    diaria = (not ok) and (not cobranca) and _is_daily_quota(detail)
     with _LLM_STATE_LOCK:
         if ok:
             _LLM_DOWN_UNTIL.pop(provider, None)
             _LLM_LAST_ERROR.pop(provider, None)
             _BILLING_ALERTED.pop(provider, None)
         else:
-            _LLM_DOWN_UNTIL[provider] = time.time() + (
-                _BILLING_COOLDOWN if cobranca else _LLM_COOLDOWN)
+            espera = (_BILLING_COOLDOWN if cobranca
+                      else _DAILY_COOLDOWN if diaria
+                      else _LLM_COOLDOWN)
+            _LLM_DOWN_UNTIL[provider] = time.time() + espera
             _LLM_LAST_ERROR[provider] = detail[:180]
+
+    if diaria:
+        log.warning(f"📅 {provider}: cota DIÁRIA esgotada — recuando "
+                    f"{_DAILY_COOLDOWN // 3600}h em vez de "
+                    f"{_LLM_COOLDOWN}s. Insistir a cada 5 min pelo resto do "
+                    f"dia só gastaria requisições que já não existem.")
 
     if cobranca:
         # Alerta uma vez por janela — o operador precisa saber, mas não a cada
@@ -1906,6 +1933,44 @@ def llm_health_report() -> dict:
         }
 
 
+# ---------------------------------------------------------------------------
+# v39.5 — ROTEAMENTO PENSADO PARA TIER GRATUITO
+#
+# A cadeia da v39 era DeepSeek -> Claude -> Groq -> Gemini: ordem de quem PAGA
+# pelo melhor modelo. Este node roda em tier gratuito, e aí a lógica é outra —
+# a restrição não é qualidade, é COTA, e cada provedor tem uma cota diferente:
+#
+#   Groq   — rapidíssimo (~1s), mas o limite é TOKENS POR DIA. Os logs mostram
+#            429 de TPD repetidamente. Cada prompt longo come uma fatia enorme
+#            do orçamento diário.
+#   Gemini — 2.5 Flash tem cota diária folgada e aceita respostas longas; é
+#            mais lento, mas é o que aguenta volume.
+#
+# Então não faz sentido uma ordem fixa. Faz sentido rotear POR TAMANHO:
+# pedido curto vai no Groq (rápido e barato em tokens), pedido longo vai no
+# Gemini (onde o custo em tokens não derruba o dia inteiro). Assim o TPD do
+# Groq é gasto em dezenas de chamadas pequenas em vez de três relatórios.
+#
+# LLM_ORDER=gemini,groq força uma ordem fixa se você preferir.
+# ---------------------------------------------------------------------------
+LLM_SMALL_TOKENS = int(os.environ.get("LLM_SMALL_TOKENS", "300"))
+_LLM_ORDER_ENV = [x.strip().lower() for x in
+                  os.environ.get("LLM_ORDER", "").split(",") if x.strip()]
+
+
+def _llm_chain(max_tokens: int) -> List[str]:
+    """Ordem de tentativa para este pedido específico."""
+    if _LLM_ORDER_ENV:
+        return _LLM_ORDER_ENV
+    pagos = [p for p in ("deepseek", "claude") if p in llm_providers_configured()]
+    if max_tokens <= LLM_SMALL_TOKENS:
+        gratis = ["groq", "gemini"]      # curto: Groq é mais rápido
+    else:
+        gratis = ["gemini", "groq"]      # longo: preserva o TPD do Groq
+    # Provedores pagos, se configurados, vêm antes — quem paga quer qualidade.
+    return pagos + gratis + ["ollama"]
+
+
 class LLM:
     @staticmethod
     def _cache_get(key: str) -> Optional[str]:
@@ -1943,100 +2008,96 @@ class LLM:
                 LLM._cache_put(ck, text)
             return text
 
-        # ---- DeepSeek (prioridade) -----------------------------------------
-        if DEEPSEEK_KEY and not _llm_is_down("deepseek"):
-            try:
-                r = requests.post("https://api.deepseek.com/v1/chat/completions",
-                    headers={"Authorization": f"Bearer {DEEPSEEK_KEY}",
-                             "Content-Type": "application/json"},
-                    json={"model": DEEPSEEK_MODEL,
-                          "messages": [{"role": "user", "content": prompt}],
-                          "max_tokens": max_tokens, "temperature": temperature},
-                    timeout=25)
-                if r.ok:
-                    return _done("deepseek",
-                                 r.json()["choices"][0]["message"]["content"])
-                _llm_mark("deepseek", False, f"HTTP {r.status_code}: {r.text[:160]}")
-                log.warning(f"LLM DeepSeek HTTP {r.status_code}: {r.text[:180]}")
-            except Exception as e:
-                _llm_mark("deepseek", False, str(e))
-                log.warning(f"LLM DeepSeek: {e}")
+        def _try_deepseek():
+            r = requests.post("https://api.deepseek.com/v1/chat/completions",
+                headers={"Authorization": f"Bearer {DEEPSEEK_KEY}",
+                         "Content-Type": "application/json"},
+                json={"model": DEEPSEEK_MODEL,
+                      "messages": [{"role": "user", "content": prompt}],
+                      "max_tokens": max_tokens, "temperature": temperature},
+                timeout=25)
+            if r.ok:
+                return r.json()["choices"][0]["message"]["content"], None
+            return None, f"HTTP {r.status_code}: {r.text[:160]}"
 
-        # ---- Claude ---------------------------------------------------------
-        if CLAUDE_KEY and not _llm_is_down("claude"):
-            try:
-                r = requests.post("https://api.anthropic.com/v1/messages",
-                    headers={"x-api-key": CLAUDE_KEY,
-                             "anthropic-version": "2023-06-01",
-                             "Content-Type": "application/json"},
-                    json={"model": CLAUDE_MODEL,
-                          "messages": [{"role": "user", "content": prompt}],
-                          "max_tokens": max_tokens, "temperature": temperature},
-                    timeout=25)
-                if r.ok:
-                    return _done("claude", r.json()["content"][0]["text"])
-                # v39 FIX: a v38 só logava exceção. Uma chave inválida ou um
-                # modelo renomeado passavam em silêncio absoluto.
-                _llm_mark("claude", False, f"HTTP {r.status_code}: {r.text[:160]}")
-                log.warning(f"LLM Claude HTTP {r.status_code}: {r.text[:180]}")
-            except Exception as e:
-                _llm_mark("claude", False, str(e))
-                log.warning(f"LLM Claude: {e}")
+        def _try_claude():
+            r = requests.post("https://api.anthropic.com/v1/messages",
+                headers={"x-api-key": CLAUDE_KEY,
+                         "anthropic-version": "2023-06-01",
+                         "Content-Type": "application/json"},
+                json={"model": CLAUDE_MODEL,
+                      "messages": [{"role": "user", "content": prompt}],
+                      "max_tokens": max_tokens, "temperature": temperature},
+                timeout=25)
+            if r.ok:
+                return r.json()["content"][0]["text"], None
+            return None, f"HTTP {r.status_code}: {r.text[:160]}"
 
-        # ---- Groq -----------------------------------------------------------
-        if GROQ_KEY and not _llm_is_down("groq"):
-            try:
-                r = requests.post("https://api.groq.com/openai/v1/chat/completions",
-                    headers={"Authorization": f"Bearer {GROQ_KEY}",
-                             "Content-Type": "application/json"},
-                    json={"model": GROQ_MODEL,
-                          "messages": [{"role": "user", "content": prompt}],
-                          "max_tokens": max_tokens, "temperature": temperature},
-                    timeout=25)
-                if r.ok:
-                    return _done("groq",
-                                 r.json()["choices"][0]["message"]["content"])
-                # 429 = TPD estourado. Quarentena evita martelar o resto do dia.
-                _llm_mark("groq", False, f"HTTP {r.status_code}: {r.text[:160]}")
-                log.warning(f"LLM Groq HTTP {r.status_code}: {r.text[:180]}")
-            except Exception as e:
-                _llm_mark("groq", False, str(e))
-                log.warning(f"LLM Groq: {e}")
+        def _try_groq():
+            r = requests.post("https://api.groq.com/openai/v1/chat/completions",
+                headers={"Authorization": f"Bearer {GROQ_KEY}",
+                         "Content-Type": "application/json"},
+                json={"model": GROQ_MODEL,
+                      "messages": [{"role": "user", "content": prompt}],
+                      "max_tokens": max_tokens, "temperature": temperature},
+                timeout=25)
+            if r.ok:
+                return r.json()["choices"][0]["message"]["content"], None
+            # 429 aqui é quase sempre TPD (tokens por dia), não RPM.
+            return None, f"HTTP {r.status_code}: {r.text[:160]}"
 
-        # ---- Gemini ---------------------------------------------------------
-        if GEMINI_KEY and not _llm_is_down("gemini"):
-            try:
-                r = requests.post(
-                    f"https://generativelanguage.googleapis.com/v1beta/models/"
-                    f"{GEMINI_MODEL}:generateContent?key={GEMINI_KEY}",
-                    json={"contents": [{"parts": [{"text": prompt}]}],
-                          "generationConfig": {"maxOutputTokens": max_tokens,
-                                               "temperature": temperature}},
-                    timeout=25)
-                if r.ok:
-                    j = r.json()
-                    return _done("gemini",
-                                 j["candidates"][0]["content"]["parts"][0]["text"])
-                _llm_mark("gemini", False, f"HTTP {r.status_code}: {r.text[:160]}")
-                log.warning(f"LLM Gemini HTTP {r.status_code} "
-                            f"(modelo={GEMINI_MODEL}): {r.text[:180]}")
-            except Exception as e:
-                _llm_mark("gemini", False, str(e))
-                log.warning(f"LLM Gemini: {e}")
+        def _try_gemini():
+            r = requests.post(
+                f"https://generativelanguage.googleapis.com/v1beta/models/"
+                f"{GEMINI_MODEL}:generateContent?key={GEMINI_KEY}",
+                json={"contents": [{"parts": [{"text": prompt}]}],
+                      "generationConfig": {"maxOutputTokens": max_tokens,
+                                           "temperature": temperature}},
+                timeout=25)
+            if r.ok:
+                j = r.json()
+                cands = j.get("candidates") or []
+                if not cands:
+                    return None, f"no candidates: {str(j)[:120]}"
+                parts = (cands[0].get("content") or {}).get("parts") or []
+                if not parts:
+                    # v39.5: MAX_TOKENS ou filtro de segurança devolvem
+                    # candidato sem parts. Antes isso estourava IndexError e
+                    # virava "exceção", escondendo a causa real.
+                    return None, (f"empty parts, finishReason="
+                                  f"{cands[0].get('finishReason')}")
+                return parts[0].get("text", ""), None
+            return None, f"HTTP {r.status_code} (modelo={GEMINI_MODEL}): {r.text[:160]}"
 
-        # ---- Ollama (local, último recurso) ---------------------------------
-        if OLLAMA_ENABLED and OLLAMA_URL and not _llm_is_down("ollama"):
+        def _try_ollama():
+            r = requests.post(f"{OLLAMA_URL}/api/generate",
+                json={"model": OLLAMA_MODEL, "prompt": prompt, "stream": False,
+                      "options": {"num_predict": max_tokens,
+                                  "temperature": temperature}},
+                timeout=30)
+            if r.ok:
+                return r.json().get("response", ""), None
+            return None, f"HTTP {r.status_code}"
+
+        _CHAMADAS = {"deepseek": (_try_deepseek, DEEPSEEK_KEY),
+                     "claude":   (_try_claude,   CLAUDE_KEY),
+                     "groq":     (_try_groq,     GROQ_KEY),
+                     "gemini":   (_try_gemini,   GEMINI_KEY),
+                     "ollama":   (_try_ollama,   OLLAMA_URL if OLLAMA_ENABLED else "")}
+
+        for _prov in _llm_chain(max_tokens):
+            _fn, _cred = _CHAMADAS.get(_prov, (None, None))
+            if not _fn or not _cred or _llm_is_down(_prov):
+                continue
             try:
-                r = requests.post(f"{OLLAMA_URL}/api/generate",
-                    json={"model": OLLAMA_MODEL, "prompt": prompt, "stream": False,
-                          "options": {"num_predict": max_tokens,
-                                      "temperature": temperature}},
-                    timeout=30)
-                if r.ok:
-                    return _done("ollama", r.json().get("response", ""))
-                _llm_mark("ollama", False, f"HTTP {r.status_code}")
+                _txt, _err = _fn()
+                if _txt:
+                    return _done(_prov, _txt)
+                _llm_mark(_prov, False, _err or "empty response")
+                log.warning(f"LLM {_prov}: {_err}")
             except Exception as e:
-                _llm_mark("ollama", False, str(e))
+                _llm_mark(_prov, False, str(e))
+                log.warning(f"LLM {_prov}: {e}")
 
         # v39: nunca mais devolver um placeholder legível. A v38 devolvia
         # "[LLM offline — configure ...]" e essa string ia PARA DENTRO da
@@ -12394,7 +12455,11 @@ def autoregister_x402scan():
         surfaces = [
             ("x402 manifest",   "/.well-known/x402.json"),
             ("MCP registry",    "/server.json"),
-            ("MCP endpoint",    "/mcp"),
+            # v39.5: GET /mcp devolve 405 DE PROPÓSITO — a spec MCP permite
+            # recusar o canal SSE server->client, e este servidor é stateless
+            # sobre POST. O health check da v39.2 fazia GET e marcava ❌ a cada
+            # boot. Alarme falso que eu mesmo introduzi; agora testa por POST.
+            ("MCP endpoint",    "/mcp", "POST"),
             ("OpenAPI",         "/openapi.json"),
             ("llms.txt",        "/llms.txt"),
             ("llms-full.txt",   "/llms-full.txt"),
@@ -12402,9 +12467,16 @@ def autoregister_x402scan():
             ("free sample",     "/try"),
         ]
         quebradas = []
-        for nome, caminho in surfaces:
+        for _item in surfaces:
+            nome, caminho = _item[0], _item[1]
+            metodo = _item[2] if len(_item) > 2 else "GET"
             try:
-                rr = requests.get(f"{PUBLIC_URL}{caminho}", timeout=10)
+                if metodo == "POST":
+                    rr = requests.post(f"{PUBLIC_URL}{caminho}", timeout=10,
+                                       json={"jsonrpc": "2.0", "id": 1,
+                                             "method": "tools/list"})
+                else:
+                    rr = requests.get(f"{PUBLIC_URL}{caminho}", timeout=10)
                 if rr.ok:
                     log.info(f"📍 {nome:18s} ✅ {rr.status_code} "
                              f"({len(rr.content)}b)")
