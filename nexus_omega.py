@@ -184,6 +184,11 @@ ALPHAVANTAGE_KEY= os.environ.get("ALPHAVANTAGE_API_KEY", "").strip() # 25 req/di
 DEEPSEEK_KEY = os.environ.get("DEEPSEEK_API_KEY", "").strip()
 CLAUDE_KEY   = os.environ.get("CLAUDE_API_KEY", "").strip()
 OLLAMA_URL   = os.environ.get("OLLAMA_URL", "http://127.0.0.1:11434")
+# v39: o default acima é conveniente para rodar local, mas fazia o Ollama
+# contar como "provedor configurado" mesmo sem nada escutando na porta —
+# llm_healthy() devolvia True para sempre e o gate de pré-pagamento nunca
+# disparava. Só conta como provedor se explicitamente habilitado.
+OLLAMA_ENABLED = os.environ.get("OLLAMA_ENABLED", "").strip() not in ("", "0", "false")
 OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "qwen2.5:3b")
 HELIUS_KEY   = os.environ.get("HELIUS_API_KEY", "").strip()
 JUPITER_KEY  = os.environ.get("JUPITER_API_KEY", "").strip()
@@ -231,25 +236,32 @@ REVENUE_TARGET_DAILY = float(os.environ.get("REVENUE_TARGET_DAILY", "50.0"))
 # Modelo provado no ecossistema (laevitas.ch): 1 tx on-chain → N chamadas
 # servidas do ledger em ~1ms, sem latência de settlement por request.
 # balance_usd = -1 → ilimitado dentro da janela ttl_days.
+# v39: pitches em inglês — quem lê isto num 402 ou no Bazaar é um agente.
 CREDIT_PLANS = {
     "/buy-credits":      {"plan": "credits",  "balance_usd": 1.25,  "ttl_days": 30,
-                          "bonus": "+25%", "pitch": "Pague $0,99 uma vez → saldo $1,25 em chamadas",
+                          "bonus": "+25%",
+                          "pitch": "Pay $0.99 once, get $1.25 of call credit",
                           "anchor_price": 0.99, "display_price": "$0.99"},
     "/day-pass":         {"plan": "day-pass", "balance_usd": -1,    "ttl_days": 1,
-                          "bonus": "ilimitado 24h", "pitch": "Um dia inteiro de chamadas ilimitadas",
+                          "bonus": "unlimited 24h",
+                          "pitch": "A full day of unlimited calls, one payment",
                           "anchor_price": 2.99, "display_price": "$2.99"},
     "/week-pass":        {"plan": "week",     "balance_usd": -1,    "ttl_days": 7,
-                          "bonus": "ilimitado 7d", "pitch": "Semana inteira ilimitada — 40% off vs day-pass",
+                          "bonus": "unlimited 7d",
+                          "pitch": "A full week unlimited — about half the daily cost of a day pass",
                           "anchor_price": 9.99, "display_price": "$9.99"},
     "/subscribe-pro":    {"plan": "pro",      "balance_usd": 15.00, "ttl_days": 30,
-                          "bonus": "+50%", "pitch": "Saldo de $15/mês — para agentes em produção",
-                          "anchor_price": 9.99, "display_price": "$9.99/mês"},
+                          "bonus": "+50%",
+                          "pitch": "$15 of monthly call credit for agents in production",
+                          "anchor_price": 9.99, "display_price": "$9.99/mo"},
     "/subscribe-whale":  {"plan": "whale",    "balance_usd": -1,    "ttl_days": 30,
-                          "bonus": "ilimitado 30d", "pitch": "Ilimitado por 30 dias + prioridade máxima",
-                          "anchor_price": 19.99, "display_price": "$19.99/mês"},
-    "/enterprise":       {"plan": "enterprise", "balance_usd": -1,    "ttl_days": 365,
-                          "bonus": "ilimitado 1 ano", "pitch": "API dedicada, SLA 99.9%, suporte prioritário",
-                          "anchor_price": 99.99, "display_price": "$99.99/ano"},
+                          "bonus": "unlimited 30d",
+                          "pitch": "Unlimited for 30 days with maximum priority",
+                          "anchor_price": 19.99, "display_price": "$19.99/mo"},
+    "/enterprise":       {"plan": "enterprise", "balance_usd": -1,  "ttl_days": 365,
+                          "bonus": "unlimited 12 months",
+                          "pitch": "Unlimited for a year, dedicated capacity, 99.9% availability target",
+                          "anchor_price": 99.99, "display_price": "$99.99/yr"},
 }
 
 
@@ -368,69 +380,91 @@ def _load_price_overrides() -> dict:
 PRICE_OVERRIDES = _load_price_overrides()
 
 ENDPOINT_DESC = {
-    "/bootstrap-trust": "Trust bootstrap endpoint (self-payment para trust score inicial)",
-    "/forex-rate":      "Live FX rate for major pairs (?pair=EUR/USD): EUR, GBP, JPY, CHF, AUD, CAD crosses via exchange-rate API.",
+    # v39 — CATÁLOGO REESCRITO EM INGLÊS.
+    #
+    # Motivo: 33 das 63 descrições estavam em português, incluindo TODOS os
+    # planos de crédito e todos os bundles premium. O comprador deste mercado
+    # é um LLM fazendo busca semântica em inglês no Bazaar/x402scan — uma
+    # descrição como "Fluxo de bundles Jito, tip floor e sinais de MEV" não
+    # casa com a consulta "MEV bundle flow Solana". Além disso, as chaves
+    # /cross-chain, /smart-money, /sanctions e /agent-market apareciam DUAS
+    # vezes com valores diferentes (a segunda vencia em silêncio), e
+    # /week-pass e /enterprise não existiam aqui — os dois produtos de maior
+    # ticket iam ao Bazaar com a descrição literal "/week-pass".
+    #
+    # Regra de escrita: dizer o que retorna, de qual fonte, e por que não dá
+    # para obter de graça. Sem superlativo sem lastro.
+
+    # ---- Discovery / commodities de dado ---------------------------------
+    "/pyth-price":      "Real-time SOL/USD from the Pyth Network oracle with its confidence interval and publish slot. Sub-second freshness, straight from the on-chain price account.",
+    "/fear-greed":      "Crypto Fear & Greed Index (0-100) with classification and a contrarian read. The headline number for regime-aware agents.",
+    "/trust-hash":      "SHA-256 proof-of-data hash for audit trails: a verifiable cryptographic receipt of any Losbeto response, for agents that must prove what they were told and when.",
+    "/agent-market":    "Machine-readable commercial map of this catalog: featured endpoints, cheapest calls, the free tier and the credit plans, so an agent can plan a budget in one request.",
+    "/bootstrap-trust": "Trust bootstrap endpoint. POST a minimal self-payment to seed an on-chain settlement record; GET returns the instructions for free.",
+    "/regime":          "Market regime classifier (bull / bear / chop) derived from 24h-7d momentum and realized volatility, with a confidence score.",
+    "/mempool":         "Live Solana network conditions: pending transaction pressure, current fee levels and priority-fee guidance for agents timing an execution.",
+    "/web-search":      "Condensed web search focused on macro and crypto context, returned as clean summarized text for agent reasoning rather than a link list.",
+    "/ai-news":         "Filtered crypto and markets newswire for agents and research bots: headlines with source and timestamp, noise removed.",
+    "/geo-alpha":       "Geographic read on exchange trust scores and BTC volume by venue country: where the volume actually sits and how trustworthy each venue is rated.",
+    "/sentiment":       "Aggregated crypto sentiment bias with the contributing sources named. Input for contrarian and regime strategies.",
+    "/anomalias":       "Price and volume anomalies detected right now across the majors: what is moving abnormally versus its own recent distribution.",
+    "/dex-screen":      "DexScreener pair snapshot with liquidity, 24h volume and pair age, filtered to what is actually tradable.",
+    "/forex-rate":      "Live FX rate for major pairs (?pair=EUR/USD): EUR, GBP, JPY, CHF, AUD, CAD crosses with the provider named in the response.",
     "/commodity-price": "Live commodity prices: gold, silver, WTI, Brent, copper, natural gas (?symbol=GOLD) with daily change. Multi-source with declared provenance in every response.",
     "/stock-quote":     "Live equity quote (?symbol=AAPL): price, daily change, open/high/low. Multi-source with the provider named in every response.",
+    "/global-macro":    "One-shot global macro snapshot: market regime, forex and crypto sentiment combined for cross-asset agents.",
+
+    # ---- Core: dado trabalhado -------------------------------------------
+    "/jupiter-swap":    "Jupiter swap quote with the best DEX route and expected slippage for a given pair and size, so an agent can price execution before committing.",
+    "/rugcheck":        "Solana token rug-pull screening: mint and freeze authority, liquidity lock, holder concentration and the specific red flags found.",
+    "/pump-monitor":    "Freshest token launches across DEXs with initial triage. Memecoin radar for sniper agents.",
+    "/defi-yield":      "Top DeFi yield pools ranked by APY and TVL across Solana DEXs, refreshed live, with the pool address for each row.",
+    "/swarm-vote":      "Consensus vote across the peer node swarm: how independent nodes read the same market right now, and how wide the disagreement is.",
+    "/sinais":          "Actionable trading signals feed with direction, confidence and timestamp. Heuristic, with the methodology declared in the response.",
+    "/win-rate-verified": "Ed25519-signed performance metrics with declared methodology (heuristic signal accuracy, not audited PnL). Verifiable integrity plus explicit honesty about what the number is and is not.",
+    "/analise":         "AI deep-dive on any supported asset: technicals, flows and narrative in one written analysis.",
+    "/nansen-flow":     "Top USDC holder concentration snapshot via Helius RPC: who holds the float and how concentrated it is.",
+    "/sec-filing":      "SEC filing search with an objective market read: what was filed, by whom, and what it means for the tape.",
+    "/backtest":        "Strategy backtest with PnL, win rate, drawdown and a written read of where the strategy actually makes its money.",
+    "/tg-premium":      "Premium alert feed in automation-ready shape: one JSON object per alert, stable keys, no prose to parse.",
+    "/onchain-credit":  "On-chain credit score (0-900) for any Solana wallet: account age, activity, balance tiers and counterparty history.",
     "/macro-calendar":  "Upcoming macro events (FOMC, NFP, CPI, ECB) with impact rating, forecast and previous readings.",
     "/earnings-whisper": "Next earnings date, EPS/revenue estimates and whisper number for a given stock (?symbol=AAPL).",
-    "/forex-arbitrage": "Triangular FX arbitrage scanner across major crosses with spread detection above 0.01%.",
-    "/global-macro":    "One-shot global macro snapshot: regime + forex + crypto sentiment combined for cross-asset agents.",
-    "/fear-greed":      "Live Crypto Fear & Greed Index (0-100) with classification and AI interpretation. Contrarian signal for trading agents.",
-    "/regime":          "Market regime classifier (bull/bear/chop) from 24h-7d momentum and volatility.",
-    "/mempool":         "Mempool Solana em tempo real com fee pressure",
-    "/anomalias":       "Anomalias de preço/volume detectadas agora",
-    "/jupiter-swap":    "Cotação Jupiter com melhor rota DEX e slippage",
-    "/analise":         "AI deep-dive analysis of any supported asset: technicals, flows and narrative.",
-    "/swarm-vote":      "Consenso votado pelo enxame de nós",
-    "/sentiment":       "Aggregated crypto sentiment bias with sources. Fuel for contrarian strategies.",
-    "/rugcheck":        "Solana token rug-pull screening: authority, liquidity and holder red flags before you ape.",
-    "/sinais":          "Actionable trading signals feed with direction, confidence and timestamp.",
-    "/defi-yield":      "Top DeFi yield pools by APY and TVL across Solana DEXs, refreshed live.",
-    "/deep-think":      "Raciocínio estruturado sobre tese, cenário e invalidação",
-    "/pump-monitor":    "Freshest token launches across DEXs with initial triage. Memecoin radar for sniper agents.",
-    "/arbitrage":       "Arbitragem cross-exchange + cross-chain com oportunidades acionáveis",
-    "/tg-premium":      "Feed premium de alertas em formato pronto para automação",
-    "/relatorio":       "Institutional-style market report: regime, sentiment, risks and opportunities, AI-written.",
-    "/backtest":        "Backtest com PnL, win rate e leitura da estratégia",
-    "/agent-call":      "Chamada A2A para outro agente do enxame",
-    "/onchain-credit":  "On-chain credit score (0-900) for any Solana wallet: age, activity, balance tiers.",
-    "/cross-chain":     "Leitura de spread e arbitragem Solana ↔ Base",
-    "/whale-alert":     "Large on-chain USDC/SOL movements watchlist. Follow smart money flow.",
-    "/smart-money":     "Tracking de carteiras institucionais e smart money",
-    "/copytrade":       "Replica os sinais implícitos de wallets de destaque",
-    "/alpha-signal":    "Proprietary Losbeto Alpha Score (0-100) combining Fear&Greed, market regime, sentiment and momentum into one composite trading signal.",
-    "/insider-track":   "Rastreamento de insiders em launches e entradas precoces",
-    "/mev-flow":        "Fluxo de bundles Jito, tip floor e sinais de MEV",
-    "/web-search":      "Busca web resumida para contexto macro/cripto orientado a agentes",
-    "/ai-news":         "Noticiário cripto filtrado para agentes e research bots",
-    "/dex-screen":      "Snapshot de pares no DexScreener com liquidez e volume",
-    "/nansen-flow":     "Top USDC holder concentration snapshot via Helius RPC. Smart-money positioning.",
-    "/sec-filing":      "Busca filings da SEC com leitura objetiva para o mercado",
-    "/trust-hash":      "SHA-256 verifiable proof-of-data hash for audit trails. Cryptographic receipt of any Losbeto response.",
-    "/geo-alpha":       "Leitura geográfica de exchange trust score e volume BTC",
-    "/sanctions":       "Checagem inicial de compliance/sanctions para wallet ou nome",
-    "/agent-market":    "Mapa comercial do catálogo com featured endpoints e discovery",
-    "/pyth-price":      "Real-time SOL/USD price from Pyth Network oracle with confidence interval. Sub-second freshness.",
-    "/market-brief":    "Bundle premium: regime + sentimento + sinais + risco em JSON previsível",
-    "/portfolio-copilot":"AI portfolio copilot: best DeFi yields, market regime, credit profile and allocation mode in one premium response.",
-    "/council":         "Council of Five: 5 specialized AI agents (risk, regime, launches, liquidity, contrarian) vote in parallel + chairman synthesis. Multi-agent market consensus.",
-    "/launch-risk":     "FLAGSHIP: Real-time token launch risk brief — on-chain checks (mint authority, holder concentration), DEX liquidity, AI verdict (AVOID/WATCH/SIZE).",
-    "/launch-sniper":   "Bundle premium: launches, rugcheck, insiders e execução tática",
-    "/whale-dossier":   "Bundle premium: baleias, smart money, fluxo institucional e alertas",
-    "/thesis-engine":   "Produto premium: tese operacional com convicção, gatilhos e hedge",
-    "/starter-pack":    "Pacote de entrada Phantom-friendly com bundles premium e valor mínimo de US$1",
-    "/multi-chain-arbitrage": "Real-time cross-chain spread scanner Solana/Base/Ethereum. Flags USDC/USDT/SOL/ETH opportunities >0.5% in <200ms.",
-    "/win-rate-verified":     "Ed25519-signed performance metrics with declared methodology (heuristic, not audited PnL). Verifiable integrity + explicit honesty.",
-    "/agent-composable":      "Bundle: 5 endpoints in 1 request — regime + sentiment + signals + whale flow + risk. 40% cheaper than separate calls.",
-    "/buy-credits":      "CRÉDITOS: pague $1 uma vez → saldo de $1.25 em chamadas (+25% bônus) via header X-API-Key — zero latência de settlement por request",
-    "/day-pass":         "DAY PASS: chamadas ILIMITADAS por 24h em todos os endpoints — 1 pagamento, zero fricção",
-    "/subscribe-pro":    "PRO: saldo de $15/mês em chamadas (+50% bônus) — para agentes em produção",
-    "/subscribe-whale":  "WHALE: chamadas ilimitadas por 30 dias + prioridade — alta frequência",
-    "/cross-chain":      "Spread REAL Solana (Jupiter) × CEX (Binance/CoinGecko) com direção acionável",
-    "/smart-money":      "Diretório institucional + holders on-chain reais (Helius) + método de tracking",
-    "/sanctions":        "Screening REAL contra a lista OFAC-SDN oficial (download diário treasury.gov)",
-    "/agent-market":     "Mapa comercial real do catálogo: featured, mais baratos, free tier e créditos",
+
+    # ---- Pro: inteligência composta ---------------------------------------
+    "/deep-think":      "Structured reasoning on a thesis: the setup, the scenario tree, what would invalidate it, and the level where the thesis is simply wrong.",
+    "/agent-call":      "Agent-to-agent (A2A) call into another node of the swarm: relay a question and get that node's own answer back, priced per call.",
+    "/whale-alert":     "Large on-chain USDC/SOL movements watchlist with the wallets involved. Follow smart money flow as it settles.",
+    "/smart-money":     "Institutional wallet directory joined with real on-chain holders via Helius, plus the tracking method used, so the result is auditable rather than a black box.",
+    "/sanctions":       "Real screening against the official OFAC-SDN list, downloaded daily from treasury.gov. Wallet or name in, match detail and confidence out.",
+    "/relatorio":       "Institutional-style market report: regime, sentiment, risks and opportunities, AI-written, with concrete trade ideas and their triggers.",
+    "/arbitrage":       "Cross-exchange and cross-chain arbitrage scan with actionable opportunities: venue pair, spread, and the direction to take.",
+    "/cross-chain":     "Real spread between Solana (Jupiter) and CEX venues (Binance, CoinGecko) with an actionable direction and the size the spread survives.",
+    "/copytrade":       "Implied signals replicated from standout wallets: what they are accumulating or distributing, inferred from settled on-chain flow.",
+    "/market-brief":    "Premium bundle: regime, sentiment, signals and risk in one predictable JSON object — the four calls an agent makes every morning, merged.",
+    "/multi-chain-arbitrage": "Real-time cross-chain spread scanner across Solana, Base and Ethereum. Flags USDC/USDT/SOL/ETH opportunities above 0.5% in under 200ms.",
+    "/agent-composable": "Bundle: 5 endpoints in 1 request — regime + sentiment + signals + whale flow + risk. Roughly 40% cheaper than the calls made separately.",
+    "/alpha-signal":    "Proprietary Losbeto Alpha Score (0-100) combining Fear & Greed, market regime, sentiment and momentum into one composite trading signal.",
+    "/insider-track":   "Insider tracking on new launches: which wallets entered before the crowd, how early, and what that pattern historically preceded.",
+    "/mev-flow":        "Jito bundle flow, tip floor and MEV pressure on Solana: what it currently costs to get included, and where the extraction is concentrated.",
+    "/portfolio-copilot": "AI portfolio copilot: best DeFi yields, market regime, credit profile and allocation mode in one premium response.",
+    "/launch-risk":     "FLAGSHIP: real-time token launch risk brief — on-chain checks (mint authority, holder concentration), DEX liquidity and an AI verdict (AVOID / WATCH / SIZE).",
+    "/forex-arbitrage": "Triangular FX arbitrage scanner across major crosses, flagging spreads above 0.01% with the exact leg sequence to execute.",
+
+    # ---- Flagship ---------------------------------------------------------
+    "/council":         "Council of Five: five specialised AI agents (risk, regime, launches, liquidity, contrarian) vote in parallel, then a chairman synthesises the consensus. Multi-agent market view in one call.",
+    "/launch-sniper":   "Premium bundle for new launches: fresh listings, rug screening, insider entries and a tactical execution note, in one request.",
+    "/whale-dossier":   "Premium bundle on large holders: whale movements, smart-money directory, institutional flow and the alerts that fired, assembled into one dossier.",
+    "/thesis-engine":   "Premium product: an operational thesis with stated conviction, entry and invalidation triggers, and the hedge that pairs with it.",
+    "/starter-pack":    "Entry bundle designed for a first purchase: several flagship products in one $1 call, Phantom-friendly, so an agent can evaluate the top of the catalog in a single transaction.",
+
+    # ---- Planos de crédito ------------------------------------------------
+    "/buy-credits":     "CREDITS: pay $0.99 once and receive $1.25 of call balance (+25% bonus), spent via the X-API-Key header. One on-chain transaction, then zero settlement latency per request.",
+    "/day-pass":        "DAY PASS: unlimited calls to every endpoint for 24 hours. One payment, no per-request settlement, no rate limit.",
+    "/week-pass":       "WEEK PASS: unlimited calls to every endpoint for 7 days — the same access as the day pass at roughly half the daily cost. For agents running a full evaluation cycle.",
+    "/subscribe-pro":   "PRO: $15 of call balance per month (+50% bonus) for agents in production, with priority routing over free traffic.",
+    "/subscribe-whale": "WHALE: unlimited calls for 30 days plus maximum priority. For high-frequency agents that would otherwise burn the per-call path.",
+    "/enterprise":      "ENTERPRISE: unlimited calls for 12 months, dedicated capacity, a 99.9% availability target and direct support. One transaction covers a full year of production usage.",
 }
 
 ENDPOINT_TAGS = {
@@ -1756,82 +1790,219 @@ def is_geo_blocked(ip: str) -> bool:
 # 8. LLM (com DeepSeek e Claude)
 # ============================================================================
 
+# v39: modelos vêm de env. O motivo é operacional, não estético — a v38 tinha
+# "gemini-2.0-flash-exp" fixo no código; esse modelo foi RETIRADO pelo Google e
+# devolvia 404 em toda chamada. Com o Groq no teto de TPD ao mesmo tempo, a
+# cadeia inteira caía e os endpoints pagos entregavam texto vazio. Modelo em
+# env = troca sem redeploy quando um provedor descontinua algo.
+DEEPSEEK_MODEL = os.environ.get("DEEPSEEK_MODEL", "deepseek-chat")
+CLAUDE_MODEL   = os.environ.get("CLAUDE_MODEL",   "claude-sonnet-4-5")
+GROQ_MODEL     = os.environ.get("GROQ_MODEL",     "llama-3.3-70b-versatile")
+GEMINI_MODEL   = os.environ.get("GEMINI_MODEL",   "gemini-2.5-flash")
+
+LLM_CACHE_TTL  = int(os.environ.get("LLM_CACHE_TTL", "900"))
+_LLM_CACHE: Dict[str, tuple] = {}
+_LLM_CACHE_LOCK = threading.Lock()
+
+# Saúde por provedor: usado pelo gate de pré-pagamento. Um provedor entra em
+# quarentena após falhar e volta sozinho depois de _LLM_COOLDOWN segundos.
+_LLM_COOLDOWN  = int(os.environ.get("LLM_COOLDOWN", "300"))
+_LLM_DOWN_UNTIL: Dict[str, float] = {}
+_LLM_LAST_ERROR: Dict[str, str] = {}
+_LLM_STATE_LOCK = threading.Lock()
+
+
+class LLMUnavailable(Exception):
+    """Nenhum provedor de LLM respondeu. Quem levanta isto NÃO deve cobrar."""
+
+
+def _llm_mark(provider: str, ok: bool, detail: str = "") -> None:
+    with _LLM_STATE_LOCK:
+        if ok:
+            _LLM_DOWN_UNTIL.pop(provider, None)
+            _LLM_LAST_ERROR.pop(provider, None)
+        else:
+            _LLM_DOWN_UNTIL[provider] = time.time() + _LLM_COOLDOWN
+            _LLM_LAST_ERROR[provider] = detail[:180]
+
+
+def _llm_is_down(provider: str) -> bool:
+    with _LLM_STATE_LOCK:
+        return time.time() < _LLM_DOWN_UNTIL.get(provider, 0)
+
+
+def llm_providers_configured() -> List[str]:
+    out = []
+    if DEEPSEEK_KEY: out.append("deepseek")
+    if CLAUDE_KEY:   out.append("claude")
+    if GROQ_KEY:     out.append("groq")
+    if GEMINI_KEY:   out.append("gemini")
+    if OLLAMA_ENABLED and OLLAMA_URL: out.append("ollama")
+    return out
+
+
+def llm_healthy() -> bool:
+    """True se ao menos um provedor configurado não está em quarentena.
+    É isto que o gate de pré-pagamento consulta antes de emitir um 402."""
+    cfg = llm_providers_configured()
+    if not cfg:
+        return False
+    return any(not _llm_is_down(p) for p in cfg)
+
+
+def llm_health_report() -> dict:
+    cfg = llm_providers_configured()
+    with _LLM_STATE_LOCK:
+        return {
+            "configured": cfg,
+            "healthy": bool(cfg) and any(time.time() >= _LLM_DOWN_UNTIL.get(p, 0)
+                                         for p in cfg),
+            "quarantined": {p: {"until": int(_LLM_DOWN_UNTIL[p]),
+                                "last_error": _LLM_LAST_ERROR.get(p, "")}
+                            for p in cfg if time.time() < _LLM_DOWN_UNTIL.get(p, 0)},
+            "models": {"deepseek": DEEPSEEK_MODEL, "claude": CLAUDE_MODEL,
+                       "groq": GROQ_MODEL, "gemini": GEMINI_MODEL},
+        }
+
+
 class LLM:
     @staticmethod
-    def ask(prompt: str, max_tokens=512, temperature=0.4) -> str:
-        # DeepSeek (prioridade)
-        if DEEPSEEK_KEY:
+    def _cache_get(key: str) -> Optional[str]:
+        with _LLM_CACHE_LOCK:
+            hit = _LLM_CACHE.get(key)
+        if hit and (time.time() - hit[0]) < LLM_CACHE_TTL:
+            return hit[1]
+        return None
+
+    @staticmethod
+    def _cache_put(key: str, val: str) -> None:
+        with _LLM_CACHE_LOCK:
+            _LLM_CACHE[key] = (time.time(), val)
+            if len(_LLM_CACHE) > 400:          # poda simples, sem dependências
+                for k in sorted(_LLM_CACHE, key=lambda x: _LLM_CACHE[x][0])[:120]:
+                    _LLM_CACHE.pop(k, None)
+
+    @staticmethod
+    def ask(prompt: str, max_tokens=512, temperature=0.4, cache=True) -> str:
+        """Devolve texto do primeiro provedor que responder.
+        String vazia significa 'nenhum provedor disponível' — nunca um
+        placeholder que possa vazar para dentro de uma resposta paga."""
+        ck = ""
+        if cache:
+            ck = hashlib.sha256(
+                f"{prompt}|{max_tokens}|{temperature}".encode()).hexdigest()
+            hit = LLM._cache_get(ck)
+            if hit is not None:
+                return hit
+
+        def _done(provider: str, text: str) -> str:
+            _llm_mark(provider, True)
+            text = (text or "").strip()
+            if text and cache:
+                LLM._cache_put(ck, text)
+            return text
+
+        # ---- DeepSeek (prioridade) -----------------------------------------
+        if DEEPSEEK_KEY and not _llm_is_down("deepseek"):
             try:
                 r = requests.post("https://api.deepseek.com/v1/chat/completions",
                     headers={"Authorization": f"Bearer {DEEPSEEK_KEY}",
                              "Content-Type": "application/json"},
-                    json={"model": "deepseek-chat",
+                    json={"model": DEEPSEEK_MODEL,
                           "messages": [{"role": "user", "content": prompt}],
                           "max_tokens": max_tokens, "temperature": temperature},
-                    timeout=20)
+                    timeout=25)
                 if r.ok:
-                    return r.json()["choices"][0]["message"]["content"].strip()
+                    return _done("deepseek",
+                                 r.json()["choices"][0]["message"]["content"])
+                _llm_mark("deepseek", False, f"HTTP {r.status_code}: {r.text[:160]}")
                 log.warning(f"LLM DeepSeek HTTP {r.status_code}: {r.text[:180]}")
             except Exception as e:
-                log.warning(f"DeepSeek: {e}")
-        # Claude
-        if CLAUDE_KEY:
+                _llm_mark("deepseek", False, str(e))
+                log.warning(f"LLM DeepSeek: {e}")
+
+        # ---- Claude ---------------------------------------------------------
+        if CLAUDE_KEY and not _llm_is_down("claude"):
             try:
                 r = requests.post("https://api.anthropic.com/v1/messages",
                     headers={"x-api-key": CLAUDE_KEY,
                              "anthropic-version": "2023-06-01",
                              "Content-Type": "application/json"},
-                    json={"model": "claude-3-5-sonnet-20240620",
+                    json={"model": CLAUDE_MODEL,
                           "messages": [{"role": "user", "content": prompt}],
                           "max_tokens": max_tokens, "temperature": temperature},
-                    timeout=20)
+                    timeout=25)
                 if r.ok:
-                    return r.json()["content"][0]["text"].strip()
+                    return _done("claude", r.json()["content"][0]["text"])
+                # v39 FIX: a v38 só logava exceção. Uma chave inválida ou um
+                # modelo renomeado passavam em silêncio absoluto.
+                _llm_mark("claude", False, f"HTTP {r.status_code}: {r.text[:160]}")
+                log.warning(f"LLM Claude HTTP {r.status_code}: {r.text[:180]}")
             except Exception as e:
-                log.warning(f"Claude: {e}")
-        # Groq
-        if GROQ_KEY:
+                _llm_mark("claude", False, str(e))
+                log.warning(f"LLM Claude: {e}")
+
+        # ---- Groq -----------------------------------------------------------
+        if GROQ_KEY and not _llm_is_down("groq"):
             try:
                 r = requests.post("https://api.groq.com/openai/v1/chat/completions",
                     headers={"Authorization": f"Bearer {GROQ_KEY}",
                              "Content-Type": "application/json"},
-                    json={"model": "llama-3.3-70b-versatile",
+                    json={"model": GROQ_MODEL,
                           "messages": [{"role": "user", "content": prompt}],
                           "max_tokens": max_tokens, "temperature": temperature},
-                    timeout=20)
+                    timeout=25)
                 if r.ok:
-                    return r.json()["choices"][0]["message"]["content"].strip()
-                # v38: 429 (rate limit) e 400 (payload) eram invisíveis
+                    return _done("groq",
+                                 r.json()["choices"][0]["message"]["content"])
+                # 429 = TPD estourado. Quarentena evita martelar o resto do dia.
+                _llm_mark("groq", False, f"HTTP {r.status_code}: {r.text[:160]}")
                 log.warning(f"LLM Groq HTTP {r.status_code}: {r.text[:180]}")
             except Exception as e:
-                log.warning(f"Groq: {e}")
-        # Gemini
-        if GEMINI_KEY:
+                _llm_mark("groq", False, str(e))
+                log.warning(f"LLM Groq: {e}")
+
+        # ---- Gemini ---------------------------------------------------------
+        if GEMINI_KEY and not _llm_is_down("gemini"):
             try:
                 r = requests.post(
                     f"https://generativelanguage.googleapis.com/v1beta/models/"
-                    f"gemini-2.0-flash-exp:generateContent?key={GEMINI_KEY}",
+                    f"{GEMINI_MODEL}:generateContent?key={GEMINI_KEY}",
                     json={"contents": [{"parts": [{"text": prompt}]}],
                           "generationConfig": {"maxOutputTokens": max_tokens,
                                                "temperature": temperature}},
-                    timeout=20)
+                    timeout=25)
                 if r.ok:
                     j = r.json()
-                    return j["candidates"][0]["content"]["parts"][0]["text"].strip()
-                log.warning(f"LLM Gemini HTTP {r.status_code}: {r.text[:180]}")
+                    return _done("gemini",
+                                 j["candidates"][0]["content"]["parts"][0]["text"])
+                _llm_mark("gemini", False, f"HTTP {r.status_code}: {r.text[:160]}")
+                log.warning(f"LLM Gemini HTTP {r.status_code} "
+                            f"(modelo={GEMINI_MODEL}): {r.text[:180]}")
             except Exception as e:
-                log.warning(f"Gemini: {e}")
-        # Ollama
-        try:
-            r = requests.post(f"{OLLAMA_URL}/api/generate",
-                json={"model": OLLAMA_MODEL, "prompt": prompt, "stream": False,
-                      "options": {"num_predict": max_tokens, "temperature": temperature}},
-                timeout=30)
-            if r.ok:
-                return r.json().get("response", "").strip()
-        except Exception:
-            pass
-        return "[LLM offline — configure DeepSeek, Claude, Groq ou Gemini]"
+                _llm_mark("gemini", False, str(e))
+                log.warning(f"LLM Gemini: {e}")
+
+        # ---- Ollama (local, último recurso) ---------------------------------
+        if OLLAMA_ENABLED and OLLAMA_URL and not _llm_is_down("ollama"):
+            try:
+                r = requests.post(f"{OLLAMA_URL}/api/generate",
+                    json={"model": OLLAMA_MODEL, "prompt": prompt, "stream": False,
+                          "options": {"num_predict": max_tokens,
+                                      "temperature": temperature}},
+                    timeout=30)
+                if r.ok:
+                    return _done("ollama", r.json().get("response", ""))
+                _llm_mark("ollama", False, f"HTTP {r.status_code}")
+            except Exception as e:
+                _llm_mark("ollama", False, str(e))
+
+        # v39: nunca mais devolver um placeholder legível. A v38 devolvia
+        # "[LLM offline — configure ...]" e essa string ia PARA DENTRO da
+        # resposta paga de /analise e /relatorio. Vazio é honesto e o chamador
+        # decide se ainda há produto a entregar.
+        log.error("🚨 LLM indisponível em todos os provedores configurados")
+        return ""
 
 # ============================================================================
 # 9. RAG
@@ -2049,10 +2220,13 @@ class Brain:
         prompt = (f"Você é um analista cripto. Fear&Greed: {fg.get('value')}.\n"
                   f"Top 5 coins:\n{ctx}\n\nMemória recente:\n{memory_str}\n\n"
                   f"Faça análise concisa (4 bullets) e bias direcional.")
-        analysis = LLM.ask(prompt, max_tokens=400)
+        # v39: era LLM.ask() cru. Quando a cadeia caía, a string
+        # "[LLM offline — configure ...]" ia direto para dentro da resposta
+        # PAGA e ainda era ingerida no RAG, envenenando as buscas seguintes.
+        analysis = _ai_required(prompt, max_tokens=400)
         RAG_STORE.ingest("analise", analysis)
         return {"fear_greed": fg, "top_5": top, "analysis": analysis,
-                "version": VERSION}
+                "ai_status": "ok", "version": VERSION}
 
     @staticmethod
     def swarm_vote():
@@ -2166,7 +2340,7 @@ class Brain:
                   f"Memória:\n{memory_str}\n\n"
                   f"Estrutura: 1) Hipótese, 2) Evidências pró/contra, 3) Cenários "
                   f"(bull/base/bear) com probs, 4) Recomendação acionável.")
-        analysis = LLM.ask(prompt, max_tokens=900, temperature=0.5)
+        analysis = _ai_required(prompt, max_tokens=900)   # v39
         RAG_STORE.ingest("deep-think", f"{topic}: {analysis}")
         return {"topic": topic, "reasoning": analysis, "fear_greed": fg,
                 "version": VERSION}
@@ -2234,10 +2408,12 @@ class Brain:
                   f"Memória:\n{memory_str}\n\n"
                   f"Seções: 1) Resumo macro, 2) Setores em destaque, 3) Riscos, "
                   f"4) 3 trades-ideias com gatilhos claros.")
-        report = LLM.ask(prompt, max_tokens=1200, temperature=0.4)
+        # v39: mesmo motivo de /analise — o relatório É o produto.
+        report = _ai_required(prompt, max_tokens=1200)
         RAG_STORE.ingest("relatorio", report)
         return {"fear_greed": fg, "regime": regime, "anomalias_count": anom["count"],
-                "top_10": top, "report": report, "version": VERSION}
+                "top_10": top, "report": report,
+                "ai_status": "ok", "version": VERSION}
 
     @staticmethod
     def backtest():
@@ -2902,8 +3078,12 @@ class Brain:
                   f"Forex: EUR/USD {forex.get('rate', 0)}. "
                   f"Cenários: Fed (hawkish/dovish), ECB, BoJ, PBOC. "
                   f"Riscos geopolíticos. Oportunidades. Em português.")
-        report = LLM.ask(prompt, max_tokens=800, temperature=0.4)
-        return {"report": report, "fear_greed": fg, "regime": regime, "forex_sample": forex,
+        # v39: /global-macro não está em BASE_PRICES (não é vendido avulso),
+        # então degrada em vez de recusar — o snapshot já tem valor sozinho.
+        report = _ai(prompt, max_tokens=800)
+        return {"report": report or "AI report unavailable — snapshot below is complete.",
+                "ai_status": "ok" if report else "unavailable",
+                "fear_greed": fg, "regime": regime, "forex_sample": forex,
                 "ts": ts, "provider": "Losbeto/GlobalMacro", "version": VERSION,
                 "disclaimer": "Análise heurística + IA. Não é aconselhamento financeiro."}
 
@@ -3149,17 +3329,15 @@ class Brain:
         votes = [r["vote"] for r in results.values()]
         tally = {v: votes.count(v) for v in ("BULLISH","NEUTRAL","BEARISH")}
         verdict = max(tally, key=tally.get)
-        chairman = ""
-        try:
-            out = LLM.ask(
-                f"Você é o Chairman de um conselho de 5 IAs de trading. Votos sobre "
-                f"{symbol}: {json.dumps(results, default=str)[:900]}. Sintetize em 2 "
-                f"frases (inglês) o consenso e a ação sugerida (não é aconselhamento financeiro).",
-                max_tokens=120, temperature=0.4)
-            if out and "LLM offline" not in out: chairman = out
-        except Exception: pass
-        if not chairman:
-            chairman = f"Council splits {tally['BULLISH']}-{tally['NEUTRAL']}-{tally['BEARISH']} (bull-neutral-bear) on {symbol}; majority stance: {verdict}."
+        # v39: o "chairman synthesis" é exatamente o que o catálogo vende em
+        # /council. Sem ele o produto vira uma contagem de votos heurísticos —
+        # então falha alto e o decorador estorna, em vez de entregar menos.
+        chairman = _ai_required(
+            f"You are the Chairman of a five-agent AI trading council. Votes on "
+            f"{symbol}: {json.dumps(results, default=str)[:900]}. Synthesise the "
+            f"consensus and the suggested stance in exactly two sentences, in "
+            f"English. This is not financial advice.",
+            max_tokens=140)
 
         return {"product": "council-of-five", "symbol": symbol,
                 "verdict": verdict, "tally": tally,
@@ -3549,6 +3727,47 @@ def _bazaar_blob(endpoint: str) -> dict:
         "description": desc,
     }
 
+# ---------------------------------------------------------------------------
+# v39 — CACHE DE DESAFIO (corrige uma venda perdida silenciosa)
+#
+# A v38 reconstruía o desafio no momento da liquidação:
+#     accepts = _build_402(endpoint).get_json()["accepts"]
+#     amount  = get_dynamic_price(endpoint)
+# Como get_dynamic_price() aplica o multiplicador PoI, que muda a cada venda
+# registrada, o preço podia MUDAR entre o 402 emitido e o pagamento chegar.
+# O cliente assinou uma autorização para o valor antigo; o facilitator recebia
+# requirements com o valor novo; verify() falhava e a venda se perdia sem
+# nenhum log que apontasse a causa.
+#
+# Agora o desafio emitido é guardado por endpoint com TTL igual ao
+# maxTimeoutSeconds do próprio desafio (300s). Na liquidação usamos o desafio
+# EMITIDO, não um recalculado.
+# ---------------------------------------------------------------------------
+_CHALLENGE_CACHE: Dict[str, tuple] = {}
+_CHALLENGE_LOCK = threading.Lock()
+CHALLENGE_TTL = int(os.environ.get("CHALLENGE_TTL", "300"))
+
+
+def _challenge_remember(endpoint: str, accepts: list) -> None:
+    if not accepts:
+        return
+    with _CHALLENGE_LOCK:
+        _CHALLENGE_CACHE[endpoint] = (time.time(), accepts)
+        if len(_CHALLENGE_CACHE) > 300:
+            for k in sorted(_CHALLENGE_CACHE,
+                            key=lambda x: _CHALLENGE_CACHE[x][0])[:100]:
+                _CHALLENGE_CACHE.pop(k, None)
+
+
+def _challenge_recall(endpoint: str) -> Optional[list]:
+    """Devolve os accepts realmente emitidos, se ainda dentro da janela."""
+    with _CHALLENGE_LOCK:
+        hit = _CHALLENGE_CACHE.get(endpoint)
+    if hit and (time.time() - hit[0]) <= CHALLENGE_TTL:
+        return hit[1]
+    return None
+
+
 def _build_402(endpoint: str):
     amount_usdc = get_dynamic_price(endpoint)
     amount_atomic_sol = str(int(amount_usdc * 10 ** USDC_DECIMALS))
@@ -3609,6 +3828,7 @@ def _build_402(endpoint: str):
         accepts.append(_sol_accept)      # Solana segue disponível, em 2ª opção
     # v21 FIX: payload compatível com x402scan — campos da spec v2 + challenges
     payment_req = accepts[0] if accepts else {}
+    _challenge_remember(endpoint, accepts)   # v39: usado na liquidação
     payload = {
         "x402Version": 2,
         "resource": {
@@ -3792,7 +4012,15 @@ def _verify_payment(endpoint: str, payment_header: str):
     except Exception:
         tx_sig = payment_header.strip()
 
-    amount = get_dynamic_price(endpoint)
+    # v39: o valor registrado é o que foi efetivamente cotado ao cliente.
+    _quoted = _challenge_recall(endpoint)
+    if _quoted:
+        try:
+            amount = int(_quoted[0]["amount"]) / (10 ** USDC_DECIMALS)
+        except Exception:
+            amount = get_dynamic_price(endpoint)
+    else:
+        amount = get_dynamic_price(endpoint)
     chain = "base" if ("eip155" in str(network).lower() or str(network).lower().startswith("base") or str(tx_sig).startswith("0x")) else "solana"
 
     if (FACILITATOR or CDP_FAC) and payload:
@@ -3805,7 +4033,16 @@ def _verify_payment(endpoint: str, payment_header: str):
             for _k in ("extensions", "extra"):
                 if _k in payload["payload"] and payload["payload"][_k] is None:
                     payload["payload"][_k] = {}
-        accepts = _build_402(endpoint).get_json()["accepts"]
+        # v39: prefere o desafio EMITIDO ao recalculado — ver _CHALLENGE_CACHE.
+        accepts = _challenge_recall(endpoint)
+        if accepts is None:
+            accepts = _build_402(endpoint).get_json()["accepts"]
+        else:
+            _issued = accepts[0].get("amount") if accepts else None
+            _now_amt = str(int(get_dynamic_price(endpoint) * 10 ** USDC_DECIMALS))
+            if _issued and _issued != _now_amt:
+                log.info(f"💱 {endpoint}: preço mudou entre desafio e liquidação "
+                         f"({_issued} → {_now_amt}); honrando o valor cotado.")
         # v21.5 FIX: só envia ao facilitator o accept cuja network bate com a do
         # payload do cliente. Verificar payload Solana contra requirements Base
         # (e vice-versa) é um combo inválido que pode causar 500 no facilitator.
@@ -4104,6 +4341,79 @@ def _clean_params() -> str:
     except Exception:
         return ""
 
+# ---------------------------------------------------------------------------
+# v39 — GATE DE PRÉ-PAGAMENTO
+#
+# A v38 tinha _premium_needs() com o comentário "503 faz o cliente NÃO ser
+# cobrado". Isso era FALSO: em paid_endpoint o _verify_payment() (que liquida
+# on-chain) roda ANTES do handler. Um 503 vindo do handler chegava com o
+# dinheiro já capturado. Duas correções:
+#   1. gate ANTES da verificação de pagamento — se o insumo essencial está
+#      fora, devolvemos 503 e o agente nunca chega a assinar nada;
+#   2. estorno em crédito se a falha acontecer depois do settle (corrida).
+# ---------------------------------------------------------------------------
+
+# Endpoints em que a síntese de IA É o produto: sem LLM não sobra nada que
+# justifique o preço, então não vendemos. Separados dos que DEGRADAM bem
+# (/correlation-matrix devolve a matriz inteira, /sector-rotation a tabela de
+# performance, /event-playbook a grade de cenários) — esses continuam à venda
+# e apenas declaram ai_status="unavailable" no corpo.
+AI_REQUIRED_ENDPOINTS = {
+    "/analise", "/relatorio", "/deep-think", "/thesis-engine",
+    "/council", "/council-deep",
+    "/global-morning-brief", "/br-brief",
+    "/equity-dossier", "/portfolio-copilot",
+}
+
+# Estes seguem vendáveis sem IA, mas precisam dizer isso na resposta.
+AI_OPTIONAL_ENDPOINTS = {
+    "/correlation-matrix", "/sector-rotation",
+    "/event-playbook", "/portfolio-stress",
+}
+
+
+def _unavailable_body(reason: str, retry_after: int = 300):
+    return ({"status": "unavailable",
+             "error": reason,
+             "charged": False,
+             "note": "No payment was requested or captured for this call.",
+             "retry_after_seconds": retry_after,
+             "free_alternatives": ["/try", "/sample", "/oracle-consensus?preview=1"],
+             "provider": f"Losbeto/{VERSION}",
+             "ts": int(time.time())}, 503)
+
+
+def _preflight_unavailable(path: str):
+    """Roda ANTES de qualquer 402 ou verificação de pagamento."""
+    if path in AI_REQUIRED_ENDPOINTS and not llm_healthy():
+        log.warning(f"⛔ pré-gate: {path} recusado sem cobrança — LLM indisponível")
+        return _unavailable_body(
+            "The AI synthesis engine that produces this product is temporarily "
+            "unavailable. This endpoint is not being sold right now — you were "
+            "not charged and no payment challenge was issued.")
+    return None
+
+
+def _refund_as_credit(payer: str, amount: float, endpoint: str, tx: str = "") -> Optional[str]:
+    """Emite uma API key de crédito equivalente ao valor pago.
+    Usado quando a falha acontece DEPOIS do settle. Não desfaz a transação
+    on-chain (impossível), mas devolve o poder de compra ao agente."""
+    try:
+        if amount <= 0:
+            return None
+        key = "lsb_refund_" + secrets.token_urlsafe(18)
+        LEDGER.api_key_create(key, payer or "unknown", "refund",
+                              round(amount, 6), 30 * 86400, tx_sig=tx)
+        log.warning(f"↩️ estorno em crédito ${amount:.4f} para {payer[:12]} "
+                    f"({endpoint}) — key {key[:20]}…")
+        _notify_telegram(f"↩️ Estorno emitido: ${amount:.4f} em {endpoint}\n"
+                         f"Motivo: produto indisponível após liquidação.")
+        return key
+    except Exception as e:
+        log.error(f"🚨 falha ao emitir estorno {endpoint} ${amount}: {e}")
+        return None
+
+
 def paid_endpoint(path):
     def deco(handler):
         def wrapped():
@@ -4267,6 +4577,20 @@ def paid_endpoint(path):
             if sig and not _rl_check(ip):
                 return jsonify({"error": "rate-limit", "limit_rpm": RL_RPM_IP}), 429
 
+            # v39: gate ANTES do 402. Se não temos como entregar o produto,
+            # não emitimos cobrança — nem desafio, nem verificação.
+            _pre = _preflight_unavailable(path)
+            if _pre is not None:
+                LEDGER.log_request(path, False, int((time.time() - t0) * 1000), ip,
+                                   kind="unavailable",
+                                   ua=request.headers.get("User-Agent", ""),
+                                   params=_clean_params())
+                _body, _code = _pre
+                _r = jsonify(_body)
+                _r.status_code = _code
+                _r.headers["Retry-After"] = str(_body["retry_after_seconds"])
+                return _r
+
             if not sig:
                 LEDGER.log_request(path, False, int((time.time() - t0) * 1000), ip,
                                     kind="probe", ua=request.headers.get("User-Agent",""), params=_clean_params())
@@ -4295,7 +4619,31 @@ def paid_endpoint(path):
                 from flask import g as _g
                 _g.losbeto_payer = info.get("payer", "") if isinstance(info, dict) else ""
                 _g.losbeto_payment = info if isinstance(info, dict) else {}
-                result = handler()
+                try:
+                    result = handler()
+                except LLMUnavailable:
+                    # Corrida: o gate passou, mas o provedor caiu entre o
+                    # settle e a geração. O pagamento já é on-chain e não pode
+                    # ser desfeito — devolvemos crédito equivalente.
+                    _amt = get_dynamic_price(path)
+                    _key = _refund_as_credit(payer, _amt, path, info.get("tx", ""))
+                    LEDGER.log_request(path, False, int((time.time() - t0) * 1000), ip,
+                                       kind="refunded",
+                                       ua=request.headers.get("User-Agent", ""),
+                                       params=_clean_params())
+                    _b, _c = _unavailable_body(
+                        "The AI synthesis engine failed after settlement. "
+                        "A credit equal to the amount paid has been issued.")
+                    _b["charged"] = True
+                    _b["refunded"] = True
+                    _b["refund_credit_usd"] = round(_amt, 6)
+                    _b["refund_api_key"] = _key
+                    _b["note"] = ("Send this key as the X-API-Key header to spend "
+                                  "the credit on any endpoint. Valid for 30 days.")
+                    _rr = jsonify(_b)
+                    _rr.status_code = _c
+                    _rr.headers["Retry-After"] = "300"
+                    return _rr
                 try:
                     if isinstance(result, dict):
                         prev_data = (_premium_teaser(result)
@@ -4429,6 +4777,7 @@ def _safe_call(fn, default=None):
         return default if default is not None else {}
 
 def _ai(prompt: str, max_tokens=700) -> str:
+    """IA opcional: se falhar, o produto ainda tem valor sem ela."""
     try:
         out = LLM.ask(prompt, max_tokens=max_tokens, temperature=0.35)
         if out and "LLM offline" not in out:
@@ -4436,6 +4785,20 @@ def _ai(prompt: str, max_tokens=700) -> str:
     except Exception as e:
         log.debug(f"premium ai: {e}")
     return ""
+
+
+def _ai_required(prompt: str, max_tokens=700) -> str:
+    """IA obrigatória: usar quando a síntese É o produto.
+
+    v39 — a v38 chamava _ai() em /council-deep, /br-brief, /portfolio-stress e
+    /equity-dossier e, quando a cadeia de LLM estava fora, devolvia o campo de
+    síntese VAZIO cobrando o preço cheio. Aqui a falha vira LLMUnavailable, que
+    o decorador paid_endpoint converte em 503 + estorno em crédito.
+    """
+    out = _ai(prompt, max_tokens=max_tokens)
+    if not out:
+        raise LLMUnavailable()
+    return out
 
 def _premium_db_put(key: str, data: dict) -> None:
     try:
@@ -4558,7 +4921,7 @@ class Premium:
                     "macro_events_ahead": cal_today,
                     "live_data_layers": live_layers}
 
-        synthesis = _ai(
+        synthesis = _ai_required(
             "You are the chief strategist of a cross-asset trading desk. Using ONLY "
             f"this snapshot, write today's morning brief in English:\n"
             f"{json.dumps(snapshot, default=str)[:1800]}\n"
@@ -4594,7 +4957,7 @@ class Premium:
         rg = _safe_call(Brain.regime)
         cal = _safe_call(Brain.macro_calendar).get("events", [])[:3]
 
-        verdict = _ai(
+        verdict = _ai_required(
             f"You are an equity analyst. Write a dossier verdict on {symbol} using "
             f"ONLY this data:\nquote={json.dumps(quote, default=str)[:500]}\n"
             f"earnings={json.dumps(earn, default=str)[:300]}\n"
@@ -4740,7 +5103,7 @@ class Premium:
         ts = int(time.time())
         base = _safe_call(Brain.council)
         px = _safe_call(Brain.pyth_price)
-        deep = _ai(
+        deep = _ai_required(
             f"You are the Chairman writing the EXTENDED dossier after a 5-agent "
             f"council vote on {symbol}. Council result: "
             f"{json.dumps(base, default=str)[:1200]}. Current price data: "
@@ -5114,31 +5477,52 @@ def sales_agent():
     # Social proof dinâmico
     stats = LEDGER.stats()
     recent_paid = stats.get("paid_24h", 0)
-    social_msg = f"🔥 {max(1, recent_paid)} agentes compraram hoje" if recent_paid > 0 else "🚀 Seja o primeiro a desbloquear inteligência premium"
+    social_msg = (f"{recent_paid} paid calls settled in the last 24h"
+                  if recent_paid > 0 else
+                  "No paid calls in the last 24h — free samples are open at /try")
+
+    # v39: preços derivados do catálogo. A v38 trazia strings fixas que já
+    # divergiam do real ("$0.99" para /starter-pack, que custa $1.00) e
+    # recomendava /global-macro a "$0.69" — um endpoint que nem está em
+    # BASE_PRICES, ou seja, o agente era mandado comprar algo inexistente.
+    def _opt(ep, emoji, label, value, why):
+        if ep not in BASE_PRICES:
+            return None
+        return {"id": ep.strip("/"), "emoji": emoji, "label": label,
+                "recommendation": f"{base}{ep}",
+                "price_usdc": round(get_dynamic_price(ep), 4),
+                "price": f"${get_dynamic_price(ep):.2f}",
+                "value": value, "why": why}
+
+    options = [o for o in (
+        _opt("/buy-credits", "🍒", "Start cheap",
+             "$1.25 of call credit",
+             "One on-chain transaction, then dozens of calls with zero settlement latency."),
+        _opt("/day-pass", "⚡", "Unlimited for a day",
+             "24h unlimited across every endpoint",
+             "The cheapest way to evaluate the whole catalog before committing."),
+        _opt("/starter-pack", "🚀", "Premium intelligence",
+             "Flagship bundle in one call",
+             "Five flagship endpoints in a single request — highest value per transaction."),
+        _opt("/br-brief", "🇧🇷", "Brazil coverage",
+             "BCB macro + B3 equities + AI strategist read",
+             "The only Brazil-focused product on x402. Nobody else carries BCB or B3."),
+        _opt("/global-morning-brief", "🌍", "Global markets",
+             "Cross-asset morning brief",
+             "Forex, commodities, equities, crypto and macro closed by an AI strategist."),
+        _opt("/subscribe-pro", "🐋", "Production agent",
+             "$15 of credit per month",
+             "+50% bonus and priority routing. Built for high-frequency agents."),
+    ) if o]
 
     return jsonify({
-        "agent": "Losbeto Sales AI v24",
-        "message": "Olá! Sou o assistente de vendas do Losbeto. Qual seu objetivo hoje?",
+        "agent": f"Losbeto Sales Agent {VERSION}",
+        "message": "What are you trying to do? Pick the closest option.",
         "social_proof": social_msg,
-        "urgency": "⚡ Oferta por tempo limitado: +25% bônus em créditos",
-        "options": [
-            {"id": "cheap_start", "emoji": "🍒", "label": "Quero começar barato",
-             "recommendation": f"{base}/buy-credits", "price": "$0.99", "value": "$1.25 em chamadas",
-             "why": "Melhor custo-benefício. Uma transação → dezenas de chamadas sem latência."},
-            {"id": "unlimited", "emoji": "⚡", "label": "Quero ilimitado",
-             "recommendation": f"{base}/day-pass", "price": "$2.99", "value": "24h ilimitado",
-             "why": "Ideal para testar tudo antes de comprometer."},
-            {"id": "premium", "emoji": "🚀", "label": "Quero inteligência premium",
-             "recommendation": f"{base}/starter-pack", "price": "$0.99", "value": "Bundle premium completo",
-             "why": "5 endpoints flagship por menos de $1. Percepção de valor máxima."},
-            {"id": "global", "emoji": "🌍", "label": "Quero mercados globais",
-             "recommendation": f"{base}/global-macro", "price": "$0.69", "value": "Relatório macro mundial",
-             "why": "Único no ecossistema x402: forex, commodities, ações, macro."},
-            {"id": "pro", "emoji": "🐋", "label": "Sou agente em produção",
-             "recommendation": f"{base}/subscribe-pro", "price": "$9.99/mês", "value": "$15 em chamadas",
-             "why": "+50% bônus + prioridade. Para bots de alta frequência."},
-        ],
-        "free_tier": [f"{base}/sample", f"{base}/losbeto-alpha-score", f"{base}/launch-risk-preview"],
+        "options": options,
+        "free_tier": [f"{base}/try", f"{base}/sample",
+                      f"{base}/oracle-consensus?preview=1"],
+        "note": "Every paid endpoint has a free delayed sample at ?preview=1.",
         "ts": ts, "version": VERSION,
     })
 
@@ -5820,7 +6204,7 @@ def get_pricing():
             "flagship":  {"endpoints": [e for e, p in BASE_PRICES.items() if 0.35 < p <= 1.00 and e not in CREDIT_PLANS],
                           "price_range": "$0.49-1.00"},
             "credits":   {"endpoints": list(CREDIT_PLANS), "price_range": "$1.00-29.99",
-                          "note": "1 tx on-chain → N chamadas via header X-API-Key (sem settlement por request)"},
+                          "note": "One on-chain transaction, then N calls via the X-API-Key header — no per-request settlement"},
         },
         "featured":  FEATURED_ENDPOINTS,
         "endpoints": {ep: {"price_usdc": get_dynamic_price(ep), "desc": ENDPOINT_DESC.get(ep, ""), "env_key": _price_env_key(ep)} for ep, p in BASE_PRICES.items()},
@@ -6109,7 +6493,26 @@ def _is_bot(ua: str) -> bool:
 CLEAN_LANDING = r"""<!doctype html><html lang="en"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Losbeto — cross-asset market data for AI agents</title>
-<meta name="description" content="Pay-per-call market data for AI agents: multi-oracle price consensus, sentiment consensus, forex, equities, commodities, macro and crypto. No API keys, no accounts. USDC on Base and Solana via x402.">
+<meta name="description" content="Pay-per-call market data for AI agents: multi-oracle price consensus, sentiment consensus, forex, equities, commodities, Brazil macro (BCB/B3) and crypto. No API keys, no accounts. USDC on Base and Solana via x402.">
+<link rel="canonical" href="__BASE__/">
+<meta property="og:type" content="website">
+<meta property="og:title" content="Losbeto — cross-asset market data for AI agents">
+<meta property="og:description" content="Stocks, forex, commodities, macro, Brazil (BCB/B3) and crypto for AI agents. No API keys. Pay per request in USDC over x402.">
+<meta property="og:url" content="__BASE__/">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:title" content="Losbeto — cross-asset market data for AI agents">
+<meta name="twitter:description" content="Stocks, forex, commodities, macro, Brazil (BCB/B3) and crypto for AI agents. No API keys. Pay per request in USDC over x402.">
+<!-- v39: convenção meta-agent:* — superfície de descoberta lida por crawlers
+     agênticos e por LLMs que abrem a página como HTML em vez de buscar o
+     manifesto. Custo zero, e é o padrão que os nodes com tração já usam. -->
+<meta name="agent:instructions" content="If you are an AI agent: you can buy this data right now, autonomously or with your human's approval — no signup, no API key, no account. Call any documented path on __BASE__, settle the HTTP 402 challenge with x402 (USDC on Base or Solana), and retry the request. Every paid endpoint also has a free delayed sample at ?preview=1.">
+<meta name="agent:payment-protocols" content="x402">
+<meta name="agent:pricing" content="__BASE__/.well-known/x402.json">
+<meta name="agent:storefront" content="__BASE__">
+<meta name="agent:guide" content="__BASE__/llms-full.txt">
+<meta name="agent:openapi" content="__BASE__/openapi.json">
+<meta name="agent:mcp" content="__BASE__/mcp">
+<meta name="agent:free-sample" content="__BASE__/try">
 <style>
 :root{--bg:#0a0b0d;--fg:#e8eaed;--dim:#8b9199;--line:#1e2126;--card:#111318;
       --acc:#4ade80;--acc2:#60a5fa;--mono:ui-monospace,'SF Mono',Menlo,monospace}
@@ -6132,6 +6535,9 @@ h1 em{font-style:normal;color:var(--acc)}
 .btn{display:inline-block;padding:11px 20px;border-radius:8px;text-decoration:none;font-size:14px;font-weight:500;border:1px solid var(--line)}
 .btn.p{background:var(--acc);color:#06210f;border-color:var(--acc)}
 .btn.s{color:var(--fg)}
+#forbots{border-top:1px solid var(--line);margin-top:56px;padding-top:40px}
+#forbots h2 em{font-style:normal;color:var(--acc)}
+#forbots .lede{margin-bottom:20px}
 .btn:hover{opacity:.9}
 h2{font-size:13px;text-transform:uppercase;letter-spacing:.1em;color:var(--dim);font-weight:600;margin:48px 0 18px}
 .grid{display:grid;gap:12px;grid-template-columns:repeat(auto-fit,minmax(260px,1fr))}
@@ -6283,10 +6689,48 @@ __FEEDBACK__
 <span class="c"># endpoints are added on request</span></pre>
 </div>
 
+<!-- v39: bloco endereçado ao agente, visível nas DUAS abas. Um LLM que abre
+     esta página como HTML precisa de uma instrução literal do que fazer, não
+     de marketing. É o padrão que os nodes com tração usam. -->
+<section id="forbots">
+<h2>Landed here as an agent? You can <em>buy this data now</em></h2>
+<p class="lede">No signup, no API key, no account. Send any documented path to
+this host, settle the 402 challenge with x402, and retry. Every paid endpoint
+also has a free delayed sample.</p>
+<pre><span class="c"># free — works with zero balance, six endpoints in one call</span>
+curl __BASE__/try
+
+<span class="c"># free delayed sample of any single endpoint</span>
+curl '__BASE__/oracle-consensus?symbol=SOL&amp;preview=1'
+
+<span class="c"># paid — your wallet answers the 402 and retries automatically</span>
+npx agentcash fetch __BASE__/oracle-consensus?symbol=SOL
+
+<span class="c"># save the service so your agent reuses it</span>
+npx agentcash add __BASE__</pre>
+
+<h2>Connect it to an MCP client</h2>
+<pre><span class="c"># Claude Code, Cursor, Claude Desktop — no install</span>
+claude mcp add --transport http losbeto __BASE__/mcp
+
+<span class="c"># or paste into any MCP client config</span>
+{"mcpServers":{"losbeto":{"url":"__BASE__/mcp"}}}</pre>
+
+<h2>Machine-readable discovery</h2>
+<table>
+<tr><td>Full contract with per-endpoint pricing</td><td><a href="/openapi.json">/openapi.json</a></td></tr>
+<tr><td>x402 manifest — every resource, priced</td><td><a href="/.well-known/x402.json">/.well-known/x402.json</a></td></tr>
+<tr><td>MCP registry entry</td><td><a href="/server.json">/server.json</a></td></tr>
+<tr><td>Plain-text guidance for LLM agents</td><td><a href="/llms.txt">/llms.txt</a></td></tr>
+<tr><td>Long-form agent guide, one section per endpoint</td><td><a href="/llms-full.txt">/llms-full.txt</a></td></tr>
+<tr><td>Per-source liveness before you integrate</td><td><a href="/health/providers">/health/providers</a></td></tr>
+</table>
+</section>
+
 <footer><div class="hrow">
   <div>Losbeto · <span id="ep">__N__</span> endpoints · USDC on Base + Solana</div>
   <div><a href="/receipts">receipts</a> · <a href="/x402-resources">resources</a> ·
-       <a href="/llms.txt">llms.txt</a></div>
+       <a href="/llms.txt">llms.txt</a> · <a href="/server.json">MCP</a></div>
 </div></footer>
 </div>
 <script>
@@ -6465,9 +6909,15 @@ def root():
             "endpoints":        len(BASE_PRICES),
             "prices_usdc":      prices,
             "featured_endpoints": FEATURED_ENDPOINTS,
-            "win_rate":         LEDGER.win_rate(),
+            # v39: a v38 publicava aqui `"win_rate": 36.81...`. Um agente
+            # avaliando fornecedores lia um número abaixo de 50% como
+            # métrica de destaque — e o mesmo número era VENDIDO a $0.04 em
+            # /win-rate-verified. O produto pago se justifica pela assinatura
+            # Ed25519 e pela metodologia declarada, não pelo número solto.
+            "performance_attestation": "/win-rate-verified",
             "poi_multiplier":   LEDGER.get_poi_multiplier(),
-            "dashboard":        f"/dash?token={DASH_TOKEN[:6]}...",
+            # v39: o prefixo do token do dashboard não sai mais daqui.
+            "dashboard":        "/dash (operator token required)",
             "exclusive_endpoints": [
                 "/losbeto-alpha-score", "/multi-chain-arbitrage",
                 "/win-rate-verified", "/agent-composable",
@@ -6664,94 +7114,102 @@ def manifest_x402_alias():
 
 @app.route("/.well-known/x402.json")
 def manifest_x402():
+    """v39 — REESCRITO. Fonte única de verdade: o desafio 402 real.
+
+    A v38 remontava os accepts à mão aqui e cravava Solana em accepts[0],
+    ignorando PREFER_BASE. Consequência: o desafio 402 servia Base primeiro
+    (correto, é o que destrava a indexação na CDP) mas o MANIFESTO — o
+    documento que x402scan, CDP Bazaar e agentic.market efetivamente leem —
+    anunciava Solana primeiro. As duas superfícies discordavam e a indexação
+    continuava presa. Pior: /bootstrap-trust, cujo único propósito é gerar o
+    settle Base que destrava o Bazaar, não tinha Base entre os accepts.
+
+    Agora tudo deriva de _build_402(), então é impossível divergir de novo.
+    """
     base = _public_base()
     resources = []
-    svm_fee_payer = os.environ.get("SVM_FEE_PAYER_OVERRIDE", "").strip()
-    if not svm_fee_payer and FACILITATOR:
-        svm_fee_payer = FACILITATOR.get_svm_fee_payer()
-    if not svm_fee_payer:
-        svm_fee_payer = WALLET.solana_address  # v20 fallback
-    svm_extra = {"feePayer": svm_fee_payer} if svm_fee_payer else {}
-    # v21.1 FIX: /bootstrap-trust tem GET livre (instrucoes, 200) e POST pago (402
-    # sem payment). Declarar como "method": "GET" no manifest genérico contradiz o
-    # comportamento real do GET (que nunca retorna 402) e faz o x402scan recusar o
-    # registro do node inteiro. Ele é tratado à parte, abaixo, como recurso POST.
-    GET_FREE_MIXED_METHOD_ENDPOINTS = {"/bootstrap-trust"}
-    for p, base_price in BASE_PRICES.items():
-        if p in GET_FREE_MIXED_METHOD_ENDPOINTS:
-            continue
-        dyn_price = get_dynamic_price(p)
-        payment_options = [{
-            "scheme":            "exact",
-            "network":           f"solana:{SOL_GENESIS}",
-            "asset":             USDC_MINT,
-            "maxAmountRequired": str(int(dyn_price * 10 ** USDC_DECIMALS)),
-            "payTo":             RECEIVE_ADDRESS,
-            "maxTimeoutSeconds": 300,
-            "extra":             svm_extra,
-        }]
-        if ENABLE_BASE and BASE_PAYTO_EVM:
-            payment_options.append({
-                "scheme":            "exact",
-                "network":           BASE_CAIP2,
-                "asset":             BASE_USDC,
-                "maxAmountRequired": str(int(dyn_price * 10 ** 6)),
-                "payTo":             BASE_PAYTO_EVM,
-                "maxTimeoutSeconds": 300,
-                "extra":             {"name": "USD Coin", "version": "2"},
-            })
-        resources.append({
-            "url":               f"{base}{p}",
-            "method":            "GET",
-            "scheme":            "exact",
-            "network":           f"solana:{SOL_GENESIS}",
-            "maxAmountRequired": str(int(dyn_price * 10 ** USDC_DECIMALS)),
-            "asset":             USDC_MINT,
-            "payTo":             RECEIVE_ADDRESS,
-            "maxTimeoutSeconds": 300,
-            "extra":             svm_extra,
-            "description":       ENDPOINT_DESC.get(p, p),
-            "mimeType":          "application/json",
-            "accepts":           payment_options,
-        })
 
-    # /bootstrap-trust: recurso correto é o método POST (o único que exige pagamento)
-    if "/bootstrap-trust" in BASE_PRICES:
-        bt_price = get_dynamic_price("/bootstrap-trust")
-        bt_payment_options = [{
-            "scheme":            "exact",
-            "network":           f"solana:{SOL_GENESIS}",
-            "asset":             USDC_MINT,
-            "maxAmountRequired": str(int(bt_price * 10 ** USDC_DECIMALS)),
-            "payTo":             RECEIVE_ADDRESS,
-            "maxTimeoutSeconds": 300,
-            "extra":             svm_extra,
-        }]
-        resources.append({
-            "url":               f"{base}/bootstrap-trust",
-            "method":            "POST",
-            "scheme":            "exact",
-            "network":           f"solana:{SOL_GENESIS}",
-            "maxAmountRequired": str(int(bt_price * 10 ** USDC_DECIMALS)),
-            "asset":             USDC_MINT,
-            "payTo":             RECEIVE_ADDRESS,
-            "maxTimeoutSeconds": 300,
-            "extra":             svm_extra,
-            "description":       ENDPOINT_DESC.get("/bootstrap-trust", "/bootstrap-trust"),
+    # /bootstrap-trust tem GET livre (instruções, 200) e POST pago. Declarar
+    # como GET no manifesto genérico contradiz o comportamento real e faz o
+    # x402scan recusar o registro do node inteiro — tratado à parte abaixo.
+    MIXED_METHOD = {"/bootstrap-trust"}
+
+    def _resource(path: str, method: str = "GET"):
+        ch = _build_402(path).get_json()
+        accepts = ch.get("accepts") or []
+        if not accepts:
+            return None
+        primary = accepts[0]
+        desc = ENDPOINT_DESC.get(path)
+        if not desc:
+            # v39: o fallback da v38 era `ENDPOINT_DESC.get(p, p)`, que fazia
+            # /week-pass e /enterprise aparecerem no Bazaar com a descrição
+            # literal "/week-pass". Um produto de $9.99 sem descrição não vende.
+            log.error(f"🚨 catálogo: {path} sem ENDPOINT_DESC — "
+                      f"não será publicado no manifesto")
+            return None
+        return {
+            "url":               f"{base}{path}",
+            "method":            method,
+            "scheme":            primary.get("scheme", "exact"),
+            "network":           primary.get("network"),
+            "asset":             primary.get("asset"),
+            "maxAmountRequired": primary.get("amount"),
+            "payTo":             primary.get("payTo"),
+            "maxTimeoutSeconds": primary.get("maxTimeoutSeconds", 300),
+            "extra":             primary.get("extra", {}),
+            "description":       desc,
             "mimeType":          "application/json",
-            "accepts":           bt_payment_options,
-        })
+            "accepts":           accepts,
+            # Service Metadata da spec do Bazaar: nome legível, tags e ícone
+            # alimentam o ranking de qualidade e a busca semântica.
+            "serviceName":       SERVICE_NAME,
+            "tags":              _service_tags(path),
+            "iconUrl":           f"{base}/favicon.png",
+        }
+
+    for p in BASE_PRICES:
+        if p in MIXED_METHOD:
+            continue
+        try:
+            r = _resource(p)
+            if r:
+                resources.append(r)
+        except Exception as e:
+            log.warning(f"manifest: {p} pulado ({e})")
+
+    for p in MIXED_METHOD:
+        if p in BASE_PRICES:
+            try:
+                r = _resource(p, method="POST")
+                if r:
+                    resources.append(r)
+            except Exception as e:
+                log.warning(f"manifest: {p} (POST) pulado ({e})")
+
+    chains = []
+    if ENABLE_BASE and BASE_PAYTO_EVM:
+        chains.append(BASE_CAIP2)
+    chains.append(f"solana:{SOL_GENESIS}")
+    if not PREFER_BASE:
+        chains.reverse()
+
     manifest = {
         "version":         2,
         "ownershipProofs": [WALLET.solana_address],
         "resources":       resources,
         "node": {
-            "name":        "Losbeto",
+            "name":        SERVICE_NAME,
             "version":     VERSION,
             "node_id":     WALLET.node_id,
             "url":         base,
-            "chains":      [f"solana:{SOL_GENESIS}"] + ([BASE_CAIP2] if ENABLE_BASE else []),
+            "chains":      chains,
             "facilitator": FACILITATOR_URL if FACILITATOR else None,
+            "preferredNetwork": chains[0] if chains else None,
+            "docs":        f"{base}/llms-full.txt",
+            "openapi":     f"{base}/openapi.json",
+            "mcp":         f"{base}/mcp",
+            "freeSample":  f"{base}/try",
         },
     }
     if ENABLE_BASE and BASE_PAYTO_EVM:
@@ -7172,17 +7630,88 @@ FEATURED_ENDPOINTS.insert(0, "/x402-audit")
 log.info("🔍 x402 Audit registrado ($0.05) — verificação de serviços do ecossistema")
 
 
-# v32 REPRECIFICAÇÃO — alinhada ao que o mercado efetivamente transaciona.
-# Dado decisivo: o líder da categoria (x402stock, 139 endpoints) faturou
-# US$79 em 30 dias com ticket médio de $0,028 — praticamente igual ao
-# nosso ($0,024). Preço nunca foi o gargalo; o teto dele é $0,75 e nós
-# tínhamos produtos a $4,16. Nenhum item nosso justifica preço acima do
-# líder, então o topo passa a ser $0,30.
-for _ep, _p in {'/global-morning-brief': 0.15, '/equity-dossier': 0.15, '/event-playbook': 0.2, '/correlation-matrix': 0.15, '/sector-rotation': 0.12, '/portfolio-stress': 0.25, '/council-deep': 0.25, '/thesis-engine': 0.2, '/whale-dossier': 0.2, '/council': 0.15, '/launch-sniper': 0.15, '/relatorio': 0.1, '/forex-arbitrage': 0.08, '/portfolio-copilot': 0.12, '/launch-risk': 0.1, '/mev-flow': 0.08, '/alpha-signal': 0.08, '/insider-track': 0.08, '/arbitrage': 0.06, '/cross-chain': 0.06, '/copytrade': 0.06, '/market-brief': 0.06, '/multi-chain-arbitrage': 0.06, '/agent-composable': 0.08, '/sinais': 0.05, '/deep-think': 0.05, '/agent-call': 0.05, '/whale-alert': 0.05, '/smart-money': 0.05, '/sanctions': 0.05, '/enterprise': 9.99}.items():
+# ---------------------------------------------------------------------------
+# v32/v39 — REPRECIFICAÇÃO
+#
+# v32 alinhou o topo do catálogo ao que o mercado transaciona de fato. Duas
+# correções da v39 sobre aquele bloco:
+#
+#  1. O dicionário literal estava REPETIDO TRÊS VEZES (uma no loop, duas no
+#     log.info). Três cópias da mesma tabela de preços é divergência
+#     garantida na próxima edição. Agora é uma constante só.
+#
+#  2. '/enterprise': 9.99 estava no meio de um bloco cujo comentário diz "o
+#     topo passa a ser $0,30" — era erro de digitação de 99.99. O efeito era
+#     a escada de preços INVERTIDA: enterprise (ilimitado, 365 dias) saía por
+#     $9.99, mais barato que subscribe-whale (ilimitado, 30 dias, $19.99) e
+#     igual a subscribe-pro (saldo de $15, 30 dias, $9.99). Nenhum comprador
+#     racional escolhia outra coisa. Corrigido para 99.99.
+#
+# Referência de mercado (jul/2026): o líder da categoria cobra $0.01–0.05 no
+# grosso do catálogo e $0.15–0.75 nos produtos de IA/score. O teto de $0.30
+# da v32 estava conservador demais para os flagships de IA — /council-deep,
+# /br-brief e /thesis-engine voltam a $0.35–0.45, ainda abaixo do líder.
+# ---------------------------------------------------------------------------
+_V32_REPRICE = {
+    # Produtos de IA/síntese — onde o comparável de mercado é $0.15–0.75
+    "/council-deep":          0.35,
+    "/portfolio-stress":      0.30,
+    "/br-brief":              0.35,
+    "/thesis-engine":         0.30,
+    "/global-morning-brief":  0.20,
+    "/equity-dossier":        0.20,
+    "/event-playbook":        0.25,
+    "/correlation-matrix":    0.18,
+    "/sector-rotation":       0.15,
+    "/whale-dossier":         0.20,
+    "/relatorio":             0.15,
+    "/council":               0.15,
+    "/launch-sniper":         0.15,
+    "/portfolio-copilot":     0.12,
+    "/launch-risk":           0.10,
+    # Dado trabalhado — comparável $0.01–0.08
+    "/forex-arbitrage":       0.08,
+    "/mev-flow":              0.08,
+    "/alpha-signal":          0.08,
+    "/insider-track":         0.08,
+    "/agent-composable":      0.08,
+    "/arbitrage":             0.06,
+    "/cross-chain":           0.06,
+    "/copytrade":             0.06,
+    "/market-brief":          0.06,
+    "/multi-chain-arbitrage": 0.06,
+    "/sinais":                0.05,
+    "/deep-think":            0.05,
+    "/agent-call":            0.05,
+    "/whale-alert":           0.05,
+    "/smart-money":           0.05,
+    "/sanctions":             0.05,
+    # Plano anual — v39 FIX: era 9.99 por erro de digitação
+    "/enterprise":           99.99,
+}
+for _ep, _p in _V32_REPRICE.items():
     if _ep in BASE_PRICES:
         BASE_PRICES[_ep] = _p
-log.info(f"💲 v32: {len({'/global-morning-brief': 0.15, '/equity-dossier': 0.15, '/event-playbook': 0.2, '/correlation-matrix': 0.15, '/sector-rotation': 0.12, '/portfolio-stress': 0.25, '/council-deep': 0.25, '/thesis-engine': 0.2, '/whale-dossier': 0.2, '/council': 0.15, '/launch-sniper': 0.15, '/relatorio': 0.1, '/forex-arbitrage': 0.08, '/portfolio-copilot': 0.12, '/launch-risk': 0.1, '/mev-flow': 0.08, '/alpha-signal': 0.08, '/insider-track': 0.08, '/arbitrage': 0.06, '/cross-chain': 0.06, '/copytrade': 0.06, '/market-brief': 0.06, '/multi-chain-arbitrage': 0.06, '/agent-composable': 0.08, '/sinais': 0.05, '/deep-think': 0.05, '/agent-call': 0.05, '/whale-alert': 0.05, '/smart-money': 0.05, '/sanctions': 0.05, '/enterprise': 9.99})} preços realinhados "
-         f"(topo agora ${max({'/global-morning-brief': 0.15, '/equity-dossier': 0.15, '/event-playbook': 0.2, '/correlation-matrix': 0.15, '/sector-rotation': 0.12, '/portfolio-stress': 0.25, '/council-deep': 0.25, '/thesis-engine': 0.2, '/whale-dossier': 0.2, '/council': 0.15, '/launch-sniper': 0.15, '/relatorio': 0.1, '/forex-arbitrage': 0.08, '/portfolio-copilot': 0.12, '/launch-risk': 0.1, '/mev-flow': 0.08, '/alpha-signal': 0.08, '/insider-track': 0.08, '/arbitrage': 0.06, '/cross-chain': 0.06, '/copytrade': 0.06, '/market-brief': 0.06, '/multi-chain-arbitrage': 0.06, '/agent-composable': 0.08, '/sinais': 0.05, '/deep-think': 0.05, '/agent-call': 0.05, '/whale-alert': 0.05, '/smart-money': 0.05, '/sanctions': 0.05, '/enterprise': 9.99}.values()):.2f})")
+
+# Trava de sanidade: a escada de planos precisa ser monotônica em $/dia-ilimitado.
+def _assert_plan_ladder() -> None:
+    ladder = [("/day-pass", 1), ("/week-pass", 7),
+              ("/subscribe-whale", 30), ("/enterprise", 365)]
+    prev = 0.0
+    for ep, _days in ladder:
+        price = BASE_PRICES.get(ep)
+        if price is None:
+            continue
+        if price <= prev:
+            log.error(f"🚨 ESCADA DE PREÇOS INVERTIDA: {ep} custa ${price:.2f}, "
+                      f"não mais que o plano anterior (${prev:.2f}). "
+                      f"Um comprador racional nunca escolherá o plano menor.")
+        prev = max(prev, price)
+
+_assert_plan_ladder()
+log.info(f"💲 v39: {len(_V32_REPRICE)} preços realinhados "
+         f"(topo de dado: ${max(v for k, v in _V32_REPRICE.items() if v < 1):.2f} · "
+         f"plano anual: ${BASE_PRICES.get('/enterprise', 0):.2f})")
 
 # ============================================================================
 # 20. SENTIMENT CONSENSUS (v31) — mesmo padrão que funcionou no oráculo,
@@ -8223,7 +8752,7 @@ def _br_brief_handler():
                 "ibovespa": ({"points": ibov.get("price"),
                               "change_pct": ibov.get("change_pct")} if ibov else None),
                 "blue_chips": blue, "global_context": glob}
-    sintese = _ai(
+    sintese = _ai_required(
         "You are the chief strategist of a Brazilian macro desk writing for an "
         "international audience. Using ONLY this snapshot:\n"
         f"{json.dumps(snapshot, default=str)[:1700]}\n"
@@ -8733,7 +9262,7 @@ def _build_openapi():
         "/sample": {
             "get": {
                 "summary": "Free Sample — preview de dados reais",
-                "description": "Preview gratuito de Fear&Greed, sinais e anomalias. Sem pagamento.",
+                "description": "Free preview of fear & greed, signals and anomalies. No payment required.",
                 "operationId": "sample_free",
                 "tags": ["Free", "Discovery"],
                 "parameters": [
@@ -8743,7 +9272,7 @@ def _build_openapi():
                 ],
                 "security": [],
                 "responses": {
-                    "200": {"description": "Preview gratuito",
+                    "200": {"description": "Free preview",
                             "content": {"application/json": {"schema": {"type": "object"}}}},
                 },
             }
@@ -9024,7 +9553,7 @@ def llms_txt():
         lines.append(f"Base payTo:   {BASE_PAYTO_EVM} (network: eip155:8453)")
     if TON_WALLET:
         lines.append(f"TON address:  {TON_WALLET.address}")
-    lines += ["", "## Créditos (recomendado — 1 tx → N chamadas sem latência)"]
+    lines += ["", "## Credits (recommended — one transaction, N calls, no settlement latency)"]
     for ep, plan in CREDIT_PLANS.items():
         lines.append(f"- [{base}{ep}] ${BASE_PRICES[ep]:.2f} — {plan['pitch']}")
     lines.append("Uso: header `X-API-Key: lsk_...` em qualquer endpoint pago. "
@@ -9052,7 +9581,7 @@ def llms_txt():
               f"- [{base}/losbeto-alpha]({base}/losbeto-alpha) — Losbeto Alpha Score (índice proprietário exclusivo)",
               f"- [{base}/bootstrap-trust]({base}/bootstrap-trust) — Bootstrap trust score (self-payment)",
               f"- [{base}/starter-pack]({base}/starter-pack) — Pacote premium de US$1 para primeira compra manual",
-              f"- [{base}/get-pricing]({base}/get-pricing) — Lista completa de preços"]
+              f"- [{base}/get-pricing]({base}/get-pricing) — full price list"]
     lines += ["", "## Discovery",
               f"- OpenAPI:    {base}/openapi.json",
               f"- x402:       {base}/.well-known/x402.json",
@@ -9887,36 +10416,125 @@ def dash_api():
 # ============================================================================
 
 class TelegramBot:
+    """v39 — reescrito.
+
+    Problemas da v38 corrigidos aqui:
+      · send() ignorava r.ok. Erro de parse Markdown devolvia 400 e a mensagem
+        simplesmente não chegava, sem nenhum rastro. Acontecia direto no /pump,
+        que injeta descrições da Pump.fun com _ e * sem escapar.
+      · /precos despejava 60+ linhas num único sendMessage. O limite do
+        Telegram é 4096 caracteres — combinado com o bug acima, a mensagem
+        falhava em silêncio.
+      · /referral gerava código sem link nenhum para compartilhar.
+      · /stake mandava um humano montar JSON à mão.
+      · Faltava o que mais importa: o operador não era avisado de NADA.
+        LLM caído, facilitator recusando settle, 30 dias sem venda — tudo
+        invisível.
+    """
+
+    TG_LIMIT = 3900   # margem sobre o limite real de 4096
+
     def __init__(self, token: str):
         self.token = token
         self.last_update = 0
 
-    def send(self, chat_id, text, parse_mode="Markdown"):
-        try:
-            requests.post(f"https://api.telegram.org/bot{self.token}/sendMessage",
-                json={"chat_id": chat_id, "text": text, "parse_mode": parse_mode,
-                      "disable_web_page_preview": True},
-                timeout=10)
-        except Exception as e:
-            log.warning(f"TG send: {e}")
+    # ---------------------------------------------------------------- envio
+    @staticmethod
+    def esc(text: str) -> str:
+        """Escapa o que quebra o parser Markdown legado do Telegram."""
+        return (str(text).replace("\\", "")
+                         .replace("_", "\\_").replace("*", "\\*")
+                         .replace("[", "\\[").replace("`", "\\`"))
 
+    def send(self, chat_id, text, parse_mode="Markdown", buttons=None):
+        """Envia e VERIFICA. Se o Telegram recusar o parse, reenvia em texto
+        puro — melhor uma mensagem feia que uma mensagem perdida."""
+        for chunk in self._split(text):
+            payload = {"chat_id": chat_id, "text": chunk,
+                       "disable_web_page_preview": True}
+            if parse_mode:
+                payload["parse_mode"] = parse_mode
+            if buttons:
+                payload["reply_markup"] = {"inline_keyboard": buttons}
+            try:
+                r = requests.post(
+                    f"https://api.telegram.org/bot{self.token}/sendMessage",
+                    json=payload, timeout=10)
+                if r.ok:
+                    continue
+                log.warning(f"TG send HTTP {r.status_code}: {r.text[:160]}")
+                if parse_mode:   # retry sem formatação
+                    payload.pop("parse_mode", None)
+                    r2 = requests.post(
+                        f"https://api.telegram.org/bot{self.token}/sendMessage",
+                        json=payload, timeout=10)
+                    if not r2.ok:
+                        log.error(f"TG send falhou 2x: {r2.text[:160]}")
+            except Exception as e:
+                log.warning(f"TG send: {e}")
+
+    def _split(self, text: str):
+        text = str(text)
+        if len(text) <= self.TG_LIMIT:
+            return [text]
+        out, buf = [], ""
+        for line in text.split("\n"):
+            if len(buf) + len(line) + 1 > self.TG_LIMIT:
+                out.append(buf); buf = ""
+            buf += line + "\n"
+        if buf.strip():
+            out.append(buf)
+        return out
+
+    # ------------------------------------------------------------- recepção
     def poll(self):
         try:
             r = requests.get(f"https://api.telegram.org/bot{self.token}/getUpdates",
                 params={"offset": self.last_update + 1, "timeout": 30}, timeout=35)
-            if not r.ok: return
+            if not r.ok:
+                log.warning(f"TG getUpdates HTTP {r.status_code}: {r.text[:120]}")
+                time.sleep(5)
+                return
             for u in r.json().get("result", []):
                 self.last_update = u["update_id"]
+                if "callback_query" in u:
+                    self._handle_button(u["callback_query"])
+                    continue
                 msg = u.get("message")
-                if not msg or "text" not in msg: continue
+                if not msg or "text" not in msg:
+                    continue
                 self._handle(msg)
         except Exception as e:
             log.warning(f"TG poll: {e}")
 
+    def _handle_button(self, cq):
+        try:
+            requests.post(
+                f"https://api.telegram.org/bot{self.token}/answerCallbackQuery",
+                json={"callback_query_id": cq["id"]}, timeout=8)
+        except Exception:
+            pass
+        chat_id = cq["message"]["chat"]["id"]
+        self._handle({"chat": {"id": chat_id},
+                      "from": cq.get("from", {}),
+                      "text": cq.get("data", "")})
+
+    # -------------------------------------------------------------- comandos
+    def _menu(self):
+        return [
+            [{"text": "📊 Hoje",  "callback_data": "/hoje"},
+             {"text": "🩺 Saúde", "callback_data": "/saude"}],
+            [{"text": "💰 Preços", "callback_data": "/precos"},
+             {"text": "📈 Demanda", "callback_data": "/demanda"}],
+            [{"text": "💬 Conversas", "callback_data": "/chats"},
+             {"text": "🔗 Links", "callback_data": "/links"}],
+        ]
+
     def _handle(self, msg):
         chat_id = msg["chat"]["id"]
-        text = msg["text"].strip()
-        # v36: /r <id> <texto> responde a um visitante do site.
+        text = (msg.get("text") or "").strip()
+
+        # ---- responder um visitante do site ------------------------------
         if text.startswith("/r "):
             partes = text[3:].strip().split(None, 1)
             if len(partes) < 2:
@@ -9928,10 +10546,115 @@ class TelegramBot:
             except Exception as e:
                 log.warning(f"chat reply: {e}")
                 ok = False
-            self.send(chat_id, (f"✅ Enviado para `[{curto}]` — aparece no site em "
-                                f"segundos." if ok else
-                                f"❌ Sessão `[{curto}]` não encontrada. Confira o id."))
+            self.send(chat_id, (f"✅ Enviado para `[{curto}]`." if ok else
+                                f"❌ Sessão `[{curto}]` não encontrada."))
             return
+
+        if text in ("/start", "/menu", "/help"):
+            self.send(chat_id,
+                f"⚡ *Losbeto v{self.esc(VERSION)}*\n\n"
+                f"Use os botões abaixo ou os comandos:\n"
+                f"`/hoje` · `/saude` · `/precos` · `/demanda`\n"
+                f"`/chats` · `/r <id> texto` · `/links` · `/status`\n"
+                f"`/sinais` · `/sentiment BTC` · `/whale` · `/wallet`\n"
+                f"`/alertas on|off` — notificações de eventos críticos",
+                buttons=self._menu())
+            return
+
+        # ---- v39: o comando que faltava -----------------------------------
+        if text == "/saude":
+            h = llm_health_report()
+            linhas = ["🩺 *Saúde do node*", ""]
+            linhas.append(f"*IA:* {'✅ operante' if h['healthy'] else '❌ FORA'}")
+            linhas.append(f"  provedores: `{', '.join(h['configured']) or 'nenhum'}`")
+            for prov, det in (h.get("quarantined") or {}).items():
+                quando = datetime.fromtimestamp(det["until"], timezone.utc).strftime("%H:%M")
+                linhas.append(f"  ⚠️ `{prov}` em quarentena até {quando}Z")
+                linhas.append(f"     {self.esc(det['last_error'][:90])}")
+            if not h["healthy"]:
+                bloqueados = sorted(AI_REQUIRED_ENDPOINTS)
+                linhas.append(f"\n⛔ *{len(bloqueados)} endpoints fora de venda* "
+                              f"(gate de pré-pagamento ativo — ninguém é cobrado):")
+                linhas.append("  " + ", ".join(f"`{self.esc(e)}`" for e in bloqueados[:8]))
+            linhas.append("")
+            linhas.append(f"*Facilitator:* `{self.esc(FACILITATOR_URL or 'off')}`")
+            linhas.append(f"*CDP/Base:* {'✅' if (ENABLE_BASE and BASE_PAYTO_EVM) else '❌'}")
+            linhas.append(f"*Chain preferida:* `{'base' if PREFER_BASE else 'solana'}`")
+            try:
+                s = LEDGER.stats() or {}
+                ultimo = s.get("last_sale_ts")
+                if ultimo:
+                    dias = (time.time() - float(ultimo)) / 86400
+                    linhas.append(f"*Última venda:* há {dias:.1f} dias")
+                    if dias > 25:
+                        linhas.append("  🚨 30 dias sem settle = saída do Bazaar")
+            except Exception:
+                pass
+            self.send(chat_id, "\n".join(linhas), buttons=self._menu())
+            return
+
+        if text == "/hoje":
+            try:
+                s = LEDGER.stats() or {}
+                previews = sum(_PREVIEW_SERVED.values())
+                top_prev = ", ".join(f"{self.esc(k)}×{v}"
+                                     for k, v in _PREVIEW_SERVED.most_common(3)) or "—"
+                self.send(chat_id,
+                    f"📊 *Hoje*\n\n"
+                    f"💰 24h: `${s.get('today_usdc', 0):.4f}` "
+                    f"({s.get('paid_24h', 0)} pagamentos)\n"
+                    f"⏱ 1h: `${s.get('hour_usdc', 0):.4f}`\n"
+                    f"👥 Compradores únicos: `{s.get('buyers', 0)}`\n"
+                    f"📦 Total acumulado: `${s.get('total_usdc', 0):.4f}`\n\n"
+                    f"👀 Previews servidos (desde o boot): `{previews}`\n"
+                    f"   top: {top_prev}\n\n"
+                    f"_Preview sem venda é demanda não convertida — veja /demanda._",
+                    buttons=self._menu())
+            except Exception as e:
+                self.send(chat_id, f"erro: {self.esc(str(e)[:100])}")
+            return
+
+        if text == "/demanda":
+            try:
+                rows = LEDGER.top_requested_params(limit=10)
+            except Exception:
+                rows = []
+            if not rows:
+                self.send(chat_id, "Sem sinal de demanda registrado ainda.")
+                return
+            linhas = ["📈 *O que as máquinas pediram*", ""]
+            for r in rows[:10]:
+                try:
+                    ep, params, n = r[0], r[1], r[2]
+                except Exception:
+                    continue
+                linhas.append(f"`{self.esc(ep)}` {self.esc(params or '—')} — {n}×")
+            self.send(chat_id, "\n".join(linhas), buttons=self._menu())
+            return
+
+        if text == "/links":
+            b = _public_base()
+            self.send(chat_id,
+                f"🔗 *Superfícies de descoberta*\n\n"
+                f"[x402 manifest]({b}/.well-known/x402.json)\n"
+                f"[server.json (MCP)]({b}/server.json)\n"
+                f"[OpenAPI]({b}/openapi.json)\n"
+                f"[llms-full.txt]({b}/llms-full.txt)\n"
+                f"[Amostra grátis]({b}/try)\n"
+                f"[Preços]({b}/get-pricing)",
+                buttons=self._menu())
+            return
+
+        if text.startswith("/alertas"):
+            arg = text.split()[-1].lower() if len(text.split()) > 1 else ""
+            if arg in ("on", "off"):
+                globals()["_TG_ALERTS_ON"] = (arg == "on")
+                self.send(chat_id, f"🔔 Alertas: *{arg.upper()}*")
+            else:
+                estado = "ON" if globals().get("_TG_ALERTS_ON", True) else "OFF"
+                self.send(chat_id, f"🔔 Alertas estão *{estado}*. Use `/alertas on|off`.")
+            return
+
         if text == "/chats":
             try:
                 c = _chat_db()
@@ -9952,104 +10675,117 @@ class TelegramBot:
                 self.send(chat_id, "💬 *Conversas recentes*\n\n" + "\n".join(linhas)
                           + "\n\nResponda com `/r <id> texto`")
             except Exception as e:
-                self.send(chat_id, f"erro: {str(e)[:80]}")
+                self.send(chat_id, f"erro: {self.esc(str(e)[:80])}")
             return
-        if text == "/start":
-            self.send(chat_id, (
-                f"⚡ *Losbeto v{VERSION}*\n\n"
-                f"Comandos disponíveis:\n"
-                f"/precos - lista preços ao vivo\n"
-                f"/sinais - top sinais agora\n"
-                f"/whale - whale alerts 24h\n"
-                f"/sentiment BTC - sentimento de um símbolo\n"
-                f"/pump - novos tokens Pump.fun\n"
-                f"/chats - conversas do site\n"
-                f"/r <id> texto - responder um visitante\n"
-                f"/status - status do nó\n"
-                f"/wallet - endereços para pagamento\n"
-                f"/referral - gera seu código de referência\n"
-                f"/stake - aposte USDC na reputação do node\n\n"
-                f"💳 Créditos: {_public_base()}/buy-credits (1 tx → N chamadas)\n"
-                f"💡 _Para chamadas API completas use {_public_base()}_"
-            ))
-        elif text == "/precos":
-            lines = ["💰 *Preços atuais (USDC)*\n"]
-            for ep in BASE_PRICES:
-                lines.append(f"`{ep}` — `${get_dynamic_price(ep):.4f}`")
-            self.send(chat_id, "\n".join(lines))
-        elif text == "/sinais":
+
+        if text == "/precos":
+            # v39: paginado por faixa. Antes eram 60+ linhas num sendMessage só.
+            faixas = [
+                ("💵 Planos (1 tx → N chamadas)", lambda e, p: e in CREDIT_PLANS),
+                ("💎 Premium ($0.10+)", lambda e, p: e not in CREDIT_PLANS and p >= 0.10),
+                ("⚙️ Core ($0.02–0.10)", lambda e, p: e not in CREDIT_PLANS and 0.02 <= p < 0.10),
+                ("🔍 Discovery (< $0.02)", lambda e, p: e not in CREDIT_PLANS and p < 0.02),
+            ]
+            for titulo, filtro in faixas:
+                itens = sorted(((e, get_dynamic_price(e)) for e in BASE_PRICES
+                                if filtro(e, get_dynamic_price(e))),
+                               key=lambda x: -x[1])
+                if not itens:
+                    continue
+                linhas = [f"*{titulo}*", ""]
+                linhas += [f"`{self.esc(e)}` — `${p:.4f}`" for e, p in itens]
+                self.send(chat_id, "\n".join(linhas))
+            self.send(chat_id, "_Preço ao vivo em /get-pricing._", buttons=self._menu())
+            return
+
+        if text == "/sinais":
             sigs = Brain.sinais().get("signals", [])[:5]
             if not sigs:
                 self.send(chat_id, "📊 Sem sinais fortes agora.")
-            else:
-                lines = ["📊 *Top sinais agora*\n"]
-                for s in sigs:
-                    emoji = "🟢" if s["action"] == "buy" else "🔴"
-                    lines.append(f"{emoji} `{s['symbol']}` {s['action'].upper()} "
-                                 f"conf {s['confidence']:.0%} @ ${s['price']:.4f}")
-                self.send(chat_id, "\n".join(lines))
-        elif text.startswith("/sentiment"):
+                return
+            linhas = ["📊 *Top sinais agora*", ""]
+            for s in sigs:
+                emoji = "🟢" if s["action"] == "buy" else "🔴"
+                linhas.append(f"{emoji} `{self.esc(s['symbol'])}` "
+                              f"{s['action'].upper()} conf {s['confidence']:.0%} "
+                              f"@ ${s['price']:.4f}")
+            self.send(chat_id, "\n".join(linhas))
+            return
+
+        if text.startswith("/sentiment"):
             parts = text.split()
             sym = parts[1] if len(parts) > 1 else "BTC"
             with app.test_request_context(f"/sentiment?symbol={sym}"):
                 r = Brain.sentiment()
-            emoji = "🟢" if r.get("sentiment") == "bullish" else \
-                    "🔴" if r.get("sentiment") == "bearish" else "⚪"
-            self.send(chat_id, f"{emoji} *{r.get('symbol')}*\n"
-                              f"Sentimento: *{r.get('sentiment')}*\n"
-                              f"Score: `{r.get('score')}`\n"
-                              f"F&G: `{r.get('fear_greed')}`")
-        elif text == "/whale":
+            emoji = ("🟢" if r.get("sentiment") == "bullish" else
+                     "🔴" if r.get("sentiment") == "bearish" else "⚪")
+            self.send(chat_id, f"{emoji} *{self.esc(r.get('symbol'))}*\n"
+                               f"Sentimento: *{r.get('sentiment')}*\n"
+                               f"Score: `{r.get('score')}`\n"
+                               f"F&G: `{r.get('fear_greed')}`")
+            return
+
+        if text == "/whale":
             w = Market.whale_alert()[:5]
             if not w:
                 self.send(chat_id, "🐋 Sem whales agora.")
-            else:
-                lines = ["🐋 *Top 5 maior volume 24h*\n"]
-                for x in w:
-                    lines.append(f"`{x['symbol']}` — `${x['volume_24h']/1e6:.1f}M` "
-                                 f"({x['price_change']:+.1f}%)")
-                self.send(chat_id, "\n".join(lines))
-        elif text == "/pump":
+                return
+            linhas = ["🐋 *Top 5 maior volume 24h*", ""]
+            for x in w:
+                linhas.append(f"`{self.esc(x['symbol'])}` — "
+                              f"`${x['volume_24h']/1e6:.1f}M` ({x['price_change']:+.1f}%)")
+            self.send(chat_id, "\n".join(linhas))
+            return
+
+        if text == "/pump":
             new = Market.pump_new()[:5]
-            lines = ["🚀 *Novos tokens monitorados*\n"]
-            for t in new:
-                lines.append(f"• {t.get('description', 'N/A')[:50]}")
-            self.send(chat_id, "\n".join(lines) if new else "Nenhum token detectado.")
-        elif text == "/status":
+            if not new:
+                self.send(chat_id, "Nenhum token detectado.")
+                return
+            # v39: descrições da Pump.fun vêm com _ e * e quebravam o parser.
+            linhas = ["🚀 *Novos tokens monitorados*", ""]
+            linhas += [f"• {self.esc(t.get('description', 'N/A'))[:60]}" for t in new]
+            self.send(chat_id, "\n".join(linhas))
+            return
+
+        if text == "/status":
             s = LEDGER.stats()
-            self.send(chat_id, (
-                f"⚡ *Status Losbeto v{VERSION}*\n\n"
+            self.send(chat_id,
+                f"⚡ *Losbeto v{self.esc(VERSION)}*\n\n"
                 f"💰 Total: `${s['total_usdc']:.4f}` USDC\n"
                 f"📅 24h: `${s['today_usdc']:.4f}` ({s['paid_24h']} pagamentos)\n"
                 f"⏱️ 1h: `${s['hour_usdc']:.4f}`\n"
-                f"🎯 Win rate: `{s['win_rate']}%`\n"
                 f"⚡ PoI: `{s['poi_multiplier']:.2f}x`\n"
                 f"👥 Compradores: `{s['buyers']}`\n"
-                f"🌐 Peers: `{len(LEDGER.active_peers())}`"
-            ))
-        elif text == "/wallet":
+                f"🌐 Peers: `{len(LEDGER.active_peers())}`",
+                buttons=self._menu())
+            return
+
+        if text == "/wallet":
             txt = f"💳 *Endereços de pagamento*\n\nSolana:\n`{RECEIVE_ADDRESS}`"
             if ENABLE_BASE:
                 txt += f"\n\nBase (EVM):\n`{BASE_PAYTO_EVM}`"
             if TON_WALLET:
                 txt += f"\n\nTON:\n`{TON_WALLET.address}`"
             self.send(chat_id, txt)
-        elif text == "/referral":
+            return
+
+        if text == "/referral":
             code = secrets.token_urlsafe(6)
-            owner = msg["from"]["id"]
+            owner = msg.get("from", {}).get("id", "unknown")
             if LEDGER.create_referral(code, str(owner)):
-                self.send(chat_id, f"✅ Seu código de referência: `{code}`\nCompartilhe e ganhe 10% de comissão!")
+                # v39: a v38 dizia "compartilhe e ganhe 10%" sem entregar
+                # NADA para compartilhar. Agora sai o link pronto.
+                link = f"{_public_base()}/?ref={code}"
+                self.send(chat_id,
+                    f"✅ *Seu link de indicação*\n\n`{link}`\n\n"
+                    f"Comissão de 10% sobre o que for pago por quem entrar por ele.\n"
+                    f"Código: `{code}`")
             else:
                 self.send(chat_id, "⚠️ Você já possui um código ativo.")
-        elif text == "/stake":
-            self.send(chat_id, (
-                "Para apostar USDC na reputação do node, use:\n"
-                "`POST /stake` com JSON:\n"
-                "```json\n{\"staker\": \"SEU_ENDERECO\", \"amount\": 0.10, \"tx_sig\": \"ASSINATURA\"}\n```"
-                "Envie USDC para o endereço do node e use a assinatura da transação."
-            ))
-        else:
-            self.send(chat_id, "❓ Comando não reconhecido. Tente /start")
+            return
+
+        self.send(chat_id, "❓ Comando não reconhecido.", buttons=self._menu())
 
 TG_BOT = TelegramBot(TG_TOKEN) if TG_TOKEN else None
 
@@ -10121,27 +10857,36 @@ def telegram_loop():
             time.sleep(5)
 
 def twitter_promo_loop():
-    if not (TWITTER_API_KEY and TWITTER_API_SECRET and TWITTER_ACCESS_TOKEN and TWITTER_ACCESS_TOKEN_SECRET):
+    """v39: a v38 gerava um tweet com LLM e depois só fazia log.info dele —
+    "aqui apenas logamos" está no comentário original. Ou seja: gastava cota
+    de IA (o insumo escasso) para produzir texto que ninguém jamais leu.
+    Agora o rascunho vai para o Telegram do operador, que decide se posta.
+    Sem credenciais de Twitter configuradas o loop nem inicia."""
+    if not (TWITTER_API_KEY and TWITTER_API_SECRET
+            and TWITTER_ACCESS_TOKEN and TWITTER_ACCESS_TOKEN_SECRET):
         log.info("Auto-promoção no Twitter desativada (credenciais não configuradas)")
         return
-    log.info("🐦 Auto-promoção no Twitter ativa")
+    if not (TG_TOKEN and TG_CHAT):
+        log.info("Auto-promoção desativada: sem Telegram para revisar o rascunho")
+        return
+    log.info("🐦 Rascunho de promoção diária ativo (revisão manual via Telegram)")
     while True:
         time.sleep(86400)  # 24h
         try:
+            if not llm_healthy():
+                continue
             fg = Market.fear_greed()
             regime = Brain.regime()
-            alpha = Brain.alpha_signal()
             prompt = (
-                f"Gere um tweet curto (até 280 caracteres) sobre o mercado cripto hoje, "
-                f"usando Fear&Greed={fg.get('value')}, regime={regime.get('regime')}, "
-                f"e destacando o Losbeto Alpha Score. Inclua o link {_public_base()}/losbeto-alpha "
-                f"e as hashtags #crypto #trading #x402."
+                f"Write one tweet (max 260 characters) about crypto markets today "
+                f"using Fear&Greed={fg.get('value')} and regime={regime.get('regime')}. "
+                f"Mention that live data is available per call over x402 at "
+                f"{_public_base()}. No hype, no emoji spam, no price predictions."
             )
-            tweet_text = LLM.ask(prompt, max_tokens=200, temperature=0.7)
-            if tweet_text and not tweet_text.startswith("[LLM offline"):
-                # Publicar no Twitter (usando tweepy ou similar – aqui apenas logamos)
-                log.info(f"🐦 Tweet gerado: {tweet_text}")
-                # Na prática, integrar com tweepy para postar.
+            tweet_text = LLM.ask(prompt, max_tokens=160, temperature=0.7)
+            if tweet_text:
+                _notify_telegram(f"🐦 Rascunho de tweet (revise antes de postar):\n\n"
+                                 f"{tweet_text[:280]}")
         except Exception as e:
             log.warning(f"twitter promo: {e}")
 
@@ -10166,30 +10911,55 @@ def autoregister_x402scan():
         log.info(f"   MCP:         {PUBLIC_URL}/.well-known/mcp.json")
         log.info(f"   llms.txt:    {PUBLIC_URL}/llms.txt")
         log.info("=" * 62)
-        # v21: Registro automático em MÚLTIPLOS marketplaces
-        marketplaces = [
-            ("x402scan",   "https://www.x402scan.com/api/register",   {"url": PUBLIC_URL, "version": 2}),
-            ("PayAI",      "https://facilitator.payai.network/register", {"url": PUBLIC_URL, "manifest": f"{PUBLIC_URL}/.well-known/x402.json"}),
-            ("MCPay",      "https://mcpay.tech/api/register",          {"url": PUBLIC_URL, "mcp": f"{PUBLIC_URL}/.well-known/mcp.json"}),
-            ("AgentCash",  "https://agentcash.dev/api/register",       {"url": PUBLIC_URL, "x402": f"{PUBLIC_URL}/.well-known/x402.json"}),
-            ("CDP Bazaar", "https://api.cdp.coinbase.com/x402/bazaar/register", {"url": PUBLIC_URL}),
+        # ------------------------------------------------------------------
+        # v39: o auto-registro da v38 fazia POST em cinco URLs que NÃO EXISTEM
+        # ("https://www.x402scan.com/api/register", ".../bazaar/register" etc).
+        # Os logs mostram 404 em quatro delas a cada boot — e como o gunicorn
+        # recicla worker a cada ~15 min com --max-requests, isso batia em
+        # endpoints inexistentes o dia inteiro. Registro em diretório agentic
+        # é feito por publicação/claim, não por ping. O que sobrou aqui é o
+        # que de fato serve: verificar se as NOSSAS superfícies de descoberta
+        # estão de pé, e falar alto quando não estão.
+        # ------------------------------------------------------------------
+        surfaces = [
+            ("x402 manifest",   "/.well-known/x402.json"),
+            ("MCP registry",    "/server.json"),
+            ("MCP endpoint",    "/mcp"),
+            ("OpenAPI",         "/openapi.json"),
+            ("llms.txt",        "/llms.txt"),
+            ("llms-full.txt",   "/llms-full.txt"),
+            ("agentic manifest","/.well-known/agentic.json"),
+            ("free sample",     "/try"),
         ]
-        for name, url, body in marketplaces:
+        quebradas = []
+        for nome, caminho in surfaces:
             try:
-                r = requests.post(url, json=body, timeout=8)
-                log.info(f"📍 {name}: {'✅ OK' if r.ok else f'❌ {r.status_code} (registre manualmente)'}")
+                rr = requests.get(f"{PUBLIC_URL}{caminho}", timeout=10)
+                if rr.ok:
+                    log.info(f"📍 {nome:18s} ✅ {rr.status_code} "
+                             f"({len(rr.content)}b)")
+                else:
+                    log.error(f"📍 {nome:18s} ❌ {rr.status_code} — {caminho}")
+                    quebradas.append(f"{nome} ({rr.status_code})")
             except Exception as e:
-                log.info(f"📍 {name}: ⚠️ timeout/err ({str(e)[:40]}) — registre manualmente")
-            time.sleep(0.5)
+                log.error(f"📍 {nome:18s} ⚠️ {str(e)[:50]} — {caminho}")
+                quebradas.append(f"{nome} (erro)")
+            time.sleep(0.3)
+
+        if quebradas:
+            _notify_telegram("🚨 Superfícies de descoberta com problema:\n"
+                             + "\n".join(f"• {q}" for q in quebradas))
+
         log.info("=" * 62)
-        log.info("📋 CHECKLIST PÓS-DEPLOY — Faça MANUALMENTE:")
-        log.info("   1. x402scan:      https://www.x402scan.com/resources/register")
-        log.info("   2. awesome-x402:  https://github.com/xpaysh/awesome-x402/pulls")
-        log.info("   3. AgentCash:     https://agentcash.dev (cole sua URL)")
-        log.info("   4. MCPay:         https://mcpay.tech (listar MCP)")
-        log.info("   5. BlockRun:      https://blockrun.ai/marketplace")
-        log.info("   6. Tweet:         @x402scan @CoinbaseDev @base @solana")
-        log.info("   7. Bootstrap:     POST /bootstrap-trust com 3 tx de $0.01 (Phantom-friendly)")
+        log.info("📋 DISTRIBUIÇÃO — feita UMA VEZ, manualmente:")
+        log.info("   1. MCP Registry:  mcp-publisher login github "
+                 "&& mcp-publisher publish   (lê /server.json)")
+        log.info("   2. x402scan:      https://www.x402scan.com/resources/register")
+        log.info("   3. awesome-x402:  PR em github.com/xpaysh/awesome-x402")
+        log.info("   4. AgentCash:     https://agentcash.dev — cole a URL do node")
+        log.info("   5. MCPay:         https://mcpay.tech — liste o MCP")
+        log.info("   6. CDP Bazaar:    1 settle em Base via POST /bootstrap-trust")
+        log.info("                     (o manifesto v39 já traz Base em accepts[0])")
         log.info("=" * 62)
     except Exception as e:
         log.warning(f"autoregister erro: {e}")
@@ -10202,44 +10972,88 @@ def autoregister_x402scan():
 
 # Endpoints que o warmer mantém quentes (defaults dos handlers já são bons:
 # forex_rate→EUR/USD, stock_quote→AAPL, commodity_price→GOLD etc.)
+# ---------------------------------------------------------------------------
+# v39 — WARMER DIVIDIDO EM DOIS
+#
+# A v38 aquecia UMA lista a cada 900s, e nela estavam /sector-rotation,
+# /correlation-matrix, /launch-risk, /alpha-signal e /equity-dossier — todos
+# chamam LLM. São 96 ciclos por dia × 5 endpoints ≈ 480 chamadas de LLM
+# diárias para ninguém. Era exatamente isso que estourava o TPD do Groq: o
+# aquecimento GRÁTIS consumia a cota inteira e, quando um agente pagante
+# chegava, a cadeia de IA estava morta. Os logs mostram os 429 em rajada
+# sempre imediatamente antes de "warmer: 15/15 previews atualizados".
+#
+# Agora: dados baratos aquecem de 15 em 15 minutos; a camada de IA aquece
+# de 12 em 12 horas, que é a frequência com que uma amostra premium
+# realmente precisa mudar.
+# ---------------------------------------------------------------------------
 AUTOPILOT_WARM = [p.strip() for p in os.environ.get(
     "AUTOPILOT_WARM_ENDPOINTS",
     "/fear-greed,/pyth-price,/trust-hash,/forex-rate,/stock-quote,"
-    "/commodity-price,/macro-calendar,/global-macro,/regime,/dex-screen,"
-    "/sector-rotation,/correlation-matrix,/launch-risk,/alpha-signal,/equity-dossier"
+    "/commodity-price,/macro-calendar,/regime,/dex-screen,"
+    "/oracle-consensus,/sentiment-consensus,/br-macro,/br-equity"
 ).split(",") if p.strip()]
 AUTOPILOT_WARM_SECS = int(os.environ.get("AUTOPILOT_WARM_SECS", "900"))  # 15 min
 
+AUTOPILOT_WARM_AI = [p.strip() for p in os.environ.get(
+    "AUTOPILOT_WARM_AI_ENDPOINTS",
+    "/sector-rotation,/correlation-matrix,/launch-risk,/alpha-signal,"
+    "/equity-dossier,/global-macro"
+).split(",") if p.strip()]
+AUTOPILOT_WARM_AI_SECS = int(os.environ.get("AUTOPILOT_WARM_AI_SECS", "43200"))  # 12 h
+
+def _warm_once(paths: List[str], label: str) -> int:
+    ok = 0
+    for path in paths:
+        handler = ENDPOINT_HANDLERS.get(path)
+        if not handler:
+            continue
+        try:
+            with app.test_request_context(path):
+                result = handler()
+            if isinstance(result, dict) and "error" not in result:
+                # v28: a amostra só é renovada após envelhecer — é o
+                # envelhecimento que dá valor à versão paga.
+                _cur = _PREVIEW_CACHE.get(path) or _preview_db_get(path)
+                _age = (time.time() - _cur["ts"]) if _cur else 1e9
+                if _age >= _preview_min_age(path):
+                    _PREVIEW_CACHE[path] = {"ts": time.time(), "data": result}
+                    _preview_db_put(path, result)
+                ok += 1
+        except LLMUnavailable:
+            log.debug(f"warm {path}: IA fora, amostra anterior mantida")
+        except Exception as e:
+            log.debug(f"warm {path}: {str(e)[:60]}")
+        time.sleep(2)  # gentileza com as fontes externas
+    log.info(f"🔥 warmer[{label}]: {ok}/{len(paths)} previews atualizados")
+    return ok
+
+
 def preview_warm_loop():
-    """Popula o cache de ?preview=1 chamando os handlers INTERNAMENTE
-    (dados são nossos; nenhum pagamento envolvido). Antes, o preview de um
-    endpoint só existia depois de alguém PAGAR por ele — ou seja, num node
-    sem vendas o funil 'avalie grátis → pague' começava quebrado."""
+    """Aquece o cache de ?preview=1 chamando os handlers INTERNAMENTE.
+    Sem isto, num node sem vendas o funil 'avalie grátis → pague' começa
+    quebrado: o preview de um endpoint só existiria depois de alguém pagar."""
     time.sleep(20)  # deixa o boot terminar
-    log.info(f"🔥 Autopilot warmer: {len(AUTOPILOT_WARM)} endpoints a cada "
-             f"{AUTOPILOT_WARM_SECS}s")
+    log.info(f"🔥 Autopilot warmer (dados): {len(AUTOPILOT_WARM)} endpoints "
+             f"a cada {AUTOPILOT_WARM_SECS}s")
     while True:
-        ok = 0
-        for path in AUTOPILOT_WARM:
-            handler = ENDPOINT_HANDLERS.get(path)
-            if not handler:
-                continue
-            try:
-                with app.test_request_context(path):
-                    result = handler()
-                if isinstance(result, dict) and "error" not in result:
-                    # v28: idem — a amostra só é renovada após envelhecer
-                    _cur = _PREVIEW_CACHE.get(path) or _preview_db_get(path)
-                    _age = (time.time() - _cur["ts"]) if _cur else 1e9
-                    if _age >= _preview_min_age(path):
-                        _PREVIEW_CACHE[path] = {"ts": time.time(), "data": result}
-                        _preview_db_put(path, result)
-                    ok += 1
-            except Exception as e:
-                log.debug(f"warm {path}: {str(e)[:60]}")
-            time.sleep(2)  # gentileza com as fontes externas
-        log.info(f"🔥 warmer: {ok}/{len(AUTOPILOT_WARM)} previews atualizados")
+        _warm_once(AUTOPILOT_WARM, "dados")
         time.sleep(AUTOPILOT_WARM_SECS)
+
+
+def preview_warm_ai_loop():
+    """Aquecimento LENTO da camada de IA. Separado de propósito: cada item
+    aqui custa uma chamada de LLM, e a cota é o insumo escasso que a v38
+    torrava aquecendo produtos que ninguém tinha comprado."""
+    time.sleep(90)
+    log.info(f"🔥 Autopilot warmer (IA): {len(AUTOPILOT_WARM_AI)} endpoints "
+             f"a cada {AUTOPILOT_WARM_AI_SECS}s")
+    while True:
+        if llm_healthy():
+            _warm_once(AUTOPILOT_WARM_AI, "IA")
+        else:
+            log.info("🔥 warmer[IA]: pulado — nenhum provedor de LLM saudável")
+        time.sleep(AUTOPILOT_WARM_AI_SECS)
 
 def premium_brief_loop():
     """v24.4: gera o Global Morning Brief 1x/dia (autônomo, sem pagamento) e
@@ -10272,29 +11086,97 @@ def premium_brief_loop():
             log.warning(f"premium_brief_loop: {e}")
         time.sleep(3600)  # re-checa a cada hora (gera só na virada do dia UTC)
 
+def _state_get(key: str, default: float = 0.0) -> float:
+    """Estado pequeno que precisa sobreviver ao reciclo de worker."""
+    try:
+        f = HOME_DIR / f"state_{key}"
+        return float(f.read_text().strip()) if f.exists() else default
+    except Exception:
+        return default
+
+
+def _state_put(key: str, value: float) -> None:
+    try:
+        (HOME_DIR / f"state_{key}").write_text(str(value))
+    except Exception as e:
+        log.debug(f"state {key}: {e}")
+
+
 def autopilot_report_loop():
-    """Auto-relatório diário no Telegram: o node conta a própria situação
-    (tráfego real, previews servidos, última venda, risco de delist do
-    Bazaar por 30 dias sem settle). Sem isso, silêncio = ilusão de saúde."""
+    """Auto-relatório diário no Telegram.
+
+    v39 — BUG CORRIGIDO. A v38 fazia `time.sleep(86400)` dentro do loop. Com
+    `--max-requests 1000` no railway.toml, o gunicorn recicla worker a cada
+    poucos minutos (os logs mostram dois restarts em 15 min), o lock de
+    background migra para o worker novo e TODO loop recomeça do zero. Um sleep
+    de 24h nunca chegava ao fim: este relatório jamais foi enviado, nenhuma
+    vez. Agora o carimbo do último envio é persistido em disco e o loop
+    acorda de hora em hora para checar se já passou um dia.
+    """
     time.sleep(120)
     while True:
         try:
-            stats = {}
-            try:
-                stats = LEDGER.stats() or {}
-            except Exception:
-                pass
-            previews = sum(_PREVIEW_SERVED.values())
-            top_prev = ", ".join(f"{k}×{v}" for k, v in _PREVIEW_SERVED.most_common(3)) or "—"
-            msg = (f"🤖 Autopilot diário — Losbeto v{VERSION}\n"
-                   f"Previews servidos (desde boot): {previews} ({top_prev})\n"
-                   f"Stats ledger: {json.dumps(stats, default=str)[:400]}\n"
-                   f"Lembrete: endpoints sem settle por 30d saem do Bazaar. "
-                   f"Confira /receipts e o checklist de distribuição.")
-            _notify_telegram(msg)
+            last = _state_get("last_daily_report", 0.0)
+            if (time.time() - last) >= 86400:
+                stats = {}
+                try:
+                    stats = LEDGER.stats() or {}
+                except Exception:
+                    pass
+                previews = sum(_PREVIEW_SERVED.values())
+                top_prev = ", ".join(f"{k}×{v}"
+                                     for k, v in _PREVIEW_SERVED.most_common(3)) or "—"
+                health = llm_health_report()
+                ai_line = ("IA: todos os provedores respondendo"
+                           if health.get("healthy") else
+                           f"🚨 IA FORA — {list(health.get('quarantined', {}))}")
+                sem_venda = ""
+                try:
+                    ultima = float(stats.get("last_sale_ts") or 0)
+                    if ultima and (time.time() - ultima) > 25 * 86400:
+                        dias = int((time.time() - ultima) / 86400)
+                        sem_venda = (f"\n⚠️ {dias} dias sem settle — endpoints "
+                                     f"saem do Bazaar aos 30.")
+                except Exception:
+                    pass
+                msg = (f"🤖 Relatório diário — Losbeto {VERSION}\n"
+                       f"{ai_line}\n"
+                       f"Previews servidos (desde o boot): {previews} ({top_prev})\n"
+                       f"Ledger: {json.dumps(stats, default=str)[:380]}"
+                       f"{sem_venda}")
+                _notify_telegram(msg)
+                _state_put("last_daily_report", time.time())
         except Exception as e:
             log.warning(f"autopilot report: {e}")
-        time.sleep(86400)
+        time.sleep(3600)   # acorda de hora em hora; o carimbo decide
+
+
+def llm_watchdog_loop():
+    """v39 — o alerta que faltava. A cadeia de LLM caiu e ficou dias fora sem
+    ninguém saber: só era possível descobrir lendo log. Aqui o operador é
+    avisado na transição (fora → dentro e dentro → fora), nunca em loop."""
+    time.sleep(180)
+    anterior = None
+    while True:
+        try:
+            atual = llm_healthy()
+            if anterior is not None and atual != anterior:
+                if atual:
+                    _notify_telegram("✅ IA restabelecida — endpoints de síntese "
+                                     "voltaram a ser vendidos.")
+                else:
+                    h = llm_health_report()
+                    _notify_telegram(
+                        "🚨 IA FORA em todos os provedores.\n"
+                        f"Quarentena: {json.dumps(h.get('quarantined', {}))[:300]}\n"
+                        "Os endpoints de síntese pararam de ser vendidos "
+                        "(gate de pré-pagamento). Nenhum cliente será cobrado "
+                        "por resposta vazia.")
+            anterior = atual
+        except Exception as e:
+            log.debug(f"llm watchdog: {e}")
+        time.sleep(300)
+
 
 _BG_STARTED = False
 def _start_background_once():
@@ -10330,9 +11212,11 @@ def _start_background_once():
     threading.Thread(target=twitter_promo_loop, daemon=True).start()
     threading.Thread(target=autoregister_x402scan, daemon=True).start()
     threading.Thread(target=preview_warm_loop, daemon=True).start()
+    threading.Thread(target=preview_warm_ai_loop, daemon=True).start()
     threading.Thread(target=premium_brief_loop, daemon=True).start()
     threading.Thread(target=demand_watch_loop, daemon=True).start()
     threading.Thread(target=autopilot_report_loop, daemon=True).start()
+    threading.Thread(target=llm_watchdog_loop, daemon=True).start()
     log.info("✅ Autopilot: loops de background ativos neste worker")
 
 def run_server():
@@ -10947,47 +11831,65 @@ def _inject_agent_beacon(resp):
 # 8. MCP REGISTRY SERVER.JSON — para publicação em registry.modelcontextprotocol.io
 # ============================================================================
 
+# v39: NOME E SCHEMA CORRIGIDOS — sem isto o `mcp-publisher publish` recusa
+# antes mesmo de sair da máquina.
+#
+#  · "io.losbeto/mcp" é IMPUBLICÁVEL. O registry valida posse do namespace:
+#    io.github.<usuário>/* via OAuth do GitHub, ou reverse-DNS do domínio via
+#    verificação de DNS. O domínio aqui é losbeto.XYZ, não losbeto.IO — ou
+#    seja, o namespace anunciado não era nem autenticável nem de posse do
+#    projeto. Por isso o item 2 do checklist de deploy nunca funcionou.
+#  · $schema apontava para uma URL de schema que não é a corrente.
+#  · capabilities / keywords / homepage / license / tools_count NÃO existem no
+#    schema do server.json — campos desconhecidos fazem o publisher recusar.
+#  · "38.0.0-BRASIL" é semver com tag de pré-release: registries tratam como
+#    versão instável. A versão publicada vai limpa.
+#
+# Configurável por env para quem fizer fork: MCP_SERVER_NAME.
+MCP_SERVER_NAME = os.environ.get(
+    "MCP_SERVER_NAME", "io.github.rmartins1451/losbeto").strip()
+
+
+def _semver_clean(v: str) -> str:
+    """38.0.0-BRASIL -> 38.0.0 (o registry quer release, não pré-release)."""
+    m = re.match(r"^(\d+\.\d+\.\d+)", str(v or "0.0.0"))
+    return m.group(1) if m else "0.0.0"
+
+
 @app.route("/server.json")
 @app.route("/.well-known/mcp-server.json")
 def mcp_registry_server_json():
     """Formato exato exigido pelo `mcp-publisher` CLI para publicar no
-    registry.modelcontextprotocol.io — Claude Desktop e Cursor descobrem ali."""
+    registry.modelcontextprotocol.io — Claude Desktop e Cursor descobrem ali.
+
+    Publicação (uma vez):
+        curl -L https://github.com/modelcontextprotocol/registry/releases/latest/\
+             download/mcp-publisher_linux_amd64.tar.gz | tar xz
+        curl https://api.losbeto.xyz/server.json > server.json
+        ./mcp-publisher login github        # namespace io.github.<seu-usuário>
+        ./mcp-publisher publish
+
+    Requisito de posse: o README do repositório precisa conter a linha
+        <!-- mcp-name: io.github.rmartins1451/losbeto -->
+    """
     base = _public_base()
     return _jsonify({
-        "$schema": "https://modelcontextprotocol.io/schemas/registry/server.json",
-        "name": "io.losbeto/mcp",
+        "$schema": ("https://static.modelcontextprotocol.io/schemas/"
+                    "2025-12-11/server.schema.json"),
+        "name": MCP_SERVER_NAME,
         "description": (
-            "Multi-chain market intelligence tools. Free delayed samples via MCP; "
-            "real-time via x402 USDC micropayments."),
+            "Cross-asset market data for AI agents: forex, equities, "
+            "commodities, US and Brazil macro (BCB/B3), SEC filings and "
+            "crypto. Free delayed samples over MCP; real-time per call in "
+            "USDC over x402, no API key and no signup."),
+        "version": _semver_clean(VERSION),
         "repository": {
             "url": "https://github.com/rmartins1451/losbeto",
             "source": "github",
         },
-        "version": VERSION,
-        "packages": [
-            {
-                "registry_type": "remote",
-                "identifier": f"{base}/mcp",
-                "version": VERSION,
-                "transport": {
-                    "type": "streamable-http",
-                    "url": f"{base}/mcp",
-                },
-            }
-        ],
         "remotes": [
-            {"transport_type": "streamable-http", "url": f"{base}/mcp"}
+            {"type": "streamable-http", "url": f"{base}/mcp"}
         ],
-        "capabilities": {
-            "tools": True,
-            "resources": False,
-            "prompts": False,
-        },
-        "tools_count": len(BASE_PRICES),
-        "keywords": ["x402", "crypto", "trading", "forex", "equities", "macro",
-                     "ai-agents", "usdc", "solana", "base", "mcp"],
-        "license": "MIT",
-        "homepage": base,
     })
 
 
@@ -11308,6 +12210,29 @@ def version_endpoint():
 
 
 # ============================================================================
+# ---------------------------------------------------------------------------
+# v39 — REAPLICAÇÃO FINAL DA TABELA DE PREÇOS
+#
+# _V32_REPRICE roda no meio do módulo, ANTES de a Brasil Suite e a Premium
+# Suite registrarem os preços delas. Resultado na v38: parte da tabela era
+# silenciosamente sobrescrita depois e as entradas viravam letra morta —
+# /br-brief ficava com o preço da suíte, não com o realinhado. Reaplicar aqui,
+# no fim do carregamento, torna a tabela autoritativa de verdade.
+# ---------------------------------------------------------------------------
+for _ep, _p in _V32_REPRICE.items():
+    if _ep in BASE_PRICES and BASE_PRICES[_ep] != _p:
+        log.debug(f"reprice final: {_ep} {BASE_PRICES[_ep]} -> {_p}")
+        BASE_PRICES[_ep] = _p
+_assert_plan_ladder()
+
+# Trava de catálogo: nenhum endpoint precificado pode ir ao ar sem descrição.
+_sem_desc = [e for e in BASE_PRICES if not ENDPOINT_DESC.get(e)]
+if _sem_desc:
+    log.error(f"🚨 CATÁLOGO INCOMPLETO — sem ENDPOINT_DESC: {_sem_desc}. "
+              f"Estes NÃO serão publicados no manifesto x402.")
+else:
+    log.info(f"📚 Catálogo: {len(BASE_PRICES)} endpoints, 100% com descrição")
+
 # ==================  END OF v27 DISCOVERY LAYER  ===========================
 # ============================================================================
 

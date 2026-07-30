@@ -2,8 +2,35 @@
 builder = "NIXPACKS"
 
 [deploy]
-startCommand = "gunicorn --worker-class gthread --workers 2 --threads 6 --timeout 120 --graceful-timeout 30 --keep-alive 30 --max-requests 1000 --max-requests-jitter 100 --bind 0.0.0.0:$PORT nexus_omega:app"
+# v39 — DUAS MUDANÇAS CRÍTICAS
+#
+# 1) --max-requests 1000 → 20000
+#    Com 1000, o gunicorn reciclava worker a cada poucos minutos (os logs de
+#    produção mostram dois restarts em 15 min). Como o lock de background
+#    migra para o worker novo, TODO loop recomeçava do zero — e qualquer
+#    loop com sleep longo nunca chegava ao fim. O relatório diário
+#    (sleep 86400) literalmente nunca foi enviado. O código v39 já persiste
+#    o carimbo em disco, mas reciclar menos evita o problema na raiz.
+#
+# 2) --preload
+#    Carrega o módulo uma vez antes do fork. Sem isso, cada worker refaz o
+#    boot inteiro (wallets, migrações de SQLite, registro de suítes).
+#
+# 3) --graceful-timeout maior: uma liquidação x402 em curso não pode ser
+#    morta no meio; settle enviado sem resposta = venda perdida e cliente
+#    cobrado sem receber.
+startCommand = "gunicorn --worker-class gthread --workers 2 --threads 8 --preload --timeout 120 --graceful-timeout 90 --keep-alive 30 --max-requests 20000 --max-requests-jitter 2000 --bind 0.0.0.0:$PORT nexus_omega:app"
 healthcheckPath = "/ready"
 healthcheckTimeout = 60
 restartPolicyType = "on_failure"
 restartPolicyMaxRetries = 5
+
+# ATENÇÃO — VOLUME PERSISTENTE
+#
+# O código usa DATA_DIR, caindo em /data se existir e em ~/.nexus_omega se não.
+# Sem um volume montado em /data, o diretório é EFÊMERO: todo redeploy apaga
+# créditos comprados, API keys ativas, referrals, receipts e o ledger inteiro.
+# Alguém compra um week-pass de $9.99, você faz deploy, a chave dele evapora.
+#
+# No painel do Railway: Service → Settings → Volumes → Mount path: /data
+# Depois confirme com:  curl https://api.losbeto.xyz/health/storage
