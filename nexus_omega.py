@@ -87,7 +87,7 @@ from typing import Any, Optional, Dict, List, Tuple
 # 0. CONFIGURAÇÃO E AUTO-SETUP
 # ============================================================================
 
-VERSION = "39.3.0-FRESH"
+VERSION = "39.4.0-FRESH"
 BRAND_NAME = "Losbeto"
 BRAND_TAGLINE = "The Global Revenue Engine for Financial AI Agents"
 BRAND_EMOJI = "🧠"
@@ -293,7 +293,7 @@ BASE_PRICES = {
     "/sinais":           0.040,
     "/win-rate-verified": 0.040,
     "/analise":          0.050,
-    "/nansen-flow":      0.050,
+    "/holder-concentration": 0.050,
     "/sec-filing":       0.050,
     "/backtest":         0.060,
     "/tg-premium":       0.060,
@@ -423,7 +423,7 @@ ENDPOINT_DESC = {
     "/sinais":          "Actionable trading signals feed with direction, confidence and timestamp. Heuristic, with the methodology declared in the response.",
     "/win-rate-verified": "Ed25519-signed performance metrics with declared methodology (heuristic signal accuracy, not audited PnL). Verifiable integrity plus explicit honesty about what the number is and is not.",
     "/analise":         "AI deep-dive on any supported asset: technicals, flows and narrative in one written analysis.",
-    "/nansen-flow":     "Top USDC holder concentration snapshot via Helius RPC: who holds the float and how concentrated it is.",
+    "/holder-concentration": "Top USDC holder concentration on Solana via Helius RPC: who holds the float, how concentrated it is, and the share held by the largest accounts. Useful for judging how much of a token's supply can move at once.",
     "/sec-filing":      "SEC filing search with an objective market read: what was filed, by whom, and what it means for the tape.",
     "/backtest":        "Strategy backtest with PnL, win rate, drawdown and a written read of where the strategy actually makes its money.",
     "/tg-premium":      "Premium alert feed in automation-ready shape: one JSON object per alert, stable keys, no prose to parse.",
@@ -504,7 +504,7 @@ ENDPOINT_TAGS = {
     "/web-search":      ["Search", "Research"],
     "/ai-news":         ["AI", "News"],
     "/dex-screen":      ["Trading", "DEX"],
-    "/nansen-flow":     ["Utility", "Onchain"],
+    "/holder-concentration": ["Utility", "Onchain"],
     "/sec-filing":      ["Search", "Equities"],
     "/trust-hash":      ["Utility", "Trust"],
     "/geo-alpha":       ["Utility", "Macro"],
@@ -1816,14 +1816,55 @@ class LLMUnavailable(Exception):
     """Nenhum provedor de LLM respondeu. Quem levanta isto NÃO deve cobrar."""
 
 
+# v39.4: HTTP 402/401 de um provedor não é falha transitória — é conta sem
+# saldo ou chave revogada. Observado em produção:
+#   LLM DeepSeek HTTP 402: {"error":{"message":"Insufficient Balance"}}
+# A quarentena de 300s fazia o node insistir a cada 5 minutos, indefinidamente,
+# numa conta que só volta quando ALGUÉM PAGA. Não é o node que resolve isso —
+# é o operador. Então: quarentena longa e alerta específico, uma vez.
+_BILLING_COOLDOWN = int(os.environ.get("LLM_BILLING_COOLDOWN", "21600"))  # 6 h
+_BILLING_ALERTED: Dict[str, float] = {}
+
+
+def _is_billing_error(detail: str) -> bool:
+    d = (detail or "").lower()
+    return ("http 402" in d or "http 401" in d
+            or "insufficient balance" in d or "insufficient_quota" in d
+            or "quota exceeded" in d or "billing" in d
+            or "invalid api key" in d or "incorrect api key" in d)
+
+
 def _llm_mark(provider: str, ok: bool, detail: str = "") -> None:
+    cobranca = (not ok) and _is_billing_error(detail)
     with _LLM_STATE_LOCK:
         if ok:
             _LLM_DOWN_UNTIL.pop(provider, None)
             _LLM_LAST_ERROR.pop(provider, None)
+            _BILLING_ALERTED.pop(provider, None)
         else:
-            _LLM_DOWN_UNTIL[provider] = time.time() + _LLM_COOLDOWN
+            _LLM_DOWN_UNTIL[provider] = time.time() + (
+                _BILLING_COOLDOWN if cobranca else _LLM_COOLDOWN)
             _LLM_LAST_ERROR[provider] = detail[:180]
+
+    if cobranca:
+        # Alerta uma vez por janela — o operador precisa saber, mas não a cada
+        # tentativa. Sem isto, a cadeia degrada em silêncio até cair inteira.
+        agora = time.time()
+        if agora - _BILLING_ALERTED.get(provider, 0) > _BILLING_COOLDOWN:
+            _BILLING_ALERTED[provider] = agora
+            log.error(f"💳 {provider}: erro de COBRANÇA, não de rede — "
+                      f"{detail[:120]}. Em quarentena por "
+                      f"{_BILLING_COOLDOWN // 3600}h; só volta se você repuser "
+                      f"saldo ou trocar a chave.")
+            try:
+                _notify_telegram(
+                    f"💳 *{provider}* fora por COBRANÇA, não por rede.\n\n"
+                    f"`{detail[:150]}`\n\n"
+                    f"Isso não se resolve sozinho — reponha saldo ou troque a "
+                    f"chave. Quarentena de {_BILLING_COOLDOWN // 3600}h para "
+                    f"não martelar a API.")
+            except Exception:
+                pass
 
 
 def _llm_is_down(provider: str) -> bool:
@@ -2548,14 +2589,14 @@ class Brain:
         vendida como 'inteligência'."""
         holders = []
         try:
-            nf = Brain.nansen_flow()
+            nf = Brain.holder_concentration()
             holders = (nf or {}).get("top_usdc_holders", [])[:5]
         except Exception:
             pass
         return {"institutional_directory": Market.smart_money(),
                 "top_usdc_holders_onchain": holders,
                 "method": ("Combine /whale-alert (fluxo 24h real) + /copytrade "
-                           "(sinais de nós com stake) + /nansen-flow (concentração "
+                           "(sinais de nós com stake) + /holder-concentration (concentração "
                            "de holders) para tracking acionável."),
                 "honesty": "diretório público de entidades conhecidas + on-chain real quando disponível",
                 "version": VERSION}
@@ -2652,7 +2693,17 @@ class Brain:
             return {"symbol": symbol, "pairs": [], "error": str(e), "ts": int(time.time())}
 
     @staticmethod
-    def nansen_flow():
+    def holder_concentration():
+        """v39.4 — RENOMEADO de /nansen-flow.
+
+        Duas razões, ambas sérias. Primeira: este endpoint NUNCA usou a Nansen —
+        consulta Helius RPC e Solscan. Vender sob o nome de outra empresa um
+        dado que não vem dela engana o comprador. Segunda: a Nansen é membro
+        do x402 Foundation e aparece no 'Trusted by' de x402.org; usar a marca
+        dela no catálogo é risco jurídico real, não hipotético.
+
+        O nome novo descreve o que o produto de fato faz.
+        """
         ts = int(time.time())
         # v21.10 FIX: comprador pagou e recebeu erro de parse — a API pública do
         # Solscan devolve HTML/rate-limit sem aviso. Fonte primária agora é o
@@ -2676,7 +2727,7 @@ class Brain:
                             "source": "helius-rpc", "ts": ts,
                             "provider": "Losbeto/SmartMoney"}
             except Exception as e:
-                log.warning(f"nansen_flow helius: {e}")
+                log.warning(f"holder_concentration helius: {e}")
         try:
             r = requests.get(
                 "https://public-api.solscan.io/token/holders"
@@ -2691,7 +2742,7 @@ class Brain:
                             "source": "solscan", "ts": ts,
                             "provider": "Losbeto/SmartMoney"}
         except Exception as e:
-            log.warning(f"nansen_flow solscan: {e}")
+            log.warning(f"holder_concentration solscan: {e}")
         # Degradação honesta: nunca um traceback cru para quem pagou
         return {"top_usdc_holders": [], "token": "USDC",
                 "status": "upstream_degraded",
@@ -3408,13 +3459,15 @@ class Brain:
     def whale_dossier():
         whales = Brain.whale_alert().get("whales_24h", [])[:10]
         smart = Brain.smart_money().get("institutional_wallets", [])[:10]
-        nansen = Brain.nansen_flow() if hasattr(Brain, 'nansen_flow') else {"note": "nansen flow unavailable"}
+        holders = (Brain.holder_concentration()
+                   if hasattr(Brain, "holder_concentration")
+                   else {"note": "holder concentration unavailable"})
         sanctions = Brain.sanctions() if hasattr(Brain, 'sanctions') else {"note": "sanctions unavailable"}
         return {
             "product": "whale-dossier",
             "whales": whales,
             "smart_money": smart,
-            "flow_overlay": nansen,
+            "flow_overlay": holders,
             "compliance_overlay": sanctions,
             "actionability": {
                 "monitor": ["/whale-alert", "/smart-money", "/copytrade"],
@@ -4863,7 +4916,7 @@ ENDPOINT_HANDLERS = {
     "/web-search":      Brain.web_search,
     "/ai-news":         Brain.ai_news,
     "/dex-screen":      Brain.dex_screen,
-    "/nansen-flow":     Brain.nansen_flow,
+    "/holder-concentration": Brain.holder_concentration,
     "/sec-filing":      Brain.sec_filing,
     "/trust-hash":      Brain.trust_hash,
     "/geo-alpha":       Brain.geo_alpha,
@@ -10822,6 +10875,16 @@ def traffic_intel():
     })
 
 
+# v39.4: alias de compatibilidade. Renomear um endpoint publicado quebra quem
+# já integrou; um 301 permanente diz ao cliente para atualizar o bookmark sem
+# derrubar a chamada de hoje.
+@app.route("/nansen-flow")
+def _legacy_nansen_flow():
+    return redirect("/holder-concentration"
+                    + ("?" + request.query_string.decode() if request.query_string else ""),
+                    code=301)
+
+
 @app.route("/pricing")
 def pricing_page():
     """v39.1 — a página que faltava.
@@ -11632,7 +11695,7 @@ const CATEGORY_MAP = {
   "anomalias":"Utility","arbitrage":"Trading","backtest":"Trading","copytrade":"Trading","cross-chain":"Trading",
   "deep-think":"AI","defi-yield":"Crypto","dex-screen":"Trading","fear-greed":"Search","geo-alpha":"Utility",
   "insider-track":"Crypto","jupiter-swap":"Trading","launch-sniper":"Trading","market-brief":"Trading",
-  "mempool":"Utility","mev-flow":"Crypto","nansen-flow":"Utility","onchain-credit":"Crypto",
+  "mempool":"Utility","mev-flow":"Crypto","holder-concentration":"Utility","onchain-credit":"Crypto",
   "portfolio-copilot":"Crypto","pump-monitor":"Crypto","pyth-price":"Utility","regime":"Trading",
   "relatorio":"Search","rugcheck":"Crypto","sanctions":"Search","sec-filing":"Search","sentiment":"Search",
   "sinais":"Trading","smart-money":"Crypto","starter-pack":"Crypto","swarm-vote":"Utility","tg-premium":"Search",
