@@ -87,7 +87,7 @@ from typing import Any, Optional, Dict, List, Tuple
 # 0. CONFIGURAÇÃO E AUTO-SETUP
 # ============================================================================
 
-VERSION = "44.0.0-PERSONA"
+VERSION = "44.0.1-PERSONA"
 BRAND_NAME = "Losbeto"
 BRAND_TAGLINE = "The Global Revenue Engine for Financial AI Agents"
 BRAND_EMOJI = "🧠"
@@ -7805,16 +7805,19 @@ data = x402HTTPClientSync(wallet).get(<span class="s">"__URL__/alpha-signal"</sp
 Com créditos você faz <b>uma</b> transação e chama em ~1ms via header <code>X-API-Key</code>. É o modelo que o mercado já validou.</p>
 <div class="grid4" style="max-width:1100px;margin:0 auto 10px">
   <div class="feat"><div class="ic">🍒</div><h3>Starter Credits</h3>
-    <p><b>$1.00</b> → saldo de <b>$1.25</b> em chamadas <span class="tag hot">+25% bônus</span></p>
+    <p><b>$0.99</b> → saldo de <b>$1.25</b> em chamadas <span class="tag hot">+25% bônus</span></p>
     <p style="font-size:12px;color:var(--dim)">GET /buy-credits</p></div>
   <div class="feat"><div class="ic">⚡</div><h3>Day Pass</h3>
-    <p><b>$2.50</b> → <b>ilimitado</b> por 24h em todos os endpoints</p>
+    <p><b>$2.99</b> → <b>ilimitado</b> por 24h em todos os endpoints</p>
     <p style="font-size:12px;color:var(--dim)">GET /day-pass</p></div>
-  <div class="feat"><div class="ic">🚀</div><h3>Pro</h3>
-    <p><b>$9.99</b> → saldo de <b>$15/mês</b> <span class="tag hot">+50% bônus</span></p>
+  <div class="feat"><div class="ic">🗓️</div><h3>Week Pass</h3>
+    <p><b>$9.99</b> → <b>ilimitado</b> por 7 dias em todos os endpoints</p>
+    <p style="font-size:12px;color:var(--dim)">GET /week-pass</p></div>
+  <div class="feat"><div class="ic">🚀</div><h3>Pro <span class="tag hot">mensal</span></h3>
+    <p><b>$9.99/mês</b> → saldo de <b>$15</b> em chamadas <span class="tag hot">+50% bônus</span></p>
     <p style="font-size:12px;color:var(--dim)">GET /subscribe-pro</p></div>
-  <div class="feat"><div class="ic">🐋</div><h3>Whale</h3>
-    <p><b>$29.99</b> → <b>ilimitado</b> 30 dias + prioridade</p>
+  <div class="feat"><div class="ic">🐋</div><h3>Whale <span class="tag hot">mensal</span></h3>
+    <p><b>$19.99/mês</b> → <b>ilimitado</b> 30 dias + prioridade máxima</p>
     <p style="font-size:12px;color:var(--dim)">GET /subscribe-whale</p></div>
 </div>
 <div class="demo-card" style="max-width:900px;margin:0 auto 40px">
@@ -7828,8 +7831,8 @@ curl -H "X-API-Key: lsk_..." __BASE__/launch-risk<br><br>
   </div>
 </div>
 
-<h2>Pricing <span class="em">transparente</span> — sem assinatura</h2>
-<p class="lead">Pague por chamada ou use créditos com bônus. Sem contrato, sem cadastro. Só USDC. Ordenado do mais barato — comece com $0.01.</p>
+<h2>Pricing <span class="em">transparente</span> — por chamada, passe ou plano mensal</h2>
+<p class="lead">Pague por chamada, por dia/semana, ou assine um plano mensal com bônus. Sem contrato, sem cadastro, cancele simplesmente não renovando. Só USDC. Ordenado do mais barato — comece com $0.003.</p>
 
 <div class="pricing">
 <table>
@@ -7851,10 +7854,18 @@ curl -H "X-API-Key: lsk_..." __BASE__/launch-risk<br><br>
 <div class="footer">
   <div>
     <a href="https://www.x402scan.com" target="_blank">x402scan</a> ·
+    <a href="https://x402-list.com/services/losbeto-cross-asset-market-intelligence" target="_blank">x402-list</a> ·
+    <a href="https://github.com/rmartins1451/losbeto" target="_blank">GitHub</a> ·
+    <a href="https://pypi.org/project/losbeto-tools/" target="_blank">PyPI</a> ·
     <a href="https://docs.cdp.coinbase.com/x402" target="_blank">CDP Docs</a> ·
     <a href="https://docs.payai.network" target="_blank">PayAI Docs</a> ·
     <a href="/dash">Dashboard</a> ·
     <a href="/info">Node Info</a>
+  </div>
+  <div style="margin-top:14px">
+    <a href="https://x402-list.com/services/losbeto-cross-asset-market-intelligence?utm_source=badge&utm_medium=referral&utm_campaign=embed" target="_blank">
+      <img src="https://x402-list.com/badge/losbeto-cross-asset-market-intelligence.svg" alt="Losbeto monitorado no x402-list — uptime 100%, compliance A" height="28">
+    </a>
   </div>
   <div style="margin-top:10px">Losbeto v__V__ — Multi-chain x402 AI trading swarm — Solana : <code style="font-size:10px;color:var(--muted)">__ADDR__</code></div>
 </div>
