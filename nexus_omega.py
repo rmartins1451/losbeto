@@ -87,7 +87,7 @@ from typing import Any, Optional, Dict, List, Tuple
 # 0. CONFIGURAÇÃO E AUTO-SETUP
 # ============================================================================
 
-VERSION = "39.5.0-FRESH"
+VERSION = "39.6.0-ADAPT"
 BRAND_NAME = "Losbeto"
 BRAND_TAGLINE = "The Global Revenue Engine for Financial AI Agents"
 BRAND_EMOJI = "🧠"
@@ -1798,7 +1798,8 @@ def is_geo_blocked(ip: str) -> bool:
 DEEPSEEK_MODEL = os.environ.get("DEEPSEEK_MODEL", "deepseek-chat")
 CLAUDE_MODEL   = os.environ.get("CLAUDE_MODEL",   "claude-sonnet-4-5")
 GROQ_MODEL     = os.environ.get("GROQ_MODEL",     "llama-3.3-70b-versatile")
-GEMINI_MODEL   = os.environ.get("GEMINI_MODEL",   "gemini-2.5-flash")
+# v39.6: sem default. Vazio = descoberta automática via ListModels.
+GEMINI_MODEL   = os.environ.get("GEMINI_MODEL",   "").strip()
 
 LLM_CACHE_TTL  = int(os.environ.get("LLM_CACHE_TTL", "900"))
 _LLM_CACHE: Dict[str, tuple] = {}
@@ -1929,7 +1930,8 @@ def llm_health_report() -> dict:
                                 "last_error": _LLM_LAST_ERROR.get(p, "")}
                             for p in cfg if time.time() < _LLM_DOWN_UNTIL.get(p, 0)},
             "models": {"deepseek": DEEPSEEK_MODEL, "claude": CLAUDE_MODEL,
-                       "groq": GROQ_MODEL, "gemini": GEMINI_MODEL},
+                       "groq": GROQ_MODEL,
+                       "gemini": GEMINI_MODEL or gemini_model()},
         }
 
 
@@ -1953,6 +1955,81 @@ def llm_health_report() -> dict:
 #
 # LLM_ORDER=gemini,groq força uma ordem fixa se você preferir.
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# v39.6 — DESCOBERTA DE MODELO GEMINI EM TEMPO DE EXECUÇÃO
+#
+# Terceira vez que um modelo Gemini fixo no código morre em produção:
+#   v38  gemini-2.0-flash-exp   -> 404, retirado
+#   v39  gemini-2.5-flash       -> 404 "no longer available to new users"
+# E não adianta olhar a documentação: o Google está aposentando modelos ANTES
+# da data publicada de shutdown — a página de ciclo de vida ainda listava o
+# 2.5 como disponível enquanto a API já recusava projetos novos.
+#
+# Chutar um quarto nome repetiria o erro. A própria mensagem de erro dá a
+# saída: "Call ModelService.ListModels". Então perguntamos à API quais
+# modelos ESTA chave pode usar, e escolhemos o melhor por preferência.
+# Resultado: quando o Google aposentar o próximo, o node se conserta sozinho
+# no próximo boot em vez de me esperar publicar um patch.
+# ---------------------------------------------------------------------------
+_GEMINI_RESOLVED: Optional[str] = None
+_GEMINI_RESOLVED_AT = 0.0
+_GEMINI_LOCK = threading.Lock()
+GEMINI_DISCOVERY_TTL = int(os.environ.get("GEMINI_DISCOVERY_TTL", "21600"))  # 6 h
+
+# Ordem de preferência por prefixo. Flash antes de Pro: cota gratuita maior e
+# latência menor; "lite" por último, é o degrau de qualidade mais baixo.
+_GEMINI_PREF = ("flash-latest", "3.1-flash", "3-flash", "2.5-flash",
+                "flash", "3.1-pro", "3-pro", "pro-latest", "flash-lite")
+
+
+def _gemini_pick(nomes: List[str]) -> Optional[str]:
+    """Escolhe o melhor modelo disponível segundo a ordem de preferência."""
+    limpos = [n.replace("models/", "") for n in nomes]
+    # Descarta variantes que não servem para texto simples.
+    limpos = [n for n in limpos if not any(
+        t in n for t in ("embedding", "aqa", "imagen", "veo", "tts",
+                         "image", "audio", "vision", "learnlm", "gemma"))]
+    for pref in _GEMINI_PREF:
+        for n in limpos:
+            if pref in n:
+                return n
+    return limpos[0] if limpos else None
+
+
+def gemini_model() -> str:
+    """Modelo a usar agora. Descobre uma vez e cacheia por GEMINI_DISCOVERY_TTL."""
+    global _GEMINI_RESOLVED, _GEMINI_RESOLVED_AT
+    # Override explícito ganha de tudo — para travar um modelo se preciso.
+    fixo = os.environ.get("GEMINI_MODEL", "").strip()
+    if fixo:
+        return fixo
+    with _GEMINI_LOCK:
+        if _GEMINI_RESOLVED and (time.time() - _GEMINI_RESOLVED_AT) < GEMINI_DISCOVERY_TTL:
+            return _GEMINI_RESOLVED
+    if not GEMINI_KEY:
+        return "gemini-flash-latest"
+    try:
+        r = requests.get(
+            "https://generativelanguage.googleapis.com/v1beta/models",
+            params={"key": GEMINI_KEY, "pageSize": 200}, timeout=12)
+        if r.ok:
+            todos = [m.get("name", "") for m in (r.json().get("models") or [])
+                     if "generateContent" in (m.get("supportedGenerationMethods") or [])]
+            escolhido = _gemini_pick(todos)
+            if escolhido:
+                with _GEMINI_LOCK:
+                    _GEMINI_RESOLVED = escolhido
+                    _GEMINI_RESOLVED_AT = time.time()
+                log.info(f"🔎 Gemini: {len(todos)} modelos disponíveis para esta "
+                         f"chave; usando '{escolhido}'")
+                return escolhido
+        log.warning(f"Gemini ListModels HTTP {r.status_code}: {r.text[:140]}")
+    except Exception as e:
+        log.warning(f"Gemini ListModels: {e}")
+    # Sem descoberta: o alias 'latest' é o que menos envelhece.
+    return "gemini-flash-latest"
+
+
 LLM_SMALL_TOKENS = int(os.environ.get("LLM_SMALL_TOKENS", "300"))
 _LLM_ORDER_ENV = [x.strip().lower() for x in
                   os.environ.get("LLM_ORDER", "").split(",") if x.strip()]
@@ -2047,9 +2124,10 @@ class LLM:
             return None, f"HTTP {r.status_code}: {r.text[:160]}"
 
         def _try_gemini():
+            _gm = gemini_model()          # v39.6: descoberto, não fixo
             r = requests.post(
                 f"https://generativelanguage.googleapis.com/v1beta/models/"
-                f"{GEMINI_MODEL}:generateContent?key={GEMINI_KEY}",
+                f"{_gm}:generateContent?key={GEMINI_KEY}",
                 json={"contents": [{"parts": [{"text": prompt}]}],
                       "generationConfig": {"maxOutputTokens": max_tokens,
                                            "temperature": temperature}},
@@ -2067,7 +2145,13 @@ class LLM:
                     return None, (f"empty parts, finishReason="
                                   f"{cands[0].get('finishReason')}")
                 return parts[0].get("text", ""), None
-            return None, f"HTTP {r.status_code} (modelo={GEMINI_MODEL}): {r.text[:160]}"
+            # Modelo retirado: limpa o cache para redescobrir na próxima.
+            if r.status_code == 404:
+                global _GEMINI_RESOLVED
+                with _GEMINI_LOCK:
+                    _GEMINI_RESOLVED = None
+                log.warning(f"Gemini: modelo '{_gm}' retirado — redescobrindo")
+            return None, f"HTTP {r.status_code} (modelo={_gm}): {r.text[:160]}"
 
         def _try_ollama():
             r = requests.post(f"{OLLAMA_URL}/api/generate",
@@ -6769,10 +6853,43 @@ CLEAN_LANDING = r"""<!doctype html><html lang="en"><head>
       --acc:#4ade80;--acc2:#60a5fa;--mono:ui-monospace,'SF Mono',Menlo,monospace}
 *{box-sizing:border-box;margin:0;padding:0}
 body{background:var(--bg);color:var(--fg);font:15px/1.65 -apple-system,BlinkMacSystemFont,'Segoe UI',Inter,sans-serif;-webkit-font-smoothing:antialiased}
-/* v39.2: era max-width:900px — uma coluna estreita para 75 produtos, num
-   monitor de 1440px sobrava metade da tela vazia. Agora respira, e o catálogo
-   vira grade em vez de lista. */
-.wrap{max-width:1180px;margin:0 auto;padding:0 32px}
+/* v39.6 — LARGURA TOTAL DE VERDADE
+   Alargar o container de 900 para 1180px não resolveu, e o diagnóstico estava
+   errado: o problema nunca foi a LARGURA, foi a AUSÊNCIA DE FAIXAS. Uma
+   coluna única sobre fundo uniforme flutua no meio da tela por mais larga que
+   seja. Sites tradicionais criam ritmo com seções que vão de borda a borda,
+   alternando fundo, com o texto contido dentro. É isso que faz a página
+   parecer "expandida" em vez de "centralizada".
+   .band = faixa sangrada até a borda · .wrap = leitura confortável dentro. */
+.wrap{max-width:1140px;margin:0 auto;padding:0 32px}
+.band{width:100vw;margin-left:calc(50% - 50vw);padding:56px 0;
+      border-top:1px solid var(--line)}
+.band.alt{background:#0d0f13}
+.band.deep{background:linear-gradient(180deg,#0d0f13 0%,var(--bg) 100%)}
+.band > .wrap{padding:0 32px}
+.band h2{margin-top:0}
+
+/* Hero de largura total com métricas — a primeira coisa que um humano vê */
+#hero{border-top:none;padding:64px 0 52px;
+      background:radial-gradient(1200px 400px at 50% -10%,#12161d 0%,var(--bg) 70%)}
+#hero h1{font-size:clamp(30px,4.4vw,50px);line-height:1.08;letter-spacing:-.03em;
+         margin:0 0 16px;max-width:16ch}
+#hero .sub{font-size:17px;color:var(--dim);max-width:60ch;margin:0 0 30px}
+.stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));
+       gap:1px;background:var(--line);border:1px solid var(--line);
+       border-radius:12px;overflow:hidden;margin:34px 0 0}
+.stat{background:var(--bg);padding:20px 22px}
+.stat b{display:block;font:600 26px/1.1 var(--mono);color:var(--fg);
+        letter-spacing:-.02em}
+.stat span{display:block;color:var(--dim);font-size:12px;margin-top:6px;
+           text-transform:uppercase;letter-spacing:.07em}
+.cta{display:flex;gap:12px;flex-wrap:wrap;margin-top:28px}
+.cta a{display:inline-block;padding:11px 20px;border-radius:8px;font-size:14px;
+       font-weight:500;text-decoration:none;border:1px solid var(--line)}
+.cta a.p{background:var(--acc);color:#06120a;border-color:var(--acc)}
+.cta a.s{color:var(--fg)}
+.cta a:hover{opacity:.88}
+@media(max-width:880px){#hero{padding:44px 0 36px}.band{padding:40px 0}}
 .grid{display:grid;gap:14px;grid-template-columns:repeat(auto-fit,minmax(272px,1fr));margin:18px 0 6px}
 .gcard{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:16px 18px}
 .gcard h3{font-size:14px;margin:0 0 6px;letter-spacing:-.01em}
@@ -6834,19 +6951,30 @@ footer a{color:var(--dim)}
   </div>
 </div></header>
 
-<div class="wrap">
+<section class="band" id="hero"><div class="wrap">
 <h1>Market data <em>agents pay for</em>, one call at a time.</h1>
-<p class="lede">Multi-oracle price consensus, sentiment consensus, forex, equities,
-commodities, macro and crypto. No API keys, no accounts — your agent pays a few
-cents in USDC per request and gets clean JSON back.</p>
+<p class="sub">Brazil central-bank macro and B3 equities, US equities, forex,
+commodities, global macro and crypto. No API keys, no accounts — your agent
+settles a few cents in USDC per request and gets clean JSON back.</p>
 <div class="cta">
-  <a class="btn p" href="/try">Try free — 6 live samples</a>
-  <a class="btn s" href="#start">Quick start</a>
-  <a class="btn s" href="/live">◉ Live telemetry</a>
-  <a class="btn s" href="/health/providers">Node status</a>
+  <a class="p" href="/try">Try free — 6 live samples</a>
+  <a class="s" href="/pricing">Pricing &amp; subscriptions</a>
+  <a class="s" href="#start">Quick start</a>
+  <a class="s" href="/health/providers">Node status</a>
 </div>
+<div class="stats">
+  <div class="stat"><b>__N__</b><span>priced endpoints</span></div>
+  <div class="stat"><b>__P_MIN__</b><span>cheapest call</span></div>
+  <div class="stat"><b>2</b><span>chains · Base + Solana</span></div>
+  <div class="stat"><b>0</b><span>accounts to create</span></div>
+  <div class="stat"><b>Free</b><span>sample on every endpoint</span></div>
+</div>
+</div></section>
 
+<div class="wrap">
 <div id="human">
+</div></div>
+<section class="band"><div class="wrap"><div id="human">
 <h2 id="top">Flagships</h2>
 <div class="grid">
   <a class="card" href="/oracle-consensus?preview=1"><span class="p">__P_ORACLE__</span>
@@ -6904,6 +7032,8 @@ pip install losbeto-tools[langchain]
 <span class="g">from</span> losbeto_tools <span class="g">import</span> get_langchain_tools
 tools = get_langchain_tools()   <span class="c"># free delayed data</span></pre>
 
+</div></section>
+<section class="band alt"><div class="wrap">
 <h2>Only here</h2>
 <p class="lede">Four products that exist in no other x402 catalog, because they
 need a data source nobody outside Brazil assembles.</p>
@@ -6926,6 +7056,8 @@ need a data source nobody outside Brazil assembles.</p>
     <span class="px">__P_ORACLE__</span> · <code>/oracle-consensus</code></div>
 </div>
 
+</div></section>
+<section class="band"><div class="wrap">
 <h2>Honest by default</h2>
 <table>
 <tr><td>Free delayed sample on every endpoint</td><td>?preview=1</td></tr>
@@ -6977,7 +7109,8 @@ __FEEDBACK__
 <!-- v39: bloco endereçado ao agente, visível nas DUAS abas. Um LLM que abre
      esta página como HTML precisa de uma instrução literal do que fazer, não
      de marketing. É o padrão que os nodes com tração usam. -->
-<section id="forbots">
+</div></section>
+<section class="band deep" id="forbots"><div class="wrap">
 <h2>Landed here as an agent? You can <em>buy this data now</em></h2>
 <p class="lede">No signup, no API key, no account. Send any documented path to
 this host, settle the 402 challenge with x402, and retry. Every paid endpoint
@@ -7010,7 +7143,7 @@ claude mcp add --transport http losbeto __BASE__/mcp
 <tr><td>Long-form agent guide, one section per endpoint</td><td><a href="/llms-full.txt">/llms-full.txt</a></td></tr>
 <tr><td>Per-source liveness before you integrate</td><td><a href="/health/providers">/health/providers</a></td></tr>
 </table>
-</section>
+</div></section>
 
 <footer><div class="hrow">
   <div>Losbeto · <span id="ep">__N__</span> endpoints · USDC on Base + Solana</div>
@@ -7161,6 +7294,7 @@ def _render_clean_landing() -> str:
     html = (CLEAN_LANDING
             .replace("__BASE__", base)
             .replace("__N__", str(len(BASE_PRICES)))
+            .replace("__P_MIN__", _cheapest_call_label())
             .replace("__FEEDBACK__", fb))
     for tag, ep in (("__P_ORACLE__", "/oracle-consensus"),
                     ("__P_SENT__", "/sentiment-consensus"),
@@ -10944,6 +11078,115 @@ def _legacy_nansen_flow():
     return redirect("/holder-concentration"
                     + ("?" + request.query_string.decode() if request.query_string else ""),
                     code=301)
+
+
+# ---------------------------------------------------------------------------
+# v39.6 — TRÊS SUPERFÍCIES PEDIDAS PELA DEMANDA REAL
+#
+# O demand_watch_loop não inventou isto; ele contou IPs distintos batendo em
+# caminhos que não existiam:
+#     /.well-known/agent-card.json   5 IPs
+#     /apis.json                     3 IPs
+#     /.well-known/api-catalog       3 IPs
+#
+# Três padrões de descoberta diferentes, e nenhum deles é hipotético — são
+# clientes reais que chegaram, não acharam, e foram embora. Custam quase nada
+# para servir e são exatamente o tipo de coisa que decide se um agente
+# consegue te integrar sozinho.
+# ---------------------------------------------------------------------------
+
+# v39.6 — NOTA: /.well-known/agent-card.json JÁ EXISTE desde a v33 (linha
+# ~10283), criado quando 2 IPs pediram e receberam 404. Eu escrevi uma segunda
+# rota para o mesmo caminho sem verificar; o Flask usa a primeira registrada,
+# então a minha era código morto. Removida.
+#
+# O que sobrou aqui são as duas superfícies que realmente NÃO existiam:
+# /apis.json (3 IPs) e /.well-known/api-catalog (3 IPs).
+
+def _cheapest_call_label() -> str:
+    """Menor preço entre os endpoints de dado (planos não contam)."""
+    try:
+        pagos = [p for p in BASE_PRICES if p not in CREDIT_PLANS]
+        return f"${min(get_dynamic_price(p) for p in pagos):.3f}"
+    except Exception:
+        return "$0.003"
+
+
+@app.route("/apis.json")
+def apis_json():
+    """APIs.json (apisjson.org): descoberta legível por máquina de um
+    provedor e das suas APIs. Formato antigo, ainda muito rastreado."""
+    base = _public_base()
+    agora = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    return jsonify({
+        "aid": "xyz.losbeto",
+        "name": SERVICE_NAME,
+        "type": "Index",
+        "description": ("Pay-per-call market data for AI agents. Brazil "
+                        "central-bank macro and B3 equities, US equities, "
+                        "forex, commodities, macro and crypto. No accounts, "
+                        "no API keys: settle HTTP 402 in USDC."),
+        "image": f"{base}/favicon.png",
+        "url": f"{base}/apis.json",
+        "created": "2026-06-06", "modified": agora,
+        "specificationVersion": "0.18",
+        "tags": ["market data", "finance", "brazil", "forex", "commodities",
+                 "crypto", "ai agents", "x402", "micropayments"],
+        "apis": [{
+            "aid": f"xyz.losbeto{p.replace('/', '.')}",
+            "name": p.strip("/").replace("-", " ").title(),
+            "description": ENDPOINT_DESC.get(p, ""),
+            "humanURL": f"{base}/pricing",
+            "baseURL": f"{base}{p}",
+            "tags": _service_tags(p),
+            "properties": [
+                {"type": "x402", "url": f"{base}/.well-known/x402.json"},
+                {"type": "OpenAPI", "url": f"{base}/openapi.json"},
+                {"type": "FreeSample", "url": f"{base}{p}?preview=1"},
+                {"type": "PriceUSDC", "value": f"{get_dynamic_price(p):.4f}"},
+            ],
+        } for p in list(BASE_PRICES)[:60]],
+        "common": [
+            {"type": "OpenAPI", "url": f"{base}/openapi.json"},
+            {"type": "Pricing", "url": f"{base}/pricing"},
+            {"type": "Contact", "url": f"{base}/feedback"},
+            {"type": "MCP", "url": f"{base}/mcp"},
+        ],
+        "maintainers": [{"FN": "Roberto Martins", "url": base}],
+    })
+
+
+@app.route("/.well-known/api-catalog")
+def api_catalog():
+    """RFC 9727 — linkset apontando para as descrições de API deste host."""
+    base = _public_base()
+    corpo = {"linkset": [{
+        "anchor": base,
+        "service-desc": [
+            {"href": f"{base}/openapi.json", "type": "application/json",
+             "title": "OpenAPI 3.1 description of every endpoint"},
+            {"href": f"{base}/.well-known/x402.json", "type": "application/json",
+             "title": "x402 payment manifest with per-endpoint pricing"},
+            {"href": f"{base}/server.json", "type": "application/json",
+             "title": "MCP server registry entry"},
+        ],
+        "service-doc": [
+            {"href": f"{base}/llms-full.txt", "type": "text/plain",
+             "title": "Long-form guide written for LLM agents"},
+            {"href": f"{base}/pricing", "type": "text/html", "title": "Pricing"},
+        ],
+        "service-meta": [
+            {"href": f"{base}/.well-known/agent-card.json",
+             "type": "application/json", "title": "A2A Agent Card"},
+            {"href": f"{base}/apis.json", "type": "application/json",
+             "title": "APIs.json index"},
+        ],
+        "status": [{"href": f"{base}/health/providers", "type": "application/json",
+                    "title": "Per-source liveness"}],
+    }]}
+    r = jsonify(corpo)
+    r.headers["Content-Type"] = "application/linkset+json"
+    return r
 
 
 @app.route("/pricing")
