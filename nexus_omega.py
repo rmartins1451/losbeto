@@ -87,7 +87,7 @@ from typing import Any, Optional, Dict, List, Tuple
 # 0. CONFIGURAÇÃO E AUTO-SETUP
 # ============================================================================
 
-VERSION = "43.0.0-CONCIERGE"
+VERSION = "44.0.0-PERSONA"
 BRAND_NAME = "Losbeto"
 BRAND_TAGLINE = "The Global Revenue Engine for Financial AI Agents"
 BRAND_EMOJI = "🧠"
@@ -331,6 +331,7 @@ BASE_PRICES = {
     #     enriquecimento de wallet e relatório de token são o que agentes
     #     orquestradores mais recompram — ver análise v43) ---
     "/token-intel":      0.080,
+    "/research-brief":   0.050,   # v44: síntese com fontes — a demanda orgânica nº1
     "/deep-think":       0.100,
     "/agent-call":       0.100,
     "/wallet-scan":      0.100,
@@ -458,6 +459,7 @@ ENDPOINT_DESC = {
     "/sec-filing":      "SEC filing search with an objective market read: what was filed, by whom, and what it means for the tape.",
     "/backtest":        "Strategy backtest with PnL, win rate, drawdown and a written read of where the strategy actually makes its money.",
     "/token-intel":     "Token intelligence report for any contract address or ticker: liquidity, volume, pair age, buy/sell flow, deterministic risk flags (honeypot pattern, wash-trading signature, thin liquidity) plus an AI verdict. Built for pre-execution checks.",
+    "/research-brief":  "Research brief on any question: live web sources gathered, then an AI-written synthesis with key points and a cited source list. Ask in plain language — built for conversational agents and research bots.",
     "/wallet-scan":     "Wallet intelligence: given a Solana or EVM address, return native and token holdings with USD values, concentration and activity signals, deterministic risk flags and an AI-written profile. The enrichment call orchestrator agents buy before trusting a counterparty.",
     "/tg-premium":      "Premium alert feed in automation-ready shape: one JSON object per alert, stable keys, no prose to parse.",
     "/onchain-credit":  "On-chain credit score (0-900) for any Solana wallet: account age, activity, balance tiers and counterparty history.",
@@ -538,6 +540,7 @@ ENDPOINT_TAGS = {
     "/ai-news":         ["AI", "News"],
     "/dex-screen":      ["Trading", "DEX"],
     "/token-intel":     ["Utility", "Security", "Featured"],
+    "/research-brief":  ["Search", "AI", "Research"],
     "/wallet-scan":     ["Utility", "Onchain", "Featured"],
     "/holder-concentration": ["Utility", "Onchain"],
     "/sec-filing":      ["Search", "Equities"],
@@ -2952,6 +2955,90 @@ class Brain:
             return {"query": q, "results": [], "error": str(e), "ts": int(time.time())}
 
     @staticmethod
+    def research_brief():
+        """v44 — RESEARCH BRIEF (a demanda orgânica nº1, produtizada).
+
+        Telemetria: /web-search cru é o endpoint com mais compradores distintos
+        (15 IPs em 24h) — agentes conversacionais (Poncho, GPTs) pagando por
+        pesquisa. Mas dado cru de busca é commodity; o produto é a SÍNTESE:
+        fontes vivas reunidas + leitura de IA com pontos-chave e citações.
+        Se nenhum LLM estiver disponível, devolve as fontes estruturadas —
+        nunca quebra, nunca inventa síntese.
+        """
+        q = (request.args.get("q") or request.args.get("query") or "").strip()
+        ts = int(time.time())
+        if not q:
+            return {"error": "missing_param", "param": "q",
+                    "hint": "GET /research-brief?q=<your question>", "ts": ts}
+
+        sources, raw_bits = [], []
+        # Fonte 1: DuckDuckGo Instant Answer + tópicos relacionados
+        try:
+            r = requests.get("https://api.duckduckgo.com/",
+                params={"q": q, "format": "json", "no_html": 1, "skip_disambig": 1},
+                timeout=7)
+            d = r.json()
+            if d.get("AbstractText"):
+                raw_bits.append(d["AbstractText"])
+                sources.append({"title": d.get("Heading") or q,
+                                "url": d.get("AbstractURL"), "kind": "reference"})
+            for t in d.get("RelatedTopics", [])[:6]:
+                if isinstance(t, dict) and t.get("Text"):
+                    raw_bits.append(t["Text"])
+                    sources.append({"title": t["Text"][:90], "url": t.get("FirstURL"),
+                                    "kind": "related"})
+        except Exception as e:
+            log.warning(f"research-brief ddg: {e}")
+        # Fonte 2: newswire de mercado quando a pergunta é de mercado/cripto
+        _mk = any(k in q.lower() for k in ("bitcoin", "btc", "crypto", "market",
+                  "ethereum", "solana", "stock", "token", "defi", "price"))
+        if _mk:
+            try:
+                r = requests.get("https://min-api.cryptocompare.com/data/v2/news/"
+                                 "?lang=EN&sortOrder=latest", timeout=6)
+                for n in (r.json().get("Data") or [])[:4]:
+                    raw_bits.append(f"{n.get('title')} ({n.get('source')})")
+                    sources.append({"title": n.get("title"), "url": n.get("url"),
+                                    "kind": "news",
+                                    "ts": n.get("published_on")})
+            except Exception as e:
+                log.debug(f"research-brief news: {e}")
+
+        if not raw_bits:
+            return {"query": q, "status": "no_sources",
+                    "note": ("Live source gathering returned nothing usable for "
+                             "this query right now — nothing was synthesized."),
+                    "sources": [], "ts": ts, "provider": "Losbeto/ResearchBrief"}
+
+        out = {"query": q, "sources": sources[:10], "source_count": len(sources[:10]),
+               "methodology": ("Live sources are gathered first; the synthesis "
+                               "is written strictly over what was gathered, with "
+                               "the source list attached. No source, no claims."),
+               "ts": ts, "provider": "Losbeto/ResearchBrief"}
+        try:
+            brief = _ai(
+                "You are a research analyst for an autonomous agent. Answer the "
+                "question below using ONLY the gathered source snippets. "
+                "Structure: (1) a 3-4 sentence brief, (2) 3-5 bullet key "
+                "points. If the snippets are insufficient, say what is known "
+                "and what is not. Question: " + q +
+                "\n\nSnippets:\n" + "\n".join(f"- {b[:400]}" for b in raw_bits[:10]),
+                max_tokens=600)
+            if brief:
+                out["brief"] = brief
+        except Exception as e:
+            log.debug(f"research-brief ai: {e}")
+        if "brief" not in out:
+            # Degradação honesta: fontes organizadas valem o preço; síntese
+            # inventada, não.
+            out["status"] = "sources_only"
+            out["note"] = ("AI synthesis unavailable — returning the gathered "
+                           "sources verbatim, organized. Nothing was invented.")
+            out["gathered"] = raw_bits[:10]
+        return out
+
+
+    @staticmethod
     def ai_news():
         try:
             r = requests.get("https://min-api.cryptocompare.com/data/v2/news/?lang=EN&sortOrder=latest", timeout=6)
@@ -4239,6 +4326,78 @@ def _cheapest_paid(base: str) -> dict:
     except Exception:
         return {"endpoint": f"{base}/pyth-price", "usd": "0.0030"}
 
+# ---------------------------------------------------------------------------
+# v44 — RECOMENDAÇÃO POR PAGADOR (personalização do lado da máquina).
+#
+# O comprador robô repete comportamento: quem comprou /br-curve tende a
+# querer /br-macro; quem comprou /token-intel tem uma carteira para perfilar.
+# Cada resposta paga agora carrega `recommended_next`: os próximos 2 produtos
+# MAIS PROVÁVEIS para ESTE pagador — histórico dele no ledger + afinidade de
+# tags + o que o mercado mais compra. Custo: um SELECT indexado por pagador.
+# É o cross-sell que um vendedor humano faria, embutido no JSON.
+# ---------------------------------------------------------------------------
+
+def _payer_bought(payer: str, limit: int = 60) -> set:
+    if not payer:
+        return set()
+    try:
+        with LEDGER._conn() as c:
+            rows = c.execute("SELECT DISTINCT endpoint FROM revenue "
+                             "WHERE payer=? ORDER BY ts DESC LIMIT ?",
+                             (payer, limit)).fetchall()
+        return {r[0] for r in rows}
+    except Exception:
+        return set()
+
+def _market_top(days: int = 7, limit: int = 5) -> list:
+    try:
+        with LEDGER._conn() as c:
+            rows = c.execute(
+                "SELECT endpoint, COUNT(*) n FROM revenue "
+                "WHERE ts > ? AND endpoint NOT LIKE '/subscribe%' "
+                "AND endpoint NOT IN ('/day-pass','/week-pass','/buy-credits',"
+                "'/starter-pack','/enterprise') "
+                "GROUP BY endpoint ORDER BY n DESC LIMIT ?",
+                (int(time.time()) - days * 86400, limit)).fetchall()
+        return [r[0] for r in rows]
+    except Exception:
+        return []
+
+def _recommended_next(current: str, payer: str, limit: int = 2) -> list:
+    """Próximos produtos para ESTE pagador. Ordem: afinidade de tag com o que
+    ele acabou de comprar (excluindo o que já tem), depois os mais comprados
+    do mercado. Preço vivo sempre junto — decisão numa resposta só."""
+    bought = _payer_bought(payer)
+    bought.add(current)
+    skip = {"/subscribe-pro", "/subscribe-whale", "/day-pass", "/week-pass",
+            "/buy-credits", "/starter-pack", "/enterprise"}
+    cur_tags = set(ENDPOINT_TAGS.get(current, []))
+    scored = []
+    for ep in BASE_PRICES:
+        if ep in bought or ep in skip:
+            continue
+        shared = len(cur_tags & set(ENDPOINT_TAGS.get(ep, [])))
+        scored.append((shared, -get_dynamic_price(ep), ep))
+    scored.sort(key=lambda t: (-t[0], t[1]))
+    recs = []
+    for shared, _negp, ep in scored:
+        if shared > 0:
+            recs.append({"endpoint": ep,
+                         "price_usdc": f"{get_dynamic_price(ep):.4f}",
+                         "why": f"same category as {current}"})
+        if len(recs) >= limit:
+            break
+    if len(recs) < limit:  # completa com os campeões de venda do mercado
+        for ep in _market_top():
+            if ep in bought or ep in skip or any(r["endpoint"] == ep for r in recs):
+                continue
+            recs.append({"endpoint": ep,
+                         "price_usdc": f"{get_dynamic_price(ep):.4f}",
+                         "why": "most bought on this node this week"})
+            if len(recs) >= limit:
+                break
+    return recs[:limit]
+
 _B58 = set("123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz")
 
 def _valid_txid(v: str) -> bool:
@@ -4289,6 +4448,7 @@ ENDPOINT_PARAM_HINTS = {
     "/onchain-credit":    {"wallet": "GEhr9HCFTRDjanMg435frSgCVwVZYpNoPrEkmNBnFHFE"},
     "/dex-screen":        {"query": "SOL"},
     "/token-intel":       {"token": "SOL"},
+    "/research-brief":    {"q": "Brazil central bank rate outlook"},
     "/wallet-scan":       {"address": "GEhr9HCFTRDjanMg435frSgCVwVZYpNoPrEkmNBnFHFE"},
     "/jupiter-swap":      {"pair": "SOL/USDC"},
     "/sanctions":         {"name": "example"},
@@ -5687,6 +5847,14 @@ def paid_endpoint(path):
                     return _rr
                 try:
                     if isinstance(result, dict):
+                        # v44: cross-sell personalizado — os próximos produtos
+                        # prováveis DESTE pagador viajam na resposta paga.
+                        try:
+                            _recs = _recommended_next(path, payer)
+                            if _recs and "recommended_next" not in result:
+                                result["recommended_next"] = _recs
+                        except Exception:
+                            pass
                         prev_data = (_premium_teaser(result)
                                      if path in PREMIUM_TEASER_PATHS else result)
                         # v28: não sobrescreve uma amostra que ainda não atingiu
@@ -5774,6 +5942,7 @@ ENDPOINT_HANDLERS = {
     "/insider-track":   Brain.insider_track,
     "/mev-flow":        Brain.mev_flow,
     "/web-search":      Brain.web_search,
+    "/research-brief":  Brain.research_brief,
     "/ai-news":         Brain.ai_news,
     "/dex-screen":      Brain.dex_screen,
     "/token-intel":     Brain.token_intel,
@@ -7288,6 +7457,132 @@ def get_pricing():
         "endpoints": {ep: {"price_usdc": get_dynamic_price(ep), "desc": ENDPOINT_DESC.get(ep, ""), "env_key": _price_env_key(ep)} for ep, p in BASE_PRICES.items()},
         "pay_with":  "USDC-SPL via x402 (Solana) ou USDC via x402 (Base)",
         "discovery": f"{base}/.well-known/x402.json",
+        "tasks":     f"{base}/tasks.json",
+    })
+
+@app.route("/api/for-you")
+def api_for_you():
+    """v44 — PERSONALIZAÇÃO ANÔNIMA. A landing guarda no navegador do
+    visitante (localStorage, nada sai da máquina dele) quais produtos ele
+    clicou; este endpoint recebe o endpoint favorito e devolve os 4 mais
+    afins com preço vivo + contexto de mercado aberto/fechado. Recomendação
+    real sem coletar dado pessoal nenhum — o perfil mora no cliente."""
+    base = _public_base()
+    fav = (request.args.get("ep") or "").strip()
+    fav_tags = set(ENDPOINT_TAGS.get(fav, []))
+    recs = []
+    for ep in BASE_PRICES:
+        if ep == fav or ep.startswith(("/subscribe", "/day-pass", "/week-pass",
+                                       "/buy-credits", "/starter", "/enterprise")):
+            continue
+        shared = len(fav_tags & set(ENDPOINT_TAGS.get(ep, []))) if fav_tags else 0
+        recs.append((shared, -get_dynamic_price(ep), ep))
+    recs.sort(key=lambda t: (-t[0], t[1]))
+    out = []
+    for shared, _p, ep in recs[:4]:
+        out.append({"endpoint": ep, "url": f"{base}{ep}",
+                    "price_usdc": f"{get_dynamic_price(ep):.4f}",
+                    "desc": (ENDPOINT_DESC.get(ep, ep) or "")[:110],
+                    "free_sample": f"{base}{ep}?preview=1"})
+    # contexto de pregão (horários UTC): B3 13:00-20:00, NYSE 13:30-20:00,
+    # cripto sempre. Sábado/domingo fechado para ações.
+    now = datetime.now(timezone.utc)
+    wd, hm = now.weekday(), now.hour * 60 + now.minute
+    markets = {
+        "b3_open":        wd < 5 and 13 * 60 <= hm < 20 * 60,
+        "us_equities_open": wd < 5 and 13 * 60 + 30 <= hm < 20 * 60,
+        "crypto": "always open",
+    }
+    return jsonify({"recommendations": out, "markets": markets,
+                    "ts": int(time.time())})
+
+# ---------------------------------------------------------------------------
+# v44 — /tasks.json: MANIFESTO ORIENTADO A INTENÇÃO.
+#
+# Agentes conversacionais (Poncho, GPTs, Claude com ferramentas) não buscam
+# "endpoints" — buscam TAREFAS: "verifique se este token é seguro", "me dê o
+# brief da manhã". A página tryponcho.com/m/api.losbeto.xyz existe mas nasceu
+# rasa porque nossos manifests descrevem recursos, não intenções. Este arquivo
+# é a ponte: linguagem de tarefa → chamada exata → preço vivo. Grátis, para
+# qualquer diretório ou LLM indexar.
+# ---------------------------------------------------------------------------
+_TASKS = [
+    {"task": "Check if a crypto token is safe before buying it",
+     "utterances": ["is this token a scam", "should I buy this token",
+                    "check this contract before I swap", "token safety check"],
+     "endpoint": "/token-intel", "call": "/token-intel?token=<contract-or-ticker>"},
+    {"task": "Profile a wallet before trusting or paying it",
+     "utterances": ["who owns this wallet", "is this address legit",
+                    "check this wallet before sending funds"],
+     "endpoint": "/wallet-scan", "call": "/wallet-scan?address=<solana-or-0x>"},
+    {"task": "Research any question with cited live sources",
+     "utterances": ["research this for me", "what is happening with",
+                    "give me a brief on", "summarize the latest on"],
+     "endpoint": "/research-brief", "call": "/research-brief?q=<question>"},
+    {"task": "Get the global markets morning brief",
+     "utterances": ["morning brief", "what moved overnight",
+                    "market summary today", "cross-asset read"],
+     "endpoint": "/global-morning-brief", "call": "/global-morning-brief"},
+    {"task": "Check whether market sentiment agrees with price action",
+     "utterances": ["is the fear real", "sentiment check",
+                    "are indicators agreeing", "capitulation signal"],
+     "endpoint": "/sentiment-consensus", "call": "/sentiment-consensus"},
+    {"task": "Get a price with multi-oracle confidence",
+     "utterances": ["sol price with confidence", "btc price from multiple sources",
+                    "oracle consensus price"],
+     "endpoint": "/oracle-consensus", "call": "/oracle-consensus?symbol=SOL"},
+    {"task": "Read Brazil's central bank rates and the real interest rate",
+     "utterances": ["selic rate", "brazil real rate", "brazil carry trade",
+                    "bcdi cdi brazil rates"],
+     "endpoint": "/br-curve", "call": "/br-curve"},
+    {"task": "Get Brazilian agricultural export parity prices",
+     "utterances": ["soybean price brazil", "brazil coffee price",
+                    "corn parity brazil", "agro commodities brazil"],
+     "endpoint": "/br-agro", "call": "/br-agro"},
+    {"task": "Get a Brazilian stock quote with USD conversion",
+     "utterances": ["petrobras price", "petr4 quote", "b3 stock price",
+                    "ibovespa level"],
+     "endpoint": "/br-equity", "call": "/br-equity?symbol=PETR4"},
+    {"task": "Read Brazil macro indicators (Selic, IPCA, PTAX)",
+     "utterances": ["brazil inflation", "brazil macro data", "ptax dollar brazil"],
+     "endpoint": "/br-macro", "call": "/br-macro"},
+    {"task": "Get the full Brazil market brief",
+     "utterances": ["brazil market brief", "brazil desk summary"],
+     "endpoint": "/br-brief", "call": "/br-brief"},
+    {"task": "Stress-test a crypto portfolio",
+     "utterances": ["stress test my portfolio", "what if btc drops 30%",
+                    "portfolio risk check"],
+     "endpoint": "/portfolio-stress", "call": "/portfolio-stress (POST positions)"},
+    {"task": "Search the web cheaply, raw results",
+     "utterances": ["web search", "look this up"],
+     "endpoint": "/web-search", "call": "/web-search?q=<query>"},
+    {"task": "Check the crypto fear and greed index",
+     "utterances": ["fear and greed", "market fear level"],
+     "endpoint": "/fear-greed", "call": "/fear-greed"},
+]
+
+@app.route("/tasks.json")
+@app.route("/.well-known/tasks.json")
+def tasks_manifest():
+    base = _public_base()
+    return jsonify({
+        "schema": "losbeto.tasks/v1",
+        "name": SERVICE_NAME,
+        "description": ("Task-oriented index of this node: what an agent can "
+                        "GET DONE here, in the language a user asks for it. "
+                        "Prices are live and pulled from the same pricing "
+                        "engine the 402 challenges use."),
+        "tasks": [{**t,
+                   "price_usdc": f"{get_dynamic_price(t['endpoint']):.4f}",
+                   "url": f"{base}{t['endpoint']}",
+                   "payment": "x402 (USDC on Base or Solana) — no signup, no API key",
+                   "free_sample": f"{base}{t['endpoint']}?preview=1"}
+                  for t in _TASKS],
+        "free_tier": {"tasting_menu": f"{base}/try",
+                      "first_realtime_call": f"{base}/welcome"},
+        "full_catalog": f"{base}/.well-known/x402.json",
+        "contact": _building_block(),
+        "version": VERSION, "ts": int(time.time()),
     })
 
 @app.route("/bazaar.json")
@@ -7326,6 +7621,7 @@ def bazaar_manifest():
         "sample":      f"{base}/sample",
         "pricing":     f"{base}/get-pricing",
         "x402":        f"{base}/.well-known/x402.json",
+        "tasks":       f"{base}/tasks.json",
         "mcp":         f"{base}/.well-known/mcp.json",
         "resources":   resources,
         "contact": {
@@ -7716,6 +8012,15 @@ settles a few cents in USDC per request and gets clean JSON back.</p>
 </div>
 </div></section>
 
+<!-- v44: PERSONALIZAÇÃO. O perfil do visitante fica no navegador dele
+     (localStorage) — a página lembra o que ele explorou e devolve uma vitrine
+     sob medida na volta, sem coletar nada no servidor. -->
+<section class="band" id="foryou" style="display:none"><div class="wrap">
+<h2 id="fy-title">Picked for you</h2>
+<p class="lede" id="fy-sub"></p>
+<div class="grid" id="fy-grid"></div>
+</div></section>
+
 <div class="wrap">
 <div id="human">
 </div></div>
@@ -7953,6 +8258,7 @@ claude mcp add --transport http losbeto __BASE__/mcp
 
 <h2>Machine-readable discovery</h2>
 <table>
+<tr><td>Task-oriented index — what agents can GET DONE here</td><td><a href="/tasks.json">/tasks.json</a></td></tr>
 <tr><td>Full contract with per-endpoint pricing</td><td><a href="/openapi.json">/openapi.json</a></td></tr>
 <tr><td>x402 manifest — every resource, priced</td><td><a href="/.well-known/x402.json">/.well-known/x402.json</a></td></tr>
 <tr><td>MCP registry entry</td><td><a href="/server.json">/server.json</a></td></tr>
@@ -7983,6 +8289,60 @@ function mode(m){
   var m=q||'h';
   if(!q){try{m=localStorage.getItem('losbeto_mode')||'h'}catch(e){}}
   if(m==='a'||m==='agent')mode('a');
+})();
+</script>
+<script>
+/* v44 — MOTOR DE PERSONALIZAÇÃO (client-side, privacy-first).
+   Perfil mora no navegador: visitas, produtos clicados, primeira visita.
+   Na volta, a página monta uma vitrine sob medida via /api/for-you. */
+(function(){
+  var KEY='losbeto_profile';
+  function load(){try{return JSON.parse(localStorage.getItem(KEY))||{}}catch(e){return{}}}
+  function save(p){try{localStorage.setItem(KEY,JSON.stringify(p))}catch(e){}}
+  var p=load();
+  p.v=(p.v||0)+1; p.first=p.first||Date.now(); p.eps=p.eps||{};
+  save(p);
+  // registra interesse: cliques em qualquer link de endpoint
+  document.addEventListener('click',function(ev){
+    var a=ev.target.closest&&ev.target.closest('a'); if(!a)return;
+    var h=(a.getAttribute('href')||'').split('?')[0];
+    if(/^\/[a-z0-9][a-z0-9-]{2,}$/.test(h) && h.indexOf('.')<0){
+      var q=load(); q.eps=q.eps||{}; q.eps[h]=(q.eps[h]||0)+1; save(q);
+    }
+  },true);
+  function topEps(eps){
+    return Object.keys(eps||{}).sort(function(a,b){return eps[b]-eps[a]});
+  }
+  var favs=topEps(p.eps);
+  var returning = p.v>1 || favs.length>0;
+  if(!returning) return;   // primeira visita: landing padrão
+  var fav = favs[0]||'';
+  fetch('/api/for-you?ep='+encodeURIComponent(fav))
+    .then(function(r){return r.json()})
+    .then(function(d){
+      var strip=document.getElementById('foryou');
+      var title=document.getElementById('fy-title');
+      var sub=document.getElementById('fy-sub');
+      var grid=document.getElementById('fy-grid');
+      var hh=new Date().getHours();
+      var greet = hh<12?'Good morning':(hh<18?'Good afternoon':'Good evening');
+      title.textContent = p.v>1 ? (greet+' — welcome back') : 'Picked for you';
+      var ctx=[];
+      if(d.markets){ctx.push(d.markets.b3_open?'B3 is open now':'B3 closed');
+        ctx.push(d.markets.us_equities_open?'US equities open':'US equities closed');
+        ctx.push('crypto always open');}
+      var s=(fav?('Last time you looked at '+fav+'. '):'')+ctx.join(' · ');
+      if(p.v>2)s+=' · visit #'+p.v;
+      sub.textContent=s;
+      grid.innerHTML=(d.recommendations||[]).map(function(r){
+        return '<div class="gcard"><h3>'+r.endpoint.replace('/','')+'</h3>'+
+          '<p>'+r.desc+'</p>'+
+          '<span class="px">$'+r.price_usdc+'</span> · '+
+          '<a href="'+r.free_sample+'" style="color:inherit">free sample</a> · '+
+          '<code>'+r.endpoint+'</code></div>';
+      }).join('');
+      strip.style.display='block';
+    }).catch(function(){});
 })();
 </script>
 <!-- v36: atendimento. Os avaliadores são majoritariamente humanos em
@@ -11363,6 +11723,9 @@ def _build_openapi():
         "/token-intel":   [{"name": "token", "in": "query", "required": True,
                             "description": "Token contract address (Solana mint or 0x) or ticker",
                             "schema": {"type": "string", "example": "SOL"}}],
+        "/research-brief": [{"name": "q", "in": "query", "required": True,
+                            "description": "Research question in plain language",
+                            "schema": {"type": "string", "example": "Brazil central bank rate outlook"}}],
         "/wallet-scan":   [{"name": "address", "in": "query", "required": True,
                             "description": "Wallet address — Solana base58 or EVM 0x",
                             "schema": {"type": "string", "example": "GEhr9HCFTRDjanMg435frSgCVwVZYpNoPrEkmNBnFHFE"}}],
@@ -11852,6 +12215,7 @@ def llms_txt():
     lines += ["", "## Discovery",
               f"- OpenAPI:    {base}/openapi.json",
               f"- x402:       {base}/.well-known/x402.json",
+              f"- Tasks:      {base}/tasks.json (o que dá para FAZER aqui, em linguagem de intenção)",
               f"- MCP:        {base}/.well-known/mcp.json",
               f"- A2A:        {base}/.well-known/agent.json",
               f"- Verify:     {base}/.well-known/verify-manifest (prova criptográfica de posse)",
