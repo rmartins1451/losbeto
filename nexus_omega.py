@@ -87,7 +87,7 @@ from typing import Any, Optional, Dict, List, Tuple
 # 0. CONFIGURAÇÃO E AUTO-SETUP
 # ============================================================================
 
-VERSION = "42.0.0-MULTIPROTOCOL"
+VERSION = "42.1.0-HOTFIX"
 BRAND_NAME = "Losbeto"
 BRAND_TAGLINE = "The Global Revenue Engine for Financial AI Agents"
 BRAND_EMOJI = "🧠"
@@ -1037,6 +1037,9 @@ class LedgerV10:
         return {
             "total_usdc":     round(total, 6),
             "today_usdc":     round(today, 6),
+            # v42.1 FIX: /live/api lia a chave "revenue_24h", que nunca existiu
+            # — a página pública mostrava "$0.0000" com 32 settlements no ar.
+            "revenue_24h":    round(today, 6),
             "hour_usdc":      round(hour, 6),
             "requests_24h":   reqs,
             "paid_24h":       paid,
@@ -4515,12 +4518,33 @@ def _build_402(endpoint: str):
 def _b64url(raw: bytes) -> str:
     return base64.urlsafe_b64encode(raw).rstrip(b"=").decode()
 
+def _ascii_header(s: str) -> str:
+    """v42.1 FIX CRÍTICO: valores de header HTTP devem ser ASCII (RFC 7230).
+    ENDPOINT_DESC tem tipografia rica (—, ·, ç, ã) — quando o travessão caía
+    nos primeiros 90 chars, o challenge MPP saía com byte não-ASCII e clients
+    HTTP estritos (httpx, Node undici) ABORTAVAM a request ao ecoar o valor.
+    Foi o que derrubou 6 endpoints no Agentic.Market ([502] 'No valid x402
+    response found') e inundou o gunicorn com 'Invalid HTTP Header' — todos
+    os 6 tinham U+2014 dentro da janela de 90 chars; os endpoints com — depois
+    do char 90 passavam pela truncagem. Coincidência perfeita, bug real."""
+    s = (s or "").replace("—", "-").replace("–", "-").replace("·", "|")
+    return s.encode("ascii", "ignore").decode("ascii")
+
 def _mpp_challenge(endpoint: str, primary: dict) -> str:
     """v42: challenge no formato MPP (IETF draft-httpauth-payment-00).
     id vinculado aos termos (endpoint+valor+payTo, janela de 5 min) — o mesmo
     padrão stateless da spec; request em base64url com o mapeamento charge→exact:
     amount atômico, moeda, destinatário, rede e asset. Clients MPP reconhecem o
-    auth-scheme "Payment" e validadores deixam de marcar o endpoint com warning."""
+    auth-scheme "Payment" e validadores deixam de marcar o endpoint com warning.
+
+    LIMITAÇÃO DECLARADA (v42.1): method="x402" não é um payment method MPP
+    registrado — a spec é agnóstica e métodos são definidos em specs separadas.
+    Este challenge satisfaz scanners de diretório (X402Scan/MPPScan/Agentic.
+    Market) e documenta os termos num formato legível; o fluxo MPP completo
+    (Credential/Receipt) NÃO é implementado. Um client MPP bem-comportado
+    ignora métodos desconhecidos e cai no challenge x402 ao lado — que é o
+    caminho real de pagamento. Se um dia existir method spec x402 registrada,
+    basta implementar o handshake aqui."""
     base = _public_base()
     atomic = str(primary.get("amount") or primary.get("maxAmountRequired") or "0")
     req = {"amount": atomic,
@@ -4534,7 +4558,7 @@ def _mpp_challenge(endpoint: str, primary: dict) -> str:
     cid = hashlib.sha256(
         f"mpp|{endpoint}|{atomic}|{primary.get('payTo')}|{int(time.time() // 300)}"
         .encode()).hexdigest()[:20]
-    desc = (ENDPOINT_DESC.get(endpoint, endpoint) or "")[:90].replace('"', "'")
+    desc = _ascii_header(ENDPOINT_DESC.get(endpoint, endpoint) or "")[:90].replace('"', "'")
     exp = datetime.fromtimestamp(time.time() + 300, timezone.utc
                                  ).strftime("%Y-%m-%dT%H:%M:%SZ")
     return (f'Payment id="{cid}", realm="losbeto", method="x402", intent="charge", '
@@ -7487,9 +7511,9 @@ tools = get_langchain_tools()   <span class="c"># free delayed data</span></pre>
 need a data source nobody outside Brazil assembles.</p>
 <div class="grid">
   <div class="gcard"><h3>Brazil agricultural parity<span class="bz">exclusive</span></h3>
-    <p>Soybeans, corn, arabica coffee and live cattle in the Brazilian domestic
-       unit — official BCB series when they publish, CBOT/ICE futures converted
-       at the official PTAX when they don't. Provenance declared in every response.</p>
+    <p>Soybeans, corn and arabica coffee in the Brazilian 60kg bag — official
+       BCB series when they publish, CBOT/ICE futures converted at the official
+       PTAX when they don't. Provenance declared in every response.</p>
     <span class="px">__P_AGRO__</span> · <code>/br-agro</code></div>
   <div class="gcard"><h3>Brazil rate structure<span class="bz">exclusive</span></h3>
     <p>Selic, CDI annualised on the 252-day convention, TJLP and IPCA — plus the
@@ -10236,7 +10260,7 @@ _BCB_AGRO = {
     "coffee_arabica_brl_per_60kg_bag": (
         1464, "Arabica coffee, domestic spot, BRL per 60kg bag"),
     "cattle_brl_per_arroba": (
-        1467, "Live cattle (boi gordo), BRL per arroba (15kg)"),
+        1467, "Live cattle (boi gordo), BRL per arroba (14.688kg)"),
 }
 
 _BCB_CURVE = {
@@ -10343,17 +10367,25 @@ def _bcb_parallel(series: dict) -> dict:
 # mas o PRODUTO (preço doméstico brasileiro que forma a paridade de exportação)
 # pode continuar vivo, com a fonte correta declarada. Cadeia: BCB fresco →
 # futuros CBOT/ICE (Yahoo) → Stooq → 503 honesto. Conversão para a unidade
-# doméstica (saca 60kg / arroba 14,688kg) usando a PTAX oficial — a mesma
-# conta que um desk de exportação faz na mão. Proveniência declarada em campo
-# próprio: NÃO é o spot oficial CEPEA/ESALQ, é paridade implícita de futuros.
+# doméstica (saca 60kg) usando a PTAX oficial — a mesma conta que um desk de
+# exportação faz na mão. Proveniência declarada em campo próprio: NÃO é o
+# spot oficial CEPEA/ESALQ, é paridade implícita de futuros.
+#
+# v42.1 — LE=F (boi gordo) REMOVIDO da suíte de futuros, por dois motivos
+# metodológicos: (1) CME Live Cattle é cotado em cents/lb de PESO VIVO, e a
+# arroba brasileira é peso de CARCAÇA — converter sem o rendimento de carcaça
+# (~50%) produz um número errado em dobro; (2) carne BR e US são mercados
+# praticamente separados (barreiras sanitárias, graus, demanda) — não existe
+# "paridade de exportação" como em soja/milho/café, que são globais. Três
+# commodities com proveniência sólida > quatro com uma inventada. O caminho
+# BCB oficial (se um dia voltar a publicar) continua intacto abaixo.
 _AGRO_FUTURES = {
     # ticker: (chave no produto, unidade do contrato, fator USD->unidade doméstica)
     "ZS=F": ("soybean_brl_per_60kg_bag",      "cents/bushel", 60.0 / 27.2155),
     "ZC=F": ("corn_brl_per_60kg_bag",         "cents/bushel", 60.0 / 25.4012),
     "KC=F": ("coffee_arabica_brl_per_60kg_bag", "cents/lb",   132.277),
-    "LE=F": ("cattle_brl_per_arroba",          "cents/lb",   14.688 / 0.453592),
 }
-_AGRO_STOOQ = {"ZS=F": "zs.f", "ZC=F": "zc.f", "KC=F": "kc.f", "LE=F": "le.f"}
+_AGRO_STOOQ = {"ZS=F": "zs.f", "ZC=F": "zc.f", "KC=F": "kc.f"}
 
 def _agro_futures_parity(usd_brl: float) -> dict:
     """Cotação de futuros convertida para a unidade doméstica brasileira.
@@ -10394,12 +10426,15 @@ def _br_agro_handler():
                     "status": "live",
                     "prices": par,
                     "usd_brl_ptax": usd_brl,
-                    "provenance": ("CBOT/ICE front-month futures converted to the "
-                                   "Brazilian domestic unit (60kg bag / 14.688kg "
-                                   "arroba) at the official BCB PTAX rate. This is "
-                                   "futures-implied export parity, NOT the official "
-                                   "CEPEA/ESALQ domestic spot — declared so you can "
-                                   "price the basis yourself."),
+                    "provenance": ("CBOT/ICE front-month futures (soybeans, corn, "
+                                   "arabica coffee) converted to the Brazilian "
+                                   "domestic 60kg bag at the official BCB PTAX "
+                                   "rate. This is futures-implied export parity, "
+                                   "NOT the official CEPEA/ESALQ domestic spot — "
+                                   "declared so you can price the basis yourself. "
+                                   "Live cattle was removed: CME live-weight "
+                                   "cents/lb vs Brazilian carcass arroba have no "
+                                   "clean export-parity mapping."),
                     "bcb_series_status": ("Official BCB/SGS series 1464-1467 were "
                                           "discontinued (last print 01/12/2022) and "
                                           "are NOT sold here — see excluded_stale."),
@@ -11210,6 +11245,21 @@ def _build_openapi():
     # Endpoints pagos (mantêm security: [{"x402": []}])
     for p in BASE_PRICES:
         price = BASE_PRICES[p]
+        # v42.1 FIX: /bootstrap-trust é híbrido (GET grátis com instruções +
+        # POST pago) e já foi declarado em free_endpoints com requestBody
+        # completo. O loop SOBRESCREVA essa definição com um GET "pago" sem
+        # schema — exatamente o warning "Paid endpoint is missing an input
+        # schema" do Agentic.Market. Agora: preserva a definição rica e só
+        # marca o POST como pago (o requestBody dele É o input schema).
+        if p == "/bootstrap-trust" and p in paths:
+            post_op = paths[p].get("post", {})
+            post_op["security"] = [{"x402": []}]
+            post_op["x-payment-info"] = {
+                "price": {"mode": "fixed", "currency": "USD",
+                          "amount": f"{price:.6f}"},
+                "protocols": [{"x402": {}}],
+            }
+            continue
         params = ENDPOINT_PARAMS.get(p, [
             {"name": "format", "in": "query", "required": False,
              "description": "Formato da resposta",
@@ -11246,6 +11296,46 @@ def _build_openapi():
                 },
             }
         }
+        # v42.1 FIX: /portfolio-stress aceita POST com o JSON de posições —
+        # sem esse requestBody o validador marcava "missing input schema".
+        if p == "/portfolio-stress":
+            paths[p]["post"] = {
+                "summary":     ENDPOINT_DESC.get(p, p),
+                "description": "POST com o portfolio a estressar. Preco: "
+                               f"${price:.4f} USDC via x402.",
+                "operationId": "portfolio_stress_post",
+                "tags":        ENDPOINT_TAGS.get(p, ["Premium", "Risk"]),
+                "requestBody": {
+                    "required": True,
+                    "content": {"application/json": {"schema": {
+                        "type": "object",
+                        "required": ["positions"],
+                        "properties": {
+                            "positions": {
+                                "type": "array",
+                                "description": "Posições do portfolio",
+                                "items": {"type": "object",
+                                          "required": ["asset", "qty"],
+                                          "properties": {
+                                              "asset": {"type": "string",
+                                                        "example": "BTC"},
+                                              "qty":   {"type": "number",
+                                                        "example": 1.5}}}}},
+                        "example": {"positions": [{"asset": "BTC", "qty": 1.5},
+                                                  {"asset": "SOL", "qty": 40}]},
+                    }}}},
+                "security":    [{"x402": []}],
+                "x-payment-info": {
+                    "price": {"mode": "fixed", "currency": "USD",
+                              "amount": f"{price:.6f}"},
+                    "protocols": [{"x402": {}}],
+                },
+                "responses": {
+                    "200": {"description": "Stress test do portfolio",
+                            "content": {"application/json": {"schema": {"type": "object"}}}},
+                    "402": {"description": "Payment Required — use protocolo x402"},
+                },
+            }
 
     info = {
         "title":       "Losbeto",
@@ -11887,15 +11977,14 @@ def ucp_profile():
                      "endpoint": f"{base}/.well-known/agent-card.json"},
                 ],
             },
-            "capabilities": {
-                # catálogo de dados sob demanda: o "checkout" do node é o
-                # próprio fluxo 402 — 1 request, 1 pagamento, 1 resposta.
-                "dev.ucp.shopping.checkout": [
-                    {"version": "2026-04-08",
-                     "spec": "https://ucp.dev/2026-04-08/specification/checkout",
-                     "schema": f"{base}/.well-known/x402.json"},
-                ],
-            },
+            # v42.1: capability "dev.ucp.shopping.checkout" REMOVIDA. UCP
+            # checkout é uma máquina de estados de e-commerce (carrinho,
+            # fulfillment, pós-venda) — este node vende chamadas de API, não
+            # produtos físicos. Declarar uma capability que não servimos faria
+            # um agente do Google AI Mode tentar um checkout e falhar — o
+            # mesmo pecado do dado velho. O que É verdade fica: os três
+            # transports reais acima e o payment handler x402 abaixo (o nosso
+            # "checkout" é o fluxo 402: 1 request, 1 pagamento, 1 resposta).
             "payment_handlers": {
                 # namespace próprio (losbeto.xyz): handler x402 com USDC.
                 "xyz.losbeto.x402": [
