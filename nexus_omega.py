@@ -87,7 +87,7 @@ from typing import Any, Optional, Dict, List, Tuple
 # 0. CONFIGURAÇÃO E AUTO-SETUP
 # ============================================================================
 
-VERSION = "41.1.0-VERIFIED"
+VERSION = "42.0.0-MULTIPROTOCOL"
 BRAND_NAME = "Losbeto"
 BRAND_TAGLINE = "The Global Revenue Engine for Financial AI Agents"
 BRAND_EMOJI = "🧠"
@@ -201,6 +201,18 @@ LLM_FORCE_ENGLISH = os.environ.get("LLM_FORCE_ENGLISH", "1") != "0"
 # v41.1: campo experimental no settle CDP. Ver comentário em Facilitator.settle.
 # Padrão DESLIGADO — não arriscamos a liquidação em Base por uma hipótese.
 CDP_SEND_RESOURCE = os.environ.get("CDP_SEND_RESOURCE", "").strip() in ("1", "true")
+
+# v42 — MPP (Machine Payments Protocol, IETF draft-httpauth-payment-00, da
+# Stripe/Tempo) e UCP (Universal Commerce Protocol, do Google).
+# Evidência: o registrador da agentic.market/x402scan/MPPScan marcou TODOS os
+# 74 endpoints com "WWW-Authenticate header contains no Payment challenges" —
+# o header existia, mas com auth-scheme "x402", que os validadores MPP não
+# reconhecem. E 3 IPs distintos pediram /.well-known/ucp em 7 dias (Google
+# UCP virou o ponto de descoberta de agentes de compra em 2026).
+# O node continua 100% x402 na liquidação — agora ele também FALA MPP no
+# desafio e PUBLICA um perfil UCP. Desliga com MPP_CHALLENGE=0 / UCP_PROFILE=0.
+MPP_CHALLENGE = os.environ.get("MPP_CHALLENGE", "1") != "0"
+UCP_PROFILE   = os.environ.get("UCP_PROFILE", "1") != "0"
 LLM_ENGLISH_SUFFIX = (
     "\n\nIMPORTANT: Respond ONLY in clear, concise English, regardless of the "
     "language used in this prompt. The reader is an English-speaking trading agent.")
@@ -3980,6 +3992,9 @@ ENDPOINT_PARAM_HINTS = {
     "/sec-filing":        {"query": "AAPL 10-K"},
     "/web-search":        {"q": "bitcoin macro outlook"},
     "/backtest":          {"symbol": "BTC", "strategy": "momentum"},
+    # v42: era o único pago sem schema declarado — o registrador da
+    # agentic.market marcava "Paid endpoint is missing an input schema".
+    "/portfolio-stress":  {"positions": '[{"asset":"BTC","qty":1.5}]'},
 }
 
 _PARAM_DESC = {
@@ -3992,6 +4007,7 @@ _PARAM_DESC = {
     "q": "Free-text search query",
     "name": "Entity name to screen against OFAC-SDN",
     "strategy": "Strategy label, e.g. momentum, mean-reversion",
+    "positions": "JSON array of positions (asset + qty) — POST body or query param",
     "format": "Response format (json)",
 }
 
@@ -4463,6 +4479,14 @@ def _build_402(endpoint: str):
             if v is not None:
                 auth_params.append(f'{k}="{v}"')
     resp.headers["WWW-Authenticate"] = "x402 " + ", ".join(auth_params)
+    # v42 — SEGUNDO challenge, no shape MPP (RFC 7235 permite N challenges).
+    # O validador da agentic.market/x402scan/MPPScan procura um auth-scheme
+    # "Payment"; sem ele, TODOS os 74 endpoints apareciam com warning no
+    # registro. O desafio x402 continua primeiro (compat total); este apenas
+    # descreve o MESMO pagamento no vocabulário MPP (charge intent mapeia
+    # direto o fluxo "exact" do x402 — é o que a spec chama de backward-compat).
+    if MPP_CHALLENGE:
+        resp.headers.add("WWW-Authenticate", _mpp_challenge(endpoint, primary))
     resp.headers["PAYMENT-REQUIRED"]   = b64
     # v28.1: era uma cópia byte a byte de PAYMENT-REQUIRED (+6 KB à toa).
     # Mantido só se couber no orçamento total de cabeçalhos.
@@ -4487,6 +4511,34 @@ def _build_402(endpoint: str):
         "PAYMENT-REQUIRED,X-PAYMENT-REQUIRED,WWW-Authenticate,X-Free-Preview,"
         "X-402-Version,X-Accept-Chains")
     return resp
+
+def _b64url(raw: bytes) -> str:
+    return base64.urlsafe_b64encode(raw).rstrip(b"=").decode()
+
+def _mpp_challenge(endpoint: str, primary: dict) -> str:
+    """v42: challenge no formato MPP (IETF draft-httpauth-payment-00).
+    id vinculado aos termos (endpoint+valor+payTo, janela de 5 min) — o mesmo
+    padrão stateless da spec; request em base64url com o mapeamento charge→exact:
+    amount atômico, moeda, destinatário, rede e asset. Clients MPP reconhecem o
+    auth-scheme "Payment" e validadores deixam de marcar o endpoint com warning."""
+    base = _public_base()
+    atomic = str(primary.get("amount") or primary.get("maxAmountRequired") or "0")
+    req = {"amount": atomic,
+           "currency": "USDC",
+           "recipient": primary.get("payTo", ""),
+           "network": primary.get("network", ""),
+           "asset": primary.get("asset", ""),
+           "resource": f"{base}{endpoint}",
+           "protocol": "x402-exact"}
+    blob = _b64url(json.dumps(req, separators=(",", ":"), sort_keys=True).encode())
+    cid = hashlib.sha256(
+        f"mpp|{endpoint}|{atomic}|{primary.get('payTo')}|{int(time.time() // 300)}"
+        .encode()).hexdigest()[:20]
+    desc = (ENDPOINT_DESC.get(endpoint, endpoint) or "")[:90].replace('"', "'")
+    exp = datetime.fromtimestamp(time.time() + 300, timezone.utc
+                                 ).strftime("%Y-%m-%dT%H:%M:%SZ")
+    return (f'Payment id="{cid}", realm="losbeto", method="x402", intent="charge", '
+            f'request="{blob}", expires="{exp}", description="{desc}"')
 
 def _verify_payment(endpoint: str, payment_header: str):
     if not payment_header:
@@ -6689,6 +6741,16 @@ TRY_MENU = [p.strip() for p in os.environ.get(
     "/global-morning-brief,/equity-dossier,/forex-rate,/commodity-price,"
     "/fear-greed,/launch-risk").split(",") if p.strip()]
 
+# v42: evidência ao vivo (31/jul) — o /try chegou a mostrar "warming" em 4 dos
+# 6 cards (cache de preview local por worker + cadência do warmer de IA). Um
+# avaliador que recebe placeholder no cardápio vai embora achando que o node
+# está morto. Estes endpoints baratos e rápidos entram como RESERVA: se um
+# card do menu estiver frio, o reserva aquecido ocupa o lugar na hora.
+TRY_BACKFILL = [p.strip() for p in os.environ.get(
+    "TRY_BACKFILL",
+    "/pyth-price,/trust-hash,/regime,/anomalias,/sentiment,/mempool,"
+    "/dex-screen,/br-equity").split(",") if p.strip()]
+
 @app.route("/health/providers")
 def health_providers():
     """v25.3: autodiagnóstico público das fontes que sustentam as promessas do
@@ -6749,6 +6811,15 @@ def try_menu():
         if path not in BASE_PRICES:
             continue
         sample = _inline_sample(path)
+        # v42: card frio? tenta um reserva aquecido no lugar — o cardápio
+        # nunca mostra placeholder se houver QUALQUER dado real para mostrar.
+        if sample.get("status") in ("warming", "unavailable"):
+            for alt in TRY_BACKFILL:
+                if alt in BASE_PRICES and not any(i["endpoint"] == alt for i in items):
+                    alt_sample = _inline_sample(alt)
+                    if alt_sample.get("data") is not None:
+                        path, sample = alt, alt_sample
+                        break
         items.append({
             "endpoint": path,
             "title": ENDPOINT_DESC.get(path, path)[:120],
@@ -6769,6 +6840,10 @@ def try_menu():
         "pitch": "Global markets on x402: forex, equities, commodities, macro + crypto. "
                  "The only node that isn't crypto-only.",
         "cost_of_this_call": "0.00 USDC (free)",
+        "first_call_free": {
+            "endpoint": f"{base}/welcome",
+            "note": ("One FREE real-time call (not delayed): GET /welcome, send "
+                     "the token as X-Welcome-Token to any whitelisted endpoint.")},
         "how_to_buy": "Repeat the request to any 'buy' URL; pay the 402 challenge "
                       "with USDC on Solana or Base. No signup, no API key.",
         "samples": items,
@@ -7308,6 +7383,7 @@ settles a few cents in USDC per request and gets clean JSON back.</p>
   <div class="stat"><b>2</b><span>chains · Base + Solana</span></div>
   <div class="stat"><b>0</b><span>accounts to create</span></div>
   <div class="stat"><b>Free</b><span>sample on every endpoint</span></div>
+  <div class="stat"><b><a href="/welcome" style="color:inherit">1st call free</a></b><span>real-time, no wallet · /welcome</span></div>
 </div>
 </div></section>
 
@@ -7383,6 +7459,10 @@ revenue actually comes from, and they exist in no other x402 catalog.</p>
 <pre><span class="c"># free — no wallet needed</span>
 curl __BASE__/try
 
+<span class="c"># NEW: one REAL-TIME call free, no wallet — the trial</span>
+curl __BASE__/welcome
+curl -H 'X-Welcome-Token: &lt;token&gt;' __BASE__/pyth-price
+
 <span class="c"># any endpoint, free delayed sample</span>
 curl '__BASE__/oracle-consensus?preview=1'
 
@@ -7406,9 +7486,10 @@ tools = get_langchain_tools()   <span class="c"># free delayed data</span></pre>
 <p class="lede">Four products that exist in no other x402 catalog, because they
 need a data source nobody outside Brazil assembles.</p>
 <div class="grid">
-  <div class="gcard"><h3>Brazil agricultural prices<span class="bz">exclusive</span></h3>
-    <p>Soybeans, corn, arabica coffee and live cattle from the central bank, in BRL
-       and USD, with export-parity equivalents in CBOT bushels and ICE cents/lb.</p>
+  <div class="gcard"><h3>Brazil agricultural parity<span class="bz">exclusive</span></h3>
+    <p>Soybeans, corn, arabica coffee and live cattle in the Brazilian domestic
+       unit — official BCB series when they publish, CBOT/ICE futures converted
+       at the official PTAX when they don't. Provenance declared in every response.</p>
     <span class="px">__P_AGRO__</span> · <code>/br-agro</code></div>
   <div class="gcard"><h3>Brazil rate structure<span class="bz">exclusive</span></h3>
     <p>Selic, CDI annualised on the 252-day convention, TJLP and IPCA — plus the
@@ -7428,6 +7509,7 @@ need a data source nobody outside Brazil assembles.</p>
 <section class="band"><div class="wrap">
 <h2>Honest by default</h2>
 <table>
+<tr><td>First real-time call free, no wallet, no signup</td><td>/welcome</td></tr>
 <tr><td>Free delayed sample on every endpoint</td><td>?preview=1</td></tr>
 <tr><td>Six endpoints sampled in one free call</td><td>/try</td></tr>
 <tr><td>Per-source liveness before you integrate</td><td>/health/providers</td></tr>
@@ -7445,6 +7527,7 @@ GET __BASE__/x402-resources
 GET __BASE__/.well-known/x402.json
 GET __BASE__/.well-known/mcp.json
 GET __BASE__/.well-known/agent.json
+GET __BASE__/.well-known/ucp
 GET __BASE__/openapi.json
 GET __BASE__/llms.txt
 
@@ -7466,7 +7549,9 @@ GET __BASE__/oracle-consensus
 <span class="c"># 4 facilitator settles on Base or Solana; JSON returned</span>
 
 Networks: eip155:8453 (Base, Coinbase CDP) · solana (PayAI)
-Asset:    USDC · Prices: $0.003 – $0.30</pre>
+Asset:    USDC · Prices: $0.003 – $0.30
+<span class="c"># also answers MPP "Payment" challenges (IETF draft-httpauth-payment)
+# and is discoverable via Google UCP at /.well-known/ucp</span></pre>
 
 <h2>Missing something?</h2>
 <pre><span class="c"># tell the operator what your agent needs</span>
@@ -7483,7 +7568,11 @@ __FEEDBACK__
 <p class="lede">No signup, no API key, no account. Send any documented path to
 this host, settle the 402 challenge with x402, and retry. Every paid endpoint
 also has a free delayed sample.</p>
-<pre><span class="c"># free — works with zero balance, six endpoints in one call</span>
+<pre><span class="c"># first REAL-TIME call free — no wallet, no signup</span>
+curl __BASE__/welcome
+curl -H 'X-Welcome-Token: &lt;token&gt;' __BASE__/pyth-price
+
+<span class="c"># free — works with zero balance, six endpoints in one call</span>
 curl __BASE__/try
 
 <span class="c"># free delayed sample of any single endpoint</span>
@@ -7507,6 +7596,7 @@ claude mcp add --transport http losbeto __BASE__/mcp
 <tr><td>Full contract with per-endpoint pricing</td><td><a href="/openapi.json">/openapi.json</a></td></tr>
 <tr><td>x402 manifest — every resource, priced</td><td><a href="/.well-known/x402.json">/.well-known/x402.json</a></td></tr>
 <tr><td>MCP registry entry</td><td><a href="/server.json">/server.json</a></td></tr>
+<tr><td>Google UCP profile (shopping + x402 payment handler)</td><td><a href="/.well-known/ucp">/.well-known/ucp</a></td></tr>
 <tr><td>Plain-text guidance for LLM agents</td><td><a href="/llms.txt">/llms.txt</a></td></tr>
 <tr><td>Long-form agent guide, one section per endpoint</td><td><a href="/llms-full.txt">/llms-full.txt</a></td></tr>
 <tr><td>Per-source liveness before you integrate</td><td><a href="/health/providers">/health/providers</a></td></tr>
@@ -10249,12 +10339,77 @@ def _bcb_parallel(series: dict) -> dict:
     return out
 
 
+# v42 — PARIDADE VIA FUTUROS: as séries BCB 1464-1467 morreram em 01/12/2022,
+# mas o PRODUTO (preço doméstico brasileiro que forma a paridade de exportação)
+# pode continuar vivo, com a fonte correta declarada. Cadeia: BCB fresco →
+# futuros CBOT/ICE (Yahoo) → Stooq → 503 honesto. Conversão para a unidade
+# doméstica (saca 60kg / arroba 14,688kg) usando a PTAX oficial — a mesma
+# conta que um desk de exportação faz na mão. Proveniência declarada em campo
+# próprio: NÃO é o spot oficial CEPEA/ESALQ, é paridade implícita de futuros.
+_AGRO_FUTURES = {
+    # ticker: (chave no produto, unidade do contrato, fator USD->unidade doméstica)
+    "ZS=F": ("soybean_brl_per_60kg_bag",      "cents/bushel", 60.0 / 27.2155),
+    "ZC=F": ("corn_brl_per_60kg_bag",         "cents/bushel", 60.0 / 25.4012),
+    "KC=F": ("coffee_arabica_brl_per_60kg_bag", "cents/lb",   132.277),
+    "LE=F": ("cattle_brl_per_arroba",          "cents/lb",   14.688 / 0.453592),
+}
+_AGRO_STOOQ = {"ZS=F": "zs.f", "ZC=F": "zc.f", "KC=F": "kc.f", "LE=F": "le.f"}
+
+def _agro_futures_parity(usd_brl: float) -> dict:
+    """Cotação de futuros convertida para a unidade doméstica brasileira.
+    Yahoo primeiro (tempo real); Stooq como fallback (não bloqueia data center)."""
+    out = {}
+    for ticker, (chave, unidade, fator) in _AGRO_FUTURES.items():
+        q = Brain._yahoo_quote(ticker)
+        fonte = "Yahoo Finance"
+        if not q:
+            q = Brain._stooq_quote(_AGRO_STOOQ.get(ticker, ""))
+            fonte = "Stooq"
+        if not q or not q.get("price"):
+            continue
+        usd_unit = (q["price"] / 100.0) * fator     # centavos → USD → unidade doméstica
+        linha = {"usd": round(usd_unit, 4),
+                 "contract": ticker, "contract_unit": unidade,
+                 "source": fonte,
+                 "date": q.get("date") or datetime.now(timezone.utc).strftime("%Y-%m-%d")}
+        if q.get("change_pct") is not None:
+            linha["change_pct"] = q["change_pct"]
+        if usd_brl:
+            linha["brl"] = round(usd_unit * usd_brl, 2)
+        out[chave] = linha
+    return out
+
 def _br_agro_handler():
     """Preços agrícolas brasileiros com paridade em dólar."""
     ts = int(time.time())
+    ptax = _bcb_last(1, 8)
+    usd_brl = (ptax or {}).get("value")
     dados = _bcb_parallel(_BCB_AGRO)
     vivos, obsoletas = _check_freshness(dados, "commodity")
     if len(vivos) < 2:
+        # v42: antes de recusar a venda, tenta a paridade via futuros.
+        par = _agro_futures_parity(usd_brl or 0.0)
+        if len(par) >= 2:
+            return {"product": "Brazil Agricultural Prices",
+                    "status": "live",
+                    "prices": par,
+                    "usd_brl_ptax": usd_brl,
+                    "provenance": ("CBOT/ICE front-month futures converted to the "
+                                   "Brazilian domestic unit (60kg bag / 14.688kg "
+                                   "arroba) at the official BCB PTAX rate. This is "
+                                   "futures-implied export parity, NOT the official "
+                                   "CEPEA/ESALQ domestic spot — declared so you can "
+                                   "price the basis yourself."),
+                    "bcb_series_status": ("Official BCB/SGS series 1464-1467 were "
+                                          "discontinued (last print 01/12/2022) and "
+                                          "are NOT sold here — see excluded_stale."),
+                    "excluded_stale": {k: {"last_published": v.get("date"),
+                                           "age_days": v.get("age_days")}
+                                       for k, v in obsoletas.items()},
+                    "coverage": ("Brazil is the world's largest exporter of soybeans, "
+                                 "coffee, sugar and beef — these parities are the gap "
+                                 "every export desk watches."),
+                    "ts": ts, "provider": "Losbeto/Brasil", "version": VERSION}
         # v39.3: a v39.2 vendia estas séries sem olhar a data. Todas as quatro
         # estão paradas em 01/12/2022 — descontinuadas pelo BCB. A API responde
         # 200 alegremente; só a data denuncia. Não vendemos mais.
@@ -11662,9 +11817,134 @@ def health_aliases():
     return health()
 
 
+# ===========================================================================
+# v42 — MULTIPROTOCOLO: UCP + MPP
+#
+# Dois sinais de demanda REAL da telemetria de 7 dias:
+#   /.well-known/ucp          3 pedidos · 3 IPs distintos
+#   (registro agentic.market) 74 endpoints com warning de "no Payment challenges"
+#
+# UCP (Universal Commerce Protocol) é o padrão do Google (jan/2026, com
+# Shopify/Walmart/Stripe/Visa no consórcio) para um agente de compra descobrir
+# o que um merchant vende, como transacionar e com o que pagar — um JSON em
+# /.well-known/ucp. MPP (Machine Payments Protocol, IETF draft da Stripe/Tempo)
+# padroniza o 402 como auth-scheme "Payment". Este node é, até onde consta, o
+# PRIMEIRO servidor x402 a publicar um perfil UCP com handler de pagamento x402
+# e a responder challenges MPP ao lado dos x402 — sem mudar nada na liquidação.
+# ===========================================================================
+
+def _ucp_signing_keys() -> list:
+    """JWK Ed25519 da chave pública do node — UCP usa signing_keys para
+    HTTP Message Signatures (RFC 9421) e verificação de identidade."""
+    try:
+        return [{"kid": f"losbeto-{WALLET.node_id}",
+                 "kty": "OKP", "crv": "Ed25519",
+                 "x": _b64url(WALLET.public_key),
+                 "use": "sig", "alg": "EdDSA"}]
+    except Exception:
+        return []
+
+@app.route("/.well-known/ucp")
+def ucp_profile():
+    """Perfil UCP (ucp.dev/specification). Declara serviços nos 3 transportes
+    que o node JÁ tem (REST/OpenAPI, MCP streamable, A2A agent-card), a
+    capability de checkout e o handler de pagamento x402 com os instrumentos
+    USDC nas duas redes. Nada aqui muda o fluxo — é descoberta pura."""
+    base = _public_base()
+    if not UCP_PROFILE:
+        return jsonify({"error": "disabled"}), 404
+    # telemetria: platforms UCP se identificam pelo header UCP-Agent
+    ucp_agent = (request.headers.get("UCP-Agent") or "").strip()
+    try:
+        LEDGER.log_request("/.well-known/ucp", True, 0,
+                           (request.headers.get("X-Forwarded-For", request.remote_addr) or ""
+                            ).split(",")[0].strip(),
+                           kind="ucp_agent" if ucp_agent else "ucp_probe",
+                           ua=request.headers.get("User-Agent", ""),
+                           params=ucp_agent[:200])
+    except Exception:
+        pass
+    networks = ([BASE_CAIP2] if (ENABLE_BASE and BASE_PAYTO_EVM) else []) + \
+               [f"solana:{SOL_GENESIS}"]
+    profile = {
+        "ucp": {
+            "version": "2026-04-08",
+            "services": {
+                "dev.ucp.shopping": [
+                    {"version": "2026-04-08",
+                     "spec": "https://ucp.dev/2026-04-08/specification/overview",
+                     "transport": "rest",
+                     "endpoint": base,
+                     "schema": f"{base}/openapi.json"},
+                    {"version": "2026-04-08",
+                     "spec": "https://ucp.dev/2026-04-08/specification/overview",
+                     "transport": "mcp",
+                     "endpoint": f"{base}/mcp",
+                     "schema": f"{base}/.well-known/mcp.json"},
+                    {"version": "2026-04-08",
+                     "spec": "https://ucp.dev/2026-04-08/specification/overview",
+                     "transport": "a2a",
+                     "endpoint": f"{base}/.well-known/agent-card.json"},
+                ],
+            },
+            "capabilities": {
+                # catálogo de dados sob demanda: o "checkout" do node é o
+                # próprio fluxo 402 — 1 request, 1 pagamento, 1 resposta.
+                "dev.ucp.shopping.checkout": [
+                    {"version": "2026-04-08",
+                     "spec": "https://ucp.dev/2026-04-08/specification/checkout",
+                     "schema": f"{base}/.well-known/x402.json"},
+                ],
+            },
+            "payment_handlers": {
+                # namespace próprio (losbeto.xyz): handler x402 com USDC.
+                "xyz.losbeto.x402": [
+                    {"id": "x402",
+                     "version": "2",
+                     "spec": "https://www.x402.org",
+                     "schema": f"{base}/.well-known/x402.json",
+                     "available_instruments": [
+                         {"type": "stablecoin",
+                          "constraints": {"currencies": ["USDC"],
+                                          "networks": networks}}],
+                     "config": {
+                         "type": "HTTP_402",
+                         "challenge_header": "PAYMENT-REQUIRED",
+                         "mpp_challenge": MPP_CHALLENGE,
+                         "free_trial_endpoint": f"{base}/welcome",
+                         "catalog": f"{base}/x402-resources"}},
+                ],
+            },
+        },
+        "signing_keys": _ucp_signing_keys(),
+        "merchant": {
+            "name": SERVICE_NAME,
+            "url": base,
+            "description": ("Pay-per-call market data for AI agents: forex, "
+                            "equities, commodities, Brazil central-bank macro, "
+                            "B3 equities and crypto."),
+            "catalog_size": len(BASE_PRICES),
+            "free_samples": f"{base}/try",
+            "contact": os.environ.get("CONTACT_EMAIL", ""),
+        },
+        "generated_at": int(time.time()),
+    }
+    r = jsonify(profile)
+    r.headers["Cache-Control"] = "public, max-age=300"
+    return r
+
+
 @app.route("/.well-known/llms.txt")
 def llms_wellknown():
     return redirect("/llms.txt", code=301)
+
+
+@app.route("/query")
+def query_alias():
+    """v42: 3 pedidos de 2 IPs em 7 dias — agentes que procuram busca genérica.
+    Mesmo tratamento dos aliases v40: redireciona preservando a query string."""
+    qs = request.query_string.decode()
+    return redirect(f"/web-search{('?' + qs) if qs else ''}", code=308)
 
 
 @app.route("/openapi.yaml")
