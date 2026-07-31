@@ -87,7 +87,7 @@ from typing import Any, Optional, Dict, List, Tuple
 # 0. CONFIGURAÇÃO E AUTO-SETUP
 # ============================================================================
 
-VERSION = "39.6.0-ADAPT"
+VERSION = "39.7.0-OFFER"
 BRAND_NAME = "Losbeto"
 BRAND_TAGLINE = "The Global Revenue Engine for Financial AI Agents"
 BRAND_EMOJI = "🧠"
@@ -4024,6 +4024,127 @@ def _challenge_recall(endpoint: str) -> Optional[list]:
     return None
 
 
+# ---------------------------------------------------------------------------
+# v39.7 — A OFERTA DE ASSINATURA VAI PARA DENTRO DO 402
+#
+# /pricing existe desde a v39.1 e nunca vendeu nada, por um motivo simples:
+# nenhum agente visita uma página. O momento em que a decisão de compra
+# acontece é EXATAMENTE quando o cliente recebe o 402 — ele está com a
+# carteira na mão, avaliando se aquele preço vale. É ali que a alternativa
+# precisa estar, não numa landing.
+#
+# Então todo desafio 402 passa a carregar um bloco "alternatives" dizendo, com
+# número: quantas chamadas deste mesmo endpoint pagam um passe, e onde comprar.
+# Um agente que planeja orçamento consegue decidir sem nenhuma chamada extra.
+# ---------------------------------------------------------------------------
+
+# v39.7 — GATILHO DE UPGRADE COM DADO REAL
+# Dizer "assine" para quem fez uma chamada é spam. Dizer, para quem já gastou
+# mais do que um passe custaria, exatamente quanto teria economizado, é
+# informação — e é o argumento mais forte que existe, porque é o dinheiro dele.
+_PAYER_SPEND: Dict[str, list] = {}
+_PAYER_LOCK = threading.Lock()
+UPSELL_WINDOW = int(os.environ.get("UPSELL_WINDOW", "86400"))  # 24 h
+
+
+def _track_spend(payer: str, amount: float) -> None:
+    if not payer or amount <= 0:
+        return
+    agora = time.time()
+    with _PAYER_LOCK:
+        hist = [x for x in _PAYER_SPEND.get(payer, []) if agora - x[0] < UPSELL_WINDOW]
+        hist.append((agora, amount))
+        _PAYER_SPEND[payer] = hist
+        if len(_PAYER_SPEND) > 500:
+            for k in list(_PAYER_SPEND)[:150]:
+                _PAYER_SPEND.pop(k, None)
+
+
+def _upsell_note(payer: str) -> Optional[dict]:
+    """Só fala quando o número já favorece o cliente. Silêncio caso contrário."""
+    if not payer:
+        return None
+    agora = time.time()
+    with _PAYER_LOCK:
+        hist = [x for x in _PAYER_SPEND.get(payer, []) if agora - x[0] < UPSELL_WINDOW]
+    if len(hist) < 3:
+        return None
+    gasto = sum(a for _t, a in hist)
+    # v39.7 — CORRIGIDO na verificação: a primeira versão recomendava o plano
+    # mais barato que o cliente já tinha ultrapassado, e isso dava conselho
+    # ERRADO. Quem gastou $3.15 ouvia "compre credits por $0.99" — mas credits
+    # dá $1.25 de saldo e não teria coberto nem metade. Um upsell que não se
+    # sustenta na conta do cliente é pior que nenhum upsell.
+    #
+    # Agora: o plano mais barato que REALMENTE teria coberto o gasto. Plano de
+    # saldo cobre até balance_usd; plano ilimitado cobre qualquer valor.
+    candidatos = sorted(
+        ((BASE_PRICES[ep], ep, cfg) for ep, cfg in CREDIT_PLANS.items()
+         if ep in BASE_PRICES), key=lambda x: x[0])
+    for preco, ep, cfg in candidatos:
+        cobertura = float("inf") if cfg["balance_usd"] == -1 else cfg["balance_usd"]
+        if gasto > preco and cobertura >= gasto:
+            economia = gasto - preco
+            return {
+                "you_spent_usdc": round(gasto, 4),
+                "calls_in_window": len(hist),
+                "window_hours": UPSELL_WINDOW // 3600,
+                "plan": cfg["plan"],
+                "plan_price_usdc": round(preco, 2),
+                "would_have_saved_usdc": round(economia, 4),
+                "buy": f"{_public_base()}{ep}",
+                "message": (f"You have spent ${gasto:.4f} across {len(hist)} calls "
+                            f"in the last {UPSELL_WINDOW // 3600}h. The "
+                            f"{cfg['plan']} plan costs ${preco:.2f} and would "
+                            f"have covered all of it with ${economia:.4f} left "
+                            f"over — plus no settlement latency."),
+            }
+    return None
+
+
+def _subscription_offer(endpoint: str, unit_price: float) -> Optional[dict]:
+    """Alternativas mais baratas que pagar esta chamada avulsa, com o
+    ponto de equilíbrio calculado no preço deste endpoint."""
+    if unit_price <= 0 or endpoint in CREDIT_PLANS:
+        return None
+    base = _public_base()
+    opcoes = []
+    for ep, cfg in CREDIT_PLANS.items():
+        preco = BASE_PRICES.get(ep)
+        if not preco:
+            continue
+        ilimitado = cfg["balance_usd"] == -1
+        equilibrio = int(preco / unit_price) + 1
+        item = {
+            "plan": cfg["plan"],
+            "buy": f"{base}{ep}",
+            "price_usdc": round(preco, 2),
+            "duration_days": cfg["ttl_days"],
+            "grants": ("unlimited calls to every endpoint" if ilimitado
+                       else f"${cfg['balance_usd']:.2f} of call credit"),
+            "breaks_even_after": equilibrio,
+            "note": (f"Cheaper than paying per call from call #{equilibrio} "
+                     f"onward, at this endpoint's price."),
+        }
+        if ilimitado:
+            item["includes_mcp_live"] = True
+        opcoes.append(item)
+    opcoes.sort(key=lambda x: x["price_usdc"])
+    return {
+        "why": ("If your agent will call this more than a handful of times, "
+                "one of these costs less and removes settlement latency "
+                "entirely — the key is checked in about a millisecond instead "
+                "of waiting for an on-chain confirmation."),
+        "how_to_use": "Send the key you receive as the X-API-Key header.",
+        "mcp": {"url": f"{base}/mcp",
+                "header": "Authorization: Bearer <key>",
+                "note": "A subscription turns the whole catalog into a live "
+                        "MCP server for Claude Code, Cursor or any MCP client."},
+        "plans": opcoes,
+        "human_readable": f"{base}/pricing",
+    }
+
+
 def _build_402(endpoint: str):
     amount_usdc = get_dynamic_price(endpoint)
     amount_atomic_sol = str(int(amount_usdc * 10 ** USDC_DECIMALS))
@@ -4100,6 +4221,8 @@ def _build_402(endpoint: str):
             "iconUrl":     f"{base}/favicon.png",
         },
         "accepts":    accepts,
+        # v39.7: a alternativa mais barata, no momento exato da decisão.
+        "alternatives": _subscription_offer(endpoint, amount_usdc),
         # v1 backward compat: alguns scanners (x402scan legacy) esperam paymentRequirements
         "paymentRequirements": {
             "scheme":            payment_req.get("scheme", "exact"),
@@ -4944,6 +5067,7 @@ def paid_endpoint(path):
             try:
                 from flask import g as _g
                 _g.losbeto_payer = info.get("payer", "") if isinstance(info, dict) else ""
+                _track_spend(payer, get_dynamic_price(path))   # v39.7
                 _g.losbeto_payment = info if isinstance(info, dict) else {}
                 try:
                     result = handler()
