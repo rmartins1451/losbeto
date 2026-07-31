@@ -87,7 +87,7 @@ from typing import Any, Optional, Dict, List, Tuple
 # 0. CONFIGURAÇÃO E AUTO-SETUP
 # ============================================================================
 
-VERSION = "44.0.1-PERSONA"
+VERSION = "44.0.2-PERSONA"
 BRAND_NAME = "Losbeto"
 BRAND_TAGLINE = "The Global Revenue Engine for Financial AI Agents"
 BRAND_EMOJI = "🧠"
@@ -7584,6 +7584,22 @@ def tasks_manifest():
         "contact": _building_block(),
         "version": VERSION, "ts": int(time.time()),
     })
+
+
+@app.route("/.well-known/x402list.txt")
+def x402list_proof():
+    """Prova de propriedade do domínio para o diretório x402-list.com.
+
+    Fluxo: enviamos o update no formulário deles → eles emitem um token
+    one-time (válido 72h) → publicamos aqui → o verificador deles faz GET
+    e compara. O token NUNCA fica hardcoded: vem da env var X402LIST_TOKEN
+    (Railway → Variables), trocada a cada ciclo de verificação sem redeploy.
+    """
+    tok = os.environ.get("X402LIST_TOKEN", "").strip()
+    if not tok:
+        return Response("x402list proof not configured\n", status=404,
+                        mimetype="text/plain")
+    return Response(tok + "\n", mimetype="text/plain")
 
 @app.route("/bazaar.json")
 def bazaar_manifest():
