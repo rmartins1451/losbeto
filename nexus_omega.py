@@ -87,7 +87,7 @@ from typing import Any, Optional, Dict, List, Tuple
 # 0. CONFIGURAÇÃO E AUTO-SETUP
 # ============================================================================
 
-VERSION = "40.0.0-EVIDENCE"
+VERSION = "41.1.0-VERIFIED"
 BRAND_NAME = "Losbeto"
 BRAND_TAGLINE = "The Global Revenue Engine for Financial AI Agents"
 BRAND_EMOJI = "🧠"
@@ -190,6 +190,20 @@ OLLAMA_URL   = os.environ.get("OLLAMA_URL", "http://127.0.0.1:11434")
 # disparava. Só conta como provedor se explicitamente habilitado.
 OLLAMA_ENABLED = os.environ.get("OLLAMA_ENABLED", "").strip() not in ("", "0", "false")
 OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "qwen2.5:3b")
+# v41 — IDIOMA DOS PRODUTOS DE IA.
+# Evidência (2026-07-31, GET /try ao vivo): o brief do /launch-risk — produto
+# flagship de $0.10 — saía em PORTUGUÊS porque o prompt é escrito em PT e o
+# Gemini segue o idioma do prompt. O comprador deste mercado é um agente
+# operando em inglês: amostra em PT = produto "quebrado". O sufixo abaixo é
+# anexado a TODOS os prompts (desliga com LLM_FORCE_ENGLISH=0).
+LLM_FORCE_ENGLISH = os.environ.get("LLM_FORCE_ENGLISH", "1") != "0"
+
+# v41.1: campo experimental no settle CDP. Ver comentário em Facilitator.settle.
+# Padrão DESLIGADO — não arriscamos a liquidação em Base por uma hipótese.
+CDP_SEND_RESOURCE = os.environ.get("CDP_SEND_RESOURCE", "").strip() in ("1", "true")
+LLM_ENGLISH_SUFFIX = (
+    "\n\nIMPORTANT: Respond ONLY in clear, concise English, regardless of the "
+    "language used in this prompt. The reader is an English-speaking trading agent.")
 HELIUS_KEY   = os.environ.get("HELIUS_API_KEY", "").strip()
 JUPITER_KEY  = os.environ.get("JUPITER_API_KEY", "").strip()
 COINGECKO_KEY= os.environ.get("COINGECKO_API_KEY", "").strip()
@@ -1226,6 +1240,30 @@ class LedgerV10:
             c.execute("INSERT OR IGNORE INTO replay(hash,ts) VALUES(?,?)", (h, int(time.time())))
             c.execute("DELETE FROM replay WHERE ts < ?", (int(time.time()) - 86400*7,))
 
+    def replay_claim(self, h: str) -> bool:
+        """Reserva atômica: True só para QUEM inseriu a linha.
+
+        v41.1 — `replay_seen()` seguido de `replay_mark()` não é seguro sob
+        concorrência: entre a leitura e a escrita cabe outra thread inteira, e
+        o gunicorn roda com --threads 8. `INSERT OR IGNORE` sozinho também não
+        resolve, porque não distingue "inseri" de "já existia". Aqui o
+        rowcount decide: 1 = ganhei a corrida, 0 = alguém chegou antes.
+        É o mesmo padrão que protege um cupom de uso único em qualquer
+        checkout — e aqui o que está em jogo é entrega de produto grátis.
+        """
+        with self.lock, self._conn() as c:
+            cur = c.execute("INSERT OR IGNORE INTO replay(hash,ts) VALUES(?,?)",
+                            (h, int(time.time())))
+            return cur.rowcount == 1
+
+    def replay_unmark(self, h: str):
+        """Devolve a reserva quando a falha foi nossa, não do cliente."""
+        try:
+            with self.lock, self._conn() as c:
+                c.execute("DELETE FROM replay WHERE hash=?", (h,))
+        except Exception as e:
+            log.debug(f"replay_unmark {h[:24]}: {e}")
+
     def tx_recorded(self, tx_sig: str) -> bool:
         if not tx_sig:
             return False
@@ -1532,16 +1570,54 @@ class FacilitatorClient:
             return False, f"facilitator-error:{e}", {}
 
     def settle(self, payment_payload: dict, requirements: dict,
-               bazaar: Optional[dict] = None) -> Tuple[bool, dict]:
+               bazaar: Optional[dict] = None,
+               resource: Optional[dict] = None) -> Tuple[bool, dict]:
         try:
             pp = payment_payload
             # v21.13: blob de discovery do Bazaar — a CDP cataloga o endpoint
             # quando processa o settle com esse metadata (indexação automática).
-            if self.is_cdp and bazaar:
+            # v41 FIX CRÍTICO — A VENDA ACONTECIA MAS NÃO VIRAVA CATÁLOGO.
+            # Docs CDP (quickstart-for-sellers, jul/2026): o payment payload
+            # enviado ao facilitador DEVE incluir paymentPayload.resource — é
+            # esse campo que o Bazaar/Agentic.Market usa para associar o settle
+            # ao recurso e indexá-lo. Sem ele, cada settle em Base era invisível
+            # para o diretório onde os compradores descobrem serviços.
+            # ---------------------------------------------------------------
+            # v41.1 — `resource` VIROU OPT-IN. Leia antes de ligar.
+            #
+            # O patch v41 passou a injetar pp["resource"] em todo settle CDP,
+            # com a justificativa de que o Bazaar precisa dele para indexar.
+            # Fui verificar na extensão oficial do Bazaar (coinbase/x402,
+            # go/extensions/bazaar) e o que está documentado é outra coisa:
+            #
+            #   "V2: Extensions are in PaymentPayload.Extensions
+            #    (client copied from PaymentRequired)"
+            #   "V1: Discovery info is in PaymentRequirements.OutputSchema"
+            #
+            # Ou seja: o canal documentado é `extensions`, que este código já
+            # usava. Não achei `paymentPayload.resource` em lugar nenhum — nem
+            # no quickstart-for-sellers, nem na extensão Go.
+            #
+            # O risco é assimétrico. Se o facilitador ignorar o campo, não
+            # ganhamos nada. Se validar o schema estritamente, um campo
+            # desconhecido em paymentPayload pode fazer o settle ser REJEITADO
+            # — e Base é a maioria das vendas. Perder receita para testar uma
+            # hipótese não verificada é troca ruim.
+            #
+            # Então: desligado por padrão, ligável por env para testar.
+            #   CDP_SEND_RESOURCE=1  → volta ao comportamento do v41
+            # Teste com $0.01 em Base e confira /receipts antes de deixar ligado.
+            # ---------------------------------------------------------------
+            if self.is_cdp and (bazaar or (resource and CDP_SEND_RESOURCE)):
                 pp = dict(payment_payload)
-                ext = dict(pp.get("extensions") or {})
-                ext["bazaar"] = bazaar
-                pp["extensions"] = ext
+                if bazaar:
+                    ext = dict(pp.get("extensions") or {})
+                    ext["bazaar"] = bazaar
+                    pp["extensions"] = ext
+                if resource and CDP_SEND_RESOURCE:
+                    pp["resource"] = resource
+                    log.info("🧪 settle CDP com paymentPayload.resource "
+                             "(experimental, CDP_SEND_RESOURCE=1)")
             r = requests.post(f"{self.url}/settle", json={
                 "x402Version": pp.get("x402Version", 2),
                 "paymentPayload": pp,
@@ -2070,6 +2146,9 @@ class LLM:
         """Devolve texto do primeiro provedor que responder.
         String vazia significa 'nenhum provedor disponível' — nunca um
         placeholder que possa vazar para dentro de uma resposta paga."""
+        # v41: força inglês na saída (ver LLM_FORCE_ENGLISH no topo).
+        if LLM_FORCE_ENGLISH and "Respond ONLY in" not in prompt:
+            prompt += LLM_ENGLISH_SUFFIX
         ck = ""
         if cache:
             ck = hashlib.sha256(
@@ -2403,9 +2482,19 @@ class Brain:
                          for c in top])
         memory = RAG_STORE.retrieve("market analysis btc eth sol", k=3)
         memory_str = "\n".join([f"- {m[1][:120]}" for m in memory])
-        prompt = (f"Você é um analista cripto. Fear&Greed: {fg.get('value')}.\n"
-                  f"Top 5 coins:\n{ctx}\n\nMemória recente:\n{memory_str}\n\n"
-                  f"Faça análise concisa (4 bullets) e bias direcional.")
+        # v41.1: o prompt continuava em PT mesmo depois do patch v41. O sufixo
+        # LLM_FORCE_ENGLISH corrige o IDIOMA da saída, mas um prompt em PT com
+        # instrução em inglês no fim produz texto pior que um prompt nativo —
+        # o modelo gasta atenção reconciliando duas línguas em vez de analisar.
+        prompt = (f"You are a crypto market analyst. Fear & Greed index: "
+                  f"{fg.get('value')} ({fg.get('classification', 'n/a')}).\n"
+                  f"Top 5 coins by market cap:\n{ctx}\n\n"
+                  f"Recent context from prior analyses:\n{memory_str}\n\n"
+                  f"Write a concise analysis: exactly 4 bullet points covering "
+                  f"momentum, flows, positioning risk and the level that would "
+                  f"invalidate the read, then one line with the directional bias "
+                  f"(bullish / neutral / bearish) and your confidence. "
+                  f"No preamble. Not financial advice.")
         # v39: era LLM.ask() cru. Quando a cadeia caía, a string
         # "[LLM offline — configure ...]" ia direto para dentro da resposta
         # PAGA e ainda era ingerida no RAG, envenenando as buscas seguintes.
@@ -2587,13 +2676,14 @@ class Brain:
                          for c in top])
         memory = RAG_STORE.retrieve("crypto market trend", k=4)
         memory_str = "\n".join([f"- {m[1][:150]}" for m in memory])
-        prompt = (f"Relatório executivo cripto (5 min de leitura).\n"
+        # v41: prompt em inglês — o produto é vendido num mercado que compra em inglês.
+        prompt = (f"Executive crypto report (5-minute read).\n"
                   f"Fear&Greed: {fg.get('value')} ({fg.get('classification')})\n"
                   f"Regime: {regime['regime']} (conf {regime['confidence']})\n"
-                  f"Anomalias: {anom['count']}\n\nTop 10:\n{ctx}\n\n"
-                  f"Memória:\n{memory_str}\n\n"
-                  f"Seções: 1) Resumo macro, 2) Setores em destaque, 3) Riscos, "
-                  f"4) 3 trades-ideias com gatilhos claros.")
+                  f"Anomalies: {anom['count']}\n\nTop 10:\n{ctx}\n\n"
+                  f"Memory:\n{memory_str}\n\n"
+                  f"Sections: 1) Macro summary, 2) Sectors in focus, 3) Risks, "
+                  f"4) 3 trade ideas with clear triggers. In English.")
         # v39: mesmo motivo de /analise — o relatório É o produto.
         report = _ai_required(prompt, max_tokens=1200)
         RAG_STORE.ingest("relatorio", report)
@@ -3327,11 +3417,12 @@ class Brain:
         fg = Market.fear_greed()
         regime = Brain.regime()
         forex = Brain.forex_rate()
-        prompt = (f"Relatório macro global executivo (4 parágrafos). "
+        # v41: era "Em português" — o produto é vendido em mercado inglês.
+        prompt = (f"Executive global macro report (4 paragraphs). "
                   f"Fear&Greed: {fg.get('value')}. Regime: {regime.get('regime')}. "
                   f"Forex: EUR/USD {forex.get('rate', 0)}. "
-                  f"Cenários: Fed (hawkish/dovish), ECB, BoJ, PBOC. "
-                  f"Riscos geopolíticos. Oportunidades. Em português.")
+                  f"Scenarios: Fed (hawkish/dovish), ECB, BoJ, PBOC. "
+                  f"Geopolitical risks. Opportunities. In English.")
         # v39: /global-macro não está em BASE_PRICES (não é vendido avulso),
         # então degrada em vez de recusar — o snapshot já tem valor sozinho.
         report = _ai(prompt, max_tokens=800)
@@ -3502,13 +3593,14 @@ class Brain:
         # 5. Síntese LLM (com fallback determinístico honesto)
         brief, brief_source = "", "rule-based"
         try:
+            # v41: prompt em PT gerava brief em PT (visto na amostra do /try).
             prompt = (
-                "Você é um analista de risco de memecoins. Com base nos dados "
-                f"a seguir, escreva um brief de NO MÁXIMO 4 frases, direto e "
-                f"acionável, em inglês, para um trading agent decidir em 5 "
-                f"segundos. Dados: token={target}, risk_score={score}/100 "
-                f"(0=seguro), checks={json.dumps(checks)}, pair={json.dumps(pair_info)}. "
-                "Termine com uma recomendação: AVOID / WATCH / SMALL-SIZE-ONLY.")
+                "You are a memecoin risk analyst. Based on the data below, "
+                f"write a brief of AT MOST 4 sentences, direct and actionable, "
+                f"in English, so a trading agent can decide in 5 seconds. "
+                f"Data: token={target}, risk_score={score}/100 "
+                f"(0=safe), checks={json.dumps(checks)}, pair={json.dumps(pair_info)}. "
+                "End with a recommendation: AVOID / WATCH / SMALL-SIZE-ONLY.")
             out = LLM.ask(prompt, max_tokens=220, temperature=0.3)
             if out and "LLM offline" not in out:
                 brief, brief_source = out, "llm"
@@ -3568,9 +3660,11 @@ class Brain:
             reason = ""
             try:
                 out = LLM.ask(
-                    f"Você é {name}, agente de {role} num conselho de trading. "
-                    f"Dados: {json.dumps(data, default=str)[:600]}. Em UMA frase "
-                    f"(inglês), justifique sua posição {stance} sobre {symbol}.",
+                    f"You are {name}, the {role} specialist on a five-agent "
+                    f"trading council. Data: "
+                    f"{json.dumps(data, default=str)[:600]}. In ONE sentence, "
+                    f"justify your {stance} stance on {symbol}, citing the "
+                    f"single figure from the data that drives it.",
                     max_tokens=60, temperature=0.4)
                 if out and "LLM offline" not in out: reason = out
             except Exception: pass
@@ -4258,6 +4352,18 @@ def _build_402(endpoint: str):
                 "note": "Same resource, real data delayed ~15min. Evaluate before paying."},
             "try_free": [f"{base}{endpoint}?preview=1", f"{base}/try", f"{base}/sample",
                          f"{base}/losbeto-alpha", f"{base}/receipts"],
+            # v41: A PONTE QUE FALTAVA ENTRE AVALIAR E PAGAR.
+            # O funil real mostra ~10-20 avaliações/dia (python-requests) que
+            # veem a amostra ATRASADA e somem. Amostra atrasada prova que o
+            # node está vivo, mas não prova o valor do real-time. Uma chamada
+            # REAL de graça (custo marginal ~$0 nos endpoints de dados) é o
+            # trial que todo SaaS de API tem — e o x402 não tinha.
+            "first_call_free": {
+                "endpoint": f"{base}/welcome",
+                "cost": "0.00",
+                "note": ("One FREE real-time call, no payment and no signup. "
+                         "GET /welcome, then send the returned token as the "
+                         "X-Welcome-Token header to any whitelisted endpoint.")},
             "tasting_menu": {"endpoint": f"{base}/try", "cost": "0.00",
                              "note": "One free call = live samples from 6 endpoints."},
             "cheapest_paid": _cheapest_paid(base),
@@ -4374,6 +4480,12 @@ def _build_402(endpoint: str):
                             f'<{base}/.well-known/x402.json>; rel="payment"')
     # Accept-Payment header para compatibilidade com draft specs
     resp.headers["Accept-Payment"] = f'x402; networks={",".join(a["network"] for a in accepts)}'
+    # v41: agentes que rodam em browser (fetch/XHR) não conseguem LER o
+    # PAYMENT-REQUIRED sem CORS expose — o desafio existia mas era invisível
+    # para clientes web (metade das avaliações diárias são navegadores).
+    resp.headers["Access-Control-Expose-Headers"] = (
+        "PAYMENT-REQUIRED,X-PAYMENT-REQUIRED,WWW-Authenticate,X-Free-Preview,"
+        "X-402-Version,X-Accept-Chains")
     return resp
 
 def _verify_payment(endpoint: str, payment_header: str):
@@ -4490,7 +4602,12 @@ def _verify_payment(endpoint: str, payment_header: str):
             # de fato move o dinheiro on-chain é settle(). Sem isso, o "exact"
             # scheme patrocinado (SVM) nunca chega a ser transmitido.
             bz = _bazaar_blob(endpoint) if getattr(fac, "is_cdp", False) else None
-            settled, sdata = fac.settle(payload, req, bazaar=bz)
+            # v41: paymentPayload.resource — sem ele o Bazaar não indexa (ver settle()).
+            _res = ({"url": f"{_public_base()}{endpoint}",
+                     "description": ENDPOINT_DESC.get(endpoint, endpoint),
+                     "mimeType": "application/json"}
+                    if getattr(fac, "is_cdp", False) else None)
+            settled, sdata = fac.settle(payload, req, bazaar=bz, resource=_res)
             if not settled:
                 last_reason = f"settle-failed:{sdata.get('error', sdata)}"
                 log.warning(f"⚠️ FACILITATOR.settle falhou p/ {endpoint}: {sdata}")
@@ -4863,6 +4980,88 @@ def _refund_as_credit(payer: str, amount: float, endpoint: str, tx: str = "") ->
         return None
 
 
+# ---------------------------------------------------------------------------
+# v41 — FIRST-CALL-FREE ("o trial do x402")
+#
+# O funil medido: ~56 previews/24h, metade o próprio operador em navegador;
+# o resto (~10-20/dia, python-requests de ~8 IPs) avalia e some sem pagar.
+# Hipótese: a amostra atrasada não converte porque não demonstra o valor do
+# real-time — e o primeiro pagamento x402 tem fricção psicológica alta para
+# um agente com orçamento rígido. Solução clássica de API: trial gratuito.
+# /welcome emite UM cupom (JWT) válido para UMA chamada real em endpoints
+# baratos de dados. Anti-abuso: 1 por IP/dia, teto global/dia, replay-block.
+# Custo marginal: ~$0 (são endpoints de dados cacheados, sem LLM).
+# ---------------------------------------------------------------------------
+
+WELCOME_ENABLED   = os.environ.get("WELCOME_FREE_CALL", "1") != "0"
+WELCOME_DAILY_CAP = int(os.environ.get("WELCOME_DAILY_CAP", "40"))
+WELCOME_TTL       = int(os.environ.get("WELCOME_TTL_S", "3600"))
+# whitelist por PREÇO: dados baratos. Flagships com LLM ficam de fora —
+# o grátis prova o motor; o pago prova o valor.
+WELCOME_ENDPOINTS = {e for e, p in BASE_PRICES.items()
+                     if p <= 0.03 and e not in CREDIT_PLANS}
+
+def _welcome_redeem(token: str, path: str, handler, t0: float, ip: str):
+    """Consome o cupom de 1ª chamada. None = segue o fluxo normal (402)."""
+    if not WELCOME_ENABLED:
+        return None
+    claims = jwt_decode(token)
+    if not claims or not claims.get("welcome"):
+        return None
+    jti = claims.get("jti", "")
+    base = _public_base()
+    if path not in WELCOME_ENDPOINTS:
+        r = jsonify({"error": "welcome-token is not valid for this endpoint",
+                     "valid_for": sorted(WELCOME_ENDPOINTS),
+                     "buy": f"{base}{path}",
+                     "price_usd": f"{get_dynamic_price(path):.4f}"})
+        r.status_code = 403
+        return r
+    # v41.1 — CORRIDA FECHADA.
+    # O v41 checava replay_seen(), rodava o handler, e SÓ ENTÃO marcava o jti.
+    # Entre a checagem e a marcação havia uma janela aberta: com
+    # --threads 8 no gunicorn, N requisições simultâneas com o mesmo cupom
+    # passavam todas pela verificação antes de qualquer uma marcar. Um cliente
+    # com um único token conseguia N chamadas reais grátis, em paralelo.
+    # Agora marcamos ANTES de executar. Se o handler falhar por culpa nossa,
+    # devolvemos o cupom — o cliente não perde a chance por erro do servidor.
+    if not LEDGER.replay_claim("welcome:" + jti):   # reserva atômica
+        r = jsonify({"error": "welcome-token already used",
+                     "buy": f"{base}{path}",
+                     "price_usd": f"{get_dynamic_price(path):.4f}",
+                     "credits": f"{base}/buy-credits"})
+        r.status_code = 402
+        return r
+    try:
+        result = handler()
+    except LLMUnavailable:
+        LEDGER.replay_unmark("welcome:" + jti)    # falha nossa: devolve o cupom
+        return jsonify({"status": "unavailable", "charged": False,
+                        "error": "Source temporarily down. Your free call was "
+                                 "not consumed — retry with the same token.",
+                        "retry_after_seconds": 300}), 503
+    except Exception as e:
+        LEDGER.replay_unmark("welcome:" + jti)
+        log.error(f"welcome handler {path}: {e}")
+        return jsonify({"status": "error", "charged": False,
+                        "error": "Upstream failure. Your free call was not "
+                                 "consumed — retry with the same token."}), 502
+    try:
+        LEDGER.log_request(path, True, int((time.time() - t0) * 1000), ip,
+                           kind="welcome",
+                           ua=request.headers.get("User-Agent", ""),
+                           params=_clean_params())
+    except Exception:
+        pass
+    if isinstance(result, tuple):
+        result = result[0]
+    resp = jsonify(result)
+    resp.headers["X-Welcome"] = "redeemed"
+    resp.headers["X-Upsell"] = (
+        f"Real-time call delivered free. Next call: ${get_dynamic_price(path):.4f} "
+        f"via x402, or {base}/buy-credits ($1 -> $1.25 balance).")
+    return resp
+
 def paid_endpoint(path):
     def deco(handler):
         def wrapped():
@@ -4961,6 +5160,13 @@ def paid_endpoint(path):
                 return jsonify({"preview": True, "status": "warming_up",
                     "note": "Sample being generated — retry in a few seconds.",
                     "price_usd": f"{get_dynamic_price(path):.3f}"}), 200
+
+            # v41: FIRST-CALL-FREE — cupom do /welcome vale UMA chamada real.
+            _wtok = (request.headers.get("X-Welcome-Token") or "").strip()
+            if _wtok:
+                _wresp = _welcome_redeem(_wtok, path, handler, t0, ip)
+                if _wresp is not None:
+                    return _wresp
 
             # v23: CRÉDITOS PRÉ-PAGOS — header X-API-Key pula o fluxo 402 por
             # completo. Settlement on-chain por chamada tem 2-5s de latência;
@@ -6099,7 +6305,7 @@ def losbeto_alpha_free():
             "_agent_metadata": {
                 "provider":     "Losbeto",
                 "node_id":      WALLET.node_id,
-                "win_rate":     LEDGER.win_rate(),
+                # v41: win_rate fora da vitrine (ver /sample).
                 "unique_value": "Losbeto Alpha Score — índice composto proprietário disponível apenas aqui",
             },
         })
@@ -6137,7 +6343,7 @@ def multi_chain_arbitrage():
         "_agent_metadata": {
             "provider":  "Losbeto",
             "unique":    "Multi-chain simultanâneo — exclusivo Losbeto",
-            "win_rate":  LEDGER.win_rate(),
+            # v41: win_rate fora da vitrine (ver /sample).
         },
     }))()
 
@@ -6325,9 +6531,9 @@ def verify_manifest():
             "message_fmt": "x402-domain-verify:{domain}:{ts}:{node_id}",
         },
         "trust_signals": {
-            "win_rate":       LEDGER.win_rate(),
-            "poi_multiplier": LEDGER.get_poi_multiplier(),
+            # v41: idem — métricas heurísticas internas fora da vitrine pública.
             "tx_count_24h":   LEDGER.stats()["paid_24h"],
+            "methodology":    "Heuristic signals; per-endpoint methodology in each response.",
             "chains":         [f"solana:{SOL_GENESIS}"] + ([BASE_CAIP2] if ENABLE_BASE else []),
         },
     })
@@ -6595,7 +6801,7 @@ def sample_free():
             "service":      "Losbeto — Free Sample",
             "version":      VERSION,
             "ts":           ts,
-            "notice":       "PREVIEW LIMITADO — Dados reais. Desbloqueie análise completa via x402.",
+            "notice":       "LIMITED PREVIEW — real data. Unlock the full analysis via x402.",
             "fear_greed_preview": {
                 "value":          fng_val,
                 "classification": fg.get("classification", "Neutral"),
@@ -6610,14 +6816,14 @@ def sample_free():
                 "full_endpoint":  f"{base}/sinais",
                 "price_usdc":     get_dynamic_price("/sinais"),
                 "unlock_full_at": f"{base}/sinais",
-            } if top_signal else {"note": "Nenhum sinal forte no momento.", "unlock_full_at": f"{base}/sinais", "price_usdc": get_dynamic_price("/sinais")},
+            } if top_signal else {"note": "No strong signal right now.", "unlock_full_at": f"{base}/sinais", "price_usdc": get_dynamic_price("/sinais")},
             "anomalies_preview": {
                 "top_3":          [{"symbol": a["symbol"], "change_pct": a["change_pct"], "type": a["type"]} for a in top_anomalies],
                 "total_detected": anom.get("count", 0),
                 "full_endpoint":  f"{base}/anomalias",
                 "price_usdc":     get_dynamic_price("/anomalias"),
                 "unlock_full_at": f"{base}/anomalias",
-            } if top_anomalies else {"note": "Sem anomalias detectadas.", "unlock_full_at": f"{base}/anomalias", "price_usdc": get_dynamic_price("/anomalias")},
+            } if top_anomalies else {"note": "No anomalies detected.", "unlock_full_at": f"{base}/anomalias", "price_usdc": get_dynamic_price("/anomalias")},
             "mempool_snapshot": {
                 "priority_fee_lamports": mempool.get("priority_fee_lamports"),
                 "network_load":          mempool.get("network_load"),
@@ -6635,9 +6841,12 @@ def sample_free():
             "_agent_metadata": {
                 "provider":    "Losbeto",
                 "node_id":     WALLET.node_id,
-                "win_rate":    LEDGER.win_rate(),
-                "poi_multiplier": LEDGER.get_poi_multiplier(),
+                # v41: win_rate heurístico (36.8%) e PoI congelado saíram das
+                # superfícies públicas. Um comprador lia "36.8% win rate" como
+                # avaliação do produto inteiro — pior que um cara-ou-coroa.
+                # Continuam no dashboard interno (métrica operacional legítima).
                 "endpoints_count": len(BASE_PRICES),
+                "methodology": "Heuristic signals; methodology declared per response.",
             },
         }
         resp = jsonify(response)
@@ -6720,9 +6929,10 @@ def bazaar_manifest():
             "telegram": "@losbeto_x402",
         },
         "trust": {
-            "tx_count": LEDGER.stats()["paid_24h"],
-            "win_rate": LEDGER.win_rate(),
-            "poi_multiplier": LEDGER.get_poi_multiplier(),
+            "tx_count_24h": LEDGER.stats()["paid_24h"],
+            # v41: win_rate/poi fora da superfície pública — números internos
+            # que um comprador interpretava como avaliação negativa do produto.
+            "methodology": "Heuristic signals; per-endpoint methodology in each response.",
             "chains_supported": [f"solana:{SOL_GENESIS}"] + ([BASE_CAIP2] if ENABLE_BASE else []),
         },
     }
@@ -7498,7 +7708,8 @@ def root():
             # /win-rate-verified. O produto pago se justifica pela assinatura
             # Ed25519 e pela metodologia declarada, não pelo número solto.
             "performance_attestation": "/win-rate-verified",
-            "poi_multiplier":   LEDGER.get_poi_multiplier(),
+            # v41: poi_multiplier também sai da vitrine pública (mesma razão do
+            # win_rate na v39 — número interno lido como avaliação do produto).
             # v39: o prefixo do token do dashboard não sai mais daqui.
             "dashboard":        "/dash (operator token required)",
             "exclusive_endpoints": [
@@ -7661,6 +7872,55 @@ def x402_resources():
         "version": VERSION,
     })
 
+# ---------------------------------------------------------------------------
+# v41 — FIRST-CALL-FREE: rota /welcome (os aliases de demanda — /health/,
+# /status, /openapi.yaml, /.well-known/llms.txt, /.well-known/health,
+# /apis.json, /.well-known/api-catalog — já foram criados na seção v40 deste
+# arquivo; não duplicar rotas aqui).
+# ---------------------------------------------------------------------------
+
+@app.route("/welcome")
+def welcome():
+    """v41 FIRST-CALL-FREE: emite 1 cupom (JWT) para 1 chamada real grátis.
+    Anti-abuso: 1 por IP/dia + teto global/dia + replay-block no resgate."""
+    base = _public_base()
+    if not WELCOME_ENABLED:
+        return jsonify({"error": "disabled"}), 404
+    ip = (request.headers.get("X-Forwarded-For", request.remote_addr) or ""
+          ).split(",")[0].strip()
+    day = datetime.now(timezone.utc).strftime("%Y%m%d")
+    quota = LEDGER.cache_get(f"welcome:quota:{day}", 90000)
+    used_today = int(quota) if quota else 0
+    if used_today >= WELCOME_DAILY_CAP:
+        return jsonify({"error": "daily free quota exhausted — paid calls remain open",
+                        "buy_credits": f"{base}/buy-credits",
+                        "retry_after": "tomorrow 00:00 UTC"}), 429
+    if LEDGER.cache_get(f"welcome:ip:{ip}:{day}", 90000):
+        return jsonify({"error": "one free call per client per day",
+                        "buy_credits": f"{base}/buy-credits",
+                        "day_pass": f"{base}/day-pass"}), 429
+    token = jwt_encode({"welcome": True, "jti": secrets.token_urlsafe(12),
+                        "exp": int(time.time()) + WELCOME_TTL})
+    LEDGER.cache_set(f"welcome:quota:{day}", used_today + 1)
+    LEDGER.cache_set(f"welcome:ip:{ip}:{day}", 1)
+    try:
+        LEDGER.log_request("/welcome", True, 0, ip, kind="welcome_issued",
+                           ua=request.headers.get("User-Agent", ""), params="")
+    except Exception:
+        pass
+    return jsonify({
+        "welcome_token": token,
+        "how_to_use": ("GET any endpoint in valid_for with header "
+                       "'X-Welcome-Token: <token>'. One real-time call, "
+                       "token expires in 1 hour."),
+        "valid_for": sorted(WELCOME_ENDPOINTS),
+        "then": {
+            "pay_per_call": "same URL without the token — answer the 402 with USDC via x402",
+            "credits": f"{base}/buy-credits",
+            "day_pass": f"{base}/day-pass",
+        },
+        "ts": int(time.time()), "version": VERSION})
+
 def _resource_entry(ep: str) -> dict:
     """Entrada de recurso no formato que os catálogos esperam."""
     base = _public_base()
@@ -7672,20 +7932,32 @@ def _resource_entry(ep: str) -> dict:
         "description": ENDPOINT_DESC.get(ep, ep),
         "price_usdc": f"{price:.4f}",
         "amount_atomic": str(int(round(price * 1_000_000))),
+        # v41: o manifesto dizia "x402Version: 2" mas os accepts usavam só o
+        # campo v1 (maxAmountRequired) e omitiam os `extra` da spec v2 —
+        # feePayer (SVM) e domínio EIP-712 (Base). Catálogos que validam
+        # contra a spec marcavam as entradas como incompletas.
         "accepts": [
             {"scheme": "exact", "network": BASE_CAIP2,
              "asset": BASE_USDC, "payTo": BASE_PAYTO_EVM,
+             "amount": str(int(round(price * 1_000_000))),
              "maxAmountRequired": str(int(round(price * 1_000_000))),
-             "maxTimeoutSeconds": 300},
+             "maxTimeoutSeconds": 300,
+             "extra": {"name": "USD Coin", "version": "2"}},
             {"scheme": "exact", "network": f"solana:{SOL_GENESIS}",
              "asset": USDC_MINT, "payTo": RECEIVE_ADDRESS,
+             "amount": str(int(round(price * 1_000_000))),
              "maxAmountRequired": str(int(round(price * 1_000_000))),
-             "maxTimeoutSeconds": 300},
+             "maxTimeoutSeconds": 300,
+             "extra": (({"feePayer": FACILITATOR.get_svm_fee_payer()}
+                        if FACILITATOR and FACILITATOR.get_svm_fee_payer() else {}))},
         ] if (ENABLE_BASE and BASE_PAYTO_EVM) else [
             {"scheme": "exact", "network": f"solana:{SOL_GENESIS}",
              "asset": USDC_MINT, "payTo": RECEIVE_ADDRESS,
+             "amount": str(int(round(price * 1_000_000))),
              "maxAmountRequired": str(int(round(price * 1_000_000))),
-             "maxTimeoutSeconds": 300}],
+             "maxTimeoutSeconds": 300,
+             "extra": (({"feePayer": FACILITATOR.get_svm_fee_payer()}
+                        if FACILITATOR and FACILITATOR.get_svm_fee_payer() else {}))}],
         "tags": _service_tags(ep),
         "free_preview": f"{base}{ep}?preview=1",
         "lastUpdated": int(time.time()),
