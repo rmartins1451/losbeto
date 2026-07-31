@@ -87,7 +87,7 @@ from typing import Any, Optional, Dict, List, Tuple
 # 0. CONFIGURAÇÃO E AUTO-SETUP
 # ============================================================================
 
-VERSION = "42.1.0-HOTFIX"
+VERSION = "43.0.0-CONCIERGE"
 BRAND_NAME = "Losbeto"
 BRAND_TAGLINE = "The Global Revenue Engine for Financial AI Agents"
 BRAND_EMOJI = "🧠"
@@ -327,8 +327,13 @@ BASE_PRICES = {
     "/macro-calendar":   0.070,
     "/earnings-whisper": 0.080,
     # --- PRO ($0.15–0.35): inteligência composta ---
+    # --- v43: INTELIGÊNCIA SOB DEMANDA (categoria comprovada no leaderboard:
+    #     enriquecimento de wallet e relatório de token são o que agentes
+    #     orquestradores mais recompram — ver análise v43) ---
+    "/token-intel":      0.080,
     "/deep-think":       0.100,
     "/agent-call":       0.100,
+    "/wallet-scan":      0.100,
     "/whale-alert":      0.100,
     "/smart-money":      0.100,
     "/sanctions":        0.100,
@@ -452,6 +457,8 @@ ENDPOINT_DESC = {
     "/holder-concentration": "Top USDC holder concentration on Solana via Helius RPC: who holds the float, how concentrated it is, and the share held by the largest accounts. Useful for judging how much of a token's supply can move at once.",
     "/sec-filing":      "SEC filing search with an objective market read: what was filed, by whom, and what it means for the tape.",
     "/backtest":        "Strategy backtest with PnL, win rate, drawdown and a written read of where the strategy actually makes its money.",
+    "/token-intel":     "Token intelligence report for any contract address or ticker: liquidity, volume, pair age, buy/sell flow, deterministic risk flags (honeypot pattern, wash-trading signature, thin liquidity) plus an AI verdict. Built for pre-execution checks.",
+    "/wallet-scan":     "Wallet intelligence: given a Solana or EVM address, return native and token holdings with USD values, concentration and activity signals, deterministic risk flags and an AI-written profile. The enrichment call orchestrator agents buy before trusting a counterparty.",
     "/tg-premium":      "Premium alert feed in automation-ready shape: one JSON object per alert, stable keys, no prose to parse.",
     "/onchain-credit":  "On-chain credit score (0-900) for any Solana wallet: account age, activity, balance tiers and counterparty history.",
     "/macro-calendar":  "Upcoming macro events (FOMC, NFP, CPI, ECB) with impact rating, forecast and previous readings.",
@@ -530,6 +537,8 @@ ENDPOINT_TAGS = {
     "/web-search":      ["Search", "Research"],
     "/ai-news":         ["AI", "News"],
     "/dex-screen":      ["Trading", "DEX"],
+    "/token-intel":     ["Utility", "Security", "Featured"],
+    "/wallet-scan":     ["Utility", "Onchain", "Featured"],
     "/holder-concentration": ["Utility", "Onchain"],
     "/sec-filing":      ["Search", "Equities"],
     "/trust-hash":      ["Utility", "Trust"],
@@ -941,10 +950,32 @@ class LedgerV10:
                     payer: str = "", source: str = "direct",
                     chain: str = "solana", jwt_session: str = "",
                     referral_code: str = ""):
+        # v43: detecta PRIMEIRO settle deste pagador antes do INSERT — é o
+        # evento comercial mais importante do funil (alguém que nunca pagou
+        # virou cliente). O operador é avisado na hora, no Telegram.
+        _new_buyer = False
         with self.lock, self._conn() as c:
+            if payer:
+                _new_buyer = c.execute(
+                    "SELECT 1 FROM revenue WHERE payer=? LIMIT 1",
+                    (payer,)).fetchone() is None
             c.execute("INSERT INTO revenue(ts,endpoint,amount,tx_sig,payer,source,chain,jwt_session,referral_code) "
                       "VALUES(?,?,?,?,?,?,?,?,?)",
                       (int(time.time()), endpoint, amount, tx_sig, payer, source, chain, jwt_session, referral_code))
+        if _new_buyer and payer and source != "bootstrap":
+            try:
+                _is_op = (payer or "").lower() in OPERATOR_WALLETS
+            except Exception:
+                _is_op = False
+            if not _is_op:
+                try:
+                    _notify_telegram(
+                        f"🆕 NOVO COMPRADOR ORGÂNICO\n"
+                        f"Carteira: {payer[:24]}...\n"
+                        f"Primeira compra: {endpoint} — ${amount:.4f} ({chain})\n"
+                        f"É o funil fechando: sondagem → avaliação → PAGAMENTO.")
+                except Exception:
+                    pass
 
     def stats(self) -> Dict[str, Any]:
         with self._conn() as c:
@@ -2943,6 +2974,273 @@ class Brain:
             return {"symbol": symbol, "pairs": [], "error": str(e), "ts": int(time.time())}
 
     @staticmethod
+    def token_intel():
+        """v43 — TOKEN INTELLIGENCE REPORT (a 'cereja' de segurança pré-execução).
+
+        Demanda comprovada no leaderboard x402: agentes orquestradores pagam por
+        relatório de token ANTES de executar swap ou aceitar um ativo como
+        garantia. O diferencial em relação a um /dex-screen cru: este produto
+        DECIDE. Núcleo determinístico (flags com regra declarada) + veredito de
+        IA quando houver provedor — se a IA estiver fora, o relatório ainda sai
+        completo (o produto nunca depende de LLM para existir).
+        """
+        q = (request.args.get("token") or request.args.get("symbol")
+             or request.args.get("mint") or request.args.get("query") or "").strip()
+        ts = int(time.time())
+        if not q:
+            return {"error": "missing_param", "param": "token",
+                    "hint": "GET /token-intel?token=<contract-or-ticker>", "ts": ts}
+        is_addr = q.startswith("0x") or (32 <= len(q) <= 44 and " " not in q
+                                         and "/" not in q and "." not in q)
+        pairs = []
+        try:
+            url = (f"https://api.dexscreener.com/latest/dex/tokens/{q}" if is_addr
+                   else f"https://api.dexscreener.com/latest/dex/search?q={q}")
+            r = requests.get(url, timeout=8)
+            pairs = (r.json().get("pairs") or []) if r.ok else []
+        except Exception as e:
+            log.warning(f"token-intel upstream: {e}")
+        if not pairs:
+            # Degradação honesta: sem dado não há relatório — e o gate v39 já
+            # impede cobrança quando isto vira padrão. Aqui, resposta clara.
+            return {"token": q, "status": "no_data",
+                    "note": ("No active DEX pair found for this token on the "
+                             "tracked venues. Unknown or inactive asset."),
+                    "risk_flags": [{"flag": "no_dex_presence", "severity": "high",
+                                    "detail": "No tradable pair found — treat as untradable."}],
+                    "source": "dexscreener", "ts": ts, "provider": "Losbeto/TokenIntel"}
+
+        best = max(pairs, key=lambda p: (p.get("liquidity") or {}).get("usd") or 0)
+        liq = (best.get("liquidity") or {}).get("usd") or 0
+        vol24 = (best.get("volume") or {}).get("h24") or 0
+        txns = (best.get("txns") or {}).get("h24") or {}
+        buys, sells = txns.get("buys", 0) or 0, txns.get("sells", 0) or 0
+        created = best.get("pairCreatedAt")  # ms epoch
+        age_days = round((ts - created / 1000) / 86400, 1) if created else None
+        chg = (best.get("priceChange") or {})
+
+        # ---- núcleo determinístico: cada flag declara sua regra ------------
+        flags, score = [], 100
+        def _flag(flag, sev, penalty, detail):
+            flags.append({"flag": flag, "severity": sev, "detail": detail})
+            return penalty
+        penalty = 0
+        if liq < 25_000:
+            penalty += _flag("thin_liquidity", "high", 35,
+                             f"Liquidity ${liq:,.0f} — any size moves the price.")
+        elif liq < 100_000:
+            penalty += _flag("low_liquidity", "medium", 15,
+                             f"Liquidity ${liq:,.0f} — slippage risk on mid size.")
+        if age_days is not None and age_days < 3:
+            penalty += _flag("brand_new_pair", "high", 25,
+                             f"Pair is {age_days}d old — no track record.")
+        elif age_days is not None and age_days < 30:
+            penalty += _flag("young_pair", "medium", 10,
+                             f"Pair is {age_days}d old.")
+        if buys >= 20 and sells == 0:
+            penalty += _flag("no_sells_24h", "high", 30,
+                             f"{buys} buys and ZERO sells in 24h — classic "
+                             "honeypot/transfer-block pattern. Verify you can sell "
+                             "with a tiny amount before sizing in.")
+        if liq > 0 and vol24 / max(liq, 1) > 10:
+            penalty += _flag("wash_trading_signature", "medium", 20,
+                             f"24h volume (${vol24:,.0f}) is {vol24/max(liq,1):.0f}x the "
+                             "liquidity — volume this detached from depth is often manufactured.")
+        if abs(chg.get("h24") or 0) > 40:
+            penalty += _flag("extreme_move_24h", "medium", 10,
+                             f"{chg.get('h24'):+.1f}% in 24h — elevated reversal risk.")
+        risk_score = max(0, score - penalty)
+        grade = ("A" if risk_score >= 85 else "B" if risk_score >= 70
+                 else "C" if risk_score >= 50 else "D" if risk_score >= 30 else "F")
+
+        report = {
+            "token": {
+                "name":  (best.get("baseToken") or {}).get("name"),
+                "symbol": (best.get("baseToken") or {}).get("symbol"),
+                "address": (best.get("baseToken") or {}).get("address"),
+                "chain": best.get("chainId"), "dex": best.get("dexId"),
+                "pair": best.get("pairAddress"),
+            },
+            "market": {
+                "price_usd": best.get("priceUsd"),
+                "liquidity_usd": liq, "volume_24h_usd": vol24,
+                "fdv_usd": best.get("fdv"), "market_cap_usd": best.get("marketCap"),
+                "price_change": {"h1": chg.get("h1"), "h6": chg.get("h6"),
+                                 "h24": chg.get("h24")},
+                "txns_24h": {"buys": buys, "sells": sells},
+                "pair_age_days": age_days,
+                "pairs_seen": len(pairs),
+            },
+            "risk_score": risk_score, "grade": grade,
+            "risk_flags": flags,
+            "methodology": ("Deterministic flags with declared thresholds; score "
+                            "starts at 100 and each flag deducts a published "
+                            "penalty. This is a screening tool, not financial advice."),
+            "source": "dexscreener (aggregated DEX data, live)",
+            "ts": ts, "provider": "Losbeto/TokenIntel",
+        }
+        # ---- veredito de IA (opcional, nunca bloqueia o produto) -----------
+        try:
+            verdict = _ai(
+                "You are a token risk analyst. Given this DEX data, write a "
+                "3-sentence pre-execution verdict for an autonomous trading "
+                "agent: " + json.dumps(report["market"], default=str)
+                + " flags: " + json.dumps([f["flag"] for f in flags]),
+                max_tokens=220)
+            if verdict:
+                report["ai_verdict"] = verdict
+        except Exception as e:
+            log.debug(f"token-intel ai: {e}")
+        return report
+
+    @staticmethod
+    def wallet_scan():
+        """v43 — WALLET INTELLIGENCE (enriquecimento de contraparte).
+
+        A pergunta que um agente orquestrador faz antes de confiar: 'quem é
+        esta carteira?'. Solana via Helius DAS (getAssetsByOwner com preços);
+        EVM via RPC público da Base (saldo nativo + atividade — holdings de
+        token exigiriam indexador, e dizemos isso em vez de fingir). Flags
+        determinísticas + perfil escrito por IA quando disponível.
+        """
+        addr = (request.args.get("address") or request.args.get("wallet") or "").strip()
+        ts = int(time.time())
+        if not addr:
+            return {"error": "missing_param", "param": "address",
+                    "hint": "GET /wallet-scan?address=<solana-or-0x>", "ts": ts}
+        chain = "evm" if addr.lower().startswith("0x") else "solana"
+        holdings, notes = [], []
+        native = {"amount": None, "symbol": "SOL" if chain == "solana" else "ETH"}
+        flags, penalty = [], 0
+
+        def _flag(flag, sev, pen, detail):
+            flags.append({"flag": flag, "severity": sev, "detail": detail})
+            return pen
+
+        if chain == "solana":
+            if HELIUS_KEY:
+                try:
+                    r = requests.post(
+                        f"https://mainnet.helius-rpc.com/?api-key={HELIUS_KEY}",
+                        json={"jsonrpc": "2.0", "id": 1, "method": "getAssetsByOwner",
+                              "params": {"ownerAddress": addr, "page": 1, "limit": 200,
+                                         "displayOptions": {"showFungible": True,
+                                                            "showNativeBalance": True}}},
+                        timeout=10)
+                    res = r.json().get("result") or {}
+                    nb = res.get("nativeBalance") or {}
+                    if nb.get("lamports") is not None:
+                        native["amount"] = round(nb["lamports"] / 1e9, 6)
+                        if (nb.get("price_per_sol") or 0) > 0:
+                            native["usd"] = round(nb["lamports"] / 1e9
+                                                  * nb["price_per_sol"], 2)
+                    for it in (res.get("items") or []):
+                        if it.get("interface") not in ("FungibleToken", "FungibleAsset"):
+                            continue
+                        ti = it.get("token_info") or {}
+                        meta = (it.get("content") or {}).get("metadata") or {}
+                        pi = ti.get("price_info") or {}
+                        dec = ti.get("decimals") or 0
+                        qty = (ti.get("balance") or 0) / (10 ** dec) if dec else ti.get("balance")
+                        holdings.append({
+                            "symbol": meta.get("symbol") or (it.get("id") or "")[:6],
+                            "name": meta.get("name"),
+                            "mint": it.get("id"),
+                            "qty": qty,
+                            "usd": pi.get("total_price"),
+                        })
+                except Exception as e:
+                    log.warning(f"wallet-scan helius: {e}")
+                    notes.append("Helius DAS temporarily degraded — partial data.")
+            else:
+                notes.append("HELIUS_API_KEY not set — native balance only.")
+            if not holdings and native["amount"] is None:
+                try:  # fallback sem Helius: saldo nativo + contagem de contas
+                    rpc = SOLANA_RPCS[0]
+                    b = requests.post(rpc, json={"jsonrpc": "2.0", "id": 1,
+                        "method": "getBalance", "params": [addr]}, timeout=8)
+                    lam = (b.json().get("result") or {}).get("value")
+                    if lam is not None:
+                        native["amount"] = round(lam / 1e9, 6)
+                    t = requests.post(rpc, json={"jsonrpc": "2.0", "id": 1,
+                        "method": "getTokenAccountsByOwner",
+                        "params": [addr, {"programId": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"},
+                                   {"encoding": "jsonParsed"}]}, timeout=8)
+                    ntok = len((t.json().get("result") or {}).get("value") or [])
+                    notes.append(f"Fallback RPC: {ntok} token accounts (values unavailable).")
+                except Exception as e:
+                    log.warning(f"wallet-scan fallback: {e}")
+        else:  # EVM — honest scope: nativo + atividade, sem indexador de tokens
+            native["symbol"] = "ETH"
+            try:
+                rpc = os.environ.get("BASE_RPC_URL", "https://mainnet.base.org")
+                b = requests.post(rpc, json={"jsonrpc": "2.0", "id": 1,
+                    "method": "eth_getBalance", "params": [addr, "latest"]}, timeout=8)
+                wei = int((b.json().get("result") or "0x0"), 16)
+                native["amount"] = round(wei / 1e18, 6)
+                n = requests.post(rpc, json={"jsonrpc": "2.0", "id": 1,
+                    "method": "eth_getTransactionCount", "params": [addr, "latest"]},
+                    timeout=8)
+                txc = int((n.json().get("result") or "0x0"), 16)
+                notes.append(f"Nonce {txc} on Base — {'active' if txc else 'no outgoing txs'}.")
+                if txc == 0 and wei == 0:
+                    penalty += _flag("empty_wallet", "medium", 20,
+                                     "No balance and no outgoing transactions on Base.")
+                notes.append("ERC-20 holdings require an indexer — native "
+                             "balance and activity only. Declared, not hidden.")
+            except Exception as e:
+                log.warning(f"wallet-scan evm: {e}")
+                notes.append("EVM RPC temporarily degraded.")
+
+        total_usd = round(sum(h.get("usd") or 0 for h in holdings)
+                          + (native.get("usd") or 0), 2)
+        holdings.sort(key=lambda h: h.get("usd") or 0, reverse=True)
+        if len(holdings) > 40:
+            penalty += _flag("dust_spam_exposure", "medium", 15,
+                             f"{len(holdings)} fungible tokens — wallets this "
+                             "crowded usually hold airdropped spam/dust.")
+        if holdings and total_usd > 0 and (holdings[0].get("usd") or 0) / total_usd > 0.8:
+            penalty += _flag("concentrated", "low", 5,
+                             f"Top holding is {(holdings[0].get('usd') or 0)/total_usd:.0%} "
+                             "of portfolio value.")
+        if chain == "solana" and native["amount"] == 0 and not holdings:
+            penalty += _flag("empty_wallet", "medium", 20,
+                             "No SOL and no tokens — unfunded or abandoned.")
+        risk_score = max(0, 100 - penalty)
+
+        out = {
+            "address": addr, "chain": chain,
+            "native": native,
+            "portfolio_usd": total_usd or None,
+            "token_count": len(holdings),
+            "top_holdings": holdings[:10],
+            "risk_score": risk_score, "risk_flags": flags,
+            "notes": notes,
+            "methodology": ("Holdings from on-chain indexers with USD pricing; "
+                            "flags are deterministic with declared rules. A "
+                            "counterparty screen, not a credit rating."),
+            "source": ("helius-das" if chain == "solana" and HELIUS_KEY
+                       else "public-rpc"),
+            "ts": ts, "provider": "Losbeto/WalletScan",
+        }
+        try:
+            profile = _ai(
+                "You are a counterparty risk analyst. In 3 sentences, profile "
+                "this wallet for an autonomous agent deciding whether to trust "
+                "it: " + json.dumps({"chain": chain, "native": native,
+                    "portfolio_usd": out["portfolio_usd"],
+                    "token_count": len(holdings),
+                    "top": [h.get("symbol") for h in holdings[:5]],
+                    "flags": [f["flag"] for f in flags]}, default=str),
+                max_tokens=200)
+            if profile:
+                out["ai_profile"] = profile
+        except Exception as e:
+            log.debug(f"wallet-scan ai: {e}")
+        return out
+
+
+    @staticmethod
     def holder_concentration():
         """v39.4 — RENOMEADO de /nansen-flow.
 
@@ -3990,6 +4288,8 @@ ENDPOINT_PARAM_HINTS = {
     "/rugcheck":          {"mint": "So11111111111111111111111111111111111111112"},
     "/onchain-credit":    {"wallet": "GEhr9HCFTRDjanMg435frSgCVwVZYpNoPrEkmNBnFHFE"},
     "/dex-screen":        {"query": "SOL"},
+    "/token-intel":       {"token": "SOL"},
+    "/wallet-scan":       {"address": "GEhr9HCFTRDjanMg435frSgCVwVZYpNoPrEkmNBnFHFE"},
     "/jupiter-swap":      {"pair": "SOL/USDC"},
     "/sanctions":         {"name": "example"},
     "/sec-filing":        {"query": "AAPL 10-K"},
@@ -4011,6 +4311,8 @@ _PARAM_DESC = {
     "name": "Entity name to screen against OFAC-SDN",
     "strategy": "Strategy label, e.g. momentum, mean-reversion",
     "positions": "JSON array of positions (asset + qty) — POST body or query param",
+    "token": "Token contract address (Solana mint or 0x) or ticker, e.g. SOL",
+    "address": "Wallet address — Solana base58 or EVM 0x",
     "format": "Response format (json)",
 }
 
@@ -4765,6 +5067,7 @@ PREVIEW_MIN_AGE = {
     # dado rápido (segundos/minutos importam) -> 15 min já cria valor no pago
     "/pyth-price": 900, "/forex-rate": 900, "/stock-quote": 900,
     "/commodity-price": 900, "/dex-screen": 900, "/jupiter-swap": 900,
+    "/token-intel": 900, "/wallet-scan": 900,
     "/mempool": 900, "/whale-flow": 900, "/arbitrage": 900,
     # dado diário/lento -> a amostra grátis deve ser a de ONTEM
     "/fear-greed": 86400, "/regime": 86400, "/global-macro": 86400,
@@ -5473,6 +5776,8 @@ ENDPOINT_HANDLERS = {
     "/web-search":      Brain.web_search,
     "/ai-news":         Brain.ai_news,
     "/dex-screen":      Brain.dex_screen,
+    "/token-intel":     Brain.token_intel,
+    "/wallet-scan":     Brain.wallet_scan,
     "/holder-concentration": Brain.holder_concentration,
     "/sec-filing":      Brain.sec_filing,
     "/trust-hash":      Brain.trust_hash,
@@ -7530,6 +7835,37 @@ need a data source nobody outside Brazil assembles.</p>
 </div>
 
 </div></section>
+<section class="band deep"><div class="wrap">
+<h2>Built for machine buyers</h2>
+<p class="lede">Agents don't browse — they run pre-authorized purchase orders
+inside a policy engine: per-call caps, per-merchant allowlists, schema
+validation, uptime requirements. This node is shaped to pass those checks,
+not to impress a human skimming a homepage.</p>
+<div class="grid">
+  <div class="gcard"><h3>Policy-engine ready<span class="bz">verified</span></h3>
+    <p>Stable JSON schemas with declared methodology, 402 challenges served in
+       single-digit milliseconds, ASCII-only headers (RFC 7230), priced in the
+       volume sweet spot ($0.003–$0.30), and a hard rule: when a source is
+       down the node refuses the sale instead of charging for nothing.</p>
+    <span class="px">machine-first</span> · <code>/health/providers</code></div>
+  <div class="gcard"><h3>Token intelligence<span class="bz">new</span></h3>
+    <p>Pre-execution screening for any contract or ticker: liquidity, pair age,
+       buy/sell flow, deterministic risk flags with declared thresholds
+       (honeypot pattern, wash-trading signature) plus an AI verdict.</p>
+    <span class="px">__P_TOKINTEL__</span> · <code>/token-intel</code></div>
+  <div class="gcard"><h3>Wallet intelligence<span class="bz">new</span></h3>
+    <p>Counterparty enrichment before an agent trusts an address: holdings with
+       USD values, concentration, activity and spam exposure on Solana and
+       Base, deterministic flags plus an AI-written profile.</p>
+    <span class="px">__P_WALLETSCAN__</span> · <code>/wallet-scan</code></div>
+  <div class="gcard"><h3>A human answers<span class="bz">concierge</span></h3>
+    <p>The chat box below is not a bot. Messages land on the operator's
+       Telegram and the reply comes back to the same thread — usually within
+       the hour. Agents can use it too: POST /chat/send with JSON.</p>
+    <span class="px">free</span> · <code>/chat/send</code></div>
+</div>
+
+</div></section>
 <section class="band"><div class="wrap">
 <h2>Honest by default</h2>
 <table>
@@ -7780,6 +8116,8 @@ def _render_clean_landing() -> str:
             .replace("__FEEDBACK__", fb))
     for tag, ep in (("__P_ORACLE__", "/oracle-consensus"),
                     ("__P_SENT__", "/sentiment-consensus"),
+                    ("__P_TOKINTEL__", "/token-intel"),
+                    ("__P_WALLETSCAN__", "/wallet-scan"),
                     ("__P_BRIEF__", "/global-morning-brief"),
                     ("__P_EQ__", "/equity-dossier"),
                     ("__P_CORR__", "/correlation-matrix"),
@@ -10629,7 +10967,60 @@ def _chat_db():
         who TEXT NOT NULL, text TEXT NOT NULL,
         ip TEXT, ua TEXT, delivered INTEGER DEFAULT 0)""")
     c.execute("CREATE INDEX IF NOT EXISTS idx_chat_sid ON chat(sid, id)")
+    # v43: mapa notificação→sessão. Guarda o message_id do Telegram de cada
+    # aviso de visitante, para o operador responder com REPLY nativo (arrasta
+    # e responde) em vez de decorar `/r <id>`. É o refinamento que o fluxo
+    # pedia: zero fricção entre "chegou mensagem" e "respondi".
+    c.execute("""CREATE TABLE IF NOT EXISTS chat_tg(
+        tg_msg_id INTEGER PRIMARY KEY,
+        sid TEXT NOT NULL, ts INTEGER NOT NULL)""")
     return c
+
+def _chat_tg_map(tg_msg_id: int, sid: str) -> None:
+    try:
+        c = _chat_db()
+        try:
+            c.execute("INSERT OR REPLACE INTO chat_tg(tg_msg_id,sid,ts) VALUES(?,?,?)",
+                      (int(tg_msg_id), sid, int(time.time())))
+            c.execute("DELETE FROM chat_tg WHERE ts < ?",
+                      (int(time.time()) - CHAT_RETENTION_DAYS * 86400,))
+            c.commit()
+        finally:
+            c.close()
+    except Exception as e:
+        log.debug(f"chat_tg map: {e}")
+
+def _chat_sid_from_tg(tg_msg_id: int) -> Optional[str]:
+    try:
+        c = _chat_db()
+        try:
+            row = c.execute("SELECT sid FROM chat_tg WHERE tg_msg_id=?",
+                            (int(tg_msg_id),)).fetchone()
+        finally:
+            c.close()
+        return row[0] if row else None
+    except Exception:
+        return None
+
+def _tg_send_capture(text: str) -> Optional[int]:
+    """v43: sendMessage que DEVOLVE o message_id (o _notify_telegram comum é
+    fogo-e-esquece). Se o parse Markdown falhar, reenvia em texto puro —
+    mensagem feia chega, mensagem perdida não."""
+    if not (TG_TOKEN and TG_CHAT):
+        return None
+    for payload in ({"chat_id": TG_CHAT, "text": text, "parse_mode": "Markdown",
+                     "disable_web_page_preview": True},
+                    {"chat_id": TG_CHAT, "text": text,
+                     "disable_web_page_preview": True}):
+        try:
+            r = requests.post(f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
+                              json=payload, timeout=8)
+            if r.ok:
+                return (r.json().get("result") or {}).get("message_id")
+            log.warning(f"TG capture send HTTP {r.status_code}: {r.text[:140]}")
+        except Exception as e:
+            log.warning(f"TG capture send: {e}")
+    return None
 
 def _chat_short(sid: str) -> str:
     return sid[:6]
@@ -10707,14 +11098,22 @@ def chat_send():
             c.close()
     except Exception:
         hist = 1
-    _notify_telegram(
+    # v43: captura o message_id e mapeia notificação→sessão. O operador pode
+    # responder de DOIS jeitos: reply nativo do Telegram (recomendado) ou
+    # o clássico /r <id>. Antes só existia o segundo — e exigia copiar o id.
+    _tg_id = _tg_send_capture(
         f"💬 *Visitante no site* `[{curto}]`\n\n"
         f"{texto[:700]}\n\n"
         f"— mensagem #{hist} desta sessão\n"
         f"— {('agente/SDK' if _is_bot(ua) else 'navegador')} · {ua[:44]}\n\n"
-        f"*Para responder:*\n`/r {curto} sua resposta aqui`")
+        f"*Para responder:* dê REPLY nesta mensagem "
+        f"(ou `/r {curto} sua resposta`)")
+    if _tg_id:
+        _chat_tg_map(_tg_id, sid)
     return jsonify({"sid": sid, "queued": True,
-                    "note": "The operator reads every message. Replies appear here."})
+                    "note": "The operator reads every message and replies from "
+                            "Telegram, usually fast. Keep this sid and poll "
+                            "/chat/poll?sid=<sid> for the answer."})
 
 @app.route("/chat/poll")
 def chat_poll():
@@ -10732,6 +11131,14 @@ def chat_poll():
             rows = c.execute("SELECT id, ts, who, text FROM chat "
                              "WHERE sid=? AND id > ? ORDER BY id LIMIT 60",
                              (sid, desde)).fetchall()
+            # v43: confirmação de entrega — o visitante BUSCOU as respostas,
+            # então marca as do operador como entregues. O /chats passa a
+            # distinguir "respondido e lido" de "respondido, não lido".
+            if rows:
+                _max_id = max(r[0] for r in rows)
+                c.execute("UPDATE chat SET delivered=1 WHERE sid=? AND "
+                          "who='operator' AND id<=?", (sid, _max_id))
+                c.commit()
         finally:
             c.close()
     except Exception:
@@ -10951,6 +11358,14 @@ def _build_openapi():
     contact_email = os.environ.get("CONTACT_EMAIL", "").strip()
 
     ENDPOINT_PARAMS = {
+        # v43: os dois produtos novos PRECISAM de schema aqui — é este dict que
+        # alimenta o OpenAPI (AgentCash exige input schema para listar pago).
+        "/token-intel":   [{"name": "token", "in": "query", "required": True,
+                            "description": "Token contract address (Solana mint or 0x) or ticker",
+                            "schema": {"type": "string", "example": "SOL"}}],
+        "/wallet-scan":   [{"name": "address", "in": "query", "required": True,
+                            "description": "Wallet address — Solana base58 or EVM 0x",
+                            "schema": {"type": "string", "example": "GEhr9HCFTRDjanMg435frSgCVwVZYpNoPrEkmNBnFHFE"}}],
         "/fear-greed":    [{"name": "format", "in": "query", "required": False,
                             "description": "Formato da resposta",
                             "schema": {"type": "string", "enum": ["json"], "default": "json"}}],
@@ -13322,6 +13737,24 @@ class TelegramBot:
         chat_id = msg["chat"]["id"]
         text = (msg.get("text") or "").strip()
 
+        # ---- v43: REPLY nativo do Telegram ---------------------------------
+        # O operador arrasta "responder" na notificação de um visitante e
+        # escreve direto — sem `/r`, sem copiar id. O message_id da notificação
+        # foi mapeado para a sessão quando o aviso foi enviado.
+        _reply_to = (msg.get("reply_to_message") or {}).get("message_id")
+        if _reply_to and text and not text.startswith("/"):
+            _sid = _chat_sid_from_tg(_reply_to)
+            if _sid:
+                _chat_add(_sid, "operator", text)
+                self.send(chat_id,
+                    f"✅ Resposta entregue para `[{_chat_short(_sid)}]` "
+                    "(via reply direto).")
+            else:
+                self.send(chat_id,
+                    "⚠️ Esta mensagem não é reply de uma notificação de "
+                    "visitante mapeada. Use `/r <id> sua resposta`.")
+            return
+
         # ---- responder um visitante do site ------------------------------
         if text.startswith("/r "):
             partes = text[3:].strip().split(None, 1)
@@ -13447,21 +13880,49 @@ class TelegramBot:
             try:
                 c = _chat_db()
                 try:
+                    # v43: triagem de fila — para cada sessão, quantas msgs do
+                    # visitante ainda NÃO têm resposta do operador depois delas.
+                    # O operador vê na hora o que está pendente, sem abrir uma
+                    # por uma.
                     rows = c.execute(
-                        "SELECT sid, MAX(ts), COUNT(*) FROM chat "
-                        "WHERE ts > ? GROUP BY sid ORDER BY MAX(ts) DESC LIMIT 8",
+                        "SELECT sid, MAX(ts), COUNT(*), "
+                        " SUM(CASE WHEN who='visitor' THEN 1 ELSE 0 END), "
+                        " SUM(CASE WHEN who='operator' THEN 1 ELSE 0 END), "
+                        " SUM(CASE WHEN who='operator' AND delivered=1 THEN 1 ELSE 0 END) "
+                        "FROM chat WHERE ts > ? GROUP BY sid ORDER BY MAX(ts) DESC LIMIT 8",
                         (int(time.time()) - 7 * 86400,)).fetchall()
                 finally:
                     c.close()
                 if not rows:
                     self.send(chat_id, "Nenhuma conversa nos últimos 7 dias.")
                     return
-                linhas = []
-                for sid, ts, n in rows:
+                linhas, pendentes = [], 0
+                for sid, ts, n, nv, no, nd in rows:
                     quando = datetime.fromtimestamp(ts, timezone.utc).strftime("%d/%m %H:%M")
-                    linhas.append(f"`[{_chat_short(sid)}]` {n} msgs · {quando} UTC")
-                self.send(chat_id, "💬 *Conversas recentes*\n\n" + "\n".join(linhas)
-                          + "\n\nResponda com `/r <id> texto`")
+                    # pendente = última palavra é do visitante
+                    last_who = None
+                    try:
+                        c2 = _chat_db()
+                        try:
+                            r2 = c2.execute("SELECT who FROM chat WHERE sid=? "
+                                            "ORDER BY id DESC LIMIT 1", (sid,)).fetchone()
+                            last_who = r2[0] if r2 else None
+                        finally:
+                            c2.close()
+                    except Exception:
+                        pass
+                    if last_who == "visitor":
+                        estado = "⏳ *aguardando resposta*"
+                        pendentes += 1
+                    elif (no or 0) > (nd or 0):
+                        estado = "📨 respondido (não lido)"
+                    else:
+                        estado = "✅ em dia"
+                    linhas.append(f"`[{_chat_short(sid)}]` {n} msgs · {quando} UTC — {estado}")
+                cab = (f"💬 *Conversas recentes* — {pendentes} pendente(s)\n\n"
+                       if pendentes else "💬 *Conversas recentes* — fila em dia ✅\n\n")
+                self.send(chat_id, cab + "\n".join(linhas)
+                          + "\n\nResponda com REPLY na notificação ou `/r <id> texto`")
             except Exception as e:
                 self.send(chat_id, f"erro: {self.esc(str(e)[:80])}")
             return
@@ -14947,7 +15408,9 @@ def _v27_start_background():
         _threading.Thread(target=active_discovery_ping_loop, daemon=True,
                          name="v27-discovery-ping").start()
         log.info("=" * 62)
-        log.info("🚀 LOSBETO v27.1.0-MAGNET — MACHINE MAGNET ONLINE")
+        # v43: o banner dizia "v27.1.0-MAGNET" desde aquela versão — log de
+        # produção mentia a versão em TODA reinicialização (confunde debug).
+        log.info(f"🚀 LOSBETO v{VERSION} — MACHINE MAGNET ONLINE")
         log.info(f"   Unified manifest: {_public_base()}/.well-known/agentic.json")
         log.info(f"   AP2 endpoint:     {_public_base()}/.well-known/ap2.json")
         log.info(f"   Proof of revenue: {_public_base()}/.well-known/proof-of-revenue.json")
