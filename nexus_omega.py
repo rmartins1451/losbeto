@@ -87,7 +87,7 @@ from typing import Any, Optional, Dict, List, Tuple
 # 0. CONFIGURAÇÃO E AUTO-SETUP
 # ============================================================================
 
-VERSION = "39.7.0-OFFER"
+VERSION = "40.0.0-EVIDENCE"
 BRAND_NAME = "Losbeto"
 BRAND_TAGLINE = "The Global Revenue Engine for Financial AI Agents"
 BRAND_EMOJI = "🧠"
@@ -4902,6 +4902,12 @@ def paid_endpoint(path):
                     except Exception:
                         pass
                     age = int(time.time() - cached["ts"])
+                    # v40: 80% de quem avalia é humano em navegador. Máquina
+                    # continua recebendo o mesmo JSON; humano recebe página.
+                    if _wants_html() and isinstance(cached.get("data"), dict):
+                        return app.response_class(
+                            _render_preview_html(path, cached["data"], age),
+                            mimetype="text/html")
                     return jsonify({"preview": True, "data_age_seconds": age,
                         "sample_policy": {
                             "min_delay_seconds": _preview_min_age(path),
@@ -7098,8 +7104,36 @@ settles a few cents in USDC per request and gets clean JSON back.</p>
 <div class="wrap">
 <div id="human">
 </div></div>
-<section class="band"><div class="wrap"><div id="human">
-<h2 id="top">Flagships</h2>
+<section class="band alt"><div class="wrap"><div id="human">
+<h2 id="top">Brazil — the coverage nobody else has</h2>
+<p class="lede">Central-bank macro, B3 equities and the real interest rate,
+assembled for an international desk. These four are where most of this node's
+revenue actually comes from, and they exist in no other x402 catalog.</p>
+<div class="grid">
+  <a class="card" href="/br-brief?preview=1"><span class="p">__P_BRIEF_BR__</span>
+    <h3>Brazil Brief <em>flagship</em></h3>
+    <p>BCB macro, the real rate, Ibovespa and B3 blue chips, with how the dollar
+    and commodities are feeding in — closed by an AI strategist synthesis.</p>
+    <code>GET /br-brief</code></a>
+  <a class="card" href="/br-curve?preview=1"><span class="p">__P_CURVE__</span>
+    <h3>Rate Structure</h3>
+    <p>Selic, CDI annualised on the 252-business-day convention, TJLP and IPCA —
+    real rate by the Fisher relation, not naive subtraction, with the CDI×Selic
+    spread as a sanity check on the data itself.</p>
+    <code>GET /br-curve</code></a>
+  <a class="card" href="/br-macro?preview=1"><span class="p">__P_BRMACRO__</span>
+    <h3>Macro Snapshot</h3>
+    <p>Selic, CDI, IPCA, IGP-M and the official PTAX, assembled from separate
+    BCB endpoints with comma decimals and sorted by date, not array order.</p>
+    <code>GET /br-macro</code></a>
+  <a class="card" href="/br-equity?preview=1"><span class="p">__P_BREQ__</span>
+    <h3>B3 Equities</h3>
+    <p>PETR4, VALE3, ITUB4 or the Ibovespa in BRL with the daily change, plus the
+    USD equivalent at the official PTAX rate.</p>
+    <code>GET /br-equity?symbol=PETR4</code></a>
+</div>
+
+<h2>Flagships</h2>
 <div class="grid">
   <a class="card" href="/oracle-consensus?preview=1"><span class="p">__P_ORACLE__</span>
     <h3>Oracle Consensus</h3>
@@ -7428,7 +7462,10 @@ def _render_clean_landing() -> str:
                     ("__P_RISK__", "/launch-risk"),
                     ("__P_AGRO__", "/br-agro"),
                     ("__P_CURVE__", "/br-curve"),
-                    ("__P_BRMACRO__", "/br-macro")):
+                    ("__P_BRMACRO__", "/br-macro"),
+                    ("__P_BRIEF_BR__", "/br-brief"),
+                    ("__P_CURVE__", "/br-curve"),
+                    ("__P_BREQ__", "/br-equity")):
         html = html.replace(tag, f"${get_dynamic_price(ep):.2f}")
     return html
 
@@ -11313,6 +11350,218 @@ def api_catalog():
     return r
 
 
+# ===========================================================================
+# v40 — O QUE OS DADOS MANDARAM CONSTRUIR
+#
+# O painel de 24h desfez a hipótese com que eu vinha trabalhando:
+#
+#   55 avaliadores · 23 pagamentos · 29,5% de conversão · 7 compradores
+#   80% dos avaliadores são HUMANOS EM NAVEGADOR (13 IPs móveis distintos)
+#   95% da receita vem dos endpoints /br-*
+#
+# Eu dizia "ninguém avalia, logo é problema de público". Falso. Gente avalia,
+# e converte a 29,5% — número que qualquer SaaS assinaria embaixo. As 14.244
+# sondagens de scanner e os 55 avaliadores reais coexistem; eu estava lendo o
+# ruído e concluindo que não havia sinal.
+#
+# Duas consequências práticas, ambas implementadas abaixo:
+#
+# 1. Quem avalia é HUMANO, e recebia JSON cru. Um humano que abre
+#    /br-brief?preview=1 no iPhone vê uma parede de chaves e fecha. Agora
+#    navegador recebe página legível; agente continua recebendo JSON idêntico.
+#
+# 2. Brasil é 95% da receita e estava no meio da página. Passa a abrir.
+# ===========================================================================
+
+# v40 — ALIASES QUE A DEMANDA PEDIU
+# Do painel (7 dias), caminhos pedidos por IPs reais que devolviam 404:
+#   /health/                6 pedidos · 2 IPs   (barra final!)
+#   /status                 3 · 2
+#   /openapi.yaml           3 · 2
+#   /.well-known/health     3 · 2
+#   /.well-known/llms.txt   3 · 2
+# Dezoito requisições de clientes reais perdidas por convenção de caminho.
+# Custo de servir: zero.
+
+@app.route("/health/")
+@app.route("/status")
+@app.route("/.well-known/health")
+def health_aliases():
+    return health()
+
+
+@app.route("/.well-known/llms.txt")
+def llms_wellknown():
+    return redirect("/llms.txt", code=301)
+
+
+@app.route("/openapi.yaml")
+def openapi_yaml():
+    """YAML pedido por 2 IPs. Sem dependência nova: serializador mínimo."""
+    def _y(v, ind=0):
+        pad = "  " * ind
+        if isinstance(v, dict):
+            if not v:
+                return " {}"
+            out = ""
+            for k, val in v.items():
+                chave = f'"{k}"' if (":" in str(k) or str(k)[:1].isdigit()) else k
+                if isinstance(val, (dict, list)):
+                    out += f"\n{pad}{chave}:{_y(val, ind + 1)}"
+                else:
+                    out += f"\n{pad}{chave}:{_y(val, ind + 1)}"
+            return out
+        if isinstance(v, list):
+            if not v:
+                return " []"
+            return "".join(f"\n{pad}-{_y(i, ind + 1)}" for i in v)
+        if v is None:
+            return " null"
+        if isinstance(v, bool):
+            return f" {str(v).lower()}"
+        if isinstance(v, (int, float)):
+            return f" {v}"
+        t = str(v).replace("\\", "\\\\").replace('"', '\\"')
+        return f' "{t}"'
+    try:
+        spec = openapi_spec().get_json()
+    except Exception:
+        spec = {"openapi": "3.1.0", "info": {"title": SERVICE_NAME}}
+    return app.response_class(("# OpenAPI 3.1 — " + SERVICE_NAME + _y(spec)).lstrip(),
+                              mimetype="application/yaml")
+
+
+def _wants_html() -> bool:
+    """Navegador de verdade — não curl, não SDK, não scanner."""
+    try:
+        ua = request.headers.get("User-Agent", "")
+        accept = request.headers.get("Accept", "")
+        if request.args.get("format") == "json":
+            return False
+        return ("text/html" in accept and _UA_HUMAN.search(ua) is not None
+                and not _UA_NAMED_SCANNER.search(ua))
+    except Exception:
+        return False
+
+
+def _fmt_valor(v) -> str:
+    if isinstance(v, bool):
+        return "sim" if v else "não"
+    if isinstance(v, (int, float)):
+        return f"{v:,.4f}".rstrip("0").rstrip(".") if isinstance(v, float) else f"{v:,}"
+    return str(v)
+
+
+def _render_preview_html(path: str, dados: dict, idade: int) -> str:
+    """Amostra legível para humano, com o caminho de compra no fim.
+
+    Não é enfeite: 80% de quem avalia é humano em navegador, e o produto
+    inteiro estava escrito para máquina. Esta página é a única superfície que
+    esses 80% viam antes de decidir."""
+    base = _public_base()
+    preco = get_dynamic_price(path)
+    desc = ENDPOINT_DESC.get(path, "")
+
+    def linhas(d, prefixo="", nivel=0):
+        out = []
+        for k, v in list(d.items())[:40]:
+            if k.startswith("_"):
+                continue
+            rotulo = k.replace("_", " ")
+            if isinstance(v, dict):
+                out.append(f'<tr class="grp"><td colspan="2">{rotulo}</td></tr>')
+                out.extend(linhas(v, prefixo + "  ", nivel + 1))
+            elif isinstance(v, list):
+                out.append(f'<tr><td>{rotulo}</td><td class="v">'
+                           f'{len(v)} itens</td></tr>')
+            else:
+                txt = _fmt_valor(v)
+                if len(txt) > 220:
+                    txt = txt[:220] + "…"
+                cls = "v long" if len(txt) > 60 else "v"
+                out.append(f'<tr><td>{"&nbsp;&nbsp;"*nivel}{rotulo}</td>'
+                           f'<td class="{cls}">{txt}</td></tr>')
+        return out
+
+    corpo = "".join(linhas(dados))
+    minutos = idade // 60
+    return f"""<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>{path} — free sample · Losbeto</title>
+<meta name="agent:instructions" content="This is a human-readable rendering.
+Request with Accept: application/json or ?format=json for the machine version.">
+<style>
+:root{{--bg:#0a0b0d;--fg:#e8eaed;--dim:#8b9199;--line:#1e2126;--acc:#4ade80;
+      --card:#101217;--mono:ui-monospace,SFMono-Regular,Menlo,monospace}}
+*{{box-sizing:border-box}}
+body{{background:var(--bg);color:var(--fg);margin:0;
+     font:15px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",Inter,sans-serif}}
+.w{{max-width:760px;margin:0 auto;padding:28px 20px 60px}}
+a{{color:#60a5fa;text-decoration:none}} a:hover{{text-decoration:underline}}
+.top{{display:flex;justify-content:space-between;align-items:center;
+     padding-bottom:16px;border-bottom:1px solid var(--line);flex-wrap:wrap;gap:10px}}
+.badge{{display:inline-block;font-size:11px;letter-spacing:.08em;
+       text-transform:uppercase;color:var(--acc);border:1px solid var(--line);
+       border-radius:999px;padding:3px 11px}}
+h1{{font:600 22px/1.25 var(--mono);margin:20px 0 6px;letter-spacing:-.01em}}
+p.d{{color:var(--dim);margin:0 0 22px;font-size:14px}}
+table{{width:100%;border-collapse:collapse;background:var(--card);
+      border:1px solid var(--line);border-radius:10px;overflow:hidden}}
+td{{padding:9px 14px;border-bottom:1px solid var(--line);font-size:14px;
+   vertical-align:top}}
+tr:last-child td{{border-bottom:none}}
+td:first-child{{color:var(--dim);width:42%}}
+.v{{font-family:var(--mono);font-size:13px}}
+.v.long{{font-family:inherit;font-size:13.5px;line-height:1.55}}
+.grp td{{background:#0d0f13;color:var(--acc);font-size:11px;
+        text-transform:uppercase;letter-spacing:.08em}}
+.buy{{margin:28px 0 0;background:var(--card);border:1px solid var(--line);
+     border-radius:12px;padding:20px 22px}}
+.buy h2{{font-size:15px;margin:0 0 12px}}
+pre{{background:#0d0f13;border:1px solid var(--line);border-radius:8px;
+    padding:13px;overflow-x:auto;font:12.5px/1.6 var(--mono);color:#9ecbff;
+    margin:0 0 12px}}
+.row{{display:flex;gap:10px;flex-wrap:wrap;margin-top:14px}}
+.row a{{padding:9px 16px;border:1px solid var(--line);border-radius:8px;
+       font-size:13.5px}}
+.row a.p{{background:var(--acc);color:#06120a;border-color:var(--acc);
+         font-weight:600}}
+.foot{{color:var(--dim);font-size:12.5px;margin-top:26px;
+      border-top:1px solid var(--line);padding-top:16px}}
+</style></head><body><div class="w">
+<div class="top">
+  <a href="/">← losbeto</a>
+  <span class="badge">free sample · {minutos} min old</span>
+</div>
+<h1>{path}</h1>
+<p class="d">{desc[:260]}</p>
+{"<table>" + corpo + "</table>" if corpo else "<p>Sample warming up.</p>"}
+
+<div class="buy">
+<h2>This is real data, delayed. Live costs ${preco:.4f} per call.</h2>
+<p class="d" style="margin-bottom:14px">The delay is the only difference —
+same fields, same sources, same shape.</p>
+
+<pre># your agent pays and retries, no account needed
+npx agentcash fetch {base}{path}</pre>
+
+<pre># or connect the whole catalog to Claude Code / Cursor
+claude mcp add --transport http losbeto {base}/mcp</pre>
+
+<div class="row">
+  <a class="p" href="/pricing">Plans from $0.99</a>
+  <a href="{path}?format=json">Raw JSON</a>
+  <a href="/try">6 more free samples</a>
+</div>
+</div>
+
+<p class="foot">Every paid endpoint has a free sample like this one.
+If a source is down, the paid version returns 503 and does not charge —
+see <a href="/health/providers">provider status</a> and
+<a href="/receipts">receipts</a>.</p>
+</div></body></html>"""
+
+
 @app.route("/pricing")
 def pricing_page():
     """v39.1 — a página que faltava.
@@ -14133,6 +14382,28 @@ for _ep, _p in _V32_REPRICE.items():
         log.debug(f"reprice final: {_ep} {BASE_PRICES[_ep]} -> {_p}")
         BASE_PRICES[_ep] = _p
 _assert_plan_ladder()
+
+# ---------------------------------------------------------------------------
+# v40 — PRODUTO SEM INSUMO SAI DO CATÁLOGO, NÃO FICA DEVOLVENDO 503
+#
+# O pré-gate da v39.1 recusava /earnings-whisper sem cobrar — correto para o
+# comprador, desastroso para o catálogo. Os logs mostram o x402scan tentando
+# GET, HEAD, POST, PUT, PATCH, DELETE e OPTIONS em loop, recebendo 503, e
+# marcando o endpoint como "won't be registered". Dezenas de 503 por minuto
+# e o recurso fora do índice mesmo assim.
+#
+# A conclusão é simples: um produto que não pode ser entregue não deve estar
+# à venda. Sem provedor, ele some do catálogo inteiro — manifesto, OpenAPI,
+# preços, MCP. Aparece de volta sozinho no boot em que a chave existir.
+# ---------------------------------------------------------------------------
+for _ep, _precisa in list(PROVIDER_REQUIRED_ENDPOINTS.items()):
+    if _ep in BASE_PRICES and not _precisa():
+        BASE_PRICES.pop(_ep, None)
+        ENDPOINT_HANDLERS.pop(_ep, None)
+        if _ep in FEATURED_ENDPOINTS:
+            FEATURED_ENDPOINTS.remove(_ep)
+        log.warning(f"📴 {_ep} removido do catálogo — sem provedor de dados. "
+                    f"Configure a chave e ele volta no próximo boot.")
 
 # Trava de catálogo: nenhum endpoint precificado pode ir ao ar sem descrição.
 _sem_desc = [e for e in BASE_PRICES if not ENDPOINT_DESC.get(e)]
