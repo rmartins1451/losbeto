@@ -87,7 +87,7 @@ from typing import Any, Optional, Dict, List, Tuple
 # 0. CONFIGURAÇÃO E AUTO-SETUP
 # ============================================================================
 
-VERSION = "44.0.5-PERSONA"
+VERSION = "44.0.6-PERSONA"
 BRAND_NAME = "Losbeto"
 BRAND_TAGLINE = "The Global Revenue Engine for Financial AI Agents"
 BRAND_EMOJI = "🧠"
@@ -10381,6 +10381,26 @@ def demand_watch_loop():
         except Exception as e:
             log.debug(f"demand_watch: {e}")
         time.sleep(3600)
+
+@app.before_request
+def _slash_redirect():
+    """v44.0.6: catalog agents request manifest paths WITH a trailing slash
+    (/.well-known/ucp/, /apis.json/, /health/) and were getting the 404
+    teaching page — observed in the demand radar (3 IPs each). When the
+    slash-stripped path is a real route for this method, answer with a
+    308 redirect (method-preserving) instead of a 404."""
+    p = request.path or ""
+    if len(p) > 1 and p.endswith("/"):
+        stripped = p.rstrip("/")
+        if stripped:
+            try:
+                for r in app.url_map.iter_rules():
+                    if r.rule == stripped and request.method in (r.methods or ()):
+                        qs = request.query_string.decode("utf-8", "ignore")
+                        return redirect(stripped + (("?" + qs) if qs else ""), code=308)
+            except Exception:
+                pass
+    return None
 
 @app.errorhandler(404)
 def _capture_demand(e):
