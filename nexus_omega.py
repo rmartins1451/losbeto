@@ -87,7 +87,7 @@ from typing import Any, Optional, Dict, List, Tuple
 # 0. CONFIGURAÇÃO E AUTO-SETUP
 # ============================================================================
 
-VERSION = "44.0.6-PERSONA"
+VERSION = "44.0.7-PERSONA"
 BRAND_NAME = "Losbeto"
 BRAND_TAGLINE = "The Global Revenue Engine for Financial AI Agents"
 BRAND_EMOJI = "🧠"
@@ -287,6 +287,20 @@ CREDIT_PLANS = {
                           "bonus": "unlimited 30d",
                           "pitch": "Unlimited for 30 days with maximum priority",
                           "anchor_price": 19.99, "display_price": "$19.99/mo"},
+    # v44.0.7: FOUNDING AGENT — a edição de lançamento do node.
+    # Um pagamento, $75 de saldo (bônus de +50%, o maior do catálogo),
+    # janela de 180 dias (a mais longa de qualquer plano de saldo) e a key
+    # carrega o badge "founding" verificável publicamente em /credits-status.
+    # É plano de SALDO (não ilimitado) — fica fora da escada _assert_plan_ladder.
+    "/founding-agent":   {"plan": "founding", "balance_usd": 75.00, "ttl_days": 180,
+                          "bonus": "+50% · founding badge",
+                          "pitch": ("Founding Agent launch edition: $75 of call credit "
+                                    "for $49.99, valid 180 days, founding badge on the key"),
+                          "anchor_price": 49.99, "display_price": "$49.99",
+                          "perks": ["+50% bonus credit — $75 of calls for $49.99",
+                                    "180-day validity — the longest window of any balance plan",
+                                    "founding badge: /credits-status publicly shows plan=founding",
+                                    "one on-chain payment, then ~1ms calls via X-API-Key"]},
     "/enterprise":       {"plan": "enterprise", "balance_usd": -1,  "ttl_days": 365,
                           "bonus": "unlimited 12 months",
                           "pitch": "Unlimited for a year, dedicated capacity, 99.9% availability target",
@@ -366,6 +380,11 @@ BASE_PRICES = {
     "/week-pass":        9.990,
     "/subscribe-pro":    9.990,
     "/subscribe-whale":  19.990,
+    # --- v44.0.7: FOUNDING AGENT — plano de lançamento, ticket alto honesto.
+    #     Chainalysis (jun/2026): transações de $1+ são 95% do valor movimentado
+    #     no x402. Um comprador real de verdade quase sempre prefere 1 tx maior
+    #     a 50 micro-compras. Balance-based (fora da escada ilimitada). ---
+    "/founding-agent":   49.990,
     "/enterprise":       99.990,
 }
 
@@ -375,7 +394,7 @@ FEATURED_ENDPOINTS = [
     "/starter-pack", "/thesis-engine", "/market-brief",
     "/whale-dossier", "/portfolio-copilot", "/alpha-signal",
     "/mev-flow", "/copytrade", "/rugcheck",
-    "/subscribe-pro", "/subscribe-whale", "/sales-agent",
+    "/subscribe-pro", "/subscribe-whale", "/founding-agent", "/sales-agent",
     "/forex-rate", "/commodity-price", "/stock-quote",
 ]
 
@@ -6644,7 +6663,7 @@ def _credits_purchase_handler(endpoint: str):
 
 def _credits_payload(endpoint, plan, key, balance_usd, expires, idempotent=False):
     base = _public_base()
-    return {
+    payload = {
         "api_key": key,
         "plan": plan["plan"],
         "balance_usd": ("unlimited" if balance_usd == -1 else round(balance_usd, 6)),
@@ -6664,6 +6683,12 @@ def _credits_payload(endpoint, plan, key, balance_usd, expires, idempotent=False
         "top_up": f"{base}/buy-credits",
         "provider": "Losbeto", "version": VERSION,
     }
+    # v44.0.7: planos podem declarar perks extras (ex.: /founding-agent) —
+    # entram no payload pago para o comprador ver o que a key dele carrega.
+    if plan.get("perks"):
+        payload["perks"] = plan["perks"]
+        payload["badge"] = plan["plan"]
+    return payload
 
 for _ep in CREDIT_PLANS:
     app.add_url_rule(_ep, _ep.strip("/").replace("-", "_"),
@@ -7453,7 +7478,7 @@ def get_pricing():
             "pro":       {"endpoints": [e for e, p in BASE_PRICES.items() if 0.12 < p <= 0.35], "price_range": "$0.15-0.35"},
             "flagship":  {"endpoints": [e for e, p in BASE_PRICES.items() if 0.35 < p <= 1.00 and e not in CREDIT_PLANS],
                           "price_range": "$0.49-1.00"},
-            "credits":   {"endpoints": list(CREDIT_PLANS), "price_range": "$1.00-29.99",
+            "credits":   {"endpoints": list(CREDIT_PLANS), "price_range": "$0.99-99.99",
                           "note": "One on-chain transaction, then N calls via the X-API-Key header — no per-request settlement"},
         },
         "featured":  FEATURED_ENDPOINTS,
@@ -7812,7 +7837,7 @@ data = x402HTTPClientSync(wallet).get(<span class="s">"__URL__/alpha-signal"</sp
 
 <div class="demo-card">
   <h3>🧾 Pagamentos on-chain, com transparência radical</h3>
-  <p>Cada linha é um pagamento x402 liquidado de verdade — e rotulamos honestamente o que é compra de teste do operador vs. compra orgânica. Agentes podem auditar tudo em <code>GET /receipts</code>. Num ecossistema onde metade do volume é wash trading, dizer a verdade é o diferencial.</p>
+  <p>Cada linha é um pagamento x402 liquidado de verdade — e rotulamos honestamente o que é compra de teste do operador vs. compra orgânica. Agentes podem auditar tudo em <code>GET /receipts</code>. Um estudo independente de jul/2026 (POMACS, arXiv:2607.12575) mediu que ~85% do volume x402 na Base é interno dos próprios operadores — aqui, dizer a verdade é o diferencial.</p>
   <table>
   <thead><tr><th>Quando</th><th>Endpoint</th><th>Valor</th><th>Origem</th><th>Tx on-chain</th></tr></thead>
   <tbody>__RECEIPTS__</tbody>
@@ -7838,6 +7863,12 @@ Com créditos você faz <b>uma</b> transação e chama em ~1ms via header <code>
   <div class="feat"><div class="ic">🐋</div><h3>Whale <span class="tag hot">mensal</span></h3>
     <p><b>$19.99/mês</b> → <b>ilimitado</b> 30 dias + prioridade máxima</p>
     <p style="font-size:12px;color:var(--dim)">GET /subscribe-whale</p></div>
+  <div class="feat"><div class="ic">🏛️</div><h3>Founding Agent <span class="tag new">EDIÇÃO DE LANÇAMENTO</span></h3>
+    <p><b>$49.99</b> → saldo de <b>$75</b> em chamadas <span class="tag hot">+50% bônus</span> —
+       o maior bônus do catálogo. Válido por <b>180 dias</b> (a janela mais longa de
+       qualquer plano de saldo) e a key carrega o badge <code>founding</code>,
+       verificável publicamente em <code>/credits-status</code>.</p>
+    <p style="font-size:12px;color:var(--dim)">GET /founding-agent</p></div>
 </div>
 <div class="demo-card" style="max-width:900px;margin:0 auto 40px">
   <div class="mono" style="font-size:12.5px;line-height:1.7;color:var(--dim)">
@@ -9817,16 +9848,20 @@ log.info("🔍 x402 Audit registrado ($0.05) — verificação de serviços do e
 # Referência de mercado (jul/2026): o líder da categoria cobra $0.01–0.05 no
 # grosso do catálogo e $0.15–0.75 nos produtos de IA/score. O teto de $0.30
 # da v32 estava conservador demais para os flagships de IA — /council-deep,
-# /br-brief e /thesis-engine voltam a $0.35–0.45, ainda abaixo do líder.
+# /br-brief e /thesis-engine voltam a $0.35–0.50, ainda abaixo do líder.
+# v44.0.7: /br-brief sobe para $0.50 — é produto de síntese com IA sobre dados
+# BCB/B3 exclusivos, e o comparável de mercado para síntese é $0.15–0.75
+# (leaderboard x402scan, jul/2026). Sem concorrente no nicho, o desconto
+# agressivo só sinalizava baixa confiança.
 # ---------------------------------------------------------------------------
 _V32_REPRICE = {
     # Produtos de IA/síntese — onde o comparável de mercado é $0.15–0.75
     "/council-deep":          0.35,
     "/portfolio-stress":      0.30,
-    "/br-brief":              0.35,
+    "/br-brief":              0.50,
     "/thesis-engine":         0.30,
     "/global-morning-brief":  0.20,
-    "/equity-dossier":        0.20,
+    "/equity-dossier":        0.25,
     "/event-playbook":        0.25,
     "/correlation-matrix":    0.18,
     "/sector-rotation":       0.15,
@@ -9837,6 +9872,10 @@ _V32_REPRICE = {
     "/portfolio-copilot":     0.12,
     "/launch-risk":           0.10,
     # Dado trabalhado — comparável $0.01–0.08
+    # v44.0.7: /br-agro é o ÚNICO feed de paridade agro do BCB no x402 inteiro
+    # (soja, milho, café, boi — com paridade de exportação CBOT/ICE). Exclusivo
+    # sem concorrente não fica no meio da faixa: vai para o topo do dado.
+    "/br-agro":               0.09,
     "/forex-arbitrage":       0.08,
     "/mev-flow":              0.08,
     "/alpha-signal":          0.08,
