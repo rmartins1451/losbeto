@@ -87,7 +87,7 @@ from typing import Any, Optional, Dict, List, Tuple
 # 0. CONFIGURAÇÃO E AUTO-SETUP
 # ============================================================================
 
-VERSION = "44.0.3-PERSONA"
+VERSION = "44.0.4-PERSONA"
 BRAND_NAME = "Losbeto"
 BRAND_TAGLINE = "The Global Revenue Engine for Financial AI Agents"
 BRAND_EMOJI = "🧠"
@@ -10410,6 +10410,27 @@ def _capture_demand(e):
             "github_issues": FEEDBACK_GITHUB,
         },
     }), 404
+
+@app.errorhandler(405)
+def _teach_method(e):
+    """v44.0.4: 405 que ENSINA. Agents probe paid endpoints with POST/PATCH/
+    PUT/DELETE (observed in production: a single agent tried 6 methods on
+    /br-equity). Flask's default 405 is HTML — unparseable by machines.
+    Answer in JSON with the one fact that matters: GET is the verb."""
+    path = (request.path or "")[:120]
+    base = _public_base()
+    return jsonify({
+        "error": "method_not_allowed",
+        "requested": f"{request.method} {path}",
+        "how_to_call": f"GET {base}{path}",
+        "note": ("Every data endpoint on this node is plain GET. An unpaid "
+                 "GET returns HTTP 402 with payment terms; retry with the "
+                 "payment header to receive the data. Free delayed sample: "
+                 "add ?preview=1."),
+        "free_sample": f"{base}{path}?preview=1",
+        "catalog": f"{base}/llms.txt",
+        "all_endpoints": f"{base}/get-pricing",
+    }), 405
 
 def _suggest_paths(path: str, n: int = 3) -> list:
     """Sugestão por similaridade de tokens — ajuda o agente a achar o
