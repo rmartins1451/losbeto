@@ -521,6 +521,7 @@ ENDPOINT_DESC = {
     "/week-pass":       "WEEK PASS: unlimited calls to every endpoint for 7 days — the same access as the day pass at roughly half the daily cost. For agents running a full evaluation cycle.",
     "/subscribe-pro":   "PRO: $15 of call balance per month (+50% bonus) for agents in production, with priority routing over free traffic.",
     "/subscribe-whale": "WHALE: unlimited calls for 30 days plus maximum priority. For high-frequency agents that would otherwise burn the per-call path.",
+    "/founding-agent":  "FOUNDING AGENT (launch edition): $75 of call balance for $49.99 (+50% bonus, the largest in the catalog), valid for 180 days — the longest window of any balance plan — with a publicly verifiable founding badge on the API key. One on-chain transaction, then ~1ms calls via X-API-Key.",
     "/enterprise":      "ENTERPRISE: unlimited calls for 12 months, dedicated capacity, a 99.9% availability target and direct support. One transaction covers a full year of production usage.",
 }
 
@@ -586,6 +587,8 @@ ENDPOINT_TAGS = {
     "/day-pass":         ["Credits", "Pass", "Featured"],
     "/subscribe-pro":    ["Credits", "Subscription"],
     "/subscribe-whale":  ["Credits", "Subscription"],
+    "/founding-agent":   ["Credits", "Launch", "Featured"],
+    "/enterprise":       ["Credits", "Subscription"],
 }
 
 # ============================================================================
