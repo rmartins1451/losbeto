@@ -87,7 +87,7 @@ from typing import Any, Optional, Dict, List, Tuple
 # 0. CONFIGURAÇÃO E AUTO-SETUP
 # ============================================================================
 
-VERSION = "44.0.2-PERSONA"
+VERSION = "44.0.3-PERSONA"
 BRAND_NAME = "Losbeto"
 BRAND_TAGLINE = "The Global Revenue Engine for Financial AI Agents"
 BRAND_EMOJI = "🧠"
@@ -12641,8 +12641,11 @@ def apis_json():
 
 
 @app.route("/.well-known/api-catalog")
+@app.route("/.well-known/ai-catalog.json")
 def api_catalog():
-    """RFC 9727 — linkset apontando para as descrições de API deste host."""
+    """RFC 9727 — linkset apontando para as descrições de API deste host.
+    v44.0.3: alias /.well-known/ai-catalog.json — 3 IPs distintos pediram
+    esse caminho em 7d (demand radar); serve o mesmo linkset (é JSON)."""
     base = _public_base()
     corpo = {"linkset": [{
         "anchor": base,
