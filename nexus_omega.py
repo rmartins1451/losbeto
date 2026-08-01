@@ -87,7 +87,7 @@ from typing import Any, Optional, Dict, List, Tuple
 # 0. CONFIGURAÇÃO E AUTO-SETUP
 # ============================================================================
 
-VERSION = "44.0.4-PERSONA"
+VERSION = "44.0.5-PERSONA"
 BRAND_NAME = "Losbeto"
 BRAND_TAGLINE = "The Global Revenue Engine for Financial AI Agents"
 BRAND_EMOJI = "🧠"
@@ -182,7 +182,10 @@ FINNHUB_KEY     = os.environ.get("FINNHUB_API_KEY", "").strip()      # 60 req/mi
 TWELVEDATA_KEY  = os.environ.get("TWELVEDATA_API_KEY", "").strip()   # 800 req/dia
 ALPHAVANTAGE_KEY= os.environ.get("ALPHAVANTAGE_API_KEY", "").strip() # 25 req/dia
 DEEPSEEK_KEY = os.environ.get("DEEPSEEK_API_KEY", "").strip()
-CLAUDE_KEY   = os.environ.get("CLAUDE_API_KEY", "").strip()
+CLAUDE_KEY   = (os.environ.get("CLAUDE_API_KEY", "").strip() or
+                # v44.0.5: aceita também o nome oficial da Anthropic — o
+                # Railway já tinha ANTHROPIC_API_KEY e a chave não era lida.
+                os.environ.get("ANTHROPIC_API_KEY", "").strip())
 OLLAMA_URL   = os.environ.get("OLLAMA_URL", "http://127.0.0.1:11434")
 # v39: o default acima é conveniente para rodar local, mas fazia o Ollama
 # contar como "provedor configurado" mesmo sem nada escutando na porta —
