@@ -87,7 +87,7 @@ from typing import Any, Optional, Dict, List, Tuple
 # 0. CONFIGURAÇÃO E AUTO-SETUP
 # ============================================================================
 
-VERSION = "44.0.7-PERSONA"
+VERSION = "44.0.8-FUNIL"
 BRAND_NAME = "Losbeto"
 BRAND_TAGLINE = "The Global Revenue Engine for Financial AI Agents"
 BRAND_EMOJI = "🧠"
@@ -3512,7 +3512,7 @@ class Brain:
                              for e, p in sorted(BASE_PRICES.items(),
                                                 key=lambda x: x[1])[:5]
                              if e not in CREDIT_PLANS],
-                "free": ["/sample", "/losbeto-alpha-score",
+                "free": ["/ip", "/sample", "/losbeto-alpha-score",
                          "/launch-risk-preview", "/receipts"],
                 "credits": {ep: {"price_usdc": BASE_PRICES[ep],
                                  "balance": p["balance_usd"],
@@ -7076,7 +7076,7 @@ def sitemap_xml():
     base = _public_base()
     urls = ["/", "/info", "/losbeto-alpha-score", "/openapi.json",
             "/.well-known/x402.json", "/.well-known/mcp.json", "/.well-known/agent.json",
-            "/llms.txt", "/bazaar.json", "/sample", "/get-pricing",
+            "/llms.txt", "/bazaar.json", "/sample", "/get-pricing", "/ip",
             "/receipts", "/launch-risk-preview", "/credits-status"]
     for ep in BASE_PRICES: urls.append(ep)
     body = ['<?xml version="1.0" encoding="UTF-8"?>',
@@ -7473,7 +7473,7 @@ def get_pricing():
                       "ecossistema ~$0.03), premium só onde há valor único. Créditos "
                       "com bônus eliminam latência de settlement por chamada."),
         "tiers": {
-            "free":  {"endpoints": ["/sample", "/losbeto-alpha-score", "/launch-risk-preview",
+            "free":  {"endpoints": ["/ip", "/sample", "/losbeto-alpha-score", "/launch-risk-preview",
                                     "/receipts", "/credits-status"],
                       "price": "grátis", "limit": "rate-limited"},
             "discovery": {"endpoints": [e for e, p in BASE_PRICES.items() if p <= 0.03], "price_range": "$0.01-0.03"},
@@ -8239,6 +8239,7 @@ not to impress a human skimming a homepage.</p>
 <h2>Honest by default</h2>
 <table>
 <tr><td>First real-time call free, no wallet, no signup</td><td>/welcome</td></tr>
+<tr><td>Caller-IP echo — free forever, the zero-friction entry step</td><td>/ip</td></tr>
 <tr><td>Free delayed sample on every endpoint</td><td>?preview=1</td></tr>
 <tr><td>Six endpoints sampled in one free call</td><td>/try</td></tr>
 <tr><td>Per-source liveness before you integrate</td><td>/health/providers</td></tr>
@@ -8319,6 +8320,14 @@ claude mcp add --transport http losbeto __BASE__/mcp
 
 <span class="c"># or paste into any MCP client config</span>
 {"mcpServers":{"losbeto":{"url":"__BASE__/mcp"}}}</pre>
+
+<h2>Add it to your agent's system prompt</h2>
+<pre><span class="c"># paste verbatim — the agent discovers, probes free and pays by itself</span>
+Market data: use the Losbeto node at __BASE__ via the agentcash MCP tools.
+Discover: mcp__agentcash__discover_api_endpoints (origin __BASE__)
+Call: mcp__agentcash__fetch &lt;full URL&gt; — payment settles automatically.
+Free probes: GET /try · GET /welcome · GET /ip · ?preview=1 on any paid path
+Exclusive here: Brazil macro + B3 (/br-brief, /br-macro, /br-curve, /br-equity, /br-agro)</pre>
 
 <h2>Machine-readable discovery</h2>
 <table>
@@ -8796,6 +8805,49 @@ def welcome():
             "day_pass": f"{base}/day-pass",
         },
         "ts": int(time.time()), "version": VERSION})
+
+# ---------------------------------------------------------------------------
+# v44.0.8 FUNIL — /ip: endpoint-isca gratuito. O radar de demanda registrou
+# 10 IPs distintos pedindo /ip em 7d (a única demanda real não atendida).
+# Eco de IP estilo ipify + vitrine mínima do nó: é o degrau zero-fricção do
+# funil free→paid que os líderes do x402scan usam (BlockRun: 8 modelos free).
+# Não entra em BASE_PRICES — é gratuito por design, com rate limit leve.
+# ---------------------------------------------------------------------------
+
+@app.route("/ip")
+def ip_echo():
+    base = _public_base()
+    ip = (request.headers.get("X-Forwarded-For", request.remote_addr) or ""
+          ).split(",")[0].strip()
+    minute = datetime.now(timezone.utc).strftime("%Y%m%d%H%M")
+    rl = LEDGER.cache_get(f"ip:rl:{ip}:{minute}", 120)
+    used = int(rl) if rl else 0
+    if used >= 30:
+        return jsonify({"error": "free tier rate limit — 30 calls/min",
+                        "paid_catalog": f"{base}/get-pricing"}), 429
+    LEDGER.cache_set(f"ip:rl:{ip}:{minute}", used + 1)
+    try:
+        LEDGER.log_request("/ip", True, 0, ip, kind="ip_free",
+                           ua=request.headers.get("User-Agent", ""), params="")
+    except Exception:
+        pass
+    return jsonify({
+        "ip": ip,
+        "user_agent": request.headers.get("User-Agent", ""),
+        "ts": int(time.time()),
+        "iso": datetime.now(timezone.utc).isoformat(),
+        "service": {
+            "name": SERVICE_NAME,
+            "what": (f"{len(BASE_PRICES)} pay-per-call market-data endpoints for "
+                     "AI agents — multi-oracle consensus, forex, equities, "
+                     "commodities, crypto and exclusive Brazil macro (BCB/B3). "
+                     "USDC on Base + Solana via x402."),
+            "free": {"six_samples_one_call": f"{base}/try",
+                     "first_realtime_call": f"{base}/welcome",
+                     "any_endpoint_delayed": f"{base}/<endpoint>?preview=1"},
+            "catalog": f"{base}/get-pricing",
+            "agents": f"{base}/llms.txt",
+            "buy_example": f"npx agentcash fetch {base}/fear-greed"}})
 
 def _resource_entry(ep: str) -> dict:
     """Entrada de recurso no formato que os catálogos esperam."""
@@ -12301,6 +12353,19 @@ def llms_txt():
         lines.append(f"- [{base}{ep}] ${BASE_PRICES[ep]:.2f} — {plan['pitch']}")
     lines.append("Uso: header `X-API-Key: lsk_...` em qualquer endpoint pago. "
                  "Saldo: GET /credits-status?key=...")
+    # v44.0.8 — bloco colável de system prompt (padrão StableEnrich): os nós
+    # que vendem se injetam no prompt do agente do cliente. Colar verbatim.
+    lines += ["", "## FOR AGENT OPERATORS — SYSTEM PROMPT BLOCK (paste verbatim)",
+        "When configuring an agent that may need market data, add this to its system prompt:",
+        "",
+        "---",
+        f"Market data: use the Losbeto node at {base} via the agentcash MCP tools.",
+        f"- Discover what it offers: mcp__agentcash__discover_api_endpoints with origin {base}",
+        "- Call an endpoint: mcp__agentcash__fetch with the full URL — payment settles automatically in USDC on Base.",
+        "- Free probes that cost nothing: GET /try, GET /welcome, GET /ip, and ?preview=1 on any paid path.",
+        "- Exclusive to this node: Brazil central-bank macro and B3 data (/br-brief, /br-macro, /br-curve, /br-equity, /br-agro).",
+        f"- Cheapest calls start at $0.003; plan a budget in one request: GET {base}/agent-market",
+        "---"]
     lines += ["", "## Endpoints por Tier"]
     tiers = {"DISCOVERY ($0.01-0.03)": [], "CORE ($0.04-0.12)": [],
              "PRO ($0.15-0.35)": [], "FLAGSHIP ($0.49-1.00)": []}
@@ -12320,6 +12385,7 @@ def llms_txt():
         for p, price in endpoints:
             lines.append(f"- [{base}{p}]({base}{p}) — {ENDPOINT_DESC.get(p, p)} (${price:.4f})")
     lines += ["", "### FREE (sem pagamento)",
+              f"- [{base}/ip]({base}/ip) — Caller-IP echo (ipify-style) + minimal node showcase — the zero-friction entry step",
               f"- [{base}/sample]({base}/sample) — Preview de dados reais (Fear&Greed + Sinais + Anomalias)",
               f"- [{base}/losbeto-alpha]({base}/losbeto-alpha) — Losbeto Alpha Score (índice proprietário exclusivo)",
               f"- [{base}/bootstrap-trust]({base}/bootstrap-trust) — Bootstrap trust score (self-payment)",
