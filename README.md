@@ -5,7 +5,7 @@
 A single-file Python node that sells market data to AI agents, per call, in USDC,
 with no API keys and no signup. Live at **https://api.losbeto.xyz**
 
-Stocks, forex, commodities, macro, **Brazil (BCB/B3)** and crypto — **77 endpoints**,
+Stocks, forex, commodities, macro, **Brazil (BCB/B3)** and crypto — **78 endpoints**,
 $0.003–$99.99, settling on Base (Coinbase CDP) and Solana (PayAI).
 
 Public telemetry (settlements, revenue, probes, source health, straight from the
