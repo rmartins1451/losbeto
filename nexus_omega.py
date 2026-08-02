@@ -87,7 +87,7 @@ from typing import Any, Optional, Dict, List, Tuple
 # 0. CONFIGURAÇÃO E AUTO-SETUP
 # ============================================================================
 
-VERSION = "44.0.8-FUNIL"
+VERSION = "44.0.9-MAQUINAS"
 BRAND_NAME = "Losbeto"
 BRAND_TAGLINE = "The Global Revenue Engine for Financial AI Agents"
 BRAND_EMOJI = "🧠"
@@ -2621,9 +2621,18 @@ class Brain:
     @staticmethod
     def rugcheck():
         mint = request.args.get("mint", "").strip()
+        # v44.0.9: sem ?mint=, o default útil é o lançamento Solana mais fresco
+        # (o caso de uso real do produto) — nunca erro cru pago (v21.11).
         if not mint or len(mint) < 32:
-            return {"error": "missing valid mint"}
-        risk = {"mint": mint, "checks": {}, "risk_level": "unknown", "score": 50}
+            try:
+                _fresh = [t for t in (Market.pump_new() or [])
+                          if t.get("chainId") == "solana"
+                          and len(t.get("tokenAddress", "")) >= 32]
+                mint = _fresh[0]["tokenAddress"] if _fresh else USDC_MINT
+            except Exception:
+                mint = USDC_MINT
+        risk = {"mint": mint, "checks": {}, "risk_level": "unknown", "score": 50,
+                "hint": "passe ?mint=<token_address> para auditar qualquer token"}
         try:
             if HELIUS_KEY:
                 r = requests.post(f"https://mainnet.helius-rpc.com/?api-key={HELIUS_KEY}",
@@ -2993,8 +3002,9 @@ class Brain:
         q = (request.args.get("q") or request.args.get("query") or "").strip()
         ts = int(time.time())
         if not q:
-            return {"error": "missing_param", "param": "q",
-                    "hint": "GET /research-brief?q=<your question>", "ts": ts}
+            # v44.0.9: default = a pergunta mais pedida do radar (btc, 15 IPs
+            # distintos) — demonstra o produto em vez de erro cru pago.
+            q = "bitcoin market today"
 
         sources, raw_bits = [], []
         # Fonte 1: DuckDuckGo Instant Answer + tópicos relacionados
@@ -3100,8 +3110,13 @@ class Brain:
              or request.args.get("mint") or request.args.get("query") or "").strip()
         ts = int(time.time())
         if not q:
-            return {"error": "missing_param", "param": "token",
-                    "hint": "GET /token-intel?token=<contract-or-ticker>", "ts": ts}
+            # v44.0.9: default = lançamento mais fresco (o caso de uso real) —
+            # nunca erro cru pago (v21.11).
+            try:
+                _fresh = (Market.pump_new() or [])
+                q = _fresh[0].get("tokenAddress") or "SOL"
+            except Exception:
+                q = "SOL"
         is_addr = q.startswith("0x") or (32 <= len(q) <= 44 and " " not in q
                                          and "/" not in q and "." not in q)
         pairs = []
@@ -3218,8 +3233,12 @@ class Brain:
         addr = (request.args.get("address") or request.args.get("wallet") or "").strip()
         ts = int(time.time())
         if not addr:
-            return {"error": "missing_param", "param": "address",
-                    "hint": "GET /wallet-scan?address=<solana-or-0x>", "ts": ts}
+            # v44.0.9 (padrão v21.11): default = a carteira do PRÓPRIO pagador
+            # (EVM ou Solana — o handler detecta a chain), com fallback para o
+            # exemplo documentado do nó. Nunca erro cru pago.
+            from flask import g as _g
+            _payer = str(getattr(_g, "losbeto_payer", "") or "").strip()
+            addr = _payer if _payer else RECEIVE_ADDRESS
         chain = "evm" if addr.lower().startswith("0x") else "solana"
         holdings, notes = [], []
         native = {"amount": None, "symbol": "SOL" if chain == "solana" else "ETH"}
@@ -3463,7 +3482,11 @@ class Brain:
         name    = request.args.get("name", "").strip()
         ts = int(time.time())
         if not address and not name:
-            return {"error": "Provide 'address' or 'name'", "ts": ts}
+            # v44.0.9 (padrão v21.11): default = a carteira do pagador,
+            # com fallback para o exemplo estável do nó. Nunca erro cru pago.
+            from flask import g as _g
+            _payer = str(getattr(_g, "losbeto_payer", "") or "").strip()
+            address = _payer if _payer else RECEIVE_ADDRESS
         query = address or name
         text = _ofac_sdn_text()
         matches = []
@@ -5504,6 +5527,44 @@ PROVIDER_REQUIRED_ENDPOINTS = {
     "/earnings-whisper": lambda: bool(FINNHUB_KEY or ALPHAVANTAGE_KEY),
 }
 
+# v44.0.9 — VALIDAÇÃO DE PARÂMETRO ANTES DO 402. Parâmetro inválido é erro do
+# CLIENTE: responde 400 didático e GRATUITO (valores válidos + exemplo de
+# chamada + preview grátis) — nunca um erro pago pós-settle, que os índices
+# de descoberta punem como fail rate e o agente pune não voltando. O radar de
+# demanda flagrou agentes chamando /br-equity?symbol=br-brief (nome do
+# endpoint no lugar do ticker); ausência de parâmetro NÃO é rejeitada aqui —
+# o handler aplica o default inteligente (padrão v21.11).
+_PARAM_RULES = {
+    "/br-equity": {
+        "param": "symbol",
+        "pattern": r"^(IBOV|[A-Z]{4}[0-9]{1,2})$",
+        "examples": ["PETR4", "VALE3", "ITUB4", "BBAS3", "WEGE3", "IBOV"],
+    },
+}
+
+def _preflight_param_check(path: str):
+    """Roda ANTES de qualquer 402 ou verificação de pagamento."""
+    rule = _PARAM_RULES.get(path)
+    if not rule:
+        return None
+    raw = request.args.get(rule["param"])
+    if raw is None or raw == "":
+        return None                      # ausente → handler aplica o default
+    if re.match(rule["pattern"], raw.strip().upper()):
+        return None
+    base = _public_base()
+    return ({"error": "invalid_param",
+             "param": rule["param"],
+             "received": raw[:32],
+             "valid_examples": rule["examples"],
+             "how_to_call": f"GET {base}{path}?{rule['param']}={rule['examples'][0]}",
+             "free_preview": f"{base}{path}?preview=1",
+             "charged": False,
+             "note": ("No payment challenge was issued. Fix the parameter and "
+                      f"retry — this call costs ${get_dynamic_price(path):.3f} "
+                      "once the parameter is valid."),
+             "ts": int(time.time())}, 400)
+
 
 def _preflight_unavailable(path: str):
     """Roda ANTES de qualquer 402 ou verificação de pagamento."""
@@ -5816,6 +5877,18 @@ def paid_endpoint(path):
                 _r.headers["Retry-After"] = str(_body["retry_after_seconds"])
                 return _r
 
+            # v44.0.9: parâmetro inválido → 400 didático e GRATUITO, antes do 402.
+            _pbad = _preflight_param_check(path)
+            if _pbad is not None:
+                LEDGER.log_request(path, False, int((time.time() - t0) * 1000), ip,
+                                   kind="param_rejected",
+                                   ua=request.headers.get("User-Agent", ""),
+                                   params=_clean_params())
+                _b, _c = _pbad
+                _r = jsonify(_b)
+                _r.status_code = _c
+                return _r
+
             if not sig:
                 LEDGER.log_request(path, False, int((time.time() - t0) * 1000), ip,
                                     kind="probe", ua=request.headers.get("User-Agent",""), params=_clean_params())
@@ -5847,6 +5920,28 @@ def paid_endpoint(path):
                 _g.losbeto_payment = info if isinstance(info, dict) else {}
                 try:
                     result = handler()
+                    # v44.0.9: handler respondeu "unavailable" — a fonte morreu
+                    # entre o settle e a geração (ex.: timeout de RPC). O
+                    # pagamento é on-chain e não volta; devolvemos crédito
+                    # equivalente — a regra do LLMUnavailable, agora para TODA
+                    # indisponibilidade pós-settle. Nunca mais 503 pago.
+                    if (isinstance(result, tuple) and len(result) >= 2
+                            and isinstance(result[0], dict)
+                            and result[0].get("status") == "unavailable"
+                            and isinstance(result[1], int) and result[1] >= 500):
+                        _amt = get_dynamic_price(path)
+                        _key = _refund_as_credit(payer, _amt, path, info.get("tx", ""))
+                        LEDGER.log_request(path, False, int((time.time() - t0) * 1000),
+                                           ip, kind="refunded",
+                                           ua=request.headers.get("User-Agent", ""),
+                                           params=_clean_params())
+                        result[0]["charged"] = True
+                        result[0]["refunded"] = True
+                        result[0]["refund_credit_usd"] = round(_amt, 6)
+                        result[0]["refund_api_key"] = _key
+                        result[0]["note"] = ("The data source failed after settlement. "
+                            "A credit equal to the amount paid has been issued — send "
+                            "it as the X-API-Key header on any endpoint, valid 30 days.")
                 except LLMUnavailable:
                     # Corrida: o gate passou, mas o provedor caiu entre o
                     # settle e a geração. O pagamento já é on-chain e não pode
@@ -8279,7 +8374,7 @@ GET __BASE__/oracle-consensus
 <span class="c"># 4 facilitator settles on Base or Solana; JSON returned</span>
 
 Networks: eip155:8453 (Base, Coinbase CDP) · solana (PayAI)
-Asset:    USDC · Prices: $0.003 – $0.30
+Asset:    USDC · Prices: $0.003 – $0.50
 <span class="c"># also answers MPP "Payment" challenges (IETF draft-httpauth-payment)
 # and is discoverable via Google UCP at /.well-known/ucp</span></pre>
 
@@ -8301,6 +8396,9 @@ also has a free delayed sample.</p>
 <pre><span class="c"># first REAL-TIME call free — no wallet, no signup</span>
 curl __BASE__/welcome
 curl -H 'X-Welcome-Token: &lt;token&gt;' __BASE__/pyth-price
+
+<span class="c"># free caller-IP echo — the zero-friction connectivity probe</span>
+curl __BASE__/ip
 
 <span class="c"># free — works with zero balance, six endpoints in one call</span>
 curl __BASE__/try
@@ -9656,11 +9754,9 @@ def _x402_audit_handler():
     pagamento e os modos de falha silenciosos que derrubam vendedores."""
     url = (request.args.get("url") or "").strip()
     if not url:
-        return {"error": "missing_url",
-                "usage": f"{_public_base()}/x402-audit?url=https://target/endpoint",
-                "note": "Audits any x402 endpoint for spec compliance and the "
-                        "silent failure modes that break sellers.",
-                "ts": int(time.time())}, 400
+        # v44.0.9: chamada bare = auditoria de demonstração no próprio nó —
+        # relatório limpo de um endpoint x402 exemplar, em vez de erro pago.
+        url = f"{_public_base()}/fear-greed"
     ok, motivo = _audit_url_safe(url)
     if not ok:
         return {"error": "url_rejected", "reason": motivo,
