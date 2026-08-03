@@ -87,7 +87,7 @@ from typing import Any, Optional, Dict, List, Tuple
 # 0. CONFIGURAÇÃO E AUTO-SETUP
 # ============================================================================
 
-VERSION = "44.0.9-MAQUINAS"
+VERSION = "44.1.0-ESPELHO"
 BRAND_NAME = "Losbeto"
 BRAND_TAGLINE = "The Global Revenue Engine for Financial AI Agents"
 BRAND_EMOJI = "🧠"
@@ -10524,10 +10524,33 @@ _SCAN_NOISE = re.compile(
 def _is_scan_noise(path: str) -> bool:
     return bool(_SCAN_NOISE.search(path or ""))
 
+def _route_now_live(path: str) -> bool:
+    """v44.1.0: a rota pedida EXISTE hoje? O radar é janela de 7 dias — um
+    caminho que era 404 quando registrado pode ter sido construído depois
+    (foi o caso de /ip e /health/). Sem esta checagem, o painel chamava de
+    'not built' um produto que já estava no ar."""
+    p = (path or "").strip()
+    if not p:
+        return False
+    cands = {p, p.rstrip("/")}
+    try:
+        for r in app.url_map.iter_rules():
+            if r.rule in cands and "GET" in (r.methods or ()):
+                return True
+    except Exception:
+        pass
+    return False
+
 def _demand_classify(path: str) -> dict:
     """v29.1: separa pedido que já dá para atender AGORA de pedido que exige
     fonte de dados nova. A primeira categoria é ganho barato — um apelido de
-    rota, zero dado novo. A segunda é decisão de produto."""
+    rota, zero dado novo. A segunda é decisão de produto.
+    v44.1.0: antes de tudo, resolve o rótulo NA HORA da renderização — se a
+    rota já existe, o pedido virou 'atendido', não 'produto novo'."""
+    if _route_now_live(path):
+        return {"kind": "resolved",
+                "action": "Já atendido — a rota existe hoje",
+                "closest": []}
     sug = _suggest_paths(path, n=2)
     if sug:
         # existe endpoint parecido -> provavelmente é questão de NOME
@@ -10560,6 +10583,9 @@ def demand_watch_loop():
                     continue
                 avisados.add(path)
                 cls = _demand_classify(path)
+                if cls["kind"] == "resolved":
+                    # v44.1.0: a rota já existe — demanda atendida, não alerta.
+                    continue
                 _notify_telegram(
                     f"🎯 *DEMANDA DETECTADA*\n\n"
                     f"Caminho pedido: `{path}`\n"
@@ -10580,6 +10606,10 @@ def _slash_redirect():
     slash-stripped path is a real route for this method, answer with a
     308 redirect (method-preserving) instead of a 404."""
     p = request.path or ""
+    # v44.1.0 NOTA: barra dupla no início (//br-brief, visto em produção) NÃO
+    # precisa de redirect — o Werkzeug normaliza request.path antes de qualquer
+    # hook e casa a rota correta (o 402 observado em produção era o fluxo
+    # normal de /br-brief). Verificado em teste com PATH_INFO cru.
     if len(p) > 1 and p.endswith("/"):
         stripped = p.rstrip("/")
         if stripped:
@@ -10845,7 +10875,7 @@ async function tick(){
     // demanda não atendida
     document.getElementById('dm').querySelector('tbody').innerHTML=
       (s.demand_404||[]).slice(0,6).map(function(d){
-        var tag=d.kind==='alias_candidate'?'alias exists':'not built';
+        var tag=d.kind==='resolved'?'✓ live now':(d.kind==='alias_candidate'?'alias exists':'not built');
         return '<tr><td>'+esc(d.path)+'</td><td>'+d.ips+' ip · '+tag+'</td></tr>';
       }).join('')||'<tr><td>nothing requested outside the catalog</td><td></td></tr>';
 
@@ -14198,7 +14228,11 @@ async function reload(){
       // v29.1: alias = atendível hoje (só falta o nome da rota).
       //        novo produto = exige fonte de dados nova.
       const alias = d.kind === "alias_candidate";
-      const tag = alias
+      const resolvido = d.kind === "resolved";
+      const tag = resolvido
+        ? `<span style="color:var(--neon)">✅ já atendido</span><br>`+
+          `<span style="font-size:10px;color:var(--muted)">rota existe hoje</span>`
+        : alias
         ? `<span style="color:var(--neon)">🔗 apelido resolve</span><br>`+
           `<span style="font-size:10px;color:var(--muted)">${(d.closest||[]).map(u=>u.split('/').pop()).join(', ')}</span>`
         : `<span style="color:var(--amber)">🆕 produto novo</span>`;
