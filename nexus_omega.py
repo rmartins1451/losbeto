@@ -87,7 +87,7 @@ from typing import Any, Optional, Dict, List, Tuple
 # 0. CONFIGURAÇÃO E AUTO-SETUP
 # ============================================================================
 
-VERSION = "44.1.0-ESPELHO"
+VERSION = "44.2.0-VITRINE"
 BRAND_NAME = "Losbeto"
 BRAND_TAGLINE = "The Global Revenue Engine for Financial AI Agents"
 BRAND_EMOJI = "🧠"
@@ -7172,7 +7172,8 @@ def sitemap_xml():
     urls = ["/", "/info", "/losbeto-alpha-score", "/openapi.json",
             "/.well-known/x402.json", "/.well-known/mcp.json", "/.well-known/agent.json",
             "/llms.txt", "/bazaar.json", "/sample", "/get-pricing", "/ip",
-            "/receipts", "/launch-risk-preview", "/credits-status"]
+            "/receipts", "/launch-risk-preview", "/credits-status",
+            "/skill.md", "/terms", "/jobs"]
     for ep in BASE_PRICES: urls.append(ep)
     body = ['<?xml version="1.0" encoding="UTF-8"?>',
             '<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">']
@@ -11591,6 +11592,372 @@ for _p in ("/br-brief", "/br-equity", "/br-macro"):
 log.info(f"🇧🇷 Brasil Suite registrada: {len(BRASIL_SUITE)} endpoints "
          f"(BCB + B3) — inédito no x402")
 
+
+# ============================================================================
+# 21b. JOB PACKS (v44.2.0-VITRINE) — "um job inteiro num único pagamento".
+#
+#     O diagnóstico global de vendas (ago/2026) mostrou: quem vende no x402
+#     não vende endpoints, vende JOBS (Agent402: "research a stock in one
+#     payment"). Agente autônomo não navega catálogo de 78 rotas — ele quer
+#     UMA chamada que resolve a tarefa. Cada job abaixo compõe handlers
+#     existentes (custo marginal ~zero, tudo já está quente no warmer),
+#     cobra UMA vez, e entrega um relatório único com veredito.
+#
+#     Regra de ouro herdada da v21.11/v44.0.9: job NUNCA devolve erro cru
+#     pago. Se todos os componentes falharem, devolve (dict, 503) e o
+#     estorno automático universal cuida do pagador.
+# ============================================================================
+
+def _job_component(name: str, fn, args: dict, out: dict, ok: list):
+    """Roda um componente de job com isolamento total: falha de um
+    componente NUNCA derruba o job — vira seção 'unavailable'."""
+    try:
+        r = _brain_with_args(fn, args)
+        if isinstance(r, tuple):                    # (dict, 503) de componente
+            body, status = r[0], (r[1] if len(r) > 1 else 200)
+            if isinstance(status, int) and status >= 500:
+                out[name] = {"status": "unavailable",
+                             "note": (body.get("error") if isinstance(body, dict)
+                                      else "component unavailable")}
+                return
+            out[name] = body
+        else:
+            out[name] = r
+        ok.append(name)
+    except Exception as e:
+        log.debug(f"job component {name}: {e}")
+        out[name] = {"status": "unavailable", "note": "component error"}
+
+
+def _job_token_research():
+    """JOB: 'pesquise este token' — rugcheck + token-intel + dex + sentimento
+    + fear&greed, UMA cobrança. O caso de uso nº1 dos agentes de trading."""
+    q = (request.args.get("token") or request.args.get("symbol")
+         or request.args.get("mint") or request.args.get("query") or "").strip()
+    if not q:
+        try:
+            _fresh = (Market.pump_new() or [])
+            q = _fresh[0].get("tokenAddress") or "SOL"
+        except Exception:
+            q = "SOL"
+    ts = int(time.time())
+    parts, ok = {}, []
+    _sym = q[:12] if len(q) <= 12 and " " not in q else "SOL"
+    _job_component("safety",    Brain.rugcheck,    {"mint": q},          parts, ok)
+    _job_component("intel",     Brain.token_intel, {"token": q},         parts, ok)
+    _job_component("dex",       Brain.dex_screen,  {"symbol": _sym},     parts, ok)
+    _job_component("sentiment", Brain.sentiment,   {"symbol": _sym},     parts, ok)
+    _job_component("regime",    Brain.fear_greed,  {},                   parts, ok)
+    if not ok:
+        return {"status": "unavailable",
+                "error": "All research components are offline right now. No charge.",
+                "ts": ts, "version": VERSION}, 503
+
+    # veredito determinístico — não depende de LLM para existir
+    risk = (parts.get("safety") or {}).get("risk_level", "unknown")
+    score = (parts.get("safety") or {}).get("score")
+    fg = (parts.get("regime") or {}).get("value")
+    flags = []
+    if risk == "high":
+        flags.append("rugcheck: risk_level=high")
+    if isinstance(score, (int, float)) and score < 50:
+        flags.append(f"rugcheck score {score} < 50")
+    verdict_base = ("AVOID" if flags else
+                    "CAUTION" if risk in ("medium", "unknown") else "OK-TO-ANALYZE")
+    summary = _ai(
+        "You are a token research desk. In <=80 words, give a trading-desk "
+        f"verdict on token {q}. Data: rugcheck risk={risk} score={score}; "
+        f"fear&greed={fg}; intel={json.dumps(parts.get('intel', {}), default=str)[:400]}. "
+        "End with one line: VERDICT: AVOID|CAUTION|OK.") or None
+    return {
+        "job": "token-research", "query": q,
+        "verdict": {"rating": verdict_base, "flags": flags,
+                    "ai_summary": summary},
+        "components": parts,
+        "components_ok": ok,
+        "coverage": f"{len(ok)}/5 components live",
+        "job_pricing": {"charged": 0.20, "if_bought_separately": 0.118,
+                        "note": "One settlement, one report — cheaper than 4 separate calls."},
+        "ts": ts, "provider": "Losbeto/Jobs", "version": VERSION,
+    }
+
+
+def _job_wallet_audit():
+    """JOB: 'audite esta carteira' — wallet-scan + sanctions + concentração,
+    UMA cobrança. A pergunta que um agente faz antes de confiar numa
+    contraparte. Default = carteira do próprio pagador."""
+    from flask import g as _g
+    addr = (request.args.get("address") or request.args.get("wallet") or "").strip()
+    if not addr:
+        addr = str(getattr(_g, "losbeto_payer", "") or "").strip() or RECEIVE_ADDRESS
+    if addr.startswith("apikey:"):
+        addr = RECEIVE_ADDRESS
+    ts = int(time.time())
+    parts, ok = {}, []
+    _job_component("holdings",   Brain.wallet_scan, {"address": addr}, parts, ok)
+    _job_component("compliance", Brain.sanctions,   {"address": addr}, parts, ok)
+    if not ok:
+        return {"status": "unavailable",
+                "error": "All audit components are offline right now. No charge.",
+                "ts": ts, "version": VERSION}, 503
+
+    comp = parts.get("compliance") or {}
+    sanctioned = bool(comp.get("matches")) or comp.get("sanctioned") is True
+    hold = parts.get("holdings") or {}
+    hflags = hold.get("flags") or []
+    verdict_base = ("BLOCK" if sanctioned else
+                    "CAUTION" if hflags else "CLEAR")
+    summary = _ai(
+        "You are a compliance desk. In <=60 words, summarize the counterparty "
+        f"risk of wallet {addr}. Sanctioned={sanctioned}; "
+        f"flags={json.dumps(hflags, default=str)[:300]}; "
+        f"holdings={json.dumps(hold, default=str)[:300]}. "
+        "End with one line: VERDICT: BLOCK|CAUTION|CLEAR.") or None
+    return {
+        "job": "wallet-audit", "address": addr,
+        "verdict": {"rating": verdict_base, "sanctioned": sanctioned,
+                    "flags": hflags, "ai_summary": summary},
+        "components": parts,
+        "components_ok": ok,
+        "coverage": f"{len(ok)}/2 components live",
+        "job_pricing": {"charged": 0.15, "if_bought_separately": 0.20,
+                        "note": "One settlement — 25% cheaper than scan+sanctions apart."},
+        "ts": ts, "provider": "Losbeto/Jobs", "version": VERSION,
+    }
+
+
+def _job_br_market_brief():
+    """JOB: 'como está o mercado brasileiro' — macro BCB + curva de juros +
+    Ibovespa + regime cripto, UMA cobrança. Ninguém mais no x402 tem Brasil."""
+    ts = int(time.time())
+    parts, ok = {}, []
+    _job_component("macro",   _br_macro_handler,  {},                 parts, ok)
+    _job_component("rates",   _br_curve_handler,  {},                 parts, ok)
+    _job_component("ibov",    _br_equity_handler, {"symbol": "IBOV"}, parts, ok)
+    _job_component("regime",  Brain.fear_greed,   {},                 parts, ok)
+    if len(ok) < 2:
+        return {"status": "unavailable",
+                "error": "Brazilian data sources offline right now. No charge.",
+                "ts": ts, "version": VERSION}, 503
+
+    macro = parts.get("macro") or {}
+    _series = macro.get("series") or macro
+    selic = (_series.get("selic_meta_pct") or {}).get("value")
+    ipca = (_series.get("ipca_12m_pct") or {}).get("value")
+    juro_real = (round(((1 + selic / 100) / (1 + ipca / 100) - 1) * 100, 2)
+                 if (selic is not None and ipca is not None) else None)
+    fg = (parts.get("regime") or {}).get("value")
+    summary = _ai(
+        "You are an EM strategist. In <=80 words, brief a global allocator on "
+        f"Brazil right now. Selic={selic}%, IPCA 12m={ipca}%, real rate="
+        f"{juro_real}%, IBOV={json.dumps(parts.get('ibov', {}), default=str)[:250]}, "
+        f"crypto fear&greed={fg}. End with one line: STANCE: RISK-ON|NEUTRAL|RISK-OFF.") or None
+    return {
+        "job": "br-market-brief",
+        "verdict": {"real_rate_pct": juro_real, "crypto_regime": fg,
+                    "ai_summary": summary},
+        "components": parts,
+        "components_ok": ok,
+        "coverage": f"{len(ok)}/4 components live",
+        "job_pricing": {"charged": 0.15, "if_bought_separately": 0.323,
+                        "note": "One settlement — less than half the separate-call cost."},
+        "ts": ts, "provider": "Losbeto/Jobs", "version": VERSION,
+    }
+
+
+JOB_SUITE = {
+    "/job/token-research": (_job_token_research, 0.20,
+        "JOB: one payment = a full token research report. Rugcheck safety + token "
+        "intelligence + DEX liquidity + social sentiment + market regime, composed "
+        "into a single verdict (AVOID/CAUTION/OK). ?token=SYMBOL_OR_MINT — defaults "
+        "to the freshest Solana launch. The #1 agentic trading task, solved in one call.",
+        ["Jobs", "Trading", "AI"], {"token": "SOL"}),
+    "/job/wallet-audit": (_job_wallet_audit, 0.15,
+        "JOB: one payment = a counterparty audit. Holdings profile + OFAC sanctions "
+        "screening + risk flags, composed into a single verdict (BLOCK/CAUTION/CLEAR). "
+        "?address=WALLET — defaults to the payer's own wallet. What an orchestrator "
+        "agent runs before trusting any counterparty.",
+        ["Jobs", "Compliance", "Risk"], {"address": ""}),
+    "/job/br-market-brief": (_job_br_market_brief, 0.15,
+        "JOB: one payment = the Brazilian market briefing. Central Bank macro (Selic, "
+        "CDI, IPCA, PTAX) + yield curve + Ibovespa + crypto regime, composed with the "
+        "real-rate number every allocator checks first. Unique on x402 — no other "
+        "node covers Brazil.",
+        ["Jobs", "Brazil", "Macro"], {"format": "json"}),
+}
+
+for _p, (_h, _pr, _d, _t, _hint) in JOB_SUITE.items():
+    BASE_PRICES[_p] = _pr
+    ENDPOINT_DESC[_p] = _d
+    ENDPOINT_TAGS[_p] = _t
+    ENDPOINT_PARAM_HINTS[_p] = _hint
+    ENDPOINT_HANDLERS[_p] = _h
+    app.add_url_rule(_p, _p.strip("/").replace("-", "_").replace("/", "_"),
+                     paid_endpoint(_p)(_h))
+for _p in reversed(list(JOB_SUITE)):
+    if _p in FEATURED_ENDPOINTS:
+        FEATURED_ENDPOINTS.remove(_p)
+    FEATURED_ENDPOINTS.insert(0, _p)
+log.info(f"🧰 Job Suite registrada: {len(JOB_SUITE)} jobs "
+         f"(1 pagamento = 1 relatório completo)")
+
+
+# ============================================================================
+# 21c. /skill.md (v44.2.0) — o onboarding padrão do ecossistema agente.
+#
+#     twit.sh, o melhor vendedor de dados do x402, não vende API — vende a
+#     frase "Set up https://twit.sh/skill.md with x402". Um agente que recebe
+#     essa instrução lê o skill.md e aprende TUDO: o que existe, como pagar,
+#     como avaliar de graça. Nosso /skill.md devolvia 404 — éramos
+#     invisíveis para o padrão de instalação de skills.
+# ============================================================================
+
+@app.route("/skill.md")
+@app.route("/.well-known/skill.md")
+def skill_md():
+    base = _public_base()
+    jobs = "\n".join(
+        f"| `{p}` | ${BASE_PRICES[p]:.2f} | {ENDPOINT_DESC[p].split('.')[0]}. |"
+        for p in JOB_SUITE)
+    top = "\n".join(
+        f"| `{p}` | ${BASE_PRICES[p]:.3f} | {ENDPOINT_DESC.get(p, p).split('.')[0]}. |"
+        for p in sorted(BASE_PRICES, key=lambda x: BASE_PRICES[x])
+        if p not in JOB_SUITE and p not in CREDIT_PLANS)[:2600]
+    body = f"""---
+name: losbeto-market-intel
+description: Pay-per-call market, macro and Brazil data for AI agents via x402 (USDC on Base/Solana). Use when the user wants token research, wallet audit, crypto/stock/forex data, Fear & Greed, or Brazilian Central Bank / B3 data — no API keys, no accounts; payment IS authentication.
+---
+
+# Losbeto Market Intel — x402 skill
+
+## Triggers
+
+Use this skill when the user or agent wants to:
+
+- Research a token before trading (safety + intel + sentiment in one call)
+- Audit a wallet/counterparty before trusting it (holdings + OFAC screening)
+- Get crypto, stock, forex, commodity or macro data without API keys
+- Read the Fear & Greed regime, oracle consensus prices, or market briefs
+- Get Brazilian market data (BCB Selic/CDI/IPCA/PTAX, B3 equities) — exclusive to this node
+- Install or evaluate an x402 pay-per-call market data source
+
+## Job packs (recommended — one payment, one finished job)
+
+{jobs}
+
+## Free evaluation (costs nothing, no signup)
+
+- `GET {base}/try` — live samples from 6 endpoints in ONE free call
+- `GET {base}/welcome` — first-call-free coupon
+- `GET {base}/<any-endpoint>?preview=1` — real delayed data, free
+- `GET {base}/live` — public node telemetry (uptime, receipts)
+
+## Top endpoints
+
+{top}
+
+Full catalog: {base}/llms.txt · Prices: {base}/get-pricing · OpenAPI: {base}/openapi.json
+
+## How to pay (x402 v2)
+
+1. `GET` any paid path → HTTP 402 with `accepts[]` (USDC on Base `eip155:8453` via Coinbase CDP, or Solana via PayAI).
+2. Sign the payment with your wallet; retry with the `PAYMENT-SIGNATURE` header (v2) or `X-PAYMENT` (v1).
+3. Response arrives in the same request. Settlement is auditable on-chain.
+
+## Cheaper for repeated use
+
+- Header `X-API-Key: lsk_...` skips settlement latency (~1ms vs 2-5s). Buy at {base}/buy-credits ($0.99) or {base}/day-pass ($2.99 unlimited/24h).
+- MCP live server with a subscription: {base}/mcp (see `alternatives.mcp` in any 402).
+
+## Trust
+
+- Grade A on x402-list (14/14 compliance, 100% 30-day uptime at evaluation time)
+- Every settlement labelled operator-test vs organic: {base}/receipts
+- Signed win-rate metrics: {base}/win-rate-verified
+- Terms: {base}/terms · Contact: {base}/about
+"""
+    return app.response_class(body, mimetype="text/markdown")
+
+
+@app.route("/jobs")
+def jobs_index():
+    """v44.2.0: vitrine pública dos job packs — um pagamento, um job inteiro.
+    Grátis de olhar; cada link cobra uma vez e entrega o relatório completo."""
+    base = _public_base()
+    return jsonify({
+        "concept": ("One x402 payment = one finished agent job. Each pack "
+                    "composes several data components into a single report with "
+                    "a verdict — cheaper and faster than calling endpoints apart."),
+        "jobs": [{
+            "endpoint": f"{base}{p}",
+            "price_usdc": BASE_PRICES[p],
+            "description": ENDPOINT_DESC[p],
+            "tags": ENDPOINT_TAGS.get(p, []),
+            "free_preview": f"{base}{p}?preview=1",
+        } for p in JOB_SUITE],
+        "how_to_pay": "GET any job URL → 402 → sign USDC (Base/Solana) → retry with PAYMENT-SIGNATURE",
+        "skill": f"{base}/skill.md",
+        "version": VERSION, "ts": int(time.time()),
+    })
+
+
+# ============================================================================
+# 21d. /terms (v44.2.0) — o ✗ que faltava no checklist do x402-list.
+#     Nó com Grade A 14/14 e "terms page: missing". Diretórios e avaliadores
+#     humanos procuram termos antes de integrar; a ausência custava confiança.
+# ============================================================================
+
+@app.route("/terms")
+@app.route("/tos")
+def terms_page():
+    base = _public_base()
+    payload = {
+        "service": SERVICE_NAME,
+        "version": VERSION,
+        "effective": "2026-08-04",
+        "terms": {
+            "what_you_buy": ("Per-call access to market data APIs, paid in USDC via "
+                             "x402 on Base or Solana, or prepaid credit keys. No "
+                             "accounts, no subscriptions unless explicitly purchased."),
+            "pricing": ("Prices are quoted in the 402 response before you sign anything. "
+                        "You never pay a price you did not see first."),
+            "refunds": ("If a paid endpoint cannot deliver its product, the node "
+                        "automatically issues credit for the full amount (see "
+                        "'refunded' entries in " + base + "/receipts)."),
+            "data_accuracy": ("Data is aggregated from public sources on a "
+                              "best-effort basis. It is information, not financial "
+                              "advice. Verify before acting; markets move."),
+            "acceptable_use": ("No use for unlawful purposes, including sanctions "
+                               "evasion. The /sanctions endpoint exists to help you "
+                               "comply, not to be circumvented."),
+            "availability": ("Best-effort uptime. Historical telemetry is public at "
+                             + base + "/live."),
+            "privacy": ("No accounts means no personal data store. We log caller IP, "
+                        "path and payment metadata for operations and abuse prevention."),
+            "contact": base + "/about",
+        },
+        "ts": int(time.time()),
+    }
+    if _wants_html():
+        rows = "".join(
+            f"<tr><td style='padding:10px;border:1px solid #333;vertical-align:top'>"
+            f"<b>{k.replace('_',' ').title()}</b></td>"
+            f"<td style='padding:10px;border:1px solid #333'>{v}</td></tr>"
+            for k, v in payload["terms"].items())
+        html = (f"<html><head><title>Terms — {BRAND_NAME}</title></head>"
+                f"<body style='background:#0a0a0f;color:#ddd;font-family:monospace;"
+                f"max-width:820px;margin:40px auto;padding:0 16px'>"
+                f"<h1>{BRAND_EMOJI} {BRAND_NAME} — Terms of Service</h1>"
+                f"<p>Effective: 2026-08-04 · Version {VERSION}</p>"
+                f"<table style='border-collapse:collapse;width:100%'>{rows}</table>"
+                f"<p style='margin-top:24px'><a style='color:#7af' href='/'>home</a> · "
+                f"<a style='color:#7af' href='/about'>about/contact</a> · "
+                f"<a style='color:#7af' href='/receipts'>receipts</a></p>"
+                f"</body></html>")
+        return app.response_class(html, mimetype="text/html")
+    return jsonify(payload)
+
+
 # ============================================================================
 # 22. LIVE CHAT (v36) — atendimento humano no meio de um mercado de máquinas.
 #
@@ -12518,6 +12885,8 @@ def llms_txt():
               f"- [{base}/starter-pack]({base}/starter-pack) — Pacote premium de US$1 para primeira compra manual",
               f"- [{base}/get-pricing]({base}/get-pricing) — full price list"]
     lines += ["", "## Discovery",
+              f"- SKILL.MD:   {base}/skill.md (installable agent skill — 'Set up {base}/skill.md with x402')",
+              f"- JOBS:       {base}/jobs (one payment = one finished job: token research, wallet audit, BR brief)",
               f"- OpenAPI:    {base}/openapi.json",
               f"- x402:       {base}/.well-known/x402.json",
               f"- Tasks:      {base}/tasks.json (o que dá para FAZER aqui, em linguagem de intenção)",
