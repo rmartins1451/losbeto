@@ -87,7 +87,7 @@ from typing import Any, Optional, Dict, List, Tuple
 # 0. CONFIGURAÇÃO E AUTO-SETUP
 # ============================================================================
 
-VERSION = "44.3.1-FONTE-RESILIENTE"
+VERSION = "44.3.2-ALIAS"
 BRAND_NAME = "Losbeto"
 BRAND_TAGLINE = "The Global Revenue Engine for Financial AI Agents"
 BRAND_EMOJI = "🧠"
@@ -11966,6 +11966,43 @@ for _p in reversed(list(JOB_SUITE)):
     FEATURED_ENDPOINTS.insert(0, _p)
 log.info(f"🧰 Job Suite registrada: {len(JOB_SUITE)} jobs "
          f"(1 pagamento = 1 relatório completo)")
+
+
+# ============================================================================
+# 21b-ALIAS. APELIDOS DE DEMANDA (v44.3.2) — o radar de 7 dias mostrou agentes
+#     chutando caminhos convencionais e tomando 404: 29 pedidos de ~20 IPs
+#     distintos ("/search" 11/4ip, "/x402" 6/4ip, "/api/agent/discover" 6/4ip,
+#     "/token-research" 5/5ip, "/bootstrap-trust/x402" 5/5ip). Cada apelido
+#     serve o produto real INTEIRO — mesmo preço, mesmo 402, mesmo preview,
+#     mesma liquidação — porque reusa o paid_endpoint() do alvo (o verify
+#     não amarra o pagamento à URL; preço/desafio/registro seguem o alvo).
+#     Zero dado novo, zero entrada duplicada nos manifests/catálogos:
+#     os apelidos NÃO entram em BASE_PRICES nem ENDPOINT_HANDLERS.
+# ============================================================================
+
+ALIAS_ROUTES = {
+    "/search":             "/web-search",          # convenção universal de busca
+    "/x402":               "/x402-audit",          # "audite este nó x402"
+    "/api/agent/discover": "/agent-market",        # descoberta de agente
+    "/token-research":     "/job/token-research",  # nome óbvio do job
+}
+for _alias, _target in ALIAS_ROUTES.items():
+    _h = ENDPOINT_HANDLERS.get(_target)
+    if _h:
+        app.add_url_rule(
+            _alias,
+            "alias" + _alias.replace("/", "_").replace("-", "_"),
+            paid_endpoint(_target)(_h),
+            methods=["GET", "POST"],
+        )
+    else:
+        log.warning(f"⚠️ apelido {_alias} sem alvo registrado ({_target}) — pulando")
+# /bootstrap-trust/x402: quem leu os docs e chutou o caminho — mesma view
+# (GET devolve as instruções de bootstrap; POST valida o X-Payment igual).
+app.add_url_rule("/bootstrap-trust/x402", "alias_bootstrap_trust_x402",
+                 bootstrap_trust, methods=["GET", "POST"])
+log.info(f"🔗 Apelidos de demanda registrados: {len(ALIAS_ROUTES) + 1} rotas "
+         f"({', '.join(ALIAS_ROUTES)} + /bootstrap-trust/x402)")
 
 
 # ============================================================================
