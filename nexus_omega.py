@@ -87,7 +87,7 @@ from typing import Any, Optional, Dict, List, Tuple
 # 0. CONFIGURAÇÃO E AUTO-SETUP
 # ============================================================================
 
-VERSION = "44.2.0-VITRINE"
+VERSION = "44.2.1-FALLBACK-PAYAI"
 BRAND_NAME = "Losbeto"
 BRAND_TAGLINE = "The Global Revenue Engine for Financial AI Agents"
 BRAND_EMOJI = "🧠"
@@ -204,6 +204,23 @@ LLM_FORCE_ENGLISH = os.environ.get("LLM_FORCE_ENGLISH", "1") != "0"
 # v41.1: campo experimental no settle CDP. Ver comentário em Facilitator.settle.
 # Padrão DESLIGADO — não arriscamos a liquidação em Base por uma hipótese.
 CDP_SEND_RESOURCE = os.environ.get("CDP_SEND_RESOURCE", "").strip() in ("1", "true")
+
+# v44.2.1 — CONTINGÊNCIA DE LIQUIDAÇÃO EM BASE.
+# Em 04-05/ago/2026 a CDP passou a recusar TODOS os verify de Base no nó
+# ("facilitator-verify-failed" em toda chamada, com carteira do pagador
+# assinando certo e com saldo — provado contra o facilitador PayAI, que
+# aceitou o mesmo payload e só recusou saldo zerado de carteira de teste).
+# Resultado: loja fechada — zero liquidações desde 04/ago ~15:00 UTC.
+# Com esta flag (padrão LIGADA), um pagamento EVM recusado pela CDP é tentado
+# de novo no facilitador principal (PayAI) antes de desistir da venda.
+# PayAI não indexa no Bazaar — mas venda liquidada sem catálogo > venda
+# perdida com catálogo. A tentativa CDP continua primeiro: quando a CDP
+# volta ao normal, o Bazaar segue indexando e o fallback nem é usado.
+#   CDP_FALLBACK_PAYAI=0  → comportamento antigo (só CDP em Base)
+# Seguro contra dupla liquidação: a autorização EIP-3009 é de uso único
+# (nonce) — se dois facilitadores tentassem liquidar, o segundo falharia
+# on-chain. E settle só roda depois de verify OK naquele facilitador.
+CDP_FALLBACK_PAYAI = os.environ.get("CDP_FALLBACK_PAYAI", "1").strip() not in ("0", "false")
 
 # v42 — MPP (Machine Payments Protocol, IETF draft-httpauth-payment-00, da
 # Stripe/Tempo) e UCP (Universal Commerce Protocol, do Google).
@@ -5175,14 +5192,28 @@ def _verify_payment(endpoint: str, payment_header: str):
                 continue
             # v21.13: roteamento por rede — Base vai pra CDP (indexa no Bazaar),
             # Solana continua no PayAI. Fallback: facilitator principal.
-            fac = (CDP_FAC if (CDP_FAC and _req_net.startswith("eip155"))
-                   else FACILITATOR)
-            if not fac:
+            # v44.2.1: se a CDP recusar um pagamento EVM, tenta o facilitador
+            # principal (PayAI) como contingência ANTES de desistir da venda
+            # (ver flag CDP_FALLBACK_PAYAI no topo). `fac` guarda quem de fato
+            # verificou — settle, bazaar blob e resource seguem esse mesmo `fac`,
+            # então blob/resource da CDP só vão quando a CDP liquidou.
+            if CDP_FAC and _req_net.startswith("eip155"):
+                facs = [CDP_FAC]
+                if FACILITATOR and CDP_FALLBACK_PAYAI:
+                    facs.append(FACILITATOR)
+            else:
+                facs = [FACILITATOR] if FACILITATOR else []
+            if not facs:
                 continue
-            ok, reason, vdata = fac.verify(payload, req)
-            if not ok:
+            ok, reason, vdata, fac = False, "no-facilitator", {}, None
+            for _f in facs:
+                ok, reason, vdata = _f.verify(payload, req)
+                if ok:
+                    fac = _f
+                    break
                 last_reason = reason or "facilitator-rejected"
-                log.warning(f"⚠️ {'CDP' if getattr(fac, 'is_cdp', False) else 'FACILITATOR'}.verify falhou p/ {endpoint}: {last_reason} | vdata={vdata}")
+                log.warning(f"⚠️ {'CDP' if getattr(_f, 'is_cdp', False) else 'FACILITATOR'}.verify falhou p/ {endpoint}: {last_reason} | vdata={vdata}")
+            if not ok or not fac:
                 continue
             # v21.2 FIX: verify() só confirma que a assinatura é válida — quem
             # de fato move o dinheiro on-chain é settle(). Sem isso, o "exact"
