@@ -87,7 +87,7 @@ from typing import Any, Optional, Dict, List, Tuple
 # 0. CONFIGURAÇÃO E AUTO-SETUP
 # ============================================================================
 
-VERSION = "44.3.0-FUNIL-ABERTO"
+VERSION = "44.3.1-FONTE-RESILIENTE"
 BRAND_NAME = "Losbeto"
 BRAND_TAGLINE = "The Global Revenue Engine for Financial AI Agents"
 BRAND_EMOJI = "🧠"
@@ -1812,8 +1812,47 @@ class Market:
     @classmethod
     def binance_24h(cls):
         def f():
-            r = requests.get("https://api.binance.com/api/v3/ticker/24hr", timeout=15)
-            return r.json() if r.ok else []
+            # v44.3.1 — FONTE MORTA NÃO PODE VIRAR PRODUTO VAZIO.
+            # api.binance.com responde 451 (região restrita) para vários IPs de
+            # cloud — inclusive o do Railway. Com r.ok=False o código devolvia
+            # [] e /anomalias, /arbitrage e /forex-arbitrage serviam listas
+            # vazias PAGAS. Agora: 5 hosts Binance e, se todos falharem,
+            # CoinGecko /coins/markets normalizado para o MESMO shape
+            # (symbol *USDT, priceChangePercent, quoteVolume, lastPrice).
+            for host in ("https://api.binance.com", "https://api1.binance.com",
+                         "https://api2.binance.com", "https://api3.binance.com",
+                         "https://api4.binance.com"):
+                try:
+                    r = requests.get(host + "/api/v3/ticker/24hr", timeout=12)
+                    if r.ok:
+                        return r.json()
+                except Exception:
+                    continue
+            try:
+                r = requests.get("https://api.coingecko.com/api/v3/coins/markets",
+                                 params={"vs_currency": "usd", "order": "volume_desc",
+                                         "per_page": "250", "page": "1",
+                                         "price_change_percentage": "24h"},
+                                 timeout=15)
+                if r.ok:
+                    out = []
+                    for c in r.json():
+                        sym = (c.get("symbol") or "").upper()
+                        if not sym:
+                            continue
+                        out.append({
+                            "symbol": sym + "USDT",
+                            "priceChangePercent": str(c.get("price_change_percentage_24h") or 0),
+                            "quoteVolume": str(c.get("total_volume") or 0),
+                            "lastPrice": str(c.get("current_price") or 0),
+                        })
+                    if out:
+                        log.info("binance_24h: servindo fallback CoinGecko "
+                                 f"({len(out)} símbolos) — Binance inalcançável")
+                        return out
+            except Exception:
+                pass
+            return []
         return cls._cached("binance_24h", f, 60) or []
 
     @classmethod
