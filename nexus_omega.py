@@ -87,7 +87,7 @@ from typing import Any, Optional, Dict, List, Tuple
 # 0. CONFIGURAÇÃO E AUTO-SETUP
 # ============================================================================
 
-VERSION = "44.2.1-FALLBACK-PAYAI"
+VERSION = "44.2.2-MOTIVO-NO-402"
 BRAND_NAME = "Losbeto"
 BRAND_TAGLINE = "The Global Revenue Engine for Financial AI Agents"
 BRAND_EMOJI = "🧠"
@@ -5107,6 +5107,8 @@ def _verify_payment(endpoint: str, payment_header: str):
     payer  = ""
     network = "solana"
     payload = {}
+    last_reason = ""   # v44.2.2: motivo do facilitador, devolvido no 402
+    fac_reasons = {}   # v44.2.2: um motivo por facilitador (dedup entre accepts)
     try:
         decoded = base64.b64decode(payment_header).decode()
         pdata = json.loads(decoded)
@@ -5211,7 +5213,14 @@ def _verify_payment(endpoint: str, payment_header: str):
                 if ok:
                     fac = _f
                     break
-                last_reason = reason or "facilitator-rejected"
+                # v44.2.2: motivo carimbado com o nome do facilitador — vai pro
+                # log E (via retorno final) pro corpo do 402, então o cliente
+                # vê na hora POR QUE recusou, sem abrir os logs do Railway.
+                # fac_reasons guarda um por facilitador: com fallback ligado,
+                # o 402 mostra o motivo da CDP E do PayAI, não só o último.
+                _tag = 'CDP' if getattr(_f, 'is_cdp', False) else 'PayAI'
+                fac_reasons[_tag] = str(reason or 'facilitator-rejected')[:140]
+                last_reason = "; ".join(f"{k}:{v}" for k, v in fac_reasons.items())
                 log.warning(f"⚠️ {'CDP' if getattr(_f, 'is_cdp', False) else 'FACILITATOR'}.verify falhou p/ {endpoint}: {last_reason} | vdata={vdata}")
             if not ok or not fac:
                 continue
@@ -5270,9 +5279,13 @@ def _verify_payment(endpoint: str, payment_header: str):
             return True, "ok", {"payer": payer_addr or payer, "tx": tx_sig}
         return False, info if isinstance(info, str) else "verify-failed", {}
     if chain == "base":
-        if not FACILITATOR:
+        if not FACILITATOR and not CDP_FAC:
             return False, "base-needs-facilitator", {}
-        return False, "facilitator-verify-failed", {}
+        # v44.2.2: devolve o motivo real do facilitador no 402 (truncado) —
+        # o cliente vê "Payment invalid: CDP:invalid_exact_evm_..." na tela
+        # em vez de um "verify-failed" genérico. Diagnóstico sem abrir log.
+        _motivo = str(last_reason)[:220] if last_reason else "sem-detalhe"
+        return False, f"facilitator-verify-failed: {_motivo}", {}
     return False, "unknown-chain", {}
 
 def _notify_telegram(text: str):
