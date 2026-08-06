@@ -87,7 +87,7 @@ from typing import Any, Optional, Dict, List, Tuple
 # 0. CONFIGURAÇÃO E AUTO-SETUP
 # ============================================================================
 
-VERSION = "44.2.3-SETTLE-FALLBACK"
+VERSION = "44.3.0-FUNIL-ABERTO"
 BRAND_NAME = "Losbeto"
 BRAND_TAGLINE = "The Global Revenue Engine for Financial AI Agents"
 BRAND_EMOJI = "🧠"
@@ -2532,21 +2532,41 @@ class Brain:
     @staticmethod
     def anomalias():
         data = Market.binance_24h() or []
-        anomalies = []
-        for d in data:
-            try:
-                ch = float(d.get("priceChangePercent", 0))
-                vol = float(d.get("quoteVolume", 0))
-                if abs(ch) > 15 and vol > 1e6 and d["symbol"].endswith("USDT"):
-                    anomalies.append({
-                        "symbol": d["symbol"], "change_pct": ch,
-                        "volume_usd": round(vol, 0),
-                        "type": "pump" if ch > 0 else "dump",
-                    })
-            except Exception:
-                pass
-        anomalies.sort(key=lambda x: -abs(x["change_pct"]))
-        return {"count": len(anomalies), "top": anomalies[:15], "version": VERSION}
+
+        def _scan(limiar):
+            out = []
+            for d in data:
+                try:
+                    ch = float(d.get("priceChangePercent", 0))
+                    vol = float(d.get("quoteVolume", 0))
+                    if abs(ch) >= limiar and vol > 1e6 and d["symbol"].endswith("USDT"):
+                        out.append({
+                            "symbol": d["symbol"], "change_pct": ch,
+                            "volume_usd": round(vol, 0),
+                            "type": "pump" if ch > 0 else "dump",
+                        })
+                except Exception:
+                    pass
+            out.sort(key=lambda x: -abs(x["change_pct"]))
+            return out
+
+        # v44.3.0: mercado quieto NÃO pode devolver vitrine vazia — era a
+        # amostra pública do endpoint e um count=0 parecia produto quebrado.
+        # Desce o limiar em degraus e sempre lista os maiores movimentos do
+        # dia, rotulados com o limiar de fato usado. Dado real, rótulo honesto.
+        anomalies, limiar = [], 15
+        for limiar in (15, 8, 3, 0):
+            anomalies = _scan(limiar)
+            if anomalies:
+                break
+        fortes = [a for a in anomalies if abs(a["change_pct"]) >= 15]
+        return {"count": len(fortes), "top": anomalies[:15],
+                "threshold_pct": limiar,
+                "market_state": "active" if fortes else "quiet",
+                "note": (None if fortes else
+                         f"No anomalies above 15% in the last 24h — listing the "
+                         f"largest moves above {limiar}% instead."),
+                "version": VERSION}
 
     @staticmethod
     def jupiter_swap():
@@ -5386,8 +5406,20 @@ def _building_block() -> dict:
 PREVIEW_PAYWALL = {e.strip() for e in os.environ.get(
     "PREVIEW_PAYWALL", "").split(",") if e.strip()}
 
+# v44.3.0 — O EXPERIMENTO A/B DO PREVIEW ENCERROU. Veredito nos dados de
+# produção: com a amostra suspensa, o funil de avaliação morreu (5 avaliadores
+# em 24h, funil real = 2 IPs externos) E o nó quebrava a promessa de "free
+# preview" feita em 6 lugares públicos (header x-free-preview, link rel=preview,
+# sampleQueries do Bazaar, /try, docs). Loja não suspende a degustação para
+# medir se a degustação vende. A env PREVIEW_PAYWALL agora é ignorada — remova-a
+# das variáveis do Railway quando puder.
+if PREVIEW_PAYWALL:
+    log.warning("⚠️ PREVIEW_PAYWALL definido mas IGNORADO desde a v44.3.0 — "
+                "amostra grátis é o funil de avaliação. Remova a env.")
+
 def _preview_blocked(path: str) -> bool:
-    return path in PREVIEW_PAYWALL
+    # v44.3.0: preview é SEMPRE livre. O funil de avaliação é sagrado.
+    return False
 
 def _preview_paywall_body(path: str) -> dict:
     """Recusa honesta: diz que é experimento, diz o preço, e oferece as
@@ -10581,8 +10613,10 @@ log.info("🔮 Oracle Consensus registrado ($0.03) — 5 fontes em paralelo")
 # ============================================================================
 
 # Caminhos que scanners hostis varrem: ruído, não demanda.
+# v44.3.0: `/wp/` (sem hífen) escapava do filtro e o radar de demanda chamava
+# sonda de WordPress de "produto novo" — 4 IPs em 7d poluindo a leitura.
 _SCAN_NOISE = re.compile(
-    r"(\.env|\.git|\.aws|\.ssh|credentials|id_rsa|wp-|wordpress|phpmyadmin|"
+    r"(\.env|\.git|\.aws|\.ssh|credentials|id_rsa|/wp(/|$)|wp-|wordpress|phpmyadmin|"
     r"\.php|admin|backup|dump|\.sql|\.bak|serviceaccount|firebase|"
     r"secrets?\.|config\.(json|yml|yaml)|actuator|/api/v1/(pods|namespaces)|"
     r"\.well-known/(acme|security)|favicon|robots|sitemap|apple-touch|"
@@ -10614,6 +10648,12 @@ def _demand_classify(path: str) -> dict:
     rota, zero dado novo. A segunda é decisão de produto.
     v44.1.0: antes de tudo, resolve o rótulo NA HORA da renderização — se a
     rota já existe, o pedido virou 'atendido', não 'produto novo'."""
+    # v44.3.0: sonda de exploração NÃO é demanda — sai do radar de produto e
+    # não dispara alerta no Telegram. Dados crus seguem gravados no ledger.
+    if _is_scan_noise(path):
+        return {"kind": "scanner_noise",
+                "action": "Sonda de exploração (WordPress/CMS/config) — ruído filtrado",
+                "closest": []}
     if _route_now_live(path):
         return {"kind": "resolved",
                 "action": "Já atendido — a rota existe hoje",
@@ -10650,8 +10690,9 @@ def demand_watch_loop():
                     continue
                 avisados.add(path)
                 cls = _demand_classify(path)
-                if cls["kind"] == "resolved":
+                if cls["kind"] in ("resolved", "scanner_noise"):
                     # v44.1.0: a rota já existe — demanda atendida, não alerta.
+                    # v44.3.0: sonda de exploração — ruído, não alerta.
                     continue
                 _notify_telegram(
                     f"🎯 *DEMANDA DETECTADA*\n\n"
@@ -10759,6 +10800,26 @@ def _suggest_paths(path: str, n: int = 3) -> list:
         return [f"{_public_base()}{ep}" for _, ep in pontos[:n]]
     except Exception:
         return []
+
+@app.route("/.well-known/glama.json")
+def manifest_glama():
+    """v44.3.0 — o radar de demanda registrou 9 pedidos de 2 IPs em 7d para
+    /.well-known/glama.json: é o crawler do Glama (diretório MCP) procurando
+    o manifest de claim/manutenção do servidor. Formato oficial mínimo:
+    $schema + maintainers (github.com/glama.ai — blog 'what-is-glamajson').
+    Sem isso o servidor existia no índice deles sem dono verificado."""
+    return jsonify({
+        "$schema":     "https://glama.ai/mcp/schemas/server.json",
+        "maintainers": ["rmartins1451"],
+        "name":        "losbeto",
+        "description": (f"Pay-per-call market data for AI agents over x402: multi-oracle "
+                        f"price consensus, sentiment, forex, equities, commodities and "
+                        f"Brazil macro (BCB/B3). {len(BASE_PRICES)} tools, USDC on "
+                        f"Base and Solana, no API keys."),
+        "homepage":    _public_base(),
+        "mcp":         f"{_public_base()}/mcp",
+        "repository":  {"type": "git", "url": "https://github.com/rmartins1451/losbeto"},
+    })
 
 @app.route("/.well-known/mcp.json")
 def manifest_mcp():
@@ -14664,7 +14725,11 @@ async function reload(){
       //        novo produto = exige fonte de dados nova.
       const alias = d.kind === "alias_candidate";
       const resolvido = d.kind === "resolved";
-      const tag = resolvido
+      const ruido = d.kind === "scanner_noise";
+      const tag = ruido
+        ? `<span style="color:var(--muted)">🤖 scanner</span><br>`+
+          `<span style="font-size:10px;color:var(--muted)">ruído filtrado — não é demanda</span>`
+        : resolvido
         ? `<span style="color:var(--neon)">✅ já atendido</span><br>`+
           `<span style="font-size:10px;color:var(--muted)">rota existe hoje</span>`
         : alias
