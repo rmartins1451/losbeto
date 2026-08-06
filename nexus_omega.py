@@ -87,7 +87,7 @@ from typing import Any, Optional, Dict, List, Tuple
 # 0. CONFIGURAÇÃO E AUTO-SETUP
 # ============================================================================
 
-VERSION = "44.3.2-ALIAS"
+VERSION = "44.3.3-DISJUNTOR"
 BRAND_NAME = "Losbeto"
 BRAND_TAGLINE = "The Global Revenue Engine for Financial AI Agents"
 BRAND_EMOJI = "🧠"
@@ -1766,6 +1766,50 @@ else:
     log.info(f"🏪 CDP/Bazaar desabilitado: {_cdp_reason}")
 if FACILITATOR:
     log.info(f"🤝 Facilitator habilitado: {FACILITATOR_URL}")
+
+# v44.3.3 — DISJUNTOR DA CDP (circuit breaker).
+# Enquanto a conta CDP estiver sem método de pagamento (payment_method_required
+# desde 04/ago) ou com chave inválida, TODA venda Base gastava ~1s chamando a
+# CDP condenada antes de cair no PayAI, e o log enchia de WARNINGs idênticos.
+# Agora: falhas DE CONTA (billing/auth — nunca falhas do PAGADOR, tipo saldo
+# insuficiente) alimentam um contador; em N seguidas o disjuntor ABRE por um
+# cooldown e as vendas Base vão direto ao PayAI. Ao fim do cooldown a CDP é
+# sondada de novo — no instante em que a conta for regularizada, o probe
+# passa, o disjuntor fecha sozinho e o Bazaar volta a indexar. Zero deploy.
+_CDP_BREAKER = {"fails": 0, "open_until": 0.0, "broken": False}
+CDP_BREAKER_THRESHOLD = int(os.environ.get("CDP_BREAKER_THRESHOLD", "3"))
+CDP_BREAKER_COOLDOWN  = int(os.environ.get("CDP_BREAKER_COOLDOWN", "3600"))
+
+def _cdp_failure_is_account_level(reason) -> bool:
+    r = str(reason or "").lower()
+    return ("payment_method_required" in r
+            or "facilitator-401" in r or "facilitator-402" in r
+            or "facilitator-403" in r
+            or "unauthorized" in r or "forbidden" in r)
+
+def _cdp_available() -> bool:
+    return time.time() >= _CDP_BREAKER["open_until"]
+
+def _cdp_note_failure(reason):
+    if not _cdp_failure_is_account_level(reason):
+        return   # falha do pagador (saldo etc.) não diz nada sobre a conta CDP
+    _CDP_BREAKER["fails"] += 1
+    if (_CDP_BREAKER["fails"] >= CDP_BREAKER_THRESHOLD
+            and time.time() >= _CDP_BREAKER["open_until"]):
+        _CDP_BREAKER["open_until"] = time.time() + CDP_BREAKER_COOLDOWN
+        _CDP_BREAKER["broken"] = True
+        _CDP_BREAKER["fails"] = 0
+        log.warning(f"🔌 DISJUNTOR CDP ABERTO por {CDP_BREAKER_COOLDOWN // 60}min — "
+                    f"conta CDP irregular ({str(reason)[:110]}). Vendas Base vão "
+                    f"direto ao PayAI; a CDP volta a ser sondada ao fim do cooldown.")
+
+def _cdp_note_success():
+    if _CDP_BREAKER["broken"]:
+        log.info("✅ CDP RECUPERADA — settle voltou a passar; Bazaar volta a "
+                 "indexar nos próximos ciclos.")
+    _CDP_BREAKER["fails"] = 0
+    _CDP_BREAKER["open_until"] = 0.0
+    _CDP_BREAKER["broken"] = False
 
 # ============================================================================
 # 6. MARKET DATA
@@ -5273,7 +5317,9 @@ def _verify_payment(endpoint: str, payment_header: str):
             # (ver flag CDP_FALLBACK_PAYAI no topo). `fac` guarda quem de fato
             # verificou — settle, bazaar blob e resource seguem esse mesmo `fac`,
             # então blob/resource da CDP só vão quando a CDP liquidou.
-            if CDP_FAC and _req_net.startswith("eip155"):
+            # v44.3.3: disjuntor aberto = CDP fora da cadeia (venda vai direto
+            # ao PayAI, sem o ~1s perdido nem o WARNING por request).
+            if CDP_FAC and _req_net.startswith("eip155") and _cdp_available():
                 facs = [CDP_FAC]
                 if FACILITATOR and CDP_FALLBACK_PAYAI:
                     facs.append(FACILITATOR)
@@ -5301,6 +5347,8 @@ def _verify_payment(endpoint: str, payment_header: str):
                     # final) — o cliente vê na hora POR QUE recusou.
                     fac_reasons[_tag] = str(reason or 'facilitator-rejected')[:140]
                     log.warning(f"⚠️ {_tag}.verify falhou p/ {endpoint}: {reason} | vdata={vdata}")
+                    if _tag == 'CDP':
+                        _cdp_note_failure(reason)   # v44.3.3: alimenta o disjuntor
                     continue
                 # v21.2 FIX: verify() só confirma a assinatura — quem move o
                 # dinheiro on-chain é settle(). bazaar blob/resource só na CDP.
@@ -5312,9 +5360,13 @@ def _verify_payment(endpoint: str, payment_header: str):
                 _ok_settle, _sdata = _f.settle(payload, req, bazaar=bz, resource=_res)
                 if _ok_settle:
                     settled, sdata, fac = True, _sdata, _f
+                    if _tag == 'CDP':
+                        _cdp_note_success()   # v44.3.3: fecha o disjuntor na hora
                     break
                 fac_reasons[_tag] = f"settle:{str(_sdata.get('error', _sdata))[:120]}"
                 log.warning(f"⚠️ {_tag}.settle falhou p/ {endpoint}: {_sdata}")
+                if _tag == 'CDP':
+                    _cdp_note_failure(str(_sdata))   # v44.3.3: alimenta o disjuntor
             if fac_reasons:
                 last_reason = "; ".join(f"{k}:{v}" for k, v in fac_reasons.items())
             if not settled or not fac:
@@ -11985,6 +12037,7 @@ ALIAS_ROUTES = {
     "/x402":               "/x402-audit",          # "audite este nó x402"
     "/api/agent/discover": "/agent-market",        # descoberta de agente
     "/token-research":     "/job/token-research",  # nome óbvio do job
+    "/earnings-whisper/x402": "/x402-audit",       # v44.3.3: padrão "{rota}/x402"
 }
 for _alias, _target in ALIAS_ROUTES.items():
     _h = ENDPOINT_HANDLERS.get(_target)
@@ -14093,6 +14146,12 @@ def ready():
                     "node_id": WALLET.node_id,
                     "endpoints": len(BASE_PRICES),
                     "cdp_bazaar": bool(CDP_FAC),
+                    # v44.3.3: estado do disjuntor visível de fora — "open" =
+                    # conta CDP irregular, vendas Base indo direto ao PayAI.
+                    "cdp_breaker": ("open" if not _cdp_available() else "closed"),
+                    "cdp_breaker_retry_in_s": (max(0, int(_CDP_BREAKER["open_until"]
+                                                          - time.time()))
+                                               if not _cdp_available() else 0),
                     "ts": int(time.time())})
 
 @app.route("/peers")
