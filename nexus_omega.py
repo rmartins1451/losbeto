@@ -87,7 +87,7 @@ from typing import Any, Optional, Dict, List, Tuple
 # 0. CONFIGURAÇÃO E AUTO-SETUP
 # ============================================================================
 
-VERSION = "44.2.2-MOTIVO-NO-402"
+VERSION = "44.2.3-SETTLE-FALLBACK"
 BRAND_NAME = "Losbeto"
 BRAND_TAGLINE = "The Global Revenue Engine for Financial AI Agents"
 BRAND_EMOJI = "🧠"
@@ -5121,6 +5121,15 @@ def _verify_payment(endpoint: str, payment_header: str):
             tx_sig = pdata.get("signature") or pdata.get("tx") or payment_header
             payer  = pdata.get("payer", "")
         network = pdata.get("network", "solana")
+        # v44.2.3 FIX CRÍTICO — a rede do payload v2 mora em accepted.network.
+        # O SDK oficial v2 NÃO repete scheme/network no topo do PaymentPayload
+        # (só {x402Version, payload, resource, accepted}). Sem este fallback,
+        # um pagamento Base v2 caía no default "solana": o v21.5/v24.9 deixava
+        # o accept SOLANA ser verificado contra o payload EVM → o facilitator
+        # respondia "network_mismatch" e esse motivo-fantasma sobrescrevia o
+        # motivo REAL da tentativa correta (eip155) no 402 devolvido.
+        if isinstance(pdata.get("accepted"), dict) and pdata["accepted"].get("network"):
+            network = pdata["accepted"]["network"]
     except Exception:
         tx_sig = payment_header.strip()
 
@@ -5158,7 +5167,11 @@ def _verify_payment(endpoint: str, payment_header: str):
         # v21.5 FIX: só envia ao facilitator o accept cuja network bate com a do
         # payload do cliente. Verificar payload Solana contra requirements Base
         # (e vice-versa) é um combo inválido que pode causar 500 no facilitator.
-        pay_net = str(payload.get("network") or network or "")
+        # v44.2.3: rede efetiva do cliente — v1 no topo, v2 em accepted.network
+        # (a variável `network` já saiu do parse com esse fallback aplicado).
+        pay_net = str(payload.get("network")
+                      or (payload.get("accepted") or {}).get("network")
+                      or network or "")
         matched = [a for a in accepts if str(a.get("network", "")) == pay_net]
         ordered = matched if matched else accepts
         # v21.6 DEFINITIVO (formato extraído do SDK oficial x402/PayAI):
@@ -5186,7 +5199,9 @@ def _verify_payment(endpoint: str, payment_header: str):
             # Antes, um pagamento Solana era reenviado ao facilitator da CDP
             # (só EVM) → 'preflight_validation_failed', 30s de timeout gastos
             # segurando uma thread do gunicorn e o blob da tx indo pro log.
+            # v44.2.3: payload v2 não repete network no topo — olha accepted.
             _payload_net = str((payload or {}).get("network")
+                               or ((payload or {}).get("accepted") or {}).get("network")
                                or (payload or {}).get("chain") or "")
             _req_net = str(req.get("network", ""))
             if _payload_net and _req_net and _payload_net != _req_net:
@@ -5207,36 +5222,43 @@ def _verify_payment(endpoint: str, payment_header: str):
                 facs = [FACILITATOR] if FACILITATOR else []
             if not facs:
                 continue
-            ok, reason, vdata, fac = False, "no-facilitator", {}, None
+            # v44.2.3 FIX — O FALLBACK AGORA COBRE O SETLE TAMBÉM.
+            # Antes: verify OK na CDP → settle CDP falhava → `continue` pulava
+            # pro próximo accept sem NUNCA dar ao PayAI a chance de liquidar
+            # aquele pagamento válido. E o motivo do settle falho era
+            # sobrescrito pelo "network_mismatch" fantasma do accept Solana
+            # (bug de leitura da rede v2, corrigido acima). Sequência real de
+            # 04-06/ago: CDP verify OK → CDP settle recusou → venda morria.
+            # Agora verify+settle rodam em cadeia por facilitador: se a CDP
+            # verifica mas não liquida, o PayAI tenta verify+settle do MESMO
+            # pagamento antes de desistir. Seguro: autorização EIP-3009 é de
+            # uso único (nonce) — uma 2ª liquidação falharia on-chain.
+            settled, sdata, fac = False, {}, None
             for _f in facs:
-                ok, reason, vdata = _f.verify(payload, req)
-                if ok:
-                    fac = _f
-                    break
-                # v44.2.2: motivo carimbado com o nome do facilitador — vai pro
-                # log E (via retorno final) pro corpo do 402, então o cliente
-                # vê na hora POR QUE recusou, sem abrir os logs do Railway.
-                # fac_reasons guarda um por facilitador: com fallback ligado,
-                # o 402 mostra o motivo da CDP E do PayAI, não só o último.
                 _tag = 'CDP' if getattr(_f, 'is_cdp', False) else 'PayAI'
-                fac_reasons[_tag] = str(reason or 'facilitator-rejected')[:140]
+                ok, reason, vdata = _f.verify(payload, req)
+                if not ok:
+                    # v44.2.2: motivo carimbado vai pro log E pro 402 (retorno
+                    # final) — o cliente vê na hora POR QUE recusou.
+                    fac_reasons[_tag] = str(reason or 'facilitator-rejected')[:140]
+                    log.warning(f"⚠️ {_tag}.verify falhou p/ {endpoint}: {reason} | vdata={vdata}")
+                    continue
+                # v21.2 FIX: verify() só confirma a assinatura — quem move o
+                # dinheiro on-chain é settle(). bazaar blob/resource só na CDP.
+                bz = _bazaar_blob(endpoint) if getattr(_f, 'is_cdp', False) else None
+                _res = ({"url": f"{_public_base()}{endpoint}",
+                         "description": ENDPOINT_DESC.get(endpoint, endpoint),
+                         "mimeType": "application/json"}
+                        if getattr(_f, 'is_cdp', False) else None)
+                _ok_settle, _sdata = _f.settle(payload, req, bazaar=bz, resource=_res)
+                if _ok_settle:
+                    settled, sdata, fac = True, _sdata, _f
+                    break
+                fac_reasons[_tag] = f"settle:{str(_sdata.get('error', _sdata))[:120]}"
+                log.warning(f"⚠️ {_tag}.settle falhou p/ {endpoint}: {_sdata}")
+            if fac_reasons:
                 last_reason = "; ".join(f"{k}:{v}" for k, v in fac_reasons.items())
-                log.warning(f"⚠️ {'CDP' if getattr(_f, 'is_cdp', False) else 'FACILITATOR'}.verify falhou p/ {endpoint}: {last_reason} | vdata={vdata}")
-            if not ok or not fac:
-                continue
-            # v21.2 FIX: verify() só confirma que a assinatura é válida — quem
-            # de fato move o dinheiro on-chain é settle(). Sem isso, o "exact"
-            # scheme patrocinado (SVM) nunca chega a ser transmitido.
-            bz = _bazaar_blob(endpoint) if getattr(fac, "is_cdp", False) else None
-            # v41: paymentPayload.resource — sem ele o Bazaar não indexa (ver settle()).
-            _res = ({"url": f"{_public_base()}{endpoint}",
-                     "description": ENDPOINT_DESC.get(endpoint, endpoint),
-                     "mimeType": "application/json"}
-                    if getattr(fac, "is_cdp", False) else None)
-            settled, sdata = fac.settle(payload, req, bazaar=bz, resource=_res)
-            if not settled:
-                last_reason = f"settle-failed:{sdata.get('error', sdata)}"
-                log.warning(f"⚠️ FACILITATOR.settle falhou p/ {endpoint}: {sdata}")
+            if not settled or not fac:
                 continue
             settle_tx = _clean_tx(sdata, tx_sig)
             # v21.9 FIX: no scheme SVM patrocinado o payload do cliente não traz
