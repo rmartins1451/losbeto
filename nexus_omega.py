@@ -87,7 +87,7 @@ from typing import Any, Optional, Dict, List, Tuple
 # 0. CONFIGURAÇÃO E AUTO-SETUP
 # ============================================================================
 
-VERSION = "44.4.0-GLOBAL"
+VERSION = "44.5.0-ARQUIVO"
 BRAND_NAME = "Losbeto"
 # v44.4.0: reposicionamento Brasil-primeiro. "Cross-asset market data" compete
 # com CoinGecko e cem nós iguais; "BCB + B3 normalizado em inglês" não compete
@@ -480,21 +480,21 @@ ENDPOINT_DESC = {
 
     # ---- Discovery / commodities de dado ---------------------------------
     "/pyth-price":      "Real-time SOL/USD from the Pyth Network oracle with its confidence interval and publish slot. Sub-second freshness, straight from the on-chain price account.",
-    "/fear-greed":      "Crypto Fear & Greed Index (0-100) with classification and a contrarian read. The headline number for regime-aware agents.",
+    "/fear-greed":      "Is the crowd greedy or fearful right now? The Fear & Greed Index (0-100) at this exact instant, with classification — a point-in-time reading your model's training data cannot contain.",
     "/trust-hash":      "SHA-256 proof-of-data hash for audit trails: a verifiable cryptographic receipt of any Losbeto response, for agents that must prove what they were told and when.",
     "/agent-market":    "Machine-readable commercial map of this catalog: featured endpoints, cheapest calls, the free tier and the credit plans, so an agent can plan a budget in one request.",
     "/bootstrap-trust": "Trust bootstrap endpoint. POST a minimal self-payment to seed an on-chain settlement record; GET returns the instructions for free.",
-    "/regime":          "Market regime classifier (bull / bear / chop) derived from 24h-7d momentum and realized volatility, with a confidence score.",
+    "/regime":          "Bull, bear or chop — right now? Regime classification from the last 24h-7d of momentum and realized volatility, with a confidence score. The 'now' is the product: models do not know today.",
     "/mempool":         "Live Solana network conditions: pending transaction pressure, current fee levels and priority-fee guidance for agents timing an execution.",
-    "/web-search":      "Condensed web search focused on macro and crypto context, returned as clean summarized text for agent reasoning rather than a link list.",
+    "/web-search":      "What is the web saying right now? Live search results condensed into clean text for agent reasoning — answers beyond any model's training cutoff. Google-grade when the node's search provider is configured.",
     "/ai-news":         "Filtered crypto and markets newswire for agents and research bots: headlines with source and timestamp, noise removed.",
     "/geo-alpha":       "Geographic read on exchange trust scores and BTC volume by venue country: where the volume actually sits and how trustworthy each venue is rated.",
     "/sentiment":       "Aggregated crypto sentiment bias with the contributing sources named. Input for contrarian and regime strategies.",
-    "/anomalias":       "Price and volume anomalies detected right now across the majors: what is moving abnormally versus its own recent distribution.",
+    "/anomalias":       "What is moving abnormally at this exact moment? Price and volume anomalies across the majors, measured against each asset's own recent distribution — a scan that only exists now.",
     "/dex-screen":      "DexScreener pair snapshot with liquidity, 24h volume and pair age, filtered to what is actually tradable.",
     "/forex-rate":      "Live FX rate for major pairs (?pair=EUR/USD): EUR, GBP, JPY, CHF, AUD, CAD crosses with the provider named in the response.",
     "/commodity-price": "Live commodity prices: gold, silver, WTI, Brent, copper, natural gas (?symbol=GOLD) with daily change. Multi-source with declared provenance in every response.",
-    "/stock-quote":     "Live equity quote (?symbol=AAPL): price, daily change, open/high/low. Multi-source with the provider named in every response.",
+    "/stock-quote":     "What is AAPL trading at this second? Live quote with daily change and open/high/low, multi-source with the provider named in every response — the number no trained model knows.",
     "/global-macro":    "One-shot global macro snapshot: market regime, forex and crypto sentiment combined for cross-asset agents.",
 
     # ---- Core: dado trabalhado -------------------------------------------
@@ -514,7 +514,7 @@ ENDPOINT_DESC = {
     "/wallet-scan":     "Wallet intelligence: given a Solana or EVM address, return native and token holdings with USD values, concentration and activity signals, deterministic risk flags and an AI-written profile. The enrichment call orchestrator agents buy before trusting a counterparty.",
     "/tg-premium":      "Premium alert feed in automation-ready shape: one JSON object per alert, stable keys, no prose to parse.",
     "/onchain-credit":  "On-chain credit score (0-900) for any Solana wallet: account age, activity, balance tiers and counterparty history.",
-    "/macro-calendar":  "Upcoming macro events (FOMC, NFP, CPI, ECB) with impact rating, forecast and previous readings.",
+    "/macro-calendar":  "When is the next decision that moves every market? Official published schedule only — FOMC, BLS payrolls and Brazil's Copom — no forecasts, no invented figures. Dates your model's cutoff does not know.",
     "/earnings-whisper": "Next earnings date, EPS/revenue estimates and whisper number for a given stock (?symbol=AAPL).",
 
     # ---- Pro: inteligência composta ---------------------------------------
@@ -10318,13 +10318,14 @@ def _x402_audit_handler():
 
 BASE_PRICES["/x402-audit"] = 0.05
 ENDPOINT_DESC["/x402-audit"] = (
-    "Audit any x402 endpoint before your agent trusts it (?url=https://target/path). "
-    "Checks x402 v2 spec compliance — 402 status, challenge structure, accepts "
-    "fields, price floor, discovery extension — plus four silent failure modes "
-    "observed operating a live node: oversized headers that abort Node clients, "
-    "unpadded base64 that breaks strict decoders, accepts ordering that diverts "
-    "settlement away from the indexing facilitator, and free samples served with "
-    "no delay. Returns a verdict: sound, acceptable, caution or unsafe to integrate.")
+    "Will this x402 endpoint survive a real paying agent — or quietly eat its payment? "
+    "Audit any endpoint (?url=https://target/path) against the x402 v2 spec: 402 status, "
+    "challenge structure, accepts fields, price floor, discovery extension — plus failure "
+    "modes learned the hard way operating a live paid node: oversized headers that abort "
+    "Node clients, unpadded base64 that breaks strict decoders, accepts ordering that "
+    "diverts settlement away from the indexing facilitator, free samples served with no "
+    "delay. Built from production telemetry, not theory. "
+    "Verdict: sound, acceptable, caution or unsafe to integrate.")
 ENDPOINT_TAGS["/x402-audit"] = ["Verification", "Trust", "Infrastructure"]
 ENDPOINT_PARAM_HINTS["/x402-audit"] = {"url": "https://api.example.com/endpoint"}
 ENDPOINT_HANDLERS["/x402-audit"] = _x402_audit_handler
@@ -12245,8 +12246,226 @@ for _alias, _target in ALIAS_ROUTES.items():
 # (GET devolve as instruções de bootstrap; POST valida o X-Payment igual).
 app.add_url_rule("/bootstrap-trust/x402", "alias_bootstrap_trust_x402",
                  bootstrap_trust, methods=["GET", "POST"])
-log.info(f"🔗 Apelidos de demanda registrados: {len(ALIAS_ROUTES) + 1} rotas "
-         f"({', '.join(ALIAS_ROUTES)} + /bootstrap-trust/x402)")
+log.info(f"🔗 Apelidos de demanda registrados: {len(ALIAS_ROUTES)} rotas "
+         f"({', '.join(ALIAS_ROUTES)}) + /bootstrap-trust/x402")
+
+
+# ============================================================================
+# 21b. /br-archive (v44.5.0-ARQUIVO) — o ativo que nenhum concorrente copia.
+#
+#     A lei da demanda x402: agente só paga pelo que não existe de graça.
+#     Dado brasileiro de graça (BCB, B3) qualquer um embrulha — mas um
+#     snapshot DIÁRIO, point-in-time, assinado com a chave Ed25519 do nó,
+#     acumulado desde o deploy, é IRREPRODUZÍVEL: para ter o histórico de
+#     90 dias é preciso ter operado os 90 dias. Cada dia que passa, o fosso
+#     aumenta e o custo marginal é zero.
+#
+#     - archive_loop: 1 snapshot/dia a partir das 21h UTC (B3 fechada,
+#       PTAX do dia publicada), INSERT OR IGNORE — imutável por construção.
+#     - Assinatura: sha256 do payload canônico + Ed25519 do próprio nó
+#       (mesma WALLET que assina os receipts) → qualquer agente verifica
+#       offline que o dado não foi retroativamente adulterado.
+#     - /archive: status GRÁTIS (dias arquivados, cadeia, signatário,
+#       instrução de verificação) — é a vitrine do produto pago.
+#     - /br-archive?day=YYYY-MM-DD: $0.05. Dia ausente → 503 com crédito
+#       automático (regra da casa: nunca cobrar por dado que não existe).
+#     - Honestidade mantida: o fallback "Neutral 50" do fear_greed (sem ts)
+#       NUNCA entra no arquivo como se fosse leitura viva; snapshot exige
+#       >= 3 fontes reais ou o dia fica vazio.
+# ============================================================================
+
+ARCHIVE_DB = HOME_DIR / "archive.db"
+
+def _archive_conn():
+    conn = sqlite3.connect(str(ARCHIVE_DB), timeout=10)
+    conn.execute("""CREATE TABLE IF NOT EXISTS snapshots (
+        day       TEXT PRIMARY KEY,
+        ts        INTEGER,
+        payload   TEXT,
+        sha256    TEXT,
+        signature TEXT,
+        signer    TEXT
+    )""")
+    conn.commit()
+    return conn
+
+def _archive_take(day: str) -> bool:
+    """Compõe, assina e grava o snapshot do dia (INSERT OR IGNORE — imutável).
+    Retorna True se gravou (ou já existia). Exige >= 3 fontes vivas."""
+    macro = _collect_br_macro()
+    series_ok = sum(1 for v in macro.values() if isinstance(v, dict) and v.get("ok"))
+    ibov = None
+    try:
+        ibov = _br_equity_quote("IBOV")
+    except Exception as e:
+        log.debug(f"archive ibov: {e}")
+    fng, fng_live = None, False
+    try:
+        _f = Market.fear_greed()
+        # o fallback {"value": 50, "Neutral"} não tem "ts" — não é leitura
+        # viva e não pode entrar num arquivo point-in-time como se fosse.
+        if _f and _f.get("ts"):
+            fng, fng_live = _f, True
+    except Exception as e:
+        log.debug(f"archive fng: {e}")
+    got = series_ok + (1 if ibov else 0) + (1 if fng_live else 0)
+    if got < 3:
+        log.warning(f"📦 snapshot {day} abortado: só {got} fonte(s) viva(s) — "
+                    f"dia fica vazio em vez de arquivar lixo")
+        return False
+    now = datetime.now(timezone.utc)
+    payload = {
+        "day":         day,
+        "captured_at": now.isoformat(timespec="seconds").replace("+00:00", "Z"),
+        "br_macro":    macro,
+        "ibov":        ibov,
+        "fear_greed":  fng,
+        "sources":     {"br_macro": "BCB/SGS (official)",
+                        "ibov": "B3 via live quote pipeline",
+                        "fear_greed": "alternative.me"},
+    }
+    blob = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
+    sha  = hashlib.sha256(blob.encode()).hexdigest()
+    canonical = f"losbeto-br-archive|{day}|{sha}"
+    sig  = base64.b64encode(WALLET.sign(canonical.encode())).decode()
+    conn = _archive_conn()
+    conn.execute(
+        "INSERT OR IGNORE INTO snapshots (day, ts, payload, sha256, signature, signer)"
+        " VALUES (?, ?, ?, ?, ?, ?)",
+        (day, int(now.timestamp()), blob, sha, sig, WALLET.solana_address))
+    conn.commit()
+    conn.close()
+    return True
+
+def archive_loop():
+    """1 snapshot por dia, a partir das 21h UTC: B3 já fechou (17h BRT = 20h
+    UTC) e a PTAX do dia já foi publicada — o snapshot captura o dia cheio."""
+    time.sleep(75)  # deixa o boot assentar antes da primeira verificação
+    while True:
+        try:
+            now = datetime.now(timezone.utc)
+            day = now.strftime("%Y-%m-%d")
+            if now.hour >= 21:
+                conn = _archive_conn()
+                row = conn.execute("SELECT 1 FROM snapshots WHERE day=?",
+                                   (day,)).fetchone()
+                conn.close()
+                if not row and _archive_take(day):
+                    log.info(f"📦 snapshot {day} arquivado e assinado "
+                             f"(signer {WALLET.solana_address[:8]}…)")
+        except Exception as e:
+            log.warning(f"archive_loop: {e}")
+        time.sleep(1800)
+
+@app.route("/archive")
+def archive_status():
+    """Vitrine GRÁTIS do arquivo: quantos dias, cadeia recente, quem assina
+    e como verificar. O produto pago é /br-archive?day=."""
+    try:
+        conn  = _archive_conn()
+        total = conn.execute("SELECT COUNT(*) FROM snapshots").fetchone()[0]
+        first = conn.execute("SELECT day FROM snapshots ORDER BY day ASC"
+                             " LIMIT 1").fetchone()
+        rows  = conn.execute("SELECT day, sha256 FROM snapshots"
+                             " ORDER BY day DESC LIMIT 7").fetchall()
+        conn.close()
+    except Exception as e:
+        return jsonify({"status": "error", "error": str(e)}), 500
+    base = _public_base()
+    return jsonify({
+        "product":       "Losbeto Brazilian Point-in-Time Archive",
+        "days_archived": total,
+        "first_day":     first[0] if first else None,
+        "latest_days":   [{"day": d, "sha256": s[:16] + "…"} for d, s in rows],
+        "signer":        WALLET.solana_address,
+        "signature":     "Ed25519 over 'losbeto-br-archive|<day>|<sha256(payload)>'",
+        "how_to_verify": ("Fetch the paid day, recompute sha256 of the payload "
+                          "with sorted keys, then verify the base64 signature "
+                          "against the signer pubkey — proof the data was not "
+                          "altered retroactively."),
+        "how_to_buy":    f"GET {base}/br-archive?day=YYYY-MM-DD — $0.05 via x402",
+        "note":          ("A new signed snapshot is added every day after the "
+                          "B3 close and PTAX publication (21h UTC). The history "
+                          "cannot be backfilled by anyone — including us."),
+        "ts": int(time.time()),
+    })
+
+def _br_archive_handler():
+    """O dia brasileiro congelado e assinado: macro BCB + Ibovespa + sentimento,
+    exatamente como estavam naquele dia. Sem parâmetro: o último dia arquivado
+    (default inteligente, padrão v21.11)."""
+    ts_now = int(time.time())
+    day = (request.args.get("day") or "").strip()
+    conn = _archive_conn()
+    if not day:
+        row = conn.execute("SELECT day FROM snapshots ORDER BY day DESC"
+                           " LIMIT 1").fetchone()
+        if row:
+            day = row[0]
+    if day and not re.match(r"^\d{4}-\d{2}-\d{2}$", day):
+        conn.close()
+        return ({"status": "invalid_param", "charged": False, "param": "day",
+                 "received": day[:16],
+                 "examples": ["2026-08-07"],
+                 "how_to_call": f"GET {_public_base()}/br-archive?day=2026-08-07",
+                 "ts": ts_now, "version": VERSION}, 400)
+    row = (conn.execute("SELECT day, ts, payload, sha256, signature, signer"
+                        " FROM snapshots WHERE day=?", (day,)).fetchone()
+           if day else None)
+    if not row:
+        avail = conn.execute("SELECT day FROM snapshots ORDER BY day DESC"
+                             " LIMIT 30").fetchall()
+        conn.close()
+        # Regra da casa: dado que não existe não se vende — tupla 503 dispara
+        # o crédito automático do paid_endpoint (nunca 503 pago).
+        return ({"status": "unavailable",
+                 "error": (f"No snapshot for {day or 'any day yet'}. The archive "
+                           "grows one signed day at a time and cannot be "
+                           "backfilled."),
+                 "available_days": [d for (d,) in avail],
+                 "charged": False,
+                 "free_status": f"{_public_base()}/archive",
+                 "ts": ts_now, "version": VERSION}, 503)
+    depth = conn.execute("SELECT COUNT(*) FROM snapshots").fetchone()[0]
+    conn.close()
+    d, ts_snap, blob, sha, sig, signer = row
+    payload = json.loads(blob)
+    return {**payload,
+            "day": d, "snapshot_ts": ts_snap,
+            "sha256": sha, "signature": sig, "signer": signer,
+            "canonical_message": f"losbeto-br-archive|{d}|{sha}",
+            "verification": {
+                "algorithm": "Ed25519",
+                "message":   "losbeto-br-archive|<day>|<sha256(sorted payload)>",
+                "pubkey":    signer,
+                "offline":   True},
+            "archive_depth_days": depth,
+            "provider": "Losbeto/Brasil-Archive", "version": VERSION}
+
+_BASE_PRICES_BR_ARCHIVE = 0.05
+BASE_PRICES["/br-archive"] = _BASE_PRICES_BR_ARCHIVE
+ENDPOINT_DESC["/br-archive"] = (
+    "What did Brazilian markets actually look like on a specific past day — "
+    "provably? One signed, point-in-time snapshot per day: BCB macro (Selic, "
+    "CDI, IPCA, IGP-M, PTAX), Ibovespa close and fear/greed, frozen exactly as "
+    "published and signed Ed25519 with this node's key. Call ?day=YYYY-MM-DD "
+    "(default: latest). The history cannot be backfilled or altered "
+    "retroactively — verify the signature offline. Free archive status at "
+    "/archive.")
+ENDPOINT_TAGS["/br-archive"] = ["Brazil", "Archive", "PointInTime", "Signed"]
+ENDPOINT_PARAM_HINTS["/br-archive"] = {"day": "2026-08-07"}
+ENDPOINT_HANDLERS["/br-archive"] = _br_archive_handler
+app.add_url_rule("/br-archive", "br_archive",
+                 paid_endpoint("/br-archive")(_br_archive_handler))
+FEATURED_ENDPOINTS.insert(0, "/br-archive")
+# dia malformado é erro do CLIENTE — 400 didático grátis, nunca pago.
+_PARAM_RULES["/br-archive"] = {
+    "param": "day",
+    "pattern": r"^\d{4}-\d{2}-\d{2}$",
+    "examples": ["2026-08-07", "2026-08-06"],
+}
+log.info("📦 br-archive registrado ($0.05) — snapshot diário assinado Ed25519, "
+         "irreproduzível por construção")
 
 
 # ============================================================================
@@ -15977,6 +16196,7 @@ def _start_background_once():
     threading.Thread(target=preview_warm_loop, daemon=True).start()
     threading.Thread(target=preview_warm_ai_loop, daemon=True).start()
     threading.Thread(target=premium_brief_loop, daemon=True).start()
+    threading.Thread(target=archive_loop, daemon=True).start()
     threading.Thread(target=demand_watch_loop, daemon=True).start()
     threading.Thread(target=autopilot_report_loop, daemon=True).start()
     threading.Thread(target=llm_watchdog_loop, daemon=True).start()
