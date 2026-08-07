@@ -87,9 +87,14 @@ from typing import Any, Optional, Dict, List, Tuple
 # 0. CONFIGURAÇÃO E AUTO-SETUP
 # ============================================================================
 
-VERSION = "44.3.3-DISJUNTOR"
+VERSION = "44.4.0-GLOBAL"
 BRAND_NAME = "Losbeto"
-BRAND_TAGLINE = "The Global Revenue Engine for Financial AI Agents"
+# v44.4.0: reposicionamento Brasil-primeiro. "Cross-asset market data" compete
+# com CoinGecko e cem nós iguais; "BCB + B3 normalizado em inglês" não compete
+# com ninguém — é o único fosso estrutural do nó (e o resto do catálogo global
+# continua aqui, como cauda longa de captura).
+BRAND_TAGLINE = ("Brazilian macro, B3 equities & global market data for AI "
+                 "agents — BCB/B3-normalized, x402-native")
 BRAND_EMOJI = "🧠"
 HOME_DIR = Path(os.environ.get("DATA_DIR", "")).expanduser() if os.environ.get("DATA_DIR") else Path("/data") if Path("/data").exists() else Path.home() / ".nexus_omega"
 HOME_DIR.mkdir(parents=True, exist_ok=True)
@@ -181,6 +186,11 @@ GEMINI_KEY   = os.environ.get("GEMINI_API_KEY", "").strip()
 FINNHUB_KEY     = os.environ.get("FINNHUB_API_KEY", "").strip()      # 60 req/min
 TWELVEDATA_KEY  = os.environ.get("TWELVEDATA_API_KEY", "").strip()   # 800 req/dia
 ALPHAVANTAGE_KEY= os.environ.get("ALPHAVANTAGE_API_KEY", "").strip() # 25 req/dia
+# v44.4.0: Google real via Serper (google.serper.dev — ~$0.001/consulta, free
+# tier 2.500 consultas). É o movimento StableEnrich: revender por chamada um
+# dado NÃO-gratuito. Busca é a categoria nº1 de demanda x402 comprovada e o
+# nosso sinal orgânico mais forte (radar: /web-search?q=btc de 15 IPs).
+SERPER_KEY      = os.environ.get("SERPER_API_KEY", "").strip()
 DEEPSEEK_KEY = os.environ.get("DEEPSEEK_API_KEY", "").strip()
 CLAUDE_KEY   = (os.environ.get("CLAUDE_API_KEY", "").strip() or
                 # v44.0.5: aceita também o nome oficial da Anthropic — o
@@ -406,6 +416,8 @@ BASE_PRICES = {
 }
 
 FEATURED_ENDPOINTS = [
+    # v44.4.0: vitrine Brasil-primeira — o fosso na frente, o global atrás.
+    "/br-equity", "/br-agro", "/br-curve",
     "/buy-credits", "/day-pass", "/launch-risk", "/council",
     "/agent-composable", "/multi-chain-arbitrage", "/win-rate-verified",
     "/starter-pack", "/thesis-engine", "/market-brief",
@@ -3095,8 +3107,49 @@ class Brain:
 
     # --- Novos endpoints v12 (já incluídos) ---
     @staticmethod
+    @staticmethod
+    def _serper_search(q: str, num: int = 8):
+        """v44.4.0 — Google real via Serper (~$0.001/consulta; vendido a $0.008
+        = margem de ~87%). É o movimento StableEnrich: o que se vende no x402
+        é dado NÃO-gratuito fatiado por chamada. Sem SERPER_API_KEY, devolve
+        None e o caller cai no DuckDuckGo — o produto nunca quebra."""
+        if not SERPER_KEY:
+            return None
+        try:
+            r = requests.post("https://google.serper.dev/search",
+                              json={"q": q, "num": num},
+                              headers={"X-API-KEY": SERPER_KEY,
+                                       "Content-Type": "application/json"},
+                              timeout=8)
+            if r.ok:
+                d = r.json()
+                out = []
+                ab = d.get("answerBox") or {}
+                if ab.get("answer") or ab.get("snippet"):
+                    out.append({"title": ab.get("title") or "answer",
+                                "url": ab.get("link"),
+                                "snippet": ab.get("answer") or ab.get("snippet")})
+                out += [{"title": o.get("title"), "url": o.get("link"),
+                         "snippet": o.get("snippet")}
+                        for o in (d.get("organic") or [])[:num] if o.get("link")]
+                return out or None
+            log.warning(f"serper HTTP {r.status_code}")
+        except Exception as e:
+            log.warning(f"serper: {e}")
+        return None
+
+    @staticmethod
     def web_search():
+        """v44.4.0: Google real (pago) quando SERPER_API_KEY está configurada —
+        busca é a categoria nº1 de demanda comprovada do x402 e o nosso sinal
+        orgânico mais forte (radar: q=btc de 15 IPs). Sem chave: DuckDuckGo,
+        com a fonte declarada — nunca disfarçado."""
         q = request.args.get("q", "crypto market today")
+        ts = int(time.time())
+        sr = Brain._serper_search(q)
+        if sr:
+            return {"query": q, "results": sr, "source": "google",
+                    "ts": ts, "provider": "Losbeto", "version": VERSION}
         try:
             r = requests.get("https://api.duckduckgo.com/",
                 params={"q": q, "format": "json", "no_html": 1, "skip_disambig": 1},
@@ -3104,9 +3157,11 @@ class Brain:
             data = r.json()
             results = [{"title": t.get("Text"), "url": t.get("FirstURL")}
                        for t in data.get("RelatedTopics", [])[:5] if t.get("Text")]
-            return {"query": q, "results": results, "ts": int(time.time()), "provider": "Losbeto"}
+            return {"query": q, "results": results, "source": "duckduckgo",
+                    "ts": ts, "provider": "Losbeto", "version": VERSION}
         except Exception as e:
-            return {"query": q, "results": [], "error": str(e), "ts": int(time.time())}
+            return {"query": q, "results": [], "error": str(e), "ts": ts,
+                    "provider": "Losbeto", "version": VERSION}
 
     @staticmethod
     def research_brief():
@@ -3144,6 +3199,13 @@ class Brain:
                                     "kind": "related"})
         except Exception as e:
             log.warning(f"research-brief ddg: {e}")
+        # v44.4.0 — Fonte 1.5: Google real via Serper enriquece a síntese
+        # (quando a chave existe). Snippets viram matéria-prima do brief.
+        for s in (Brain._serper_search(q, num=5) or []):
+            if s.get("snippet"):
+                raw_bits.append(s["snippet"])
+                sources.append({"title": (s.get("title") or "")[:90],
+                                "url": s.get("url"), "kind": "web"})
         # Fonte 2: newswire de mercado quando a pergunta é de mercado/cripto
         _mk = any(k in q.lower() for k in ("bitcoin", "btc", "crypto", "market",
                   "ethereum", "solana", "stock", "token", "defi", "price"))
@@ -3872,17 +3934,114 @@ class Brain:
                 "error": "No live quote source reachable right now. Not charged for stale data.",
                 "ts": ts, "provider": "Losbeto/Equities", "version": VERSION}
 
+    # v44.4.0 — ações SEM FRONTEIRA. (yahoo_suffix, stooq_suffix, nome da praça,
+    # carro-chefe default). Yahoo cobre todas; stooq onde tem suporte; o que
+    # faltar cai no "unavailable" honesto em vez de inventar número.
+    WORLD_MARKETS = {
+        "US": ("",    "us", "NYSE/Nasdaq",              "AAPL"),
+        "BR": (".SA", None, "B3 (Sao Paulo)",           "PETR4"),
+        "JP": (".T",  "jp", "Japan Exchange Group",     "7203"),
+        "CN": (".SS", None, "Shanghai Stock Exchange",  "600519"),
+        "SZ": (".SZ", None, "Shenzhen Stock Exchange",  "000001"),
+        "HK": (".HK", "hk", "Hong Kong Exchange",       "0700"),
+        "UK": (".L",  "uk", "London Stock Exchange",    "SHEL"),
+        "DE": (".DE", "de", "Deutsche Boerse (Xetra)",  "SAP"),
+        "FR": (".PA", "fr", "Euronext Paris",           "MC"),
+        "NL": (".AS", None, "Euronext Amsterdam",       "ASML"),
+        "IT": (".MI", "it", "Euronext Milan",           "ENI"),
+        "ES": (".MC", "es", "BME Madrid",               "SAN"),
+        "CH": (".SW", None, "SIX Swiss Exchange",       "NESN"),
+        "CA": (".TO", None, "Toronto (TSX)",            "RY"),
+        "AU": (".AX", None, "ASX (Sydney)",             "BHP"),
+        "IN": (".NS", None, "NSE India",                "RELIANCE"),
+    }
+
+    @staticmethod
+    def world_quote():
+        """v44.4.0 — uma chamada, 16 praças, um schema. Agente nenhum quer
+        aprender o sufixo de cada bolsa; ele manda ?symbol=7203&market=JP e
+        recebe o mesmo envelope de sempre. Sem parâmetro: o carro-chefe da
+        praça (default inteligente, padrão v21.11) — nunca erro cru pago."""
+        raw    = (request.args.get("symbol") or "").strip().upper()
+        market = (request.args.get("market") or "").strip().upper()
+        ts = int(time.time())
+
+        if market and market not in Brain.WORLD_MARKETS:
+            return {"status": "invalid_param", "charged": False, "param": "market",
+                    "received": market[:12],
+                    "valid_markets": sorted(Brain.WORLD_MARKETS),
+                    "examples": ["/world-quote?symbol=7203&market=JP",
+                                 "/world-quote?symbol=MC.PA",
+                                 "/world-quote?market=BR"],
+                    "ts": ts, "provider": "Losbeto/GlobalEquities",
+                    "version": VERSION}
+
+        if "." in raw:
+            full, mkt_label = raw, market or "auto"
+        else:
+            y_suffix, _, exch_name, flagship = Brain.WORLD_MARKETS.get(
+                market or "US", Brain.WORLD_MARKETS["US"])
+            full = (raw or flagship) + y_suffix
+            mkt_label = market or "US"
+
+        q = None
+        # chaveados só cobrem US com símbolo cru; fora de US vão direto às fontes
+        if mkt_label == "US":
+            q = Brain._keyed_quote(full)
+        if not q:
+            stooq_suffix = Brain.WORLD_MARKETS.get(mkt_label, (None, None))[1]
+            if stooq_suffix and "." not in raw:
+                q = Brain._stooq_quote(f"{(raw or Brain.WORLD_MARKETS[mkt_label][3])}.{stooq_suffix}")
+            elif stooq_suffix:
+                q = Brain._stooq_quote(raw)
+        if not q:
+            q = Brain._yahoo_quote(full)
+        if q:
+            return {"symbol": full, "market": mkt_label,
+                    "exchange": q.get("exchange") or
+                                Brain.WORLD_MARKETS.get(mkt_label, ("", "", ""))[2],
+                    "currency": q.get("currency", "USD"), "ts": ts,
+                    "markets_supported": len(Brain.WORLD_MARKETS),
+                    "provider": "Losbeto/GlobalEquities", "version": VERSION, **q}
+        return {"symbol": full, "market": mkt_label, "status": "unavailable",
+                "error": "No live quote source reachable for this market right now. "
+                         "Not charged for stale data.",
+                "ts": ts, "provider": "Losbeto/GlobalEquities", "version": VERSION}
+
     @staticmethod
     def macro_calendar():
+        """v44.4.0 — FIM DOS NÚMEROS INVENTADOS. A versão anterior servia
+        eventos de jul/2026 (já no passado) com forecast/previous FABRICADOS
+        ("0.3%", "235K") num produto pago de $0.07 — o mesmo pecado da v39.
+        Agora: apenas DATAS OFICIAIS publicadas pelos próprios organismos
+        (Fed, BLS e BCB publicam o calendário do ano com meses de antecedência),
+        filtradas para o futuro, sem forecast nenhum. Cobramos pela agenda
+        oficial normalizada — não por palpite disfarçado."""
         ts = int(time.time())
-        events = [
-            {"date": "2026-07-17", "time": "14:30 UTC", "country": "US", "event": "Retail Sales MoM", "impact": "high", "forecast": "0.3%", "previous": "0.1%"},
-            {"date": "2026-07-21", "time": "18:00 UTC", "country": "US", "event": "FOMC Minutes", "impact": "high", "forecast": "-", "previous": "-"},
-            {"date": "2026-07-23", "time": "12:30 UTC", "country": "US", "event": "Initial Jobless Claims", "impact": "medium", "forecast": "235K", "previous": "243K"},
-            {"date": "2026-07-25", "time": "08:00 UTC", "country": "EU", "event": "ECB Rate Decision", "impact": "high", "forecast": "3.75%", "previous": "3.75%"},
+        today = datetime.fromtimestamp(ts, timezone.utc).strftime("%Y-%m-%d")
+        # (data, hora UTC, país, evento) — fontes oficiais:
+        # Fed: calendário FOMC 2026 publicado · BLS: Employment Situation,
+        # 1ª sexta do mês 12:30 UTC · BCB: calendário Copom 2026 publicado
+        official = [
+            ("2026-09-04", "12:30 UTC", "US", "BLS Employment Situation (Aug payrolls)"),
+            ("2026-09-16", "18:00 UTC", "US", "FOMC Rate Decision"),
+            ("2026-09-16", "21:00 UTC", "BR", "Copom Rate Decision (Selic)"),
+            ("2026-10-02", "12:30 UTC", "US", "BLS Employment Situation (Sep payrolls)"),
+            ("2026-10-28", "18:00 UTC", "US", "FOMC Rate Decision"),
+            ("2026-11-04", "21:00 UTC", "BR", "Copom Rate Decision (Selic)"),
+            ("2026-11-06", "12:30 UTC", "US", "BLS Employment Situation (Oct payrolls)"),
+            ("2026-12-04", "12:30 UTC", "US", "BLS Employment Situation (Nov payrolls)"),
+            ("2026-12-09", "18:00 UTC", "US", "FOMC Rate Decision"),
+            ("2026-12-09", "21:00 UTC", "BR", "Copom Rate Decision (Selic)"),
         ]
-        return {"events": events, "ts": ts, "provider": "Losbeto/Macro", "version": VERSION,
-                "note": "Calendário macro indicativo. Configure API para dados em tempo real."}
+        events = [{"date": d, "time": t, "country": c, "event": e, "impact": "high"}
+                  for d, t, c, e in official if d >= today][:8]
+        return {"events": events, "ts": ts, "provider": "Losbeto/Macro",
+                "version": VERSION,
+                "source": "Official published schedules (Federal Reserve, BLS, Banco Central do Brasil)",
+                "note": "Official decision/release dates only — no forecasts or "
+                        "invented figures. Window rolls to the next published "
+                        "schedule as dates pass."}
 
     @staticmethod
     def earnings_whisper():
@@ -4644,7 +4803,8 @@ _PARAM_DESC = {
     "format": "Response format (json)",
 }
 
-SERVICE_NAME = os.environ.get("SERVICE_NAME", "Losbeto Market Intel")[:32]
+# v44.4.0: nome de serviço alinhado ao fosso (<=32 chars, ASCII — regra Bazaar)
+SERVICE_NAME = os.environ.get("SERVICE_NAME", "Losbeto Brazil Macro & Markets")[:32]
 
 def _service_tags(endpoint: str) -> list:
     """v25: até 5 tags, cada uma <=32 chars ASCII imprimível (regra da spec).
@@ -5728,6 +5888,13 @@ _PARAM_RULES = {
         "param": "symbol",
         "pattern": r"^(IBOV|[A-Z]{4}[0-9]{1,2})$",
         "examples": ["PETR4", "VALE3", "ITUB4", "BBAS3", "WEGE3", "IBOV"],
+    },
+    # v44.4.0: market inválido é erro do CLIENTE — 400 didático grátis,
+    # nunca erro pago pós-settle.
+    "/world-quote": {
+        "param": "market",
+        "pattern": r"^(US|BR|JP|CN|SZ|HK|UK|DE|FR|NL|IT|ES|CH|CA|AU|IN)$",
+        "examples": ["JP", "BR", "US", "DE", "HK", "IN"],
     },
 }
 
@@ -10170,6 +10337,29 @@ log.info("🔍 x402 Audit registrado ($0.05) — verificação de serviços do e
 
 
 # ---------------------------------------------------------------------------
+# /world-quote (v44.4.0) — ações sem fronteira: 16 praças, um schema.
+# Posicionamento "produto sem fronteiras": o agente manda symbol+market e
+# recebe envelope idêntico para NYSE, Tóquio, Xangai, Euronext, B3...
+# Fontes: pipeline já existente (chaveados → stooq → Yahoo), honestidade
+# mantida: sem fonte viva, "unavailable" sem cobrar.
+# ---------------------------------------------------------------------------
+BASE_PRICES["/world-quote"] = 0.02
+ENDPOINT_DESC["/world-quote"] = (
+    "Global equity quote across 16 exchanges — NYSE/Nasdaq, B3, Tokyo (JPX), "
+    "Shanghai/Shenzhen, Hong Kong, London, Xetra, Euronext (Paris/Amsterdam/"
+    "Milan), Madrid, SIX, TSX, ASX, NSE India — in one normalized, agent-ready "
+    "schema. Call ?symbol=7203&market=JP, a suffixed ticker (?symbol=MC.PA), or "
+    "just ?market=BR for the market flagship. Live sources only.")
+ENDPOINT_TAGS["/world-quote"] = ["GlobalMarkets", "Equities"]
+ENDPOINT_PARAM_HINTS["/world-quote"] = {"symbol": "7203", "market": "JP"}
+ENDPOINT_HANDLERS["/world-quote"] = Brain.world_quote
+app.add_url_rule("/world-quote", "world_quote",
+                 paid_endpoint("/world-quote")(Brain.world_quote))
+FEATURED_ENDPOINTS.insert(0, "/world-quote")
+log.info("🌍 world-quote registrado ($0.02) — 16 praças globais, um schema")
+
+
+# ---------------------------------------------------------------------------
 # v32/v39 — REPRECIFICAÇÃO
 #
 # v32 alinhou o topo do catálogo ao que o mercado transaciona de fato. Duas
@@ -10903,9 +11093,10 @@ def manifest_glama():
         "$schema":     "https://glama.ai/mcp/schemas/server.json",
         "maintainers": ["rmartins1451"],
         "name":        "losbeto",
-        "description": (f"Pay-per-call market data for AI agents over x402: multi-oracle "
-                        f"price consensus, sentiment, forex, equities, commodities and "
-                        f"Brazil macro (BCB/B3). {len(BASE_PRICES)} tools, USDC on "
+        "description": (f"Brazilian macro and B3 equity data (BCB-normalized, English) "
+                        f"plus global pay-per-call market data for AI agents over x402: "
+                        f"16-exchange equities, multi-oracle price consensus, sentiment, "
+                        f"forex and commodities. {len(BASE_PRICES)} tools, USDC on "
                         f"Base and Solana, no API keys."),
         "homepage":    _public_base(),
         "mcp":         f"{_public_base()}/mcp",
@@ -12550,10 +12741,11 @@ def about_operator():
             "contact": _building_block(),
             "responds": "Every message is read. Endpoints are added on request.",
         },
-        "what_this_is": ("Pay-per-call market data for AI agents over x402: "
-                         "multi-oracle price consensus, sentiment consensus, forex, "
-                         "equities, commodities, macro and crypto. No API keys, "
-                         "no accounts."),
+        "what_this_is": ("Brazilian macro and B3 equity data for AI agents "
+                         "(BCB/B3, normalized, English) plus global pay-per-call "
+                         "market data over x402: 16-exchange equities, multi-oracle "
+                         "price consensus, sentiment, forex, commodities and crypto. "
+                         "No API keys, no accounts."),
         "audit_us": {
             "labelled_receipts": f"{base}/receipts",
             "note": ("Every settlement is labelled operator-test vs organic. "
