@@ -87,7 +87,7 @@ from typing import Any, Optional, Dict, List, Tuple
 # 0. CONFIGURAÇÃO E AUTO-SETUP
 # ============================================================================
 
-VERSION = "44.5.0-ARQUIVO"
+VERSION = "44.6.0-DEMANDA"
 BRAND_NAME = "Losbeto"
 # v44.4.0: reposicionamento Brasil-primeiro. "Cross-asset market data" compete
 # com CoinGecko e cem nós iguais; "BCB + B3 normalizado em inglês" não compete
@@ -108,7 +108,6 @@ TON_WALLET_PATH = HOME_DIR / "wallet_ton.json"
 LOG_PATH        = HOME_DIR / "omega_v24.log"
 CONFIG_PATH     = HOME_DIR / "config_v24.json"
 RAG_DB_PATH     = HOME_DIR / "rag_v24.db"
-REFERRAL_DB     = HOME_DIR / "referrals.db"
 STAKE_DB        = HOME_DIR / "stakes.db"
 
 # Portas
@@ -1875,7 +1874,11 @@ class Market:
             # vazias PAGAS. Agora: 5 hosts Binance e, se todos falharem,
             # CoinGecko /coins/markets normalizado para o MESMO shape
             # (symbol *USDT, priceChangePercent, quoteVolume, lastPrice).
-            for host in ("https://api.binance.com", "https://api1.binance.com",
+            # v44.6.0: data-api.binance.vision é o espelho PÚBLICO de market
+            # data da própria Binance (só /api/v3/*, sem conta/saque) e não
+            # sofre o 451 geo-regulatório do host principal — vai primeiro.
+            for host in ("https://data-api.binance.vision",
+                         "https://api.binance.com", "https://api1.binance.com",
                          "https://api2.binance.com", "https://api3.binance.com",
                          "https://api4.binance.com"):
                 try:
@@ -10911,15 +10914,27 @@ def _route_now_live(path: str) -> bool:
     """v44.1.0: a rota pedida EXISTE hoje? O radar é janela de 7 dias — um
     caminho que era 404 quando registrado pode ter sido construído depois
     (foi o caso de /ip e /health/). Sem esta checagem, o painel chamava de
-    'not built' um produto que já estava no ar."""
+    'not built' um produto que já estava no ar.
+    v44.6.0: match real pelo roteador do Flask (MapAdapter) em vez de
+    comparação exata de string — rotas-curinga como /bootstrap-trust/<sub>
+    passam a contar como 'atendido', senão o radar continuaria chamando de
+    alias_candidate um caminho que a regra-curinga já resolve."""
     p = (path or "").strip()
     if not p:
         return False
-    cands = {p, p.rstrip("/")}
     try:
-        for r in app.url_map.iter_rules():
-            if r.rule in cands and "GET" in (r.methods or ()):
+        from werkzeug.routing import RequestRedirect
+        adapter = app.url_map.bind("radar.local")
+        for cand in (p, p.rstrip("/")):
+            if not cand:
+                continue
+            try:
+                adapter.match(cand, method="GET")
                 return True
+            except RequestRedirect:
+                return True   # rota existe, só difere pela barra final
+            except Exception:
+                continue      # NotFound / MethodNotAllowed -> próximo
     except Exception:
         pass
     return False
@@ -12246,8 +12261,50 @@ for _alias, _target in ALIAS_ROUTES.items():
 # (GET devolve as instruções de bootstrap; POST valida o X-Payment igual).
 app.add_url_rule("/bootstrap-trust/x402", "alias_bootstrap_trust_x402",
                  bootstrap_trust, methods=["GET", "POST"])
+
+# v44.6.0-DEMANDA — o radar de 7d flagrou um varredor SISTEMÁTICO testando
+# subcaminhos de /bootstrap-trust: /weather (6 pedidos/3 IPs), /pay (6/4),
+# /paid (6/4), /data (6/5), /api/x402 (6/4). Cinco regras fixas cobririam só
+# o passado — UMA regra-curinga cobre o padrão inteiro, inclusive o sufixo
+# que inventarem amanhã. GET devolve as instruções de bootstrap (grátis);
+# POST valida X-Payment igual à rota-mãe. A view não aceita kwargs, então
+# o wrapper descarta o sufixo.
+def _bootstrap_trust_sub(sub):
+    return bootstrap_trust()
+app.add_url_rule("/bootstrap-trust/<path:sub>", "alias_bootstrap_trust_sub",
+                 _bootstrap_trust_sub, methods=["GET", "POST"])
+
+# v44.6.0 — /api/v1: 7 pedidos de 4 IPs em 7d, radar classificou "produto
+# novo". Crawlers chutam a raiz convencional de API procurando o índice do
+# serviço. Resposta canônica: um índice GRÁTIS que transforma varredor em
+# crawler informado — aponta manifestos, catálogo, preços e como comprar.
+@app.route("/api/v1")
+def api_v1_index():
+    base = _public_base()
+    return jsonify({
+        "service":    "Losbeto x402 Data Node",
+        "version":    VERSION,
+        "api":        "v1",
+        "endpoints":  len(BASE_PRICES),
+        "pricing":    f"{base}/get-pricing",
+        "catalog":    f"{base}/.well-known/x402.json",
+        "openapi":    f"{base}/openapi.json",
+        "manifests": {
+            "x402":    f"{base}/.well-known/x402.json",
+            "mcp":     f"{base}/.well-known/mcp.json",
+            "agentic": f"{base}/.well-known/agentic.json",
+            "llms":    f"{base}/llms.txt",
+        },
+        "free_sample": f"{base}/sample",
+        "how_to_pay":  ("x402: GET qualquer endpoint monetizado, pague o "
+                        "desafio 402 em USDC (Base ou Solana) e reenvie com "
+                        "X-Payment. Sem contas, sem API keys."),
+        "ts": int(time.time()),
+    })
+
 log.info(f"🔗 Apelidos de demanda registrados: {len(ALIAS_ROUTES)} rotas "
-         f"({', '.join(ALIAS_ROUTES)}) + /bootstrap-trust/x402")
+         f"({', '.join(ALIAS_ROUTES)}) + /bootstrap-trust/x402 + "
+         f"/bootstrap-trust/* (curinga) + /api/v1 (índice grátis)")
 
 
 # ============================================================================
@@ -12379,6 +12436,7 @@ def archive_status():
         "latest_days":   [{"day": d, "sha256": s[:16] + "…"} for d, s in rows],
         "signer":        WALLET.solana_address,
         "signature":     "Ed25519 over 'losbeto-br-archive|<day>|<sha256(payload)>'",
+        "schedule_utc":  "daily at 21:00 (B3 close + PTAX publication)",
         "how_to_verify": ("Fetch the paid day, recompute sha256 of the payload "
                           "with sorted keys, then verify the base64 signature "
                           "against the signer pubkey — proof the data was not "
@@ -14511,15 +14569,22 @@ def health_storage():
     except Exception as e:
         erro_escrita = str(e)[:120]
 
+    # v44.6.0: a tabela referrals vive DENTRO do ledger (omega_v24.db) — o
+    # antigo item "referrals" apontava para um arquivo que nunca existiria.
+    # E o archive.db (v44.5.0) agora entra na checagem: é o ativo assinado
+    # que mais dói perder num redeploy sem volume.
     dbs = {}
     for rotulo, caminho in (("ledger", DB_PATH), ("preview", PREVIEW_DB_PATH),
-                            ("rag", RAG_DB_PATH), ("referrals", REFERRAL_DB)):
+                            ("rag", RAG_DB_PATH),
+                            ("archive", globals().get("ARCHIVE_DB",
+                                                      HOME_DIR / "archive.db"))):
         try:
             dbs[rotulo] = {"path": str(caminho), "exists": Path(caminho).exists(),
                            "bytes": Path(caminho).stat().st_size
                                     if Path(caminho).exists() else 0}
         except Exception:
             dbs[rotulo] = {"path": str(caminho), "exists": False, "bytes": 0}
+    dbs["referrals"] = {"note": "tabela dentro do ledger — sem arquivo próprio"}
 
     contas = {}
     try:
