@@ -87,7 +87,7 @@ from typing import Any, Optional, Dict, List, Tuple
 # 0. CONFIGURAÇÃO E AUTO-SETUP
 # ============================================================================
 
-VERSION = "44.6.0-DEMANDA"
+VERSION = "44.7.0-ALGORAND"
 BRAND_NAME = "Losbeto"
 # v44.4.0: reposicionamento Brasil-primeiro. "Cross-asset market data" compete
 # com CoinGecko e cem nós iguais; "BCB + B3 normalizado em inglês" não compete
@@ -161,6 +161,23 @@ ENABLE_BASE       = bool(BASE_PAYTO_EVM)
 # v25.1: Base como 1ª opção de pagamento -> settles vão pela CDP -> indexação
 # automática no Bazaar (a camada de descoberta que os agentes consultam).
 PREFER_BASE       = os.environ.get("PREFER_BASE", "1") != "0"
+
+# Algorand (AVM) — v44.7.0-ALGORAND: 3ª chain de pagamento, via GoPlausible.
+# Regras oficiais do Global x402 Challenge que este bloco obedece:
+#  - MESMO payTo durante TODA a competição (o leaderboard agrega por endereço;
+#    trocar de endereço = perder o volume acumulado). Grave o segredo OFFLINE.
+#  - Facilitator obrigatório: GoPlausible (gasless p/ o merchant).
+#  - Campo 'tag': 'x402-global-challenge' dentro do extra do accept.
+#  - USDC na Algorand mainnet = ASA 31566704 (6 casas, igual Base/Solana).
+#  - Composite Entry: todos os endpoints com o mesmo payTo somam volume sob
+#    UM merchant — o catálogo inteiro compete como uma única entrada forte.
+ALGO_PAYTO         = os.environ.get("ALGORAND_WALLET_ADDRESS", "").strip()
+ALGO_USDC_ASA      = "31566704"
+ALGO_CAIP2         = "algorand:wGHE2Pwdvd7S12BL5FaOP20EGYesN73ktiC1qzkkit8="
+ALGO_FEEPAYER      = "ZMFK2OI7ZBD2U27ISERZC4S6LKM6WMFJPZQ4MYNJDZ2VNBNMBA67RA22AA"
+GO_FACILITATOR_URL = os.environ.get("GOPLAUSIBLE_FACILITATOR",
+                                    "https://facilitator.goplausible.xyz").strip()
+ENABLE_ALGO        = bool(ALGO_PAYTO)
 
 # Facilitator (padrão: PayAI – produção)
 # v21.15: wallets do operador — compras destas carteiras são marcadas como
@@ -804,6 +821,8 @@ def _check_wallet_consistency():
     chains = ["solana"]
     if ENABLE_BASE:
         chains.append("base")
+    if ENABLE_ALGO:
+        chains.append("algorand")
     log.info(f"✅ Chains ativas: {', '.join(chains)}")
     if warnings:
         log.warning("="*70)
@@ -1591,6 +1610,9 @@ class FacilitatorClient:
     def __init__(self, url: str):
         self.url = url.rstrip("/")
         self.is_cdp = "cdp.coinbase.com" in self.url
+        # v44.7.0: rótulo por facilitador (log e 402 carimbam quem recusou)
+        self.tag = ("CDP" if self.is_cdp else
+                    "GoPlausible" if "goplausible" in self.url else "PayAI")
 
     def _cdp_jwt(self, method: str, path: str) -> Optional[str]:
         """v21.13.3: JWT p/ CDP — suporta Ed25519 (secret base64, keys novas)
@@ -1775,6 +1797,14 @@ else:
     _cdp_reason = ("CDP_API_KEY_ID ausente" if not CDP_API_KEY_ID
                    else "CDP_API_KEY_SECRET ausente")
     log.info(f"🏪 CDP/Bazaar desabilitado: {_cdp_reason}")
+# v44.7.0: GoPlausible — rail Algorand (obrigatório p/ o Global x402 Challenge;
+# settles por ele alimentam o leaderboard da competição).
+GO_FAC = FacilitatorClient(GO_FACILITATOR_URL) if ENABLE_ALGO else None
+if GO_FAC:
+    log.info(f"🟣 GoPlausible habilitado p/ Algorand: {GO_FACILITATOR_URL} "
+             f"(payTo {ALGO_PAYTO[:10]}…{ALGO_PAYTO[-4:]})")
+elif not ALGO_PAYTO:
+    log.info("🟣 Algorand: OFF — defina ALGORAND_WALLET_ADDRESS p/ entrar no challenge")
 if FACILITATOR:
     log.info(f"🤝 Facilitator habilitado: {FACILITATOR_URL}")
 
@@ -5109,6 +5139,22 @@ def _build_402(endpoint: str):
         })
     if PREFER_BASE and ENABLE_BASE and BASE_PAYTO_EVM:
         accepts.append(_sol_accept)      # Solana segue disponível, em 2ª opção
+    if ENABLE_ALGO:
+        # v44.7.0-ALGORAND: 3ª opção de pagamento — USDC na Algorand mainnet
+        # (ASA 31566704, 6 casas decimais como Base/Solana) via GoPlausible.
+        # Requisito oficial do Global x402 Challenge: campo 'tag' dentro do
+        # extra. Posição 3 proposital: Base continua 1ª (indexação CDP/Bazaar)
+        # e Solana 2ª — Algorand soma, não canibaliza as rails que já rankeiam.
+        accepts.append({
+            "scheme":            "exact",
+            "network":           ALGO_CAIP2,
+            "asset":             ALGO_USDC_ASA,
+            "amount":            amount_atomic_base,
+            "payTo":             ALGO_PAYTO,
+            "maxTimeoutSeconds": 300,
+            "extra":             {"feePayer": ALGO_FEEPAYER,
+                                  "tag": "x402-global-challenge"},
+        })
     # v21 FIX: payload compatível com x402scan — campos da spec v2 + challenges
     payment_req = accepts[0] if accepts else {}
     _challenge_remember(endpoint, accepts)   # v39: usado na liquidação
@@ -5486,6 +5532,11 @@ def _verify_payment(endpoint: str, payment_header: str):
                 facs = [CDP_FAC]
                 if FACILITATOR and CDP_FALLBACK_PAYAI:
                     facs.append(FACILITATOR)
+            elif GO_FAC and _req_net.startswith("algorand"):
+                # v44.7.0: pagamento AVM vai SÓ ao GoPlausible — regra do
+                # challenge (settle fora dele não conta no leaderboard) e
+                # fato técnico (PayAI/CDP não verificam ASA).
+                facs = [GO_FAC]
             else:
                 facs = [FACILITATOR] if FACILITATOR else []
             if not facs:
@@ -5503,7 +5554,7 @@ def _verify_payment(endpoint: str, payment_header: str):
             # uso único (nonce) — uma 2ª liquidação falharia on-chain.
             settled, sdata, fac = False, {}, None
             for _f in facs:
-                _tag = 'CDP' if getattr(_f, 'is_cdp', False) else 'PayAI'
+                _tag = getattr(_f, 'tag', ('CDP' if getattr(_f, 'is_cdp', False) else 'PayAI'))
                 ok, reason, vdata = _f.verify(payload, req)
                 if not ok:
                     # v44.2.2: motivo carimbado vai pro log E pro 402 (retorno
@@ -9311,6 +9362,34 @@ def _resource_entry(ep: str) -> dict:
     """Entrada de recurso no formato que os catálogos esperam."""
     base = _public_base()
     price = get_dynamic_price(ep)
+    _accepts = ([
+        {"scheme": "exact", "network": BASE_CAIP2,
+         "asset": BASE_USDC, "payTo": BASE_PAYTO_EVM,
+         "amount": str(int(round(price * 1_000_000))),
+         "maxAmountRequired": str(int(round(price * 1_000_000))),
+         "maxTimeoutSeconds": 300,
+         "extra": {"name": "USD Coin", "version": "2"}},
+    ] if (ENABLE_BASE and BASE_PAYTO_EVM) else []) + [
+        {"scheme": "exact", "network": f"solana:{SOL_GENESIS}",
+         "asset": USDC_MINT, "payTo": RECEIVE_ADDRESS,
+         "amount": str(int(round(price * 1_000_000))),
+         "maxAmountRequired": str(int(round(price * 1_000_000))),
+         "maxTimeoutSeconds": 300,
+         "extra": (({"feePayer": FACILITATOR.get_svm_fee_payer()}
+                    if FACILITATOR and FACILITATOR.get_svm_fee_payer() else {}))},
+    ]
+    # v44.7.0: o accept Algorand entra no manifesto também — o Bazaar do
+    # GoPlausible enriquece o merchant lendo os well-known do domínio, e a
+    # tag do challenge precisa estar visível aqui.
+    if ENABLE_ALGO:
+        _accepts.append({
+            "scheme": "exact", "network": ALGO_CAIP2,
+            "asset": ALGO_USDC_ASA, "payTo": ALGO_PAYTO,
+            "amount": str(int(round(price * 1_000_000))),
+            "maxAmountRequired": str(int(round(price * 1_000_000))),
+            "maxTimeoutSeconds": 300,
+            "extra": {"feePayer": ALGO_FEEPAYER,
+                      "tag": "x402-global-challenge"}})
     return {
         "resource": f"{base}{ep}",
         "type": "http",
@@ -9322,28 +9401,7 @@ def _resource_entry(ep: str) -> dict:
         # campo v1 (maxAmountRequired) e omitiam os `extra` da spec v2 —
         # feePayer (SVM) e domínio EIP-712 (Base). Catálogos que validam
         # contra a spec marcavam as entradas como incompletas.
-        "accepts": [
-            {"scheme": "exact", "network": BASE_CAIP2,
-             "asset": BASE_USDC, "payTo": BASE_PAYTO_EVM,
-             "amount": str(int(round(price * 1_000_000))),
-             "maxAmountRequired": str(int(round(price * 1_000_000))),
-             "maxTimeoutSeconds": 300,
-             "extra": {"name": "USD Coin", "version": "2"}},
-            {"scheme": "exact", "network": f"solana:{SOL_GENESIS}",
-             "asset": USDC_MINT, "payTo": RECEIVE_ADDRESS,
-             "amount": str(int(round(price * 1_000_000))),
-             "maxAmountRequired": str(int(round(price * 1_000_000))),
-             "maxTimeoutSeconds": 300,
-             "extra": (({"feePayer": FACILITATOR.get_svm_fee_payer()}
-                        if FACILITATOR and FACILITATOR.get_svm_fee_payer() else {}))},
-        ] if (ENABLE_BASE and BASE_PAYTO_EVM) else [
-            {"scheme": "exact", "network": f"solana:{SOL_GENESIS}",
-             "asset": USDC_MINT, "payTo": RECEIVE_ADDRESS,
-             "amount": str(int(round(price * 1_000_000))),
-             "maxAmountRequired": str(int(round(price * 1_000_000))),
-             "maxTimeoutSeconds": 300,
-             "extra": (({"feePayer": FACILITATOR.get_svm_fee_payer()}
-                        if FACILITATOR and FACILITATOR.get_svm_fee_payer() else {}))}],
+        "accepts": _accepts,
         "tags": _service_tags(ep),
         "free_preview": f"{base}{ep}?preview=1",
         "lastUpdated": int(time.time()),
