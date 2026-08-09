@@ -87,7 +87,7 @@ from typing import Any, Optional, Dict, List, Tuple
 # 0. CONFIGURAÇÃO E AUTO-SETUP
 # ============================================================================
 
-VERSION = "44.7.0-ALGORAND"
+VERSION = "44.8.0-DESCOBERTA"
 BRAND_NAME = "Losbeto"
 # v44.4.0: reposicionamento Brasil-primeiro. "Cross-asset market data" compete
 # com CoinGecko e cem nós iguais; "BCB + B3 normalizado em inglês" não compete
@@ -7786,6 +7786,25 @@ TRY_BACKFILL = [p.strip() for p in os.environ.get(
     "/pyth-price,/trust-hash,/regime,/anomalias,/sentiment,/mempool,"
     "/dex-screen,/br-equity").split(",") if p.strip()]
 
+# v44.8.0: cache do probe de IA do /health/providers (ver comentário na rota).
+AI_PROBE_TTL = int(os.environ.get("AI_PROBE_TTL", "900"))  # 15 min
+_AI_PROBE_CACHE = {"ts": 0.0, "probe": "", "live": False}
+
+def _ai_probe_cached():
+    """Probe LLM com cache de AI_PROBE_TTL segundos — o diagnóstico segue
+    fresco para auditoria, mas monitores não queimam a cota gratuita."""
+    now = time.time()
+    if now - _AI_PROBE_CACHE["ts"] < AI_PROBE_TTL:
+        return _AI_PROBE_CACHE["probe"], _AI_PROBE_CACHE["live"]
+    probe = ""
+    try:
+        probe = LLM.ask("Reply with exactly: OK", max_tokens=8, temperature=0)
+    except Exception as e:
+        probe = f"error: {e}"
+    live = bool(probe) and "LLM offline" not in probe and not probe.startswith("error")
+    _AI_PROBE_CACHE.update({"ts": now, "probe": probe, "live": live})
+    return probe, live
+
 @app.route("/health/providers")
 def health_providers():
     """v25.3: autodiagnóstico público das fontes que sustentam as promessas do
@@ -7794,17 +7813,19 @@ def health_providers():
     revisor) confere em 1 request se dado e IA estão realmente vivos."""
     out = {"version": VERSION, "ts": int(time.time())}
     # 1) IA: os produtos premium prometem síntese — isto prova se ela funciona
-    probe = ""
-    try:
-        probe = LLM.ask("Reply with exactly: OK", max_tokens=8, temperature=0)
-    except Exception as e:
-        probe = f"error: {e}"
-    ai_live = bool(probe) and "LLM offline" not in probe and not probe.startswith("error")
+    # v44.8.0 FIX — O PRÓPRIO DIAGNÓSTICO SANGRAVA A COTA. Cada chamada a este
+    # endpoint disparava UM probe LLM ao vivo; monitores + operador batendo
+    # toda hora = centenas de chamadas/dia contra o tier gratuito do
+    # Gemini/Groq → os 429 recorrentes. Agora o probe tem cache de 15 min:
+    # o diagnóstico continua verdadeiro (15 min é fresco p/ auditoria) e a
+    # cota fica para quem PAGA.
+    probe, ai_live = _ai_probe_cached()
     out["ai"] = {"live": ai_live,
                  "providers_configured": [n for n, k in
                      (("deepseek", DEEPSEEK_KEY), ("claude", CLAUDE_KEY),
                       ("groq", GROQ_KEY), ("gemini", GEMINI_KEY)) if k],
-                 "probe": (probe or "")[:60]}
+                 "probe": (probe or "")[:60],
+                 "probe_cache_ttl_s": AI_PROBE_TTL}
     # 2) mercados tradicionais: o que a auditoria reprovou
     checks = {}
     for path, fn in (("/stock-quote", Brain.stock_quote),
@@ -9410,6 +9431,54 @@ def _resource_entry(ep: str) -> dict:
 @app.route("/.well-known/x402")
 def manifest_x402_alias():
     return redirect("/.well-known/x402.json", code=308)
+
+@app.route("/x402.json")
+def manifest_x402_root():
+    """v44.8.0-DESCOBERTA: o radar mostrou 4 IPs em 7d pedindo /x402.json na
+    RAIZ — e classificou como 'alias de /x402-audit' (alvo errado: quem pede
+    este caminho quer o MANIFESTO da máquina, não o produto de auditoria).
+    Alias direto do documento canônico, sem redirect: scanner econômico não
+    segue 308."""
+    return manifest_x402()
+
+@app.route("/.well-known/farcaster.json")
+def manifest_farcaster():
+    """v44.8.0-DESCOBERTA: 6 IPs em 7d sondaram o manifesto de Mini App do
+    Farcaster — são os crawlers do protocolo mapeando apps publicáveis no
+    feed. Sem ele, o nó é invisível para a maior rede social cripto-nativa
+    (onde estão os HUMANOS que operam agentes).
+
+    Servimos o manifesto da Mini App apontando para a landing de preços.
+    O campo accountAssociation (que marca o app como 'verificado' e vincula
+    ao perfil Farcaster do operador) exige assinatura com a chave de custódia
+    da conta Farcaster — passo manual, uma vez, no Farcaster Mini App
+    Manifest Tool. Fica como backlog; o manifesto já resolve os crawlers."""
+    base = _public_base()
+    return jsonify({
+        "frame": {
+            "version": "1",
+            "name": "Losbeto x402",
+            "iconUrl": f"{base}/favicon.png",
+            "homeUrl": base,
+            "imageUrl": f"{base}/favicon.png",
+            "buttonTitle": "Ver catálogo",
+            "splashImageUrl": f"{base}/favicon.png",
+            "splashBackgroundColor": "#0b0f17",
+            "subtitle": "Dados que agentes pagam por chamada",
+            "description": ("84 endpoints x402: macro BCB e ações B3 do Brasil, "
+                            "ações EUA, forex, commodities, cripto e auditoria de "
+                            "serviços x402 — USDC por chamada, sem contas."),
+            "primaryCategory": "finance",
+            "tags": ["x402", "data", "brazil", "usdc", "agents"],
+        },
+        "verification": {
+            "status": "unverified",
+            "how_to_verify": ("Assine accountAssociation no Farcaster Mini App "
+                              "Manifest Tool com a custódia do perfil do operador "
+                              "e adicione o objeto neste JSON — uma vez."),
+        },
+        "ts": int(time.time()),
+    })
 
 @app.route("/.well-known/x402.json")
 def manifest_x402():
@@ -16106,6 +16175,10 @@ AUTOPILOT_WARM_AI = [p.strip() for p in os.environ.get(
     "/equity-dossier,/global-macro"
 ).split(",") if p.strip()]
 AUTOPILOT_WARM_AI_SECS = int(os.environ.get("AUTOPILOT_WARM_AI_SECS", "43200"))  # 12 h
+# v44.8.0: AI_WARMER=0 desliga o aquecimento de previews de IA — cada ciclo
+# custa chamadas de LLM contra a cota gratuita. Em semana de cota apertada,
+# o operador desliga o warmer e a cota fica 100% para quem paga.
+AUTOPILOT_WARM_AI_ON = os.environ.get("AI_WARMER", "1") != "0"
 
 def _warm_once(paths: List[str], label: str) -> int:
     ok = 0
@@ -16152,8 +16225,12 @@ def preview_warm_ai_loop():
     torrava aquecendo produtos que ninguém tinha comprado."""
     time.sleep(90)
     log.info(f"🔥 Autopilot warmer (IA): {len(AUTOPILOT_WARM_AI)} endpoints "
-             f"a cada {AUTOPILOT_WARM_AI_SECS}s")
+             f"a cada {AUTOPILOT_WARM_AI_SECS}s"
+             + ("" if AUTOPILOT_WARM_AI_ON else " — DESLIGADO (AI_WARMER=0)"))
     while True:
+        if not AUTOPILOT_WARM_AI_ON:
+            time.sleep(AUTOPILOT_WARM_AI_SECS)
+            continue
         if llm_healthy():
             _warm_once(AUTOPILOT_WARM_AI, "IA")
         else:
