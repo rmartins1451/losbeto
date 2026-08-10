@@ -87,7 +87,7 @@ from typing import Any, Optional, Dict, List, Tuple
 # 0. CONFIGURAÇÃO E AUTO-SETUP
 # ============================================================================
 
-VERSION = "44.8.0-DESCOBERTA"
+VERSION = "44.8.1-DESCOBERTA"
 BRAND_NAME = "Losbeto"
 # v44.4.0: reposicionamento Brasil-primeiro. "Cross-asset market data" compete
 # com CoinGecko e cem nós iguais; "BCB + B3 normalizado em inglês" não compete
@@ -12768,7 +12768,7 @@ def terms_page():
         "effective": "2026-08-04",
         "terms": {
             "what_you_buy": ("Per-call access to market data APIs, paid in USDC via "
-                             "x402 on Base or Solana, or prepaid credit keys. No "
+                             "x402 on Base, Solana or Algorand, or prepaid credit keys. No "
                              "accounts, no subscriptions unless explicitly purchased."),
             "pricing": ("Prices are quoted in the 402 response before you sign anything. "
                         "You never pay a price you did not see first."),
@@ -12789,7 +12789,13 @@ def terms_page():
         },
         "ts": int(time.time()),
     }
-    if _wants_html():
+    # v44.8.1: inverter a negociação — crawlers de diretório (x402-list marca
+    # "terms page: missing") não mandam Accept: text/html nem UA de navegador,
+    # então caíam no JSON e o pillar não era detectado. HTML vira o padrão;
+    # JSON só para quem pede explicitamente.
+    quer_json = ("application/json" in request.headers.get("Accept", "")
+                 or request.args.get("format") == "json")
+    if not quer_json:
         rows = "".join(
             f"<tr><td style='padding:10px;border:1px solid #333;vertical-align:top'>"
             f"<b>{k.replace('_',' ').title()}</b></td>"
@@ -13222,6 +13228,28 @@ def _cached_spec(key: str, builder):
 @app.route("/openapi.json")
 def openapi_spec():
     return _cached_spec("openapi", _build_openapi)
+
+@app.route("/swagger.json")
+def swagger_json():
+    """v44.8: /swagger.json pedido por 5 IPs distintos em 7 dias (radar) —
+    convenção Swagger que SDKs de agente tentam antes de /openapi.json.
+    Serve a MESMA spec já em cache: custo de CPU zero, sem redirect
+    (muitos clientes de agente não seguem redirect em fetch de spec)."""
+    return _cached_spec("openapi", _build_openapi)
+
+@app.route("/api/actions")
+def api_actions_alias():
+    """v44.8.1: /api/actions pedido por 6 IPs em 7 dias (radar) — agentes
+    procurando o mapa de ações do catálogo. 308 para o /agent-market
+    (o mapa comercial legível por máquina), preservando query string."""
+    qs = request.query_string.decode()
+    return redirect(f"/agent-market{('?' + qs) if qs else ''}", code=308)
+
+@app.route("/api/x402")
+def api_x402_alias():
+    """v44.8.1: /api/x402 marcado como alias_candidate pelo radar (6 IPs) —
+    convenção de manifesto x402. 308 para o manifesto canônico."""
+    return redirect("/.well-known/x402.json", code=308)
 
 def _build_openapi():
     base = _public_base()
@@ -14546,8 +14574,8 @@ def pricing_page():
             "endpoints": len(pagos),
             "from_usdc": round(min(get_dynamic_price(p) for p in pagos), 4),
             "to_usdc": round(max(get_dynamic_price(p) for p in pagos), 4),
-            "how": "Call any endpoint, settle the 402 challenge in USDC on Base "
-                   "or Solana, retry. No signup, no API key.",
+            "how": "Call any endpoint, settle the 402 challenge in USDC on Base, "
+                   "Solana or Algorand, retry. No signup, no API key.",
             "catalog": f"{base}/get-pricing",
         },
         "free": {
@@ -14573,9 +14601,11 @@ def pricing_page():
         "ts": int(time.time()),
     }
 
-    ua = request.headers.get("User-Agent", "")
+    # v44.8.1: HTML vira o padrão — o crawler do x402-list identifica-se como
+    # bot, caía no JSON e o pillar "pricing page" ficava ✗ apesar da página
+    # existir. JSON só para quem pedir explicitamente.
     if ("application/json" in request.headers.get("Accept", "").lower()
-            or _is_bot(ua) or request.args.get("format") == "json"):
+            or request.args.get("format") == "json"):
         return jsonify(corpo)
 
     linhas = "".join(
