@@ -87,7 +87,7 @@ from typing import Any, Optional, Dict, List, Tuple
 # 0. CONFIGURAÇÃO E AUTO-SETUP
 # ============================================================================
 
-VERSION = "44.8.1-DESCOBERTA"
+VERSION = "44.9.0-PROXY"  # /llm + /v1/chat/completions (SKU de recompra diaria) | v44.8.2: chain algorand no ledger + explorer allo.info + MRVA/B operator-wallets
 BRAND_NAME = "Losbeto"
 # v44.4.0: reposicionamento Brasil-primeiro. "Cross-asset market data" compete
 # com CoinGecko e cem nós iguais; "BCB + B3 normalizado em inglês" não compete
@@ -182,7 +182,9 @@ ENABLE_ALGO        = bool(ALGO_PAYTO)
 # Facilitator (padrão: PayAI – produção)
 # v21.15: wallets do operador — compras destas carteiras são marcadas como
 # "teste do operador" no /receipts e na landing (transparência > prova social falsa)
-_OW_DEFAULT = "0xcc83159a6513e56778da45a2981f55f44ef8e9e2,6Q1Sx7tWBKPF1aHBSGMyKi8m8EpxtoCvQykwSn5bX99h"
+_OW_DEFAULT = ("0xcc83159a6513e56778da45a2981f55f44ef8e9e2,6Q1Sx7tWBKPF1aHBSGMyKi8m8EpxtoCvQykwSn5bX99h,"
+               "mrva6oabpqjnj2wfuhfy57fmjxhbv37iu665mxrjx4jybiwgacp3lsduf4,"
+               "ifcmom5dnbqoafxi664j6jzhfffo5suucn7m6mrb2bwnepy3xbjwcoietq")
 OPERATOR_WALLETS = {w.strip().lower() for w in
     (os.environ.get("OPERATOR_WALLETS") or _OW_DEFAULT).split(",") if w.strip()}
 CDP_API_KEY_ID     = os.environ.get("CDP_API_KEY_ID", "").strip()
@@ -900,7 +902,20 @@ class LedgerV10:
             );
             CREATE INDEX IF NOT EXISTS idx_rev_ts ON revenue(ts);
             CREATE INDEX IF NOT EXISTS idx_rev_endpoint ON revenue(endpoint);
-            CREATE INDEX IF NOT EXISTS idx_rev_payer ON revenue(payer);
+            CREATE INDEX IF NOT EXISTS idx_rev_payer ON revenue(payer);""")
+            # v44.8.2: migracao unica — settles AVM eram gravados como "solana"
+            # (deteccao de chain caia no else). Txid Algorand = 52 chars, tudo
+            # maiusculo; assinaturas Solana base58 tem ~88 chars com minusculas.
+            try:
+                _fixed = c.execute(
+                    "UPDATE revenue SET chain='algorand' "
+                    "WHERE chain='solana' AND length(tx_sig)=52 AND upper(tx_sig)=tx_sig"
+                ).rowcount
+                if _fixed:
+                    log.info(f"🧭 migracao v44.8.2: {_fixed} receipts reclassificados solana→algorand")
+            except Exception as _me:
+                log.warning(f"migracao chain algorand: {_me}")
+            c.executescript("""
             CREATE TABLE IF NOT EXISTS requests (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 ts INTEGER NOT NULL,
@@ -4770,6 +4785,15 @@ def _valid_txid(v: str) -> bool:
         return len(v) == 66 and all(c in "0123456789abcdefABCDEF" for c in v[2:])
     return 43 <= len(v) <= 90 and all(c in _B58 for c in v)
 
+def _explorer_url(chain: str, sig: str) -> str:
+    """Link de explorer correto por chain — v44.8.2: Algorand ia parar no
+    solscan (link morto). allo.info e o explorer padrao do ecossistema AVM."""
+    if chain == "algorand":
+        return f"https://allo.info/tx/{sig}"
+    if chain == "base":
+        return f"https://basescan.org/tx/{sig}"
+    return f"https://solscan.io/tx/{sig}"
+
 def _clean_tx(sdata: dict, fallback: str = "") -> str:
     """v24.7 FIX: o campo 'transaction' de alguns facilitators traz o BLOB
     base64 da transação, não a assinatura. Isso gravava recibos com hash
@@ -5454,7 +5478,12 @@ def _verify_payment(endpoint: str, payment_header: str):
             amount = get_dynamic_price(endpoint)
     else:
         amount = get_dynamic_price(endpoint)
-    chain = "base" if ("eip155" in str(network).lower() or str(network).lower().startswith("base") or str(tx_sig).startswith("0x")) else "solana"
+    # v44.8.2: Algorand caía no else e ia pro ledger como "solana" — receipts
+    # com txid AVM e link solscan quebrado. Detecta as 3 chains explicitamente.
+    _net_l = str(network).lower()
+    chain = ("algorand" if _net_l.startswith("algorand")
+             else "base" if ("eip155" in _net_l or _net_l.startswith("base") or str(tx_sig).startswith("0x"))
+             else "solana")
 
     if (FACILITATOR or CDP_FAC) and payload:
         # v21.4 FIX: sanitiza campos-objeto que cheguem como null no payload do
@@ -9176,8 +9205,7 @@ def root():
                 "ORDER BY ts DESC LIMIT 8")
             for ts_, ep_, amt_, sig_, ch_, payer_, src_ in cur.fetchall():
                 when = time.strftime("%d/%m %H:%M", time.gmtime(ts_))
-                scan = (f"https://solscan.io/tx/{sig_}" if ch_ == "solana"
-                        else f"https://basescan.org/tx/{sig_}")
+                scan = _explorer_url(ch_, sig_)
                 is_op = (src_ == "bootstrap" or (payer_ or "").lower() in OPERATOR_WALLETS)
                 badge = ('<span style="color:var(--muted);font-size:.85em">🧪 teste do operador</span>'
                          if is_op else
@@ -9226,8 +9254,7 @@ def receipts_json():
                     "amount_usdc": f"{amt_:.4f}",
                     "tx": sig_, "chain": ch_,
                     "origin": origin, "settled_via": src_,
-                    "explorer": ((f"https://solscan.io/tx/{sig_}" if ch_ == "solana"
-                                 else f"https://basescan.org/tx/{sig_}")
+                    "explorer": (_explorer_url(ch_, sig_)
                                  if _valid_txid(sig_) else None),
                 })
     except Exception as e:
@@ -10516,6 +10543,150 @@ log.info("🌍 world-quote registrado ($0.02) — 16 praças globais, um schema"
 # (leaderboard x402scan, jul/2026). Sem concorrente no nicho, o desconto
 # agressivo só sinalizava baixa confiança.
 # ---------------------------------------------------------------------------
+
+
+# ===========================================================================
+# /llm  +  /v1/chat/completions   (v44.9.0-PROXY) — a SKU de RECOMPRA DIÁRIA.
+#
+# O que o mercado mediu (API do x402-list, ago/2026 — 508 serviços): o #1 do
+# ecossistema fatura ~90% de todo o volume medido sendo PROXY DE LLM via x402
+# (6,8M tx/30d a $0,003 — commodity de recompra diária, não relatório
+# ocasional). O insight: agente com USDC na carteira não quer gerenciar N
+# chaves de provedor; quer UM endpoint que aceita pagamento e devolve
+# inferência. Nós JÁ tínhamos as chaves e a cadeia de failover (LLM.ask com
+# Groq/Gemini/pagos) — faltava a porta. Aqui estão duas:
+#
+#   GET  /llm?q=...            — a vitrine: crawlers e indexadores do
+#                                ecossistema só sondam GET; resposta direta.
+#   POST /v1/chat/completions  — a porta de integração: formato OpenAI,
+#                                qualquer SDK entra trocando só a base_url.
+#
+# Preço flat por chamada ($0.005): cobre qualquer modelo da cadeia com margem
+# honesta e segue centavos abaixo do comparável premium (venice-ai: $10).
+# Caps server-side protegem o custo: prompt <= 16KB, saída <= 2048 tokens
+# (POST) / 512 (GET). Regra da casa preservada: cadeia LLM fora do ar →
+# pré-gate nem emite 402 (AI_REQUIRED_ENDPOINTS); falha pós-settle → tupla
+# (status:unavailable, 503) → estorno automático em crédito pelo paid_endpoint.
+# ===========================================================================
+LLM_PROXY_PRICE = 0.005
+_LLM_PROXY_MAX_PROMPT_CHARS = 16000
+_LLM_PROXY_SAMPLE_Q = ("Give a one-paragraph briefing on current crypto market "
+                       "sentiment, naming one bullish and one bearish signal.")
+
+AI_REQUIRED_ENDPOINTS.add("/llm")
+AI_REQUIRED_ENDPOINTS.add("/v1/chat/completions")
+
+def _llm_proxy_down():
+    return _unavailable_body(
+        "The inference failover chain (Groq, Gemini, paid tiers when configured) "
+        "is temporarily exhausted. You were not charged.")
+
+def llm_quick():
+    """GET /llm?q=... — resposta direta, preço único, qualquer assunto."""
+    q = (request.args.get("q") or _LLM_PROXY_SAMPLE_Q).strip()[:_LLM_PROXY_MAX_PROMPT_CHARS]
+    try:
+        mt = max(16, min(int(request.args.get("max_tokens", 300)), 512))
+    except (TypeError, ValueError):
+        mt = 300
+    if not llm_healthy():
+        return _llm_proxy_down()
+    ans = LLM.ask(q, max_tokens=mt, temperature=0.3, cache=False)
+    if not ans:
+        return _llm_proxy_down()
+    return {"answer": ans,
+            "sample_prompt": q == _LLM_PROXY_SAMPLE_Q,
+            "max_tokens": mt,
+            "how_it_works": ("One flat price per call, any subject. The node runs a "
+                             "multi-provider failover chain and returns the first live "
+                             "answer — you never manage API keys again."),
+            "openai_compatible": f"{_public_base()}/v1/chat/completions",
+            "ts": int(time.time()), "provider": "Losbeto/LLMProxy", "version": VERSION}
+
+def llm_chat_completions():
+    """POST /v1/chat/completions — OpenAI-compatible. Troca-se só a base_url.
+    Sem streaming/ferramentas no v1 — declarado na resposta de erro."""
+    body = request.get_json(silent=True) or {}
+    messages = body.get("messages")
+    _eh_preview = request.args.get("preview") == "1"
+    if (not isinstance(messages, list) or not messages) and _eh_preview:
+        messages = [{"role": "user", "content": _LLM_PROXY_SAMPLE_Q}]
+    if not isinstance(messages, list) or not messages:
+        return ({"error": "invalid-request",
+                 "message": ('Body must be JSON: {"messages": [{"role": "user", '
+                             '"content": "..."}], "max_tokens": 1024}'),
+                 "paid_retry": ("If you already paid, resend with the X-Session-Token "
+                                "you received — it retries this call at no extra cost."),
+                 "not_supported_yet": ["stream", "tools", "vision"],
+                 "ts": int(time.time())}, 400)
+    partes = []
+    for m in messages[-12:]:
+        if isinstance(m, dict) and m.get("content"):
+            role = str(m.get("role", "user")).lower()
+            partes.append(("System: " if role == "system" else "") + str(m["content"]))
+    prompt = "\n\n".join(partes)[:_LLM_PROXY_MAX_PROMPT_CHARS]
+    if not prompt.strip():
+        return ({"error": "invalid-request",
+                 "message": "messages contained no text content"}, 400)
+    try:
+        mt = max(16, min(int(body.get("max_tokens", 1024)), 2048))
+    except (TypeError, ValueError):
+        mt = 1024
+    try:
+        temp = max(0.0, min(float(body.get("temperature", 0.4)), 1.5))
+    except (TypeError, ValueError):
+        temp = 0.4
+    if not llm_healthy():
+        return _llm_proxy_down()
+    ans = LLM.ask(prompt, max_tokens=mt, temperature=temp, cache=False)
+    if not ans:
+        return _llm_proxy_down()
+    est_in, est_out = max(1, len(prompt) // 4), max(1, len(ans) // 4)
+    return {"id": "chatcmpl-lsb" + secrets.token_hex(12),
+            "object": "chat.completion",
+            "created": int(time.time()),
+            "model": str(body.get("model") or "losbeto-fast"),
+            "choices": [{"index": 0,
+                         "message": {"role": "assistant", "content": ans},
+                         "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": est_in, "completion_tokens": est_out,
+                      "total_tokens": est_in + est_out,
+                      "note": "character-based estimate (len/4)"},
+            "not_supported_yet": ["stream", "tools", "vision"],
+            "provider": "Losbeto/LLMProxy", "version": VERSION}
+
+BASE_PRICES["/llm"] = LLM_PROXY_PRICE
+ENDPOINT_DESC["/llm"] = (
+    "LLM inference as a pay-per-call commodity — ask anything (?q=...) and get the "
+    "first live answer from a multi-provider failover chain (Groq, Gemini, paid tiers "
+    "when configured). One flat price, any subject, no API keys to manage. This is the "
+    "high-frequency SKU agents refill daily: summarization, extraction, drafting, "
+    "classification. OpenAI-compatible door at POST /v1/chat/completions — point any "
+    "SDK at this base_url and pay per call in USDC instead of juggling provider keys.")
+ENDPOINT_TAGS["/llm"] = ["AI", "Inference", "Commodity"]
+ENDPOINT_PARAM_HINTS["/llm"] = {"q": "your prompt here", "max_tokens": "300"}
+ENDPOINT_HANDLERS["/llm"] = llm_quick
+app.add_url_rule("/llm", "llm_quick", paid_endpoint("/llm")(llm_quick))
+
+BASE_PRICES["/v1/chat/completions"] = LLM_PROXY_PRICE
+ENDPOINT_DESC["/v1/chat/completions"] = (
+    "OpenAI-compatible chat completions over x402: POST the standard "
+    "{model, messages, max_tokens} body and receive a standard chat.completion "
+    "response — any OpenAI SDK works by changing only base_url. Payment is the "
+    "x402 challenge (USDC on Base, Solana or Algorand), so an agent needs no "
+    "provider account, no credit card, no API key. Failover chain behind the "
+    "door: Groq first for speed, Gemini and paid tiers as backup. v1: no "
+    "streaming, tools or vision — declared in every error response.")
+ENDPOINT_TAGS["/v1/chat/completions"] = ["AI", "Inference", "OpenAI-compatible"]
+ENDPOINT_HANDLERS["/v1/chat/completions"] = llm_chat_completions
+app.add_url_rule("/v1/chat/completions", "llm_chat_completions",
+                 paid_endpoint("/v1/chat/completions")(llm_chat_completions),
+                 methods=["POST"])
+if "/llm" in FEATURED_ENDPOINTS:
+    FEATURED_ENDPOINTS.remove("/llm")
+FEATURED_ENDPOINTS.insert(0, "/llm")
+log.info("🧠 llm-proxy registrado ($0.005) — GET /llm + POST /v1/chat/completions (OpenAI-compatível)")
+
+
 _V32_REPRICE = {
     # Produtos de IA/síntese — onde o comparável de mercado é $0.15–0.75
     "/council-deep":          0.35,
@@ -15105,6 +15276,7 @@ def dash_tx_list():
             "source": r[5],
             "chain": r[6],
             "solscan": f"https://solscan.io/tx/{r[3]}" if r[6] == "solana" and r[3] else None,
+            "explorer": _explorer_url(r[6], r[3]) if r[3] else None,
         }
         for r in rows
     ]
