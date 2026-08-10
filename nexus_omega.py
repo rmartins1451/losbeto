@@ -87,7 +87,7 @@ from typing import Any, Optional, Dict, List, Tuple
 # 0. CONFIGURAÇÃO E AUTO-SETUP
 # ============================================================================
 
-VERSION = "44.9.1-SCHEMA"  # input schema do POST p/ x402scan + porta GET didatica | v44.9.0: /llm + /v1/chat/completions | v44.8.2: receipts algorand
+VERSION = "44.9.2-OPENAPI"  # input schema do POST p/ x402scan + porta GET didatica | v44.9.0: /llm + /v1/chat/completions | v44.8.2: receipts algorand
 BRAND_NAME = "Losbeto"
 # v44.4.0: reposicionamento Brasil-primeiro. "Cross-asset market data" compete
 # com CoinGecko e cem nós iguais; "BCB + B3 normalizado em inglês" não compete
@@ -10644,6 +10644,34 @@ ENDPOINT_BODY_SCHEMAS = {
                           "content": "Summarize today's crypto market sentiment in one paragraph."}],
             "max_tokens": 300,
         },
+        # v44.9.2: o discovery (AgentCash/x402scan) exige input E output schema
+        # na operação — este é o shape chat.completion que o handler devolve.
+        "outputSchema": {
+            "type": "object",
+            "properties": {
+                "id":      {"type": "string", "example": "chatcmpl-lsb9f2c41a0b3e"},
+                "object":  {"type": "string", "enum": ["chat.completion"]},
+                "created": {"type": "integer", "description": "Unix timestamp."},
+                "model":   {"type": "string"},
+                "choices": {"type": "array", "items": {
+                    "type": "object",
+                    "properties": {
+                        "index": {"type": "integer"},
+                        "message": {"type": "object",
+                                    "properties": {
+                                        "role": {"type": "string", "enum": ["assistant"]},
+                                        "content": {"type": "string"}},
+                                    "required": ["role", "content"]},
+                        "finish_reason": {"type": "string", "enum": ["stop", "length"]}},
+                    "required": ["index", "message", "finish_reason"]}},
+                "usage": {"type": "object",
+                          "properties": {
+                              "prompt_tokens":     {"type": "integer"},
+                              "completion_tokens": {"type": "integer"},
+                              "total_tokens":      {"type": "integer"}}},
+            },
+            "required": ["id", "object", "created", "model", "choices"],
+        },
     }
 }
 
@@ -13880,6 +13908,52 @@ def _build_openapi():
                 },
             }
         }
+        # v44.9.2: endpoints cujo contrato real é POST com corpo JSON (ex.:
+        # /v1/chat/completions, OpenAI-compatível) — o OpenAPI é a fonte nº 1
+        # do discovery (AgentCash/x402scan). Declarar o recurso como GET pago
+        # sem requestBody era exatamente o warning "Paid endpoint is missing
+        # an input schema" e ainda listava o recurso com o método errado.
+        # Aqui o documento passa a declarar SÓ o POST pago, com requestBody
+        # (input) e resposta 200 (output) formalizados; o GET didático
+        # gratuito fica fora do documento para não ser classificado como pago.
+        _obs = ENDPOINT_BODY_SCHEMAS.get(p) if "ENDPOINT_BODY_SCHEMAS" in globals() else None
+        if _obs:
+            paths[p] = {
+                "post": {
+                    "summary":     ENDPOINT_DESC.get(p, p),
+                    "description": f"{ENDPOINT_DESC.get(p, p)}. Preco: ${price:.4f} USDC via x402.",
+                    "operationId": p.strip("/").replace("/", "_").replace("-", "_") + "_post",
+                    "tags":        ENDPOINT_TAGS.get(p, ["AI"]),
+                    "requestBody": {
+                        "required": True,
+                        "content": {_obs["contentType"]: {
+                            "schema":  _obs["schema"],
+                            "example": _obs["example"],
+                        }},
+                    },
+                    "security":    [{"x402": []}],
+                    "x-payment-info": {
+                        "price": {"mode": "fixed", "currency": "USD",
+                                  "amount": f"{price:.6f}"},
+                        "protocols": [{"x402": {}}],
+                    },
+                    "x-x402-details": {
+                        "scheme":  "exact",
+                        "network": f"solana:{SOL_GENESIS}",
+                        "asset":   USDC_MINT,
+                        "amount_atomic": str(int(price * 10 ** USDC_DECIMALS)),
+                        "payTo":   RECEIVE_ADDRESS,
+                        "credits": "Poupe settlement por chamada: compre /buy-credits e use header X-API-Key",
+                    },
+                    "responses": {
+                        "200": {"description": "chat.completion OpenAI-compatível",
+                                "content": {"application/json": {
+                                    "schema": _obs.get("outputSchema", {"type": "object"})}}},
+                        "402": {"description": "Payment Required — use protocolo x402"},
+                    },
+                }
+            }
+            continue
         # v42.1 FIX: /portfolio-stress aceita POST com o JSON de posições —
         # sem esse requestBody o validador marcava "missing input schema".
         if p == "/portfolio-stress":
