@@ -87,7 +87,7 @@ from typing import Any, Optional, Dict, List, Tuple
 # 0. CONFIGURAÇÃO E AUTO-SETUP
 # ============================================================================
 
-VERSION = "44.9.0-PROXY"  # /llm + /v1/chat/completions (SKU de recompra diaria) | v44.8.2: chain algorand no ledger + explorer allo.info + MRVA/B operator-wallets
+VERSION = "44.9.1-SCHEMA"  # input schema do POST p/ x402scan + porta GET didatica | v44.9.0: /llm + /v1/chat/completions | v44.8.2: receipts algorand
 BRAND_NAME = "Losbeto"
 # v44.4.0: reposicionamento Brasil-primeiro. "Cross-asset market data" compete
 # com CoinGecko e cem nós iguais; "BCB + B3 normalizado em inglês" não compete
@@ -4899,6 +4899,7 @@ def _bazaar_blob(endpoint: str) -> dict:
     desc = ENDPOINT_DESC.get(endpoint, endpoint)
     params = dict(ENDPOINT_PARAM_HINTS.get(endpoint, {"format": "json"}))
 
+
     # exemplo de saída: dado real que o warmer já mantém quente (custo zero)
     example_out = {}
     try:
@@ -4920,6 +4921,34 @@ def _bazaar_blob(endpoint: str) -> dict:
     except Exception as e:
         log.debug(f"bazaar example {endpoint}: {e}")
 
+    # v44.9.1: endpoints POST com corpo JSON (ex.: /v1/chat/completions) — o
+    # blob padrão descreveria um GET com queryParams, e o x402scan avisava
+    # "Paid endpoint is missing an input schema". Aqui o método e o schema
+    # do corpo são declarados de verdade.
+    _bs = ENDPOINT_BODY_SCHEMAS.get(endpoint) if "ENDPOINT_BODY_SCHEMAS" in globals() else None
+    if _bs:
+        return {
+            "info": {
+                "input": {"type": "http", "method": _bs["method"],
+                          "contentType": _bs["contentType"],
+                          "bodyParams": _bs["example"]},
+                "output": ({"type": "json", "example": example_out} if example_out
+                           else {"type": "json"}),
+            },
+            "inputSchema": _bs["schema"],
+            "schema": {
+                "$schema": "https://json-schema.org/draft/2020-12/schema",
+                "type": "object",
+                "properties": {
+                    "input": {"type": "object", "properties": {
+                        "method": {"type": "string", "description": _bs["method"]},
+                        "bodyParams": _bs["schema"]}},
+                    "output": {"type": "object", "properties": {
+                        "example": {"type": "object", "description": desc}}},
+                },
+                "required": ["input"]},
+            "description": desc,
+        }
     props = {k: {"type": "string", "description": _PARAM_DESC.get(k, f"{k} parameter")}
              for k in params}
     return {
@@ -5304,12 +5333,21 @@ def _build_402(endpoint: str):
                   "description": _PARAM_DESC.get(k, f"{k} parameter"),
                   "example": v}
               for k, v in _hints.items() if k != "format"}
-    payload["inputSchema"] = {
-        "type": "object",
-        "properties": _props,
-        "required": [],
-        "additionalProperties": False,
-    }
+    # v44.9.1: endpoints POST declaram o schema do CORPO (não queryParams) —
+    # era o warning "missing an input schema" do registro no x402scan.
+    _bs402 = ENDPOINT_BODY_SCHEMAS.get(endpoint) if "ENDPOINT_BODY_SCHEMAS" in globals() else None
+    if _bs402:
+        payload["inputSchema"] = _bs402["schema"]
+        payload["inputMethod"] = _bs402["method"]
+        payload["inputContentType"] = _bs402["contentType"]
+        payload["inputExample"] = _bs402["example"]
+    else:
+        payload["inputSchema"] = {
+            "type": "object",
+            "properties": _props,
+            "required": [],
+            "additionalProperties": False,
+        }
     payload["outputSchema"] = {"type": "object", "mimeType": "application/json"}
 
     payload_hdr = _slim(payload)
@@ -10573,6 +10611,63 @@ _LLM_PROXY_MAX_PROMPT_CHARS = 16000
 _LLM_PROXY_SAMPLE_Q = ("Give a one-paragraph briefing on current crypto market "
                        "sentiment, naming one bullish and one bearish signal.")
 
+# v44.9.1: schema formal do corpo POST — alimenta o 402 (inputSchema), o blob
+# Bazaar (info.input.bodyParams) e a porta didática GET. Era o único warning
+# do registro no x402scan ("missing an input schema").
+ENDPOINT_BODY_SCHEMAS = {
+    "/v1/chat/completions": {
+        "method": "POST",
+        "contentType": "application/json",
+        "schema": {
+            "type": "object",
+            "properties": {
+                "model": {"type": "string", "default": "losbeto-fast",
+                          "description": "Model alias; any string accepted (failover chain picks the live provider)."},
+                "messages": {"type": "array",
+                             "description": "OpenAI chat messages, oldest first.",
+                             "items": {"type": "object",
+                                       "properties": {
+                                           "role": {"type": "string", "enum": ["system", "user", "assistant"]},
+                                           "content": {"type": "string"}},
+                                       "required": ["role", "content"]}},
+                "max_tokens": {"type": "integer", "default": 1024,
+                               "description": "Completion cap, 16-2048."},
+                "temperature": {"type": "number", "default": 0.4,
+                                "description": "Sampling temperature, 0.0-1.5."},
+            },
+            "required": ["messages"],
+            "additionalProperties": False,
+        },
+        "example": {
+            "model": "losbeto-fast",
+            "messages": [{"role": "user",
+                          "content": "Summarize today's crypto market sentiment in one paragraph."}],
+            "max_tokens": 300,
+        },
+    }
+}
+
+def llm_chat_docs():
+    """GET gratuito e didático na MESMA rota do POST pago — scanners e humanos
+    veem como chamar; o registro no x402scan lia GET aqui e achava endpoint
+    sem schema. Agora a rota responde a documentação da integração."""
+    _bs = ENDPOINT_BODY_SCHEMAS["/v1/chat/completions"]
+    return jsonify({
+        "endpoint": "/v1/chat/completions",
+        "method": "POST",
+        "price_usd": f"{LLM_PROXY_PRICE:.4f}",
+        "how": "Send the POST body below with a valid x402 payment header (PAYMENT-SIGNATURE or X-PAYMENT).",
+        "input_schema": _bs["schema"],
+        "example_body": _bs["example"],
+        "example_curl": (f"curl -X POST {_public_base()}/v1/chat/completions "
+                         "-H 'Content-Type: application/json' "
+                         "-H 'PAYMENT-SIGNATURE: <signed-payload>' "
+                         "-d '" + json.dumps(_bs["example"]) + "'"),
+        "get_alternative": f"{_public_base()}/llm?q=your+prompt (same engine, GET, same price)",
+        "not_supported_yet": ["stream", "tools", "vision"],
+        "ts": int(time.time()), "provider": "Losbeto/LLMProxy", "version": VERSION,
+    })
+
 AI_REQUIRED_ENDPOINTS.add("/llm")
 AI_REQUIRED_ENDPOINTS.add("/v1/chat/completions")
 
@@ -10681,6 +10776,8 @@ ENDPOINT_HANDLERS["/v1/chat/completions"] = llm_chat_completions
 app.add_url_rule("/v1/chat/completions", "llm_chat_completions",
                  paid_endpoint("/v1/chat/completions")(llm_chat_completions),
                  methods=["POST"])
+app.add_url_rule("/v1/chat/completions", "llm_chat_docs",
+                 llm_chat_docs, methods=["GET"])
 if "/llm" in FEATURED_ENDPOINTS:
     FEATURED_ENDPOINTS.remove("/llm")
 FEATURED_ENDPOINTS.insert(0, "/llm")
