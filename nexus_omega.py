@@ -87,7 +87,7 @@ from typing import Any, Optional, Dict, List, Tuple
 # 0. CONFIGURAÇÃO E AUTO-SETUP
 # ============================================================================
 
-VERSION = "44.9.2-OPENAPI"  # input schema do POST p/ x402scan + porta GET didatica | v44.9.0: /llm + /v1/chat/completions | v44.8.2: receipts algorand
+VERSION = "44.9.3-PARTNER"  # input schema do POST p/ x402scan + porta GET didatica | v44.9.0: /llm + /v1/chat/completions | v44.8.2: receipts algorand
 BRAND_NAME = "Losbeto"
 # v44.4.0: reposicionamento Brasil-primeiro. "Cross-asset market data" compete
 # com CoinGecko e cem nós iguais; "BCB + B3 normalizado em inglês" não compete
@@ -135,6 +135,9 @@ PUBLIC_URL = (
 ).rstrip("/")
 
 DASH_TOKEN = os.environ.get("DASH_TOKEN", secrets.token_urlsafe(16))
+# v44.9.3: chave de parceiro B2B (storefronts que revendem nosso dado, ex.:
+# Actor na Apify Store). Só em Railway Variables — nunca em código/GitHub.
+PARTNER_KEY = os.environ.get("PARTNER_KEY", "").strip()
 JWT_SECRET = os.environ.get("JWT_SECRET", secrets.token_urlsafe(32))
 JWT_TTL    = int(os.environ.get("JWT_TTL_SECONDS", "300"))
 
@@ -6269,6 +6272,37 @@ def paid_endpoint(path):
                 _wresp = _welcome_redeem(_wtok, path, handler, t0, ip)
                 if _wresp is not None:
                     return _wresp
+
+            # v44.9.3: PARTNER KEY — storefronts parceiras (ex.: nosso Actor na
+            # Apify Store) usam o próprio nó como motor de dados. A receita
+            # entra em FIAT pela plataforma parceira, então aqui NÃO vira
+            # revenue nem leaderboard: logado como kind="partner" (telemetria
+            # honesta). Chave errada cai no fluxo normal (402) sem revelar
+            # que o recurso existe.
+            _pk = (request.headers.get("X-Partner-Key") or "").strip()
+            if _pk and PARTNER_KEY and _pk == PARTNER_KEY:
+                try:
+                    from flask import g as _g
+                    _g.losbeto_payer = "partner:storefront"
+                    _g.losbeto_payment = {"payer": "partner", "tx": "", "via": "partner-key"}
+                    result = handler()
+                    if isinstance(result, tuple) and len(result) > 1 and result[1] == 503:
+                        LEDGER.log_request(path, False, int((time.time() - t0) * 1000), ip,
+                                           kind="probe", ua=request.headers.get("User-Agent",""), params=_clean_params())
+                        return jsonify(result[0]), 503
+                    LEDGER.log_request(path, True, int((time.time() - t0) * 1000), ip,
+                                       kind="partner", ua=request.headers.get("User-Agent",""), params=_clean_params())
+                    if isinstance(result, Response):
+                        resp = result
+                    elif isinstance(result, tuple) and result and isinstance(result[0], Response):
+                        resp = result[0]
+                    else:
+                        resp = jsonify(result[0] if isinstance(result, tuple) else result)
+                    resp.headers["X-Channel"] = "partner"
+                    return resp
+                except Exception as e:
+                    log.error(f"handler {path} (partner): {e}")
+                    return jsonify({"error": str(e)}), 500
 
             # v23: CRÉDITOS PRÉ-PAGOS — header X-API-Key pula o fluxo 402 por
             # completo. Settlement on-chain por chamada tem 2-5s de latência;
