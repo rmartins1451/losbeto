@@ -1,148 +1,143 @@
-# Losbeto — Cross-Asset Market Intelligence over x402
+# Losbeto — point-in-time Brazilian market data for AI agents
 
-[![Losbeto on x402-list — monitored uptime](https://x402-list.com/badge/losbeto-cross-asset-market-intelligence.svg?data=uptime)](https://x402-list.com/services/losbeto-cross-asset-market-intelligence?utm_source=badge&utm_medium=referral&utm_campaign=embed)
+[![Losbeto on x402-list — monitored uptime](https://x402-list.com/badge/losbeto-cross-asset-market-intelligence.svg?data=uptime)](https://x402-list.com/services/losbeto-cross-asset-market-intelligence)
 
-A single-file Python node that sells market data to AI agents, per call, in USDC, with no API keys and no signup. Live at https://api.losbeto.xyz
+**The problem:** the IPCA number you fetch from the Banco Central API today is *not* the
+number that was published back then. Official Brazilian series are revised. Any backtest
+built on the current series silently contains look-ahead bias.
 
-Stocks, forex, commodities, macro, Brazil (BCB/B3), crypto — **and LLM inference as a pay-per-call commodity** — 86 endpoints, $0.003–$99.99, settling on **Base (Coinbase CDP), Solana (PayAI) and Algorand (gasless challenge)**.
+The US has [ALFRED](https://alfred.stlouisfed.org/) for this. Brazil has nothing public.
 
-Public telemetry (settlements, revenue, probes, source health, straight from the node's own ledger): https://api.losbeto.xyz/live
+**What this is:** a node that has been recording Brazilian official statistics *as they
+were published*, timestamping every reading, and signing each day with Ed25519 —
+continuously, since deploy. That archive cannot be scraped retroactively by anyone,
+including us. It only exists because the node was running.
 
-## Try it without paying anything
+Paid per call over [x402](https://x402.org) — USDC on Base, Solana or Algorand.
+No signup, no API key, no invoice.
+
+---
+
+## Quick start
 
 ```bash
-# first REAL-TIME call free — no wallet, no signup
-curl https://api.losbeto.xyz/welcome
+# free — see the whole archive and how to verify it
+curl https://api.losbeto.xyz/br-pit-proof
 
-# six live samples from six endpoints, one call, $0.00
-curl https://api.losbeto.xyz/try
+# free — what the paid endpoints actually cost and why
+curl https://api.losbeto.xyz/why-buy
 
-# any endpoint, free delayed sample
-curl 'https://api.losbeto.xyz/oracle-consensus?symbol=SOL&preview=1'
-
-# is the node actually healthy right now?
-curl https://api.losbeto.xyz/health/providers
+# paid — IPCA as it was known on 5 Aug 2026 (not as revised since)
+curl https://api.losbeto.xyz/br-asof?series=ipca_12m_pct&date=2026-08-05
+# -> HTTP 402 with the payment challenge; pay and repeat
 ```
 
-## LLM inference as a commodity — new
+### With an x402 client
 
-Any OpenAI SDK works by changing only `base_url` — payment is the x402 challenge, so an agent needs no provider account, no credit card, no API key:
+```ts
+import { wrapFetchWithPayment } from "x402-fetch";
+
+const fetchWithPay = wrapFetchWithPayment(fetch, wallet);
+const r = await fetchWithPay(
+  "https://api.losbeto.xyz/br-asof?series=selic_meta_pct&date=2026-06-30"
+);
+console.log(await r.json());
+```
+
+### As an MCP server (Claude Desktop, Cursor, Claude Code)
+
+```json
+{
+  "mcpServers": {
+    "losbeto": {
+      "url": "https://api.losbeto.xyz/mcp",
+      "headers": { "Authorization": "Bearer <credit-key>" }
+    }
+  }
+}
+```
+
+Get a credit key with one on-chain payment: `POST https://api.losbeto.xyz/buy-credits`.
+
+---
+
+## The products
+
+| Endpoint | Price | What you get |
+|---|---|---|
+| `/br-pit-proof` | free | Merkle roots, signer key, coverage window, verification recipe |
+| `/br-asof?series=&date=` | $0.09 | The value **as known on that date** — vintage, not revised |
+| `/br-revisions?series=` | $0.19 | First print → every correction, with size and observation timestamp |
+| `/br-archive?day=` | $0.05 | Signed daily snapshot: BCB macro + Ibovespa close |
+| `/br-brief` | $0.50 | Daily Brazil macro + equity brief, in English |
+
+Series tracked: `selic_meta_pct`, `cdi_daily_pct`, `ipca_12m_pct`, `igpm_month_pct`,
+`usd_brl_ptax`, `eur_brl`.
+
+The node also exposes ~80 other endpoints (crypto, FX, commodities, equities). Those are
+convenience wrappers over public sources — see `/why-buy`, where we tell you plainly which
+ones you should *not* pay for.
+
+---
+
+## Verify anything, offline
+
+Every observation is a Merkle leaf:
+
+```
+leaf = sha256("<series>|<ref_date>|<value>|<seq>|<observed_ts>")
+```
+
+Leaves are sorted and hashed into a daily Merkle root (sha256; an odd level duplicates its
+last leaf). The root is signed:
+
+```
+Ed25519( "losbeto-pit|<day>|<root>" )   # pubkey published at /br-pit-proof
+```
 
 ```python
-from openai import OpenAI
-client = OpenAI(base_url="https://api.losbeto.xyz/v1", api_key="x402")
-# POST /v1/chat/completions — $0.005 flat, USDC via x402 (Base, Solana or Algorand)
+import base64, nacl.signing
+pub = nacl.signing.VerifyKey(base58_decode(signer))
+pub.verify(f"losbeto-pit|{day}|{root}".encode(), base64.b64decode(signature))
 ```
 
-Or the plain GET door: `curl 'https://api.losbeto.xyz/llm?q=your+prompt'` (paid via x402). Failover chain behind the door: Groq first for speed, Gemini and paid tiers as backup. v1: no streaming, tools or vision — declared in every error response.
+Daily roots are optionally anchored on Algorand as a zero-value note transaction, so the
+timestamp does not depend on trusting us.
 
-## Use it from an agent
+---
 
-MCP (Claude Code, Cursor, Claude Desktop — no install):
+## Revenue transparency
 
-```bash
-claude mcp add --transport http losbeto https://api.losbeto.xyz/mcp
-```
+`GET /.well-known/honest-revenue.json` — signed, and it separates:
 
-LangChain / CrewAI / OpenAI function calling — free delayed data:
+- `organic` — paid by a wallet the operator does not control
+- `operator-test` — the operator's own declared wallets
+- `self-sweep` — one wallet settling many distinct endpoints in a short window
 
-```bash
-pip install 'losbeto-tools[langchain]'   # https://pypi.org/project/losbeto-tools/
-```
+Operator-funded traffic is labelled, not hidden. If the organic number is small, it says so.
 
-Any x402 wallet:
+---
 
-```bash
-npx agentcash fetch https://api.losbeto.xyz/oracle-consensus?symbol=SOL
-npx agentcash add https://api.losbeto.xyz
-```
-
-## Pay per call, or buy a pass
-
-Per-call is the default. For agents running evaluation cycles or production workloads, one on-chain payment buys balance or unlimited time — then zero settlement latency per request:
-
-| Plan | Price | What you get |
-|---|---|---|
-| /buy-credits | $0.99 | $1.25 of call balance (+25% bonus), spent via X-API-Key |
-| /day-pass | $2.99 | unlimited calls, 24h |
-| /week-pass | $9.99 | unlimited calls, 7 days |
-| /subscribe-pro | $9.99/mo | $15 of call balance monthly (+50% bonus), priority routing |
-| /subscribe-whale | $19.99/mo | unlimited calls, 30 days, maximum priority |
-| /enterprise | $99.99/yr | 12 months unlimited, 99.9% availability target, direct support |
-
-## What makes it different
-
-Most x402 services are crypto-only. This one covers traditional markets too, and it is the only one that covers Brazil:
-
-| Area | Examples |
-|---|---|
-| Brazil | BCB/SGS macro (Selic, CDI, IPCA, PTAX), B3 equities, real interest rate, agro export parity |
-| Forex | EUR/USD, GBP/USD, USD/JPY, triangular arbitrage |
-| Equities | live quotes, AI single-stock dossiers, sector rotation |
-| Commodities | gold, silver, WTI, Brent, copper, natural gas |
-| Macro | FOMC / NFP / CPI / ECB calendar, event playbooks, regime |
-| Crypto | multi-oracle price consensus, Pyth feeds, fear & greed, DEX screening, rug checks |
-| Security | token intelligence, wallet scan, OFAC/SDN sanctions screening, launch risk |
-| Research | daily cross-asset brief, 90-day correlation matrix, 5-agent council |
-| AI | LLM inference per call (OpenAI-compatible), research briefs, council votes |
-
-**Oracle Consensus — /oracle-consensus?symbol=SOL · $0.03**
-
-Every oracle publishes its own number. None publishes the agreement between them. This queries Pyth, Coinbase, Kraken, Binance.US, Bitstamp and CoinGecko in parallel and returns the median across primary sources, spread and MAD in basis points, outliers by modified Z-score (Iglewicz & Hoaglin, |Z|>3.5) distinguishing a lagging index from a stale or manipulated feed, per-source latency, and an execution verdict with suggested slippage.
-
-If fewer than two sources respond, it returns 503 and does not charge.
-
-## Machine-readable discovery
-
-Every surface an agent or directory might ask for:
-
-/llms.txt · /llms-full.txt · /openapi.json · /tasks.json · /.well-known/x402.json · /.well-known/mcp.json · /server.json · /.well-known/agent-card.json (A2A) · /.well-known/ai-catalog.json · /.well-known/api-catalog (RFC 9727 linkset) · /apis.json · /.well-known/ucp (Google UCP) · /health/providers · /receipts
-
-## Design decisions worth stealing
-
-Everything below was learned by operating the node and measuring it. If you run an x402 service, some of it may save you weeks.
-
-**Measure your 402 header size.** Ours grew to 19,627 bytes (duplicate challenge blobs across WWW-Authenticate, PAYMENT-REQUIRED and X-PAYMENT-REQUIRED). Node's default max header size is 16 KB and proxies commonly cap at 8 KB, so Node-based x402 clients aborted the connection on every paid endpoint while free ones worked fine. Settlements went to zero and it looked like ordinary probe traffic.
-
-**Base64 padding matters.** Stripping = from the PAYMENT-REQUIRED payload makes strict b64decode fail on ~75% of payloads.
-
-**accepts order decides your chain.** Most clients take accepts[0]. With Solana first, virtually every settle went through the Solana facilitator — and the Bazaar only indexes on CDP settles.
-
-**Generate the manifest from the challenge, not beside it.** We fixed the accepts order in the 402 challenge and left /.well-known/x402.json building its own array by hand. For months the challenge said Base-first and the manifest — the document scanners actually read — said Solana-first. Two code paths for one fact will diverge. The manifest is now derived from _build_402().
-
-**On Base, the tx sender is not the payer.** EIP-3009 transfer-with-authorization means the buyer only signs; the facilitator's relayer submits and pays gas. If you reconcile by tx.from, you attribute every sale to the relayer.
-
-**Not every txid is base58.** Algorand transaction ids are 52-char base32 (A-Z2-7) — they contain O and I, which the base58 alphabet excludes. A base58-only validator silently records receipts with no explorer link for the entire Algorand rail.
-
-**A free sample must actually be delayed.** Ours served data with ~0s of age — identical to the paid response. The delay is now proportional to each feed's volatility.
-
-**Don't let the free path starve the paid one.** Our preview warmer refreshed five LLM-backed endpoints every 15 minutes — roughly 480 model calls a day for nobody. It exhausted the daily token quota, so when a paying agent arrived the AI layer was dead. Warm cheap data often; warm expensive inference rarely.
-
-**A 503 from your handler is not a refund.** Payment verification runs before the handler. If you check availability inside the handler, the money is already captured. Gate on availability before issuing the 402 — and if the input dies after settlement, issue credit back explicitly.
-
-**Never let a fallback string reach a paid response.** Our LLM helper returned "[LLM offline — configure ...]" when every provider failed. That string was served inside paid /analise and /relatorio responses, and ingested into the RAG store. Fail loudly and refuse the sale instead.
-
-**Pin the price you quoted.** Dynamic pricing recomputed the amount at settlement time. If it moved between the 402 and the payment, the client's signature no longer matched the requirements and the facilitator rejected a perfectly good sale, silently.
-
-**Answer 404 and 405 in JSON that teaches.** Agents probe paid endpoints with POST/PATCH/PUT/DELETE and mis-type paths. Framework defaults are HTML — dead ends for a machine. Our 404 suggests the closest real endpoints and the 405 answers the one fact that matters (how_to_call: GET ...) plus the free sample URL. Wrong turns became a funnel.
-
-**Catalog agents ask for trailing slashes.** Directories and linkset crawlers requested /.well-known/ucp/, /apis.json/, /health/ and got 404s while the routes existed without the slash. One method-preserving 308 redirect on slash-stripped known routes fixed the whole class — watch your 404 log before building "new" endpoints that already exist.
-
-## Running your own
+## Run it yourself
 
 ```bash
 pip install -r requirements.txt
-python nexus_omega.py
+export SOLANA_WALLET_ADDRESS=...      # where payments land
+export BASE_PAYTO_EVM=0x...           # optional
+export ALGORAND_WALLET_ADDRESS=...    # optional
+export BUYER_WALLETS=...              # your own test-buyer wallets, comma separated
+gunicorn --workers 2 --threads 8 --preload --bind 0.0.0.0:$PORT nexus_omega:app
 ```
 
-Configuration is entirely through environment variables — wallets, facilitators, API keys, pricing, partner channel (PARTNER_KEY) and LLM model names (GEMINI_MODEL, GROQ_MODEL, CLAUDE_MODEL, DEEPSEEK_MODEL), so a discontinued model can be swapped without a redeploy. No secrets in the source.
+Useful env vars: `AI_WARMER=1` (re-enable AI preview warming), `LLM_DAILY_BUDGET`,
+`LLM_PAID_RESERVE`, `PIT_INTERVAL_S`, `ALGO_ANCHOR_MNEMONIC` (+ `pip install py-algorand-sdk`).
 
-## Listed on
-
-x402scan · x402-list.com (Grade A) · CDP Bazaar / agentic.market · MCP Registry · AgentCash · Apify Store (Brazil Macro & Markets) · PyPI (losbeto-tools)
+---
 
 ## Contact
 
-Missing an endpoint your agent needs? Open an issue — endpoints are added on request, and every message gets read. Several routes on this node exist because an agent's 404 showed up in the demand log.
+Roberto Martins — roberto.martins622@gmail.com
+
+Missing a series or a market you need? Open an issue. New endpoints get built on request.
 
 MIT licensed.
