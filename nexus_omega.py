@@ -87,7 +87,7 @@ from typing import Any, Optional, Dict, List, Tuple
 # 0. CONFIGURAÇÃO E AUTO-SETUP
 # ============================================================================
 
-VERSION = "44.9.3-PARTNER"  # input schema do POST p/ x402scan + porta GET didatica | v44.9.0: /llm + /v1/chat/completions | v44.8.2: receipts algorand
+VERSION = "44.9.4-RECIBOS"  # input schema do POST p/ x402scan + porta GET didatica | v44.9.0: /llm + /v1/chat/completions | v44.8.2: receipts algorand
 BRAND_NAME = "Losbeto"
 # v44.4.0: reposicionamento Brasil-primeiro. "Cross-asset market data" compete
 # com CoinGecko e cem nós iguais; "BCB + B3 normalizado em inglês" não compete
@@ -4778,14 +4778,20 @@ def _recommended_next(current: str, payer: str, limit: int = 2) -> list:
 
 _B58 = set("123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz")
 
+_AVM32 = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567"
+
 def _valid_txid(v: str) -> bool:
     """Assinatura Solana = base58 (43-90 chars). TX EVM = 0x + 64 hex.
+    TXID Algorand = base32 A-Z2-7 de 52 chars (v44.9.4: contém O e I, que o
+    base58 exclui — era a causa dos recibos Algorand gravados sem link).
     Blob base64 de transação (contém +, /, = ou é gigante) NÃO é assinatura."""
     if not v or not isinstance(v, str):
         return False
     v = v.strip()
     if v.startswith("0x"):
         return len(v) == 66 and all(c in "0123456789abcdefABCDEF" for c in v[2:])
+    if len(v) == 52 and all(c in _AVM32 for c in v):
+        return True
     return 43 <= len(v) <= 90 and all(c in _B58 for c in v)
 
 def _explorer_url(chain: str, sig: str) -> str:
@@ -4808,10 +4814,27 @@ def _clean_tx(sdata: dict, fallback: str = "") -> str:
         v = sdata.get(key)
         if isinstance(v, str) and _valid_txid(v):
             return v.strip()
+        # v44.9.4: settle da PayAI voltou a trazer o BLOB base64 da transação
+        # Solana inteira em 'transaction' (campos vistos no log: success,
+        # transaction, network, payer). A assinatura são os primeiros 64
+        # bytes do blob — recuperamos em vez de gravar recibo sem link.
+        if isinstance(v, str) and (len(v) > 90 or any(c in v for c in "+/=")):
+            try:
+                import base64 as _b64
+                raw = _b64.b64decode(v + "=" * (-len(v) % 4))
+                if len(raw) >= 64:
+                    sig = base58.b58encode(raw[:64]).decode()
+                    if _valid_txid(sig):
+                        return sig
+            except Exception:
+                pass
     if _valid_txid(fallback):
         return fallback.strip()
-    log.warning(f"⚠️ settle sem assinatura válida (campos: {list(sdata)[:6]}) — "
-                f"recibo será registrado sem link de explorer")
+    # v44.9.4: preview do valor ofensor no log — a próxima ocorrência diz
+    # exatamente o que o facilitator mandou, sem adivinhação.
+    _prev = str(sdata.get("transaction", ""))[:40]
+    log.warning(f"⚠️ settle sem assinatura válida (campos: {list(sdata)[:6]}, "
+                f"transaction='{_prev}...') — recibo será registrado sem link de explorer")
     return ""
 
 ENDPOINT_PARAM_HINTS = {
@@ -8560,7 +8583,7 @@ def _is_bot(ua: str) -> bool:
 CLEAN_LANDING = r"""<!doctype html><html lang="en"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Losbeto — cross-asset market data for AI agents</title>
-<meta name="description" content="Pay-per-call market data for AI agents: multi-oracle price consensus, sentiment consensus, forex, equities, commodities, Brazil macro (BCB/B3) and crypto. No API keys, no accounts. USDC on Base and Solana via x402.">
+<meta name="description" content="Pay-per-call market data for AI agents: multi-oracle price consensus, sentiment consensus, forex, equities, commodities, Brazil macro (BCB/B3) and crypto. No API keys, no accounts. USDC on Base, Solana and Algorand via x402.">
 <link rel="canonical" href="__BASE__/">
 <meta property="og:type" content="website">
 <meta property="og:title" content="Losbeto — cross-asset market data for AI agents">
@@ -8697,7 +8720,7 @@ settles a few cents in USDC per request and gets clean JSON back.</p>
 <div class="stats">
   <div class="stat"><b>__N__</b><span>priced endpoints</span></div>
   <div class="stat"><b>__P_MIN__</b><span>cheapest call</span></div>
-  <div class="stat"><b>2</b><span>chains · Base + Solana</span></div>
+  <div class="stat"><b>3</b><span>chains · Base + Solana + Algorand</span></div>
   <div class="stat"><b>0</b><span>accounts to create</span></div>
   <div class="stat"><b>Free</b><span>sample on every endpoint</span></div>
   <div class="stat"><b><a href="/welcome" style="color:inherit">1st call free</a></b><span>real-time, no wallet · /welcome</span></div>
@@ -8974,7 +8997,7 @@ Exclusive here: Brazil macro + B3 (/br-brief, /br-macro, /br-curve, /br-equity, 
 </div></section>
 
 <footer><div class="hrow">
-  <div>Losbeto · <span id="ep">__N__</span> endpoints · USDC on Base + Solana</div>
+  <div>Losbeto · <span id="ep">__N__</span> endpoints · USDC on Base + Solana + Algorand</div>
   <div><a href="/receipts">receipts</a> · <a href="/x402-resources">resources</a> ·
        <a href="/llms.txt">llms.txt</a> · <a href="/server.json">MCP</a></div>
 </div></footer>
