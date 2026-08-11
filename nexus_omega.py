@@ -87,7 +87,7 @@ from typing import Any, Optional, Dict, List, Tuple
 # 0. CONFIGURAÇÃO E AUTO-SETUP
 # ============================================================================
 
-VERSION = "44.9.4-RECIBOS"  # input schema do POST p/ x402scan + porta GET didatica | v44.9.0: /llm + /v1/chat/completions | v44.8.2: receipts algorand
+VERSION = "45.0.1-VERDADE"  # v45 da revisão externa + ajustes Kimi: no-store /why-buy, aviso persistência PIT, hero landing PIT, CTA prova grátis  # input schema do POST p/ x402scan + porta GET didatica | v44.9.0: /llm + /v1/chat/completions | v44.8.2: receipts algorand
 BRAND_NAME = "Losbeto"
 # v44.4.0: reposicionamento Brasil-primeiro. "Cross-asset market data" compete
 # com CoinGecko e cem nós iguais; "BCB + B3 normalizado em inglês" não compete
@@ -8419,9 +8419,11 @@ tr:hover td{background:var(--bg2)}
 <div class="hero">
   <div class="badge-live"><span class="pulse"></span>NODE ONLINE — v__V__</div>
   <h1>APIs pagas por AI Agents.<br>Instant. Onchain. Zero setup.</h1>
-  <p class="sub">__EPS__ endpoints de inteligência de mercado cripto monetizados via <b>x402</b> — pague por chamada com USDC em Solana ou Base. Descubra via manifest, pague via header, receba dados em <b>&lt;500ms</b>.</p>
+  <p class="sub">__EPS__ endpoints monetizados via <b>x402</b> — flagship: <b>macro Brasil point-in-time</b> (IPCA, Selic e PTAX como foram publicados na época, sem look-ahead, assinados Ed25519). Pague por chamada com USDC em <b>Base, Solana ou Algorand</b>, receba em <b>&lt;500ms</b>.</p>
   <div class="cta">
     <a href="/try" class="btn btn-p">🍽️ Degustação grátis — 6 endpoints em 1 chamada →</a>
+    <a href="/br-pit-proof" class="btn btn-s">📐 Prova do arquivo Brasil (grátis) — Merkle + Ed25519</a>
+    <a href="/why-buy" class="btn btn-s">🧭 Por que pagar? (resposta honesta)</a>
     <a href="/losbeto-alpha-score" class="btn btn-s">⚡ Alpha Score grátis</a>
     <a href="#creditos" class="btn btn-p" style="background:var(--gold,#f0b90b);box-shadow:0 4px 20px rgba(240,185,11,.3)">💳 Créditos: 1 tx → N chamadas</a>
     <a href="/.well-known/x402.json" class="btn btn-s">Ver x402 Manifest</a>
@@ -17896,6 +17898,956 @@ def cli():
         print(__doc__)
         return
     run_server()
+
+
+# ============================================================================
+# ============================================================================
+#  v45.0.0-VERDADE  —  "Pare de falar com scanners. Comece a vender dado
+#                       que não existe em lugar nenhum."
+# ============================================================================
+#
+#  DIAGNÓSTICO QUE ORIGINOU ESTA CAMADA (11/ago/2026, dados do próprio nó):
+#
+#   [1] O NÓ MENTE PARA O PRÓPRIO DONO.  GET /receipts devolve 50 recibos,
+#       TODOS com "origin":"organic", todos na Algorand, todos liquidados
+#       entre ts=1786474907 e ts=1786475117 — 50 pagamentos em 210 segundos,
+#       um por endpoint, em ordem decrescente de preço. Isso é uma varredura
+#       do catálogo feita pelo operador, não demanda. A rotulagem falha
+#       porque OPERATOR_WALLETS contém o payTo (MRVA6O…DUF4) e não a carteira
+#       PAGADORA. Consequência prática: (a) o dashboard não mede nada,
+#       (b) a página pública de transparência afirma algo falso, e (c) o
+#       Global x402 Challenge da Algorand exige explicitamente "proof of who
+#       is paying for it" — 86 endpoints pagos pela mesma carteira em 3
+#       minutos é o padrão exato que um avaliador classifica como wash.
+#       => BLOCO A reclassifica, separa e ASSINA a receita orgânica.
+#
+#   [2] O CARDÁPIO GRÁTIS ESTAVA SERVINDO COMIDA DE UMA SEMANA ATRÁS.
+#       GET /try em 11/ago devolveu um corpo inteiro capturado em
+#       04/ago 13:36 UTC (version:"44.2.0-VITRINE" dentro das amostras,
+#       age_seconds=50 congelado junto). Nenhuma rota dinâmica manda
+#       Cache-Control. O avaliador — o único humano/agente que chega perto
+#       de comprar — vê dado velho e vai embora.
+#       => BLOCO B: no-store nas rotas vivas + carimbo de idade honesto.
+#
+#   [3] O PRODUTO CARO DEPENDE DE COTA GRÁTIS DE LLM. Os logs mostram o
+#       Gemini em 429 e quarentena de 6h. /br-brief custa $0.50 e promete
+#       síntese. Vender um produto cuja matéria-prima acaba é pior do que
+#       não vender.  => BLOCO C: orçamento diário de LLM com RESERVA
+#       intocável para quem paga; warmer de IA desligado por padrão.
+#
+#   [4] 86 ENDPOINTS = NENHUM PRODUTO. O catálogo é, na maior parte, revenda
+#       de API grátis (Pyth, alternative.me, exchangerate-api, Yahoo). Um
+#       agente não paga $0.003 pelo que ele busca de graça na fonte. Só há
+#       UMA coisa aqui que ninguém pode copiar: o histórico point-in-time
+#       que este nó vem acumulando e assinando desde o deploy.
+#       => BLOCO D: o produto novo. E BLOCO E põe ele na frente.
+#
+#  A APOSTA DESTA VERSÃO (o que muda de verdade):
+#
+#    O nó para de competir em "dado de mercado" — onde ele perde para a
+#    fonte grátis — e passa a vender a ÚNICA classe de dado financeiro que
+#    é impossível de reconstruir depois: O QUE SE SABIA NAQUELE DIA.
+#
+#    Séries do BCB são REVISADAS. O IPCA que você lê hoje para março não é
+#    o número que estava publicado em março. Quem faz backtest com a série
+#    de hoje comete look-ahead bias e não percebe. A base de "vintages"
+#    (primeira impressão + cada revisão, com o carimbo de quando foi
+#    observada) não existe pública no Brasil, não pode ser raspada
+#    retroativamente, e vale dinheiro para quem faz modelo quantitativo,
+#    risco, ou avaliação de LLM em dado financeiro.
+#
+#    Este nó já roda 24/7 e já assina Ed25519. Registrar cada leitura com
+#    carimbo de tempo custa ZERO a mais — e cada dia que passa o fosso
+#    aumenta sozinho. É o oposto de tudo o que está no catálogo hoje:
+#    não dá para um concorrente subir amanhã e ter o mesmo produto.
+#
+#    /br-asof      — valor de uma série COMO ERA CONHECIDO numa data passada
+#    /br-revisions — histórico completo de revisões (1ª impressão → hoje)
+#    /br-pit-proof — GRÁTIS: raiz de Merkle + assinatura para auditoria
+#
+# ============================================================================
+
+V45_LAYER_VERSION = "45.0.1-VERDADE"
+
+# ============================================================================
+# BLOCO A — VERDADE NO LEDGER
+#   Nada aqui apaga um dado. O ledger continua imutável; o que muda é a
+#   CLASSIFICAÇÃO e o que o nó afirma em público.
+# ============================================================================
+
+# Carteiras que o próprio operador controla do lado COMPRADOR. O bug de hoje
+# é que só o lado RECEBEDOR estava listado. Configure via env (uma linha,
+# separada por vírgula) e o /receipts para de chamar seu teste de "orgânico".
+BUYER_WALLETS = {w.strip().lower() for w in
+                 (os.environ.get("BUYER_WALLETS") or "").split(",") if w.strip()}
+
+# Varredura de catálogo: mesmo pagador liquidando N endpoints DISTINTOS
+# dentro de uma janela curta. Nenhum comprador real faz isso — um comprador
+# real chama o MESMO endpoint várias vezes, não 50 endpoints diferentes em
+# ordem de preço. Este é o detector que sobrevive à troca de carteira.
+SWEEP_MIN_ENDPOINTS = int(os.environ.get("SWEEP_MIN_ENDPOINTS", "8"))
+SWEEP_WINDOW_S      = int(os.environ.get("SWEEP_WINDOW_S", "600"))
+
+
+def _self_pay_wallets() -> set:
+    """Todo endereço que este nó controla ou já declarou como próprio."""
+    s = set(OPERATOR_WALLETS) | set(BUYER_WALLETS)
+    for a in (RECEIVE_ADDRESS, BASE_PAYTO_EVM, ALGO_PAYTO,
+              getattr(WALLET, "solana_address", "")):
+        if a:
+            s.add(str(a).lower())
+    return s
+
+
+def _sweep_payers(limit_rows: int = 4000) -> dict:
+    """Devolve {payer_lower: n_endpoints_distintos_na_rajada} para pagadores
+    que varreram o catálogo. Lê o ledger direto, sem alterar nada."""
+    out = {}
+    try:
+        with LEDGER.lock, LEDGER._conn() as c:
+            rows = c.execute(
+                "SELECT ts, endpoint, payer FROM revenue "
+                "WHERE payer IS NOT NULL AND payer != '' "
+                "ORDER BY ts DESC LIMIT ?", (limit_rows,)).fetchall()
+    except Exception as e:
+        log.debug(f"sweep scan: {e}")
+        return out
+    by_payer = defaultdict(list)
+    for ts_, ep_, p_ in rows:
+        by_payer[(p_ or "").lower()].append((int(ts_ or 0), ep_ or ""))
+    for payer, evs in by_payer.items():
+        evs.sort()
+        i = 0
+        best = 0
+        for j in range(len(evs)):
+            while evs[j][0] - evs[i][0] > SWEEP_WINDOW_S:
+                i += 1
+            best = max(best, len({e for _, e in evs[i:j + 1]}))
+        if best >= SWEEP_MIN_ENDPOINTS:
+            out[payer] = best
+    return out
+
+
+_SWEEP_CACHE = {"ts": 0.0, "data": {}}
+
+
+def _sweep_payers_cached(ttl: int = 300) -> dict:
+    now = time.time()
+    if now - _SWEEP_CACHE["ts"] > ttl:
+        _SWEEP_CACHE.update({"ts": now, "data": _sweep_payers()})
+    return _SWEEP_CACHE["data"]
+
+
+def classify_payer(payer: str, source: str = "") -> str:
+    """operator-test | self-sweep | organic. Uma só definição, usada em
+    TODO lugar que fala de receita — dashboard, recibos, manifests."""
+    p = (payer or "").lower()
+    if source == "bootstrap":
+        return "operator-test"
+    if p and p in _self_pay_wallets():
+        return "operator-test"
+    if p and p in _sweep_payers_cached():
+        return "self-sweep"
+    return "organic"
+
+
+def revenue_split(window_s: int = 0) -> dict:
+    """A única métrica que importa: quanto veio de FORA. Tudo o mais é
+    contabilidade interna e não deve aparecer como 'Receita Total'."""
+    out = {"organic_usdc": 0.0, "organic_tx": 0, "organic_buyers": 0,
+           "operator_usdc": 0.0, "operator_tx": 0,
+           "self_sweep_usdc": 0.0, "self_sweep_tx": 0,
+           "window_seconds": window_s or None}
+    try:
+        cutoff = int(time.time()) - window_s if window_s else 0
+        with LEDGER.lock, LEDGER._conn() as c:
+            rows = c.execute(
+                "SELECT amount, payer, source FROM revenue WHERE ts > ?",
+                (cutoff,)).fetchall()
+    except Exception as e:
+        out["error"] = str(e)[:80]
+        return out
+    buyers = set()
+    for amt, payer, src in rows:
+        k = classify_payer(payer or "", src or "")
+        a = float(amt or 0)
+        if k == "organic":
+            out["organic_usdc"] += a
+            out["organic_tx"] += 1
+            if payer:
+                buyers.add((payer or "").lower())
+        elif k == "self-sweep":
+            out["self_sweep_usdc"] += a
+            out["self_sweep_tx"] += 1
+        else:
+            out["operator_usdc"] += a
+            out["operator_tx"] += 1
+    out["organic_buyers"] = len(buyers)
+    for k in ("organic_usdc", "operator_usdc", "self_sweep_usdc"):
+        out[k] = round(out[k], 6)
+    return out
+
+
+def _receipts_json_v45():
+    """Substitui a rota /receipts. Mesma URL, mesma forma — mas nenhum
+    pagamento seu é mais anunciado ao mundo como venda orgânica."""
+    out = []
+    try:
+        with LEDGER.lock, LEDGER._conn() as _c:
+            cur = _c.execute(
+                "SELECT ts, endpoint, amount, tx_sig, chain, payer, source "
+                "FROM revenue WHERE tx_sig IS NOT NULL AND tx_sig != '' "
+                "ORDER BY ts DESC LIMIT 50")
+            for ts_, ep_, amt_, sig_, ch_, payer_, src_ in cur.fetchall():
+                origin = classify_payer(payer_ or "", src_ or "")
+                out.append({
+                    "ts": ts_, "endpoint": ep_,
+                    "amount_usdc": f"{float(amt_ or 0):.4f}",
+                    "tx": sig_, "chain": ch_,
+                    "origin": origin, "settled_via": src_,
+                    "explorer": (_explorer_url(ch_, sig_)
+                                 if _valid_txid(sig_) else None),
+                })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+    split = revenue_split()
+    return jsonify({
+        "receipts": out, "count": len(out),
+        "revenue_truth": split,
+        "legend": {
+            "organic": "paid by a wallet this node does not control",
+            "operator-test": "paid by the operator's own declared wallet",
+            "self-sweep": ("same wallet settled >= "
+                           f"{SWEEP_MIN_ENDPOINTS} distinct endpoints within "
+                           f"{SWEEP_WINDOW_S}s — catalog sweep, not demand"),
+        },
+        "note": ("Every line is verifiable on-chain. Operator-funded traffic "
+                 "is labelled as such: only 'organic' is a real customer."),
+    })
+
+
+try:
+    app.view_functions["receipts_json"] = _receipts_json_v45
+    log.info("🧾 v45: /receipts agora separa orgânico × teste do operador × varredura")
+except Exception as _e:
+    log.warning(f"v45 receipts override: {_e}")
+
+
+@app.route("/.well-known/honest-revenue.json")
+def honest_revenue_json():
+    """O documento que se manda para um avaliador (Algorand Challenge, CDP,
+    investidor) quando ele pergunta 'quem está pagando?'. Assinado Ed25519.
+    Contém os números RUINS de propósito: um relatório que só tem número
+    bom não prova nada."""
+    all_time = revenue_split()
+    d1 = revenue_split(86400)
+    d7 = revenue_split(7 * 86400)
+    body = {
+        "node": BRAND_NAME,
+        "node_id": getattr(WALLET, "node_id", ""),
+        "url": _public_base(),
+        "generated_at": datetime.now(timezone.utc).isoformat(
+            timespec="seconds").replace("+00:00", "Z"),
+        "methodology": {
+            "organic": "payer wallet is not controlled or declared by the operator",
+            "excluded": ["operator wallets (OPERATOR_WALLETS + BUYER_WALLETS)",
+                         "bootstrap settlements",
+                         f"catalog sweeps (>= {SWEEP_MIN_ENDPOINTS} distinct "
+                         f"endpoints from one payer in {SWEEP_WINDOW_S}s)"],
+            "source": "this node's own SQLite ledger; every tx_sig is on-chain",
+        },
+        "all_time": all_time,
+        "last_24h": d1,
+        "last_7d": d7,
+        "self_declared_operator_wallets": sorted(_self_pay_wallets()),
+        "receipts": f"{_public_base()}/receipts",
+    }
+    blob = json.dumps(body, sort_keys=True, separators=(",", ":"), default=str)
+    body["sha256"] = hashlib.sha256(blob.encode()).hexdigest()
+    try:
+        body["signature"] = base64.b64encode(
+            WALLET.sign(f"losbeto-honest-revenue|{body['sha256']}".encode())).decode()
+        body["signer"] = WALLET.solana_address
+    except Exception as e:
+        body["signature_error"] = str(e)[:60]
+    return jsonify(body)
+
+
+# ============================================================================
+# BLOCO B — FRESCOR (o /try de uma semana atrás nunca mais)
+# ============================================================================
+
+_NO_STORE_PREFIXES = ("/try", "/live", "/receipts", "/health", "/sample",
+                      "/archive", "/dash", "/x402-resources", "/get-pricing",
+                      "/br-asof", "/br-revisions", "/br-pit-proof",
+                      "/.well-known/honest-revenue.json", "/why-buy")
+
+
+@app.after_request
+def _v45_no_store(resp):
+    """Rotas vivas param de ser cacheáveis por CDN, proxy ou fetcher.
+    Sem isto, uma amostra de 04/ago segue sendo servida em 11/ago com
+    'age_seconds: 50' — que é pior do que não ter amostra nenhuma."""
+    try:
+        p = request.path or ""
+        if resp.status_code == 402 or p == "/" or any(
+                p.startswith(x) for x in _NO_STORE_PREFIXES):
+            resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+            resp.headers["Pragma"] = "no-cache"
+            resp.headers["Vary"] = "X-PAYMENT, Authorization, X-API-Key, Accept"
+            resp.headers["X-Generated-At"] = str(int(time.time()))
+    except Exception:
+        pass
+    return resp
+
+
+# Idade máxima que uma amostra pode ter antes de ser rotulada como velha.
+SAMPLE_STALE_S = int(os.environ.get("SAMPLE_STALE_S", "7200"))   # 2h
+_v45_inline_sample_orig = _inline_sample
+
+
+def _inline_sample(endpoint: str) -> dict:            # noqa: F811
+    """Mesma amostra, agora com a verdade sobre a idade dela. Um avaliador
+    que recebe dado velho rotulado como velho ainda pode confiar no nó;
+    dado velho rotulado como fresco queima a confiança de uma vez só."""
+    s = _v45_inline_sample_orig(endpoint)
+    try:
+        age = int(s.get("age_seconds") or 0)
+        if s.get("data") is not None and age > SAMPLE_STALE_S:
+            s["stale"] = True
+            s["note"] = (f"Cached sample is {age // 3600}h old — the paid call "
+                         "is computed live at request time.")
+    except Exception:
+        pass
+    return s
+
+
+# ============================================================================
+# BLOCO C — A COTA DE LLM PERTENCE A QUEM PAGA
+# ============================================================================
+
+LLM_DAILY_BUDGET  = int(os.environ.get("LLM_DAILY_BUDGET", "800"))
+LLM_PAID_RESERVE  = int(os.environ.get("LLM_PAID_RESERVE", "300"))
+_llm_budget = {"day": "", "used": 0}
+_llm_budget_lock = threading.Lock()
+
+
+def llm_budget_take(paid: bool) -> bool:
+    """True se pode gastar uma chamada de LLM agora.
+    Chamada gratuita (warmer, probe, preview) NUNCA encosta na reserva."""
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    with _llm_budget_lock:
+        if _llm_budget["day"] != today:
+            _llm_budget.update({"day": today, "used": 0})
+        left = LLM_DAILY_BUDGET - _llm_budget["used"]
+        if left <= 0:
+            return False
+        if not paid and left <= LLM_PAID_RESERVE:
+            return False
+        _llm_budget["used"] += 1
+        return True
+
+
+def llm_budget_state() -> dict:
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    with _llm_budget_lock:
+        used = _llm_budget["used"] if _llm_budget["day"] == today else 0
+    return {"day": today, "used": used, "budget": LLM_DAILY_BUDGET,
+            "reserved_for_paid": LLM_PAID_RESERVE,
+            "free_calls_left": max(0, LLM_DAILY_BUDGET - used - LLM_PAID_RESERVE),
+            "paid_calls_left": max(0, LLM_DAILY_BUDGET - used)}
+
+
+@app.route("/health/llm-budget")
+def health_llm_budget():
+    return jsonify(llm_budget_state())
+
+
+# O warmer de IA passa a ser opt-in. Ele existia para deixar a vitrine bonita
+# e gastava a cota que o produto pago precisa. Ligue de volta com AI_WARMER=1
+# só quando houver cota paga sobrando.
+if os.environ.get("AI_WARMER", "") == "":
+    AUTOPILOT_WARM_AI_ON = False
+    log.info("🧯 v45: warmer de IA DESLIGADO por padrão — cota reservada para quem paga "
+             "(AI_WARMER=1 religa)")
+
+
+# ============================================================================
+# BLOCO D — O PRODUTO QUE NINGUÉM PODE COPIAR AMANHÃ
+#           Point-in-Time Brasil: o que se sabia naquele dia.
+# ============================================================================
+#
+#  Por que isto vende e /pyth-price não:
+#
+#   - O valor do IPCA para março que está na API do BCB HOJE não é o valor
+#     que estava lá em março. Séries macro são revisadas. Quem faz backtest
+#     com a série atual está usando informação do futuro e não sabe disso.
+#   - Não existe base pública brasileira de vintages (1ª impressão + cada
+#     revisão + carimbo de observação). O FED publica ALFRED para os EUA;
+#     o Brasil não tem equivalente aberto.
+#   - Não pode ser raspado depois. Ou você estava ligado observando naquele
+#     dia, ou o dado se perdeu. Este nó ESTÁ ligado desde o deploy.
+#   - Custo marginal de produzir: uma chamada HTTP a cada 3 horas.
+#   - Comprador real e identificável: quant/risco/fintech/pesquisa — gente
+#     que já paga por dado e sabe o que é look-ahead bias.
+#
+#  Cada leitura vira uma folha; as folhas viram uma raiz de Merkle diária;
+#  a raiz é assinada Ed25519 e (opcionalmente) ancorada on-chain. A prova
+#  é verificável por qualquer um, de graça, em /br-pit-proof.
+# ============================================================================
+
+PIT_DB = HOME_DIR / "pit_brasil.db"
+PIT_INTERVAL_S = int(os.environ.get("PIT_INTERVAL_S", "10800"))   # 3h
+
+# O VALOR INTEIRO deste produto está na persistência: se o diretório de dados
+# for efêmero (Railway sem Volume), cada redeploy zera o arquivo de vintages
+# e o fosso nunca acumula. O ledger principal (omega_v24.db) tem a mesma
+# dependência — se ele já sobrevive a deploys, o PIT sobrevive também.
+if not (os.environ.get("DATA_DIR") or Path("/data").exists()):
+    log.warning(f"⚠️ v45: DATA_DIR não definido e /data inexistente — PIT_DB em "
+                f"{PIT_DB} pode ser EFÊMERO. Monte um Volume no Railway e/ou "
+                f"sete DATA_DIR, ou o arquivo de vintages zera a cada redeploy.")
+else:
+    log.info(f"📐 v45: PIT_DB em {PIT_DB}")
+
+
+def _pit_conn():
+    conn = sqlite3.connect(str(PIT_DB), timeout=10)
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("""CREATE TABLE IF NOT EXISTS prints (
+        series       TEXT NOT NULL,
+        ref_date     TEXT NOT NULL,   -- data a que o número se refere (BCB)
+        value        REAL NOT NULL,
+        seq          INTEGER NOT NULL,-- 0 = primeira impressão, 1+ = revisão
+        observed_ts  INTEGER NOT NULL,
+        observed_day TEXT NOT NULL,
+        leaf         TEXT NOT NULL,   -- sha256 canônico desta folha
+        PRIMARY KEY (series, ref_date, seq)
+    )""")
+    conn.execute("CREATE INDEX IF NOT EXISTS ix_prints_obs "
+                 "ON prints(series, observed_day)")
+    conn.execute("""CREATE TABLE IF NOT EXISTS roots (
+        day       TEXT PRIMARY KEY,
+        root      TEXT NOT NULL,
+        n_leaves  INTEGER NOT NULL,
+        signature TEXT,
+        signer    TEXT,
+        anchor_tx TEXT DEFAULT '',
+        ts        INTEGER
+    )""")
+    conn.commit()
+    return conn
+
+
+def _pit_leaf(series: str, ref_date: str, value: float, seq: int,
+              observed_ts: int) -> str:
+    canon = f"{series}|{ref_date}|{value!r}|{seq}|{observed_ts}"
+    return hashlib.sha256(canon.encode()).hexdigest()
+
+
+def _merkle_root(leaves: List[str]) -> str:
+    """Raiz de Merkle sobre folhas hex já ordenadas. Nível ímpar duplica a
+    última folha (convenção Bitcoin) — simples e verificável em 10 linhas
+    por quem quiser auditar."""
+    if not leaves:
+        return ""
+    level = [bytes.fromhex(x) for x in leaves]
+    while len(level) > 1:
+        if len(level) % 2:
+            level.append(level[-1])
+        level = [hashlib.sha256(level[i] + level[i + 1]).digest()
+                 for i in range(0, len(level), 2)]
+    return level[0].hex()
+
+
+def pit_record_once() -> int:
+    """Grava a leitura atual de cada série. Só insere quando o valor MUDA —
+    o que gera exatamente a trilha 1ª impressão → revisões."""
+    n_new = 0
+    now = int(time.time())
+    day = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    conn = _pit_conn()
+    try:
+        for series, (code, _desc) in BCB_SERIES.items():
+            d = _bcb_last(code)
+            if not d or d.get("value") is None or not d.get("date"):
+                continue
+            ref = str(d["date"])                      # dd/mm/aaaa, como o BCB publica
+            val = float(d["value"])
+            row = conn.execute(
+                "SELECT seq, value FROM prints WHERE series=? AND ref_date=? "
+                "ORDER BY seq DESC LIMIT 1", (series, ref)).fetchone()
+            if row is not None and abs(float(row[1]) - val) < 1e-12:
+                continue                              # nada mudou: não polui
+            seq = 0 if row is None else int(row[0]) + 1
+            leaf = _pit_leaf(series, ref, val, seq, now)
+            conn.execute(
+                "INSERT OR IGNORE INTO prints"
+                "(series, ref_date, value, seq, observed_ts, observed_day, leaf) "
+                "VALUES (?,?,?,?,?,?,?)",
+                (series, ref, val, seq, now, day, leaf))
+            n_new += 1
+            if seq > 0:
+                log.info(f"📐 PIT: REVISÃO detectada — {series} ref={ref} "
+                         f"{row[1]} → {val} (revisão #{seq})")
+        conn.commit()
+        if n_new:
+            _pit_seal_day(conn, day)
+    finally:
+        conn.close()
+    return n_new
+
+
+def _pit_seal_day(conn, day: str):
+    """Fecha o dia com raiz de Merkle assinada. Recalcula sempre que o dia
+    ganha folhas — o selo final é o do fim do dia."""
+    leaves = [r[0] for r in conn.execute(
+        "SELECT leaf FROM prints WHERE observed_day=? ORDER BY leaf", (day,))]
+    root = _merkle_root(leaves)
+    if not root:
+        return
+    try:
+        sig = base64.b64encode(
+            WALLET.sign(f"losbeto-pit|{day}|{root}".encode())).decode()
+        signer = WALLET.solana_address
+    except Exception:
+        sig, signer = "", ""
+    conn.execute(
+        "INSERT INTO roots(day, root, n_leaves, signature, signer, ts) "
+        "VALUES (?,?,?,?,?,?) ON CONFLICT(day) DO UPDATE SET "
+        "root=excluded.root, n_leaves=excluded.n_leaves, "
+        "signature=excluded.signature, ts=excluded.ts",
+        (day, root, len(leaves), sig, signer, int(time.time())))
+    conn.commit()
+
+
+def pit_loop():
+    time.sleep(120)
+    log.info(f"📐 Point-in-Time Brasil: gravando vintages a cada {PIT_INTERVAL_S}s")
+    while True:
+        try:
+            n = pit_record_once()
+            if n:
+                log.info(f"📐 PIT: {n} nova(s) folha(s) gravada(s) e seladas")
+        except Exception as e:
+            log.warning(f"pit_loop: {e}")
+        time.sleep(PIT_INTERVAL_S)
+
+
+def _pit_parse_day(s: str) -> Optional[str]:
+    s = (s or "").strip()
+    if re.match(r"^\d{4}-\d{2}-\d{2}$", s):
+        return s
+    return None
+
+
+def _br_asof_handler():
+    """O VALOR COMO ERA CONHECIDO NA DATA PEDIDA — sem look-ahead."""
+    series = (request.args.get("series") or "").strip()
+    date   = _pit_parse_day(request.args.get("date") or
+                            request.args.get("asof") or "")
+    ts_now = int(time.time())
+    if not date:
+        return ({"status": "bad_request", "charged": False,
+                 "error": "date=YYYY-MM-DD is required (the observation date)",
+                 "available_series": sorted(BCB_SERIES.keys()),
+                 "example": f"{_public_base()}/br-asof?series=ipca_12m_pct&date=2026-08-05",
+                 "ts": ts_now, "version": VERSION}, 400)
+    if series and series not in BCB_SERIES:
+        return ({"status": "bad_request", "charged": False,
+                 "error": f"unknown series '{series}'",
+                 "available_series": sorted(BCB_SERIES.keys()),
+                 "ts": ts_now, "version": VERSION}, 400)
+    wanted = [series] if series else sorted(BCB_SERIES.keys())
+    conn = _pit_conn()
+    try:
+        out, missing = {}, []
+        for s in wanted:
+            row = conn.execute(
+                "SELECT ref_date, value, seq, observed_ts, observed_day, leaf "
+                "FROM prints WHERE series=? AND observed_day<=? "
+                "ORDER BY observed_ts DESC, seq DESC LIMIT 1",
+                (s, date)).fetchone()
+            if not row:
+                missing.append(s)
+                continue
+            ref, val, seq, obs_ts, obs_day, leaf = row
+            out[s] = {
+                "value_as_known_on": date,
+                "value": val,
+                "reference_date": ref,
+                "revision_seq": seq,
+                "is_first_print": seq == 0,
+                "observed_at": datetime.fromtimestamp(
+                    obs_ts, timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"),
+                "observed_day": obs_day,
+                "leaf_sha256": leaf,
+                "description": BCB_SERIES[s][1],
+            }
+        first = conn.execute("SELECT MIN(observed_day) FROM prints").fetchone()
+        depth_from = first[0] if first else None
+        root_row = conn.execute(
+            "SELECT root, signature, signer, anchor_tx FROM roots "
+            "WHERE day<=? ORDER BY day DESC LIMIT 1", (date,)).fetchone()
+    finally:
+        conn.close()
+    if not out:
+        return ({"status": "unavailable", "charged": False,
+                 "product": "Point-in-Time Brazil",
+                 "error": ("No observation recorded on or before "
+                           f"{date}. This archive starts at "
+                           f"{depth_from or 'the first run of v45'} and cannot "
+                           "be backfilled — that is precisely what makes it "
+                           "worth buying."),
+                 "coverage_starts": depth_from,
+                 "free_proof": f"{_public_base()}/br-pit-proof",
+                 "ts": ts_now, "version": VERSION}, 503)
+    return {
+        "product": "Point-in-Time Brazil (as-of)",
+        "asof": date,
+        "series": out,
+        "not_found": missing or None,
+        "coverage_starts": depth_from,
+        "why_this_matters": ("BCB series are revised. Backtesting with today's "
+                             "series injects look-ahead bias. These are the "
+                             "numbers as they were actually published on the "
+                             "date you asked for."),
+        "merkle": ({"root": root_row[0], "signature": root_row[1],
+                    "signer": root_row[2],
+                    "anchor_tx": root_row[3] or None,
+                    "verify": f"{_public_base()}/br-pit-proof"}
+                   if root_row else None),
+        "source": "Banco Central do Brasil / SGS, observed and timestamped by this node",
+        "provider": "Losbeto/PIT-Brasil", "ts": ts_now, "version": VERSION,
+    }
+
+
+def _br_revisions_handler():
+    """A TRILHA COMPLETA DE REVISÕES — 1ª impressão, cada correção, e de
+    quanto foi o erro. Isto não existe público no Brasil."""
+    series = (request.args.get("series") or "").strip()
+    ts_now = int(time.time())
+    if series and series not in BCB_SERIES:
+        return ({"status": "bad_request", "charged": False,
+                 "error": f"unknown series '{series}'",
+                 "available_series": sorted(BCB_SERIES.keys()),
+                 "ts": ts_now, "version": VERSION}, 400)
+    wanted = [series] if series else sorted(BCB_SERIES.keys())
+    conn = _pit_conn()
+    try:
+        result, total_rev = {}, 0
+        for s in wanted:
+            rows = conn.execute(
+                "SELECT ref_date, seq, value, observed_ts FROM prints "
+                "WHERE series=? ORDER BY ref_date, seq", (s,)).fetchall()
+            if not rows:
+                continue
+            by_ref = defaultdict(list)
+            for ref, seq, val, obs in rows:
+                by_ref[ref].append({"seq": seq, "value": val,
+                                    "observed_at": datetime.fromtimestamp(
+                                        obs, timezone.utc).isoformat(
+                                        timespec="seconds").replace("+00:00", "Z")})
+            entries = []
+            for ref, prints in sorted(by_ref.items()):
+                first, last = prints[0]["value"], prints[-1]["value"]
+                n_rev = len(prints) - 1
+                total_rev += n_rev
+                entries.append({
+                    "reference_date": ref,
+                    "first_print": first,
+                    "current": last,
+                    "revision_bps": (round((last - first) * 100, 2)
+                                     if isinstance(first, (int, float)) else None),
+                    "revisions": n_rev,
+                    "trail": prints,
+                })
+            result[s] = {"description": BCB_SERIES[s][1],
+                         "reference_dates_tracked": len(entries),
+                         "revisions_observed": sum(e["revisions"] for e in entries),
+                         "entries": entries[-60:]}
+        first_day = conn.execute("SELECT MIN(observed_day) FROM prints").fetchone()
+    finally:
+        conn.close()
+    if not result:
+        return ({"status": "unavailable", "charged": False,
+                 "product": "Brazil revision history",
+                 "error": "The vintage archive is still filling. Nothing to sell yet.",
+                 "free_proof": f"{_public_base()}/br-pit-proof",
+                 "ts": ts_now, "version": VERSION}, 503)
+    return {
+        "product": "Brazil revision history (vintages)",
+        "series": result,
+        "total_revisions_observed": total_rev,
+        "coverage_starts": first_day[0] if first_day else None,
+        "why_this_matters": ("The FED publishes ALFRED for US vintages. Brazil "
+                             "has no public equivalent. This archive is built "
+                             "by observation and cannot be reconstructed after "
+                             "the fact by anyone, including us."),
+        "provider": "Losbeto/PIT-Brasil", "ts": ts_now, "version": VERSION,
+    }
+
+
+@app.route("/br-pit-proof")
+def br_pit_proof():
+    """GRÁTIS e de propósito: a prova é a vitrine. Qualquer um confere que o
+    arquivo é antigo, contínuo e não foi reescrito — e é justamente isso que
+    dá valor ao produto pago."""
+    conn = _pit_conn()
+    try:
+        depth = conn.execute("SELECT COUNT(*) FROM prints").fetchone()[0]
+        days  = conn.execute("SELECT COUNT(DISTINCT observed_day) FROM prints").fetchone()[0]
+        first = conn.execute("SELECT MIN(observed_day) FROM prints").fetchone()[0]
+        revs  = conn.execute("SELECT COUNT(*) FROM prints WHERE seq>0").fetchone()[0]
+        roots = [{"day": d, "root": r, "n_leaves": n, "signature": s,
+                  "signer": g, "anchor_tx": a or None}
+                 for d, r, n, s, g, a in conn.execute(
+                     "SELECT day, root, n_leaves, signature, signer, anchor_tx "
+                     "FROM roots ORDER BY day DESC LIMIT 14")]
+    finally:
+        conn.close()
+    base = _public_base()
+    return jsonify({
+        "product": "Point-in-Time Brazil — public proof",
+        "cost": "0.00 USDC (free forever)",
+        "observations": depth,
+        "days_covered": days,
+        "coverage_starts": first,
+        "revisions_caught": revs,
+        "recent_daily_roots": roots,
+        "verification": {
+            "leaf": "sha256('<series>|<ref_date>|<value>|<seq>|<observed_ts>')",
+            "tree": "Merkle, sha256, odd level duplicates last leaf",
+            "message": "losbeto-pit|<day>|<root>",
+            "algorithm": "Ed25519",
+            "pubkey": getattr(WALLET, "solana_address", ""),
+            "offline": True,
+        },
+        "paid_products": {
+            "as_of": {"url": f"{base}/br-asof?series=ipca_12m_pct&date=2026-08-05",
+                      "price_usdc": BASE_PRICES.get("/br-asof")},
+            "revisions": {"url": f"{base}/br-revisions?series=ipca_12m_pct",
+                          "price_usdc": BASE_PRICES.get("/br-revisions")},
+        },
+        "ts": int(time.time()), "version": VERSION,
+    })
+
+
+# --- registro dos dois produtos pagos (mesmo padrão do /br-archive) ---------
+BASE_PRICES["/br-asof"]      = float(os.environ.get("PRICE_BR_ASOF", "0.09"))
+BASE_PRICES["/br-revisions"] = float(os.environ.get("PRICE_BR_REVISIONS", "0.19"))
+
+ENDPOINT_DESC["/br-asof"] = (
+    "What was this Brazilian macro series worth AS KNOWN ON a past date — "
+    "not as revised since. Selic, CDI, IPCA 12m, IGP-M, PTAX and EUR/BRL, "
+    "returned at the vintage that was actually published on ?date=YYYY-MM-DD. "
+    "Backtests built on today's revised series contain look-ahead bias; this "
+    "endpoint removes it. Every value carries its Merkle leaf and the day's "
+    "Ed25519-signed root. Free proof of the archive at /br-pit-proof.")
+ENDPOINT_DESC["/br-revisions"] = (
+    "The full revision trail of Brazilian official statistics: first print, "
+    "every correction, the size of each revision in basis points and the "
+    "timestamp we observed it. The FED publishes ALFRED for US vintages; "
+    "Brazil has no public equivalent. Cannot be scraped retroactively by "
+    "anyone — it only exists because this node was running and recording.")
+
+ENDPOINT_TAGS["/br-asof"]      = ["Brazil", "PointInTime", "Macro", "Backtest", "Signed"]
+ENDPOINT_TAGS["/br-revisions"] = ["Brazil", "Vintages", "Macro", "Research", "Signed"]
+ENDPOINT_PARAM_HINTS["/br-asof"]      = {"series": "ipca_12m_pct", "date": "2026-08-05"}
+ENDPOINT_PARAM_HINTS["/br-revisions"] = {"series": "ipca_12m_pct"}
+ENDPOINT_HANDLERS["/br-asof"]      = _br_asof_handler
+ENDPOINT_HANDLERS["/br-revisions"] = _br_revisions_handler
+app.add_url_rule("/br-asof", "br_asof",
+                 paid_endpoint("/br-asof")(_br_asof_handler))
+app.add_url_rule("/br-revisions", "br_revisions",
+                 paid_endpoint("/br-revisions")(_br_revisions_handler))
+_PARAM_RULES["/br-asof"] = {
+    "param": "date",
+    "pattern": r"^\d{4}-\d{2}-\d{2}$",
+    "examples": ["2026-08-05", "2026-08-01"],
+}
+log.info("📐 v45: /br-asof ($%.2f) e /br-revisions ($%.2f) registrados — "
+         "point-in-time brasileiro, irreproduzível por construção"
+         % (BASE_PRICES["/br-asof"], BASE_PRICES["/br-revisions"]))
+
+
+# --- ancoragem opcional na Algorand (uso nativo e honesto da chain) --------
+# Por que faz sentido: a raiz de Merkle diária é 32 bytes. Publicá-la numa
+# transação com nota na Algorand transforma "confie na minha assinatura" em
+# "confira o carimbo de tempo público". É um caso de uso REAL de chain — e
+# é exatamente o tipo de coisa que o Global x402 Challenge diz avaliar
+# ("use case quality, technical execution"), ao contrário de volume próprio.
+ALGO_ANCHOR_MNEMONIC = os.environ.get("ALGO_ANCHOR_MNEMONIC", "").strip()
+ALGOD_URL = os.environ.get("ALGOD_URL", "https://mainnet-api.algonode.cloud").strip()
+
+
+def pit_anchor_once() -> Optional[str]:
+    """Publica a raiz do dia anterior como nota on-chain. Silencioso e
+    opcional: sem mnemônico configurado, o nó não tenta e não mente."""
+    if not ALGO_ANCHOR_MNEMONIC:
+        return None
+    try:
+        from algosdk import mnemonic as _mn, account as _acct, transaction as _txn
+        from algosdk.v2client import algod as _algod
+    except ImportError:
+        log.info("⚓ v45: ancoragem Algorand desativada — falta `pip install py-algorand-sdk`")
+        return None
+    conn = _pit_conn()
+    try:
+        row = conn.execute("SELECT day, root FROM roots WHERE anchor_tx='' "
+                           "ORDER BY day ASC LIMIT 1").fetchone()
+        if not row:
+            return None
+        day, root = row
+        sk = _mn.to_private_key(ALGO_ANCHOR_MNEMONIC)
+        addr = _acct.address_from_private_key(sk)
+        client = _algod.AlgodClient("", ALGOD_URL)
+        params = client.suggested_params()
+        note = f"losbeto-pit|{day}|{root}".encode()
+        tx = _txn.PaymentTxn(addr, params, addr, 0, note=note)
+        txid = client.send_transaction(tx.sign(sk))
+        conn.execute("UPDATE roots SET anchor_tx=? WHERE day=?", (txid, day))
+        conn.commit()
+        log.info(f"⚓ v45: raiz PIT de {day} ancorada na Algorand — tx {txid}")
+        return txid
+    except Exception as e:
+        log.warning(f"pit_anchor: {e}")
+        return None
+    finally:
+        conn.close()
+
+
+def pit_anchor_loop():
+    time.sleep(300)
+    while True:
+        try:
+            pit_anchor_once()
+        except Exception as e:
+            log.warning(f"pit_anchor_loop: {e}")
+        time.sleep(3600)
+
+
+# ============================================================================
+# BLOCO E — FOCO: o catálogo passa a ter uma frente
+# ============================================================================
+#
+#  86 endpoints numa vitrine não é abundância, é ruído. O scanner que lê o
+#  manifest pega os primeiros; hoje ele pegava /pyth-price — o item mais
+#  substituível do catálogo. A partir daqui a frente é a única coisa
+#  que só existe aqui.
+
+V45_HERO = ["/br-asof", "/br-revisions", "/br-archive", "/br-brief",
+            "/br-macro", "/br-equity", "/br-curve", "/br-agro"]
+try:
+    for _p in reversed(V45_HERO):
+        if _p in FEATURED_ENDPOINTS:
+            FEATURED_ENDPOINTS.remove(_p)
+        if _p in BASE_PRICES or _p in ("/br-asof", "/br-revisions"):
+            FEATURED_ENDPOINTS.insert(0, _p)
+    log.info("🎯 v45: vitrine reordenada — point-in-time Brasil na frente")
+except Exception as _e:
+    log.warning(f"v45 featured: {_e}")
+
+V45_POSITIONING = (
+    "Point-in-time Brazilian macro & market data for AI agents and quants: "
+    "every official series recorded as it was actually published, with the "
+    "full revision trail, Ed25519-signed and Merkle-anchored. "
+    "Not a wrapper around a free API — an archive that only exists because "
+    "this node has been watching.")
+
+
+@app.route("/why-buy")
+def why_buy():
+    """Uma página só para responder a pergunta que nenhum manifest responde:
+    por que pagar por isto e não pegar de graça na fonte?"""
+    base = _public_base()
+    return jsonify({
+        "positioning": V45_POSITIONING,
+        "honest_answer": {
+            "do_not_buy": [
+                f"{base}/pyth-price — Pyth Hermes is public and free",
+                f"{base}/fear-greed — alternative.me is public and free",
+                f"{base}/forex-rate — exchangerate-api has a free tier",
+            ],
+            "buy_instead": [
+                {"endpoint": "/br-asof",
+                 "because": "the revised series you can fetch for free today is "
+                            "NOT what was published back then — this is",
+                 "price_usdc": BASE_PRICES.get("/br-asof")},
+                {"endpoint": "/br-revisions",
+                 "because": "no public Brazilian vintage database exists; this "
+                            "one cannot be rebuilt retroactively",
+                 "price_usdc": BASE_PRICES.get("/br-revisions")},
+                {"endpoint": "/br-archive",
+                 "because": "signed daily snapshot of the Brazilian market, "
+                            "immutable by construction",
+                 "price_usdc": BASE_PRICES.get("/br-archive")},
+            ],
+        },
+        "free_proof": f"{base}/br-pit-proof",
+        "revenue_truth": f"{base}/.well-known/honest-revenue.json",
+        "operator": {"name": "Roberto Martins",
+                     "note": "I answer every message. Tell me what your agent "
+                             "needs and I build the endpoint."},
+        "version": VERSION,
+    })
+
+
+# ============================================================================
+# BLOCO F — BOOT
+# ============================================================================
+
+_v45_started = False
+
+
+def _v45_start_loops():
+    global _v45_started
+    if _v45_started:
+        return
+    _v45_started = True
+    # Mesma disciplina do _start_background_once: com 2 workers gunicorn, sem
+    # lock o PIT gravaria em dobro e bateria no BCB duas vezes por ciclo.
+    _own_loops = True
+    try:
+        import fcntl
+        _pit_lock_f = open(HOME_DIR / "pit_loops.lock", "w")
+        try:
+            fcntl.flock(_pit_lock_f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            globals()["_PIT_LOCK_FILE"] = _pit_lock_f   # mantém o lock vivo
+        except OSError:
+            _own_loops = False
+            log.info("⏭ v45: loops PIT já ativos em outro worker")
+    except Exception as e:
+        log.warning(f"v45 pit lock indisponível ({e}) — seguindo sem lock")
+    if _own_loops:
+        threading.Thread(target=pit_loop, daemon=True).start()
+        if ALGO_ANCHOR_MNEMONIC:
+            threading.Thread(target=pit_anchor_loop, daemon=True).start()
+    log.info("=" * 62)
+    log.info(f"🧭 LOSBETO {V45_LAYER_VERSION} — camada da verdade ativa")
+    log.info(f"   Receita honesta:  {_public_base()}/.well-known/honest-revenue.json")
+    log.info(f"   Prova PIT grátis: {_public_base()}/br-pit-proof")
+    log.info(f"   Por que comprar:  {_public_base()}/why-buy")
+    try:
+        _sp = revenue_split()
+        log.info(f"   Orgânico até hoje: ${_sp['organic_usdc']:.4f} em "
+                 f"{_sp['organic_tx']} tx de {_sp['organic_buyers']} carteira(s)")
+        if _sp["self_sweep_tx"]:
+            log.warning(f"   ⚠️  {_sp['self_sweep_tx']} tx classificadas como "
+                        f"VARREDURA DE CATÁLOGO (${_sp['self_sweep_usdc']:.4f}) — "
+                        "não conte isso como venda e não submeta como prova.")
+    except Exception as _e:
+        log.debug(f"v45 split: {_e}")
+    log.info("=" * 62)
+
+
+if os.environ.get("AUTOPILOT", "1") != "0":
+    _v45_start_loops()
+
+# ============================================================================
+# FIM DA CAMADA v45
+# ============================================================================
+
 
 if __name__ == "__main__":
     cli()
