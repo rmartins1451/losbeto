@@ -1,5 +1,7 @@
 # Losbeto — Cross-Asset Market Intelligence over x402
 
+[![Losbeto on x402-list — monitored uptime](https://x402-list.com/badge/losbeto-cross-asset-market-intelligence.svg?data=uptime)](https://x402-list.com/services/losbeto-cross-asset-market-intelligence?utm_source=badge&utm_medium=referral&utm_campaign=embed)
+
 A single-file Python node that sells market data to AI agents, per call, in USDC, with no API keys and no signup. Live at https://api.losbeto.xyz
 
 Stocks, forex, commodities, macro, Brazil (BCB/B3), crypto — **and LLM inference as a pay-per-call commodity** — 86 endpoints, $0.003–$99.99, settling on **Base (Coinbase CDP), Solana (PayAI) and Algorand (gasless challenge)**.
