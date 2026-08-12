@@ -87,7 +87,7 @@ from typing import Any, Optional, Dict, List, Tuple
 # 0. CONFIGURAÇÃO E AUTO-SETUP
 # ============================================================================
 
-VERSION = "46.0.3-SCORECARD"  # v46.0.3: boot log lia chaves antigas (None) + backfill movido p/ thread pós-boot (deploy abre a porta mais rápido, menos 502) | v46.0.2: availability x served_rate | v46.0.1: /live e /dash leem revenue_split  # v45 da revisão externa + ajustes Kimi: no-store /why-buy, aviso persistência PIT, hero landing PIT, CTA prova grátis  # input schema do POST p/ x402scan + porta GET didatica | v44.9.0: /llm + /v1/chat/completions | v44.8.2: receipts algorand
+VERSION = "46.0.4-SCORECARD"  # v46.0.4: /agents.json (demanda real: 5 IPs/7d pedindo) | v46.0.3: boot log + backfill pós-boot | v46.0.2: availability x served_rate  # v46.0.3: boot log lia chaves antigas (None) + backfill movido p/ thread pós-boot (deploy abre a porta mais rápido, menos 502) | v46.0.2: availability x served_rate | v46.0.1: /live e /dash leem revenue_split  # v45 da revisão externa + ajustes Kimi: no-store /why-buy, aviso persistência PIT, hero landing PIT, CTA prova grátis  # input schema do POST p/ x402scan + porta GET didatica | v44.9.0: /llm + /v1/chat/completions | v44.8.2: receipts algorand
 BRAND_NAME = "Losbeto"
 # v44.4.0: reposicionamento Brasil-primeiro. "Cross-asset market data" compete
 # com CoinGecko e cem nós iguais; "BCB + B3 normalizado em inglês" não compete
@@ -18937,7 +18937,7 @@ if os.environ.get("AUTOPILOT", "1") != "0":
 #  o único arquivo de vintages de estatística oficial brasileira que existe.
 # ============================================================================
 
-V46_LAYER_VERSION = "46.0.1-SCORECARD"
+V46_LAYER_VERSION = "46.0.4-SCORECARD"  # acompanha VERSION (banner de boot)
 
 # ============================================================================
 # BLOCO G — SCORECARD: os números que o avaliador ia calcular sozinho
@@ -19551,6 +19551,98 @@ try:
 except Exception as _e:
     log.warning(f"v46 commodity tag: {_e}")
 
+
+
+
+# ============================================================================
+# BLOCO N-2 — /agents.json: a demanda que o próprio ledger revelou
+# ============================================================================
+#  O painel "asked for, not served" mostrou /agents.json pedido por 5 IPs
+#  distintos em 7 dias — o ÚNICO item sem resposta. É o padrão agents.json
+#  (wild-card-ai, v0.1.0): um contrato legível por LLM sobre o OpenAPI,
+#  com flows (o resultado que o agente quer) em vez de endpoints crus.
+#  Custa zero e transforma 404 em vitrine.
+
+_AGENTS_FLOWS = [
+    {"id": "brazil-macro-asof",
+     "name": "Brazilian macro series as known on a past date",
+     "description": ("Returns the value of a BCB series (Selic, CDI, IPCA 12m, "
+                     "IGP-M, PTAX, EUR/BRL) AS IT WAS PUBLISHED on a given date — "
+                     "no look-ahead bias. Costs $0.09 in USDC via x402 (HTTP 402)."),
+     "actions": [{"id": "br_asof", "source_id": "losbeto-api",
+                  "path": "/br-asof", "method": "GET",
+                  "parameters": [
+                      {"name": "series", "in": "query", "required": True,
+                       "schema": {"type": "string",
+                                  "enum": ["selic_meta_pct", "cdi_daily_pct",
+                                           "ipca_12m_pct", "igpm_month_pct",
+                                           "usd_brl_ptax", "eur_brl"]}},
+                      {"name": "date", "in": "query", "required": True,
+                       "schema": {"type": "string", "pattern": "^\\d{4}-\\d{2}-\\d{2}$"},
+                       "description": "observation date, YYYY-MM-DD"}]}]},
+    {"id": "brazil-revision-trail",
+     "name": "Full revision history of Brazilian official statistics",
+     "description": ("First print and every correction of a BCB series, with "
+                     "timestamps and deltas. No public Brazilian equivalent "
+                     "exists. $0.19 in USDC via x402."),
+     "actions": [{"id": "br_revisions", "source_id": "losbeto-api",
+                  "path": "/br-revisions", "method": "GET",
+                  "parameters": [
+                      {"name": "series", "in": "query", "required": False,
+                       "schema": {"type": "string"}}]}]},
+    {"id": "verify-archive-proof",
+     "name": "Verify the point-in-time archive (free)",
+     "description": ("Merkle roots, Ed25519 signer key and the offline "
+                     "verification recipe. Free forever, no payment."),
+     "actions": [{"id": "br_pit_proof", "source_id": "losbeto-api",
+                  "path": "/br-pit-proof", "method": "GET", "parameters": []}]},
+    {"id": "brazil-market-brief",
+     "name": "Brazil macro + equities brief with AI synthesis",
+     "description": ("BCB macro, Ibovespa, B3 blue chips and global context in "
+                     "one call, with AI-written synthesis. $0.50 via x402."),
+     "actions": [{"id": "br_brief", "source_id": "losbeto-api",
+                  "path": "/br-brief", "method": "GET", "parameters": []}]},
+    {"id": "discover-full-catalog",
+     "name": "Discover all ~88 priced endpoints (free)",
+     "description": ("Machine-readable catalog with prices, descriptions and "
+                     "free samples. Free."),
+     "actions": [{"id": "catalog", "source_id": "losbeto-api",
+                  "path": "/.well-known/ai-catalog.json", "method": "GET", "parameters": []}]},
+]
+
+
+@app.route("/agents.json")
+@app.route("/.well-known/agents.json")
+def agents_json():
+    base = _public_base()
+    resp = jsonify({
+        "schema_version": "0.1.0",
+        "info": {"title": f"{BRAND_NAME} — point-in-time Brazilian market data",
+                 "description": V45_POSITIONING,
+                 "version": VERSION},
+        "contact": {"email": "roberto.martins622@gmail.com", "url": base},
+        "sources": [{"id": "losbeto-api", "path": f"{base}/openapi.json"}],
+        "payment": {
+            "protocol": "x402 (HTTP 402 payment challenge)",
+            "asset": "USDC",
+            "networks": [n for n, on in (("eip155:8453", ENABLE_BASE),
+                                         (f"solana:{SOL_GENESIS}", True),
+                                         (ALGO_CAIP2, ENABLE_ALGO)) if on],
+            "how": ("Call any priced endpoint without credentials, receive a "
+                    "402 challenge, settle USDC on any listed network, retry "
+                    "with the payment header. No signup, no API key."),
+            "free_tier": [f"{base}/br-pit-proof", f"{base}/try",
+                          f"{base}/.well-known/ai-catalog.json", f"{base}/why-buy"],
+        },
+        "flows": _AGENTS_FLOWS,
+        "links": [],
+        "x402_manifest": f"{base}/.well-known/x402.json",
+        "scorecard": f"{base}/scorecard.json",
+        "fidelity_recipes": f"{base}/.well-known/fidelity.json",
+    })
+    resp.headers["Access-Control-Allow-Origin"] = "*"
+    resp.headers["Cache-Control"] = "public, max-age=3600"
+    return resp
 
 # ============================================================================
 # BLOCO N — BOOT
