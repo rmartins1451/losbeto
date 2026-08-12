@@ -87,7 +87,7 @@ from typing import Any, Optional, Dict, List, Tuple
 # 0. CONFIGURAÇÃO E AUTO-SETUP
 # ============================================================================
 
-VERSION = "46.0.1-SCORECARD"  # v46 da revisão externa + patches Kimi: /live e /dash leem revenue_split (a crítica que a v46 não corrigiu)  # v45 da revisão externa + ajustes Kimi: no-store /why-buy, aviso persistência PIT, hero landing PIT, CTA prova grátis  # input schema do POST p/ x402scan + porta GET didatica | v44.9.0: /llm + /v1/chat/completions | v44.8.2: receipts algorand
+VERSION = "46.0.2-SCORECARD"  # v46.0.2: scorecard não conta mais 402 correto como falha (availability x served_rate) | v46.0.1: /live e /dash leem revenue_split  # v45 da revisão externa + ajustes Kimi: no-store /why-buy, aviso persistência PIT, hero landing PIT, CTA prova grátis  # input schema do POST p/ x402scan + porta GET didatica | v44.9.0: /llm + /v1/chat/completions | v44.8.2: receipts algorand
 BRAND_NAME = "Losbeto"
 # v44.4.0: reposicionamento Brasil-primeiro. "Cross-asset market data" compete
 # com CoinGecko e cem nós iguais; "BCB + B3 normalizado em inglês" não compete
@@ -18955,18 +18955,29 @@ def _pct(sorted_vals: List[int], p: float) -> Optional[int]:
 
 
 def _latency_stats(window_s: int = 86400) -> dict:
-    """p50/p95 e taxa de erro por endpoint, do próprio ledger de requests."""
+    """p50/p95 por endpoint + DUAS taxas distintas, do ledger de requests.
+    v46.0.2: um 402 correto é SUCESSO de disponibilidade — o scanner pediu e
+    o nó respondeu o desafio em milissegundos. Contar probe como falha fazia
+    o scorecard anunciar ~2% de 'sucesso' (97% de 'erro') para os indexadores
+    que ele foi feito para impressionar. Falha real: 5xx (nem chega ao
+    ledger) ou fonte indisponível (503, kind='unavailable')."""
     cutoff = int(time.time()) - window_s
-    per, ok_n, tot_n = defaultdict(list), 0, 0
+    per, ok_n, tot_n, avail_n = defaultdict(list), 0, 0, 0
+    probe_ms = []
     try:
         with LEDGER.lock, LEDGER._conn() as c:
             rows = c.execute(
-                "SELECT endpoint, ok, latency_ms FROM requests WHERE ts > ? "
+                "SELECT endpoint, ok, latency_ms, kind FROM requests WHERE ts > ? "
                 "AND latency_ms IS NOT NULL", (cutoff,)).fetchall()
     except Exception as e:
         return {"error": str(e)[:80]}
-    for ep, ok, ms in rows:
+    for ep, ok, ms, kind in rows:
         tot_n += 1
+        k = kind or ""
+        if ok or k in ("probe", "param_rejected", "partner"):
+            avail_n += 1
+        if k == "probe" and ms and ms > 0:
+            probe_ms.append(int(ms))
         if ok:
             ok_n += 1
             if ms and ms > 0:
@@ -18977,12 +18988,21 @@ def _latency_stats(window_s: int = 86400) -> dict:
         out[ep] = {"n": len(vals), "p50_ms": _pct(vals, 0.50),
                    "p95_ms": _pct(vals, 0.95)}
     all_vals = sorted(v for vals in per.values() for v in vals)
+    probe_ms.sort()
     return {
         "per_endpoint": dict(sorted(out.items(),
                                     key=lambda kv: -kv[1]["n"])[:40]),
         "overall": {"n": len(all_vals), "p50_ms": _pct(all_vals, 0.50),
                     "p95_ms": _pct(all_vals, 0.95),
                     "success_rate": round(ok_n / tot_n, 5) if tot_n else None,
+                    "availability": round(avail_n / tot_n, 5) if tot_n else None,
+                    "probe_response": {"n": len(probe_ms),
+                                       "p50_ms": _pct(probe_ms, 0.50),
+                                       "p95_ms": _pct(probe_ms, 0.95)},
+                    "availability_note": ("A correct 402 payment challenge "
+                                          "counts as AVAILABLE — the node "
+                                          "answered properly. 'success_rate' "
+                                          "is paid/preview content served."),
                     "requests": tot_n},
     }
 
@@ -19052,9 +19072,12 @@ def build_scorecard() -> dict:
                     "Independently verifiable by probing the endpoints below."),
         "availability_24h": {
             "requests": lat.get("overall", {}).get("requests"),
-            "success_rate": lat.get("overall", {}).get("success_rate"),
-            "p50_ms": lat.get("overall", {}).get("p50_ms"),
-            "p95_ms": lat.get("overall", {}).get("p95_ms"),
+            "availability": lat.get("overall", {}).get("availability"),
+            "availability_note": lat.get("overall", {}).get("availability_note"),
+            "served_rate": lat.get("overall", {}).get("success_rate"),
+            "probe_response": lat.get("overall", {}).get("probe_response"),
+            "served_p50_ms": lat.get("overall", {}).get("p50_ms"),
+            "served_p95_ms": lat.get("overall", {}).get("p95_ms"),
         },
         "challenge_402": _challenge_latency_probe(),
         "latency_by_endpoint_24h": lat.get("per_endpoint"),
