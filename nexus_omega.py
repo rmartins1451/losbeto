@@ -87,7 +87,7 @@ from typing import Any, Optional, Dict, List, Tuple
 # 0. CONFIGURAÇÃO E AUTO-SETUP
 # ============================================================================
 
-VERSION = "46.0.4-SCORECARD"  # v46.0.4: /agents.json (demanda real: 5 IPs/7d pedindo) | v46.0.3: boot log + backfill pós-boot | v46.0.2: availability x served_rate  # v46.0.3: boot log lia chaves antigas (None) + backfill movido p/ thread pós-boot (deploy abre a porta mais rápido, menos 502) | v46.0.2: availability x served_rate | v46.0.1: /live e /dash leem revenue_split  # v45 da revisão externa + ajustes Kimi: no-store /why-buy, aviso persistência PIT, hero landing PIT, CTA prova grátis  # input schema do POST p/ x402scan + porta GET didatica | v44.9.0: /llm + /v1/chat/completions | v44.8.2: receipts algorand
+VERSION = "47.0.1-PRIMITIVOS"  # v47.0.1: PIX ascii-safe (acentos nao derrubam mais) + ETag/304 no openapi/swagger  # v46.0.4: /agents.json (demanda real: 5 IPs/7d pedindo) | v46.0.3: boot log + backfill pós-boot | v46.0.2: availability x served_rate  # v46.0.3: boot log lia chaves antigas (None) + backfill movido p/ thread pós-boot (deploy abre a porta mais rápido, menos 502) | v46.0.2: availability x served_rate | v46.0.1: /live e /dash leem revenue_split  # v45 da revisão externa + ajustes Kimi: no-store /why-buy, aviso persistência PIT, hero landing PIT, CTA prova grátis  # input schema do POST p/ x402scan + porta GET didatica | v44.9.0: /llm + /v1/chat/completions | v44.8.2: receipts algorand
 BRAND_NAME = "Losbeto"
 # v44.4.0: reposicionamento Brasil-primeiro. "Cross-asset market data" compete
 # com CoinGecko e cem nós iguais; "BCB + B3 normalizado em inglês" não compete
@@ -13586,9 +13586,23 @@ def _cached_spec(key: str, builder):
     _SPEC_CACHE[key] = (time.time(), val)
     return val
 
+def _spec_with_etag(key: str, builder):
+    """v47.0.1: um único scanner rebuscava a spec de 126 KB entre cada
+    endpoint sondado (88 × 126 KB por passada). ETag estável + 304 fecha
+    essa torneira sem mudar uma linha do conteúdo."""
+    val = _cached_spec(key, builder)
+    body = (val.get_data() if isinstance(val, Response)
+            else json.dumps(val, sort_keys=True, default=str).encode())
+    etag = '"%s"' % hashlib.sha256(body).hexdigest()[:16]
+    headers = {"ETag": etag, "Cache-Control": "public, max-age=300"}
+    if request.headers.get("If-None-Match") == etag:
+        return Response(status=304, headers=headers)
+    return Response(body, mimetype="application/json", headers=headers)
+
+
 @app.route("/openapi.json")
 def openapi_spec():
-    return _cached_spec("openapi", _build_openapi)
+    return _spec_with_etag("openapi", _build_openapi)
 
 @app.route("/swagger.json")
 def swagger_json():
@@ -13596,7 +13610,7 @@ def swagger_json():
     convenção Swagger que SDKs de agente tentam antes de /openapi.json.
     Serve a MESMA spec já em cache: custo de CPU zero, sem redirect
     (muitos clientes de agente não seguem redirect em fetch de spec)."""
-    return _cached_spec("openapi", _build_openapi)
+    return _spec_with_etag("openapi", _build_openapi)
 
 @app.route("/api/actions")
 def api_actions_alias():
@@ -19709,6 +19723,648 @@ if os.environ.get("AUTOPILOT", "1") != "0":
 
 # ============================================================================
 # FIM DA CAMADA v46
+# ============================================================================
+
+
+
+# ============================================================================
+# ============================================================================
+#  v47.0.0-PRIMITIVOS — "As máquinas compram o que elas NÃO conseguem de graça."
+# ============================================================================
+#
+#  O MISTÉRIO, RESOLVIDO
+#
+#  A pergunta era: 10.813 sondagens em 24h e US$ 0,0030 de receita orgânica.
+#  O que as máquinas procuram? Os concorrentes vendem? O quê, e por quê?
+#
+#  Eles vendem. E a resposta é embaraçosamente simples.
+#
+#  O maior vendedor curado do x402scan é o StableEnrich: ~108 mil transações
+#  em 30 dias. O catálogo dele é acesso por chamada a FullEnrich,
+#  CompanyEnrich, LeadMagic, Clado, Exa, Firecrawl, Google Maps, Serper e
+#  Whitepages, a US$ 0,10–0,28 por requisição. Um usuário de BD descreveu o
+#  valor em uma frase: torna a pesquisa de contas viável "sem precisar de uma
+#  assinatura enterprise de ZoomInfo, Apollo ou similar".
+#
+#  É isso. O produto do StableEnrich não é o dado — é o DESMEMBRAMENTO DA
+#  ASSINATURA. Ele pega APIs que exigem contrato mínimo de centenas ou
+#  milhares de dólares por mês, mais conversa comercial, mais duas semanas de
+#  onboarding, e entrega uma chamada avulsa por vinte centavos, sem conta.
+#
+#  A fórmula que decide se um endpoint x402 vende é uma só:
+#
+#      valor_para_o_agente = custo_da_alternativa_mais_barata − seu_preço
+#
+#  Aplique a este nó, honestamente:
+#
+#      /pyth-price      → alternativa: hermes.pyth.network, grátis  → valor ≤ 0
+#      /fear-greed      → alternativa: alternative.me, grátis       → valor ≤ 0
+#      /forex-rate      → alternativa: exchangerate-api, grátis     → valor ≤ 0
+#      /br-macro        → alternativa: api.bcb.gov.br, grátis       → valor ≤ 0
+#      /stock-quote     → alternativa: Finnhub free tier            → valor ≤ 0
+#
+#  Não existe assinatura para desmembrar. O nó revende o que já é público.
+#  Nenhuma quantidade de manifesto, ranking ou marketing conserta isso —
+#  e a única venda orgânica das últimas 24 horas foi US$ 0,003 em
+#  /pyth-price, que é exatamente alguém TESTANDO se o pagamento funciona.
+#
+#  O SEGUNDO MOTIVO, QUE O PRÓPRIO SCORECARD DA v46 DENUNCIOU
+#
+#      servido p50 = 2058 ms · p95 = 3752 ms
+#
+#  O desafio 402 sai em 1 ms, mas ENTREGAR o dado leva dois segundos na
+#  mediana, porque quase todo handler chama BCB, Yahoo, Finnhub ou
+#  exchangerate-api de forma síncrona no caminho da requisição. Os
+#  concorrentes que vendem rodam em Cloudflare Workers e respondem em
+#  dezenas de milissegundos. A EntRoute ranqueia por latência. Um agente
+#  dentro de um laço não espera 2 segundos por um número que ele busca de
+#  graça em 200 ms na fonte.
+#
+#  O TERCEIRO: 88 ENDPOINTS ESCRITOS PARA UM LEITOR HUMANO
+#
+#  "dossiê", "brief", "tese operacional", "conselho de cinco agentes",
+#  "relatório institucional". Isso é entregável de consultoria. Um agente
+#  não lê um brief de US$ 0,50 — ele chama a MESMA função dez mil vezes
+#  dentro de um pipeline. O que vende para máquina é primitivo:
+#  determinístico, idempotente, um verbo, um recurso.
+#
+#  O QUE A v47 CONSTRÓI
+#
+#  Quatro primitivos brasileiros que satisfazem a fórmula ao mesmo tempo em
+#  que consertam a latência, porque NÃO TÊM DEPENDÊNCIA EXTERNA NENHUMA —
+#  são computação pura, medida em 0,12 ms e 0,32 ms por chamada:
+#
+#    /br-pix-parse  decodifica e VALIDA o CRC de um BR Code (PIX EMV-MPM)
+#    /br-pix-code   gera um BR Code estático válido, com CRC16 correto
+#    /br-bizdays    dias úteis e fator 252 pelo calendário bancário ANBIMA
+#    /br-doc        validação de CNPJ e CPF por dígito verificador
+#
+#  Por que ISTO tem valor positivo pela fórmula, e /pyth-price não:
+#
+#   · Não existe fonte pública que devolva isso pronto. Existe a
+#     ESPECIFICAÇÃO — o Manual de Padrões do BACEN, a tabela de feriados da
+#     ANBIMA, a regra de módulo 11 da Receita. Implementar é 200 linhas e
+#     três armadilhas: o CRC16-CCITT/FALSE com polinômio 0x1021 e semente
+#     0xFFFF, o Carnaval e o Corpus Christi que se movem com a Páscoa, e a
+#     Consciência Negra que virou feriado nacional só em 2024. Errar
+#     qualquer uma corrompe silenciosamente um cálculo de taxa ou faz um QR
+#     ser recusado no caixa.
+#   · São idempotentes e ficam dentro de um laço — o perfil de consumo que
+#     gera 108 mil transações, não 1.
+#   · Zero upstream: sem chave, sem cota, sem 429, sem 503, sem 2058 ms.
+#     Isso é vantagem de RANKING, não só de produto: os indexadores medem
+#     latência e disponibilidade, e estes endpoints não têm como cair.
+#   · Compõem com o que já existe aqui: /br-bizdays é literalmente o
+#     denominador que o /br-curve já usa para anualizar o CDI em base 252.
+#
+#  E NÃO — isto não é o produto principal. É o degrau.
+#
+#  O arquivo point-in-time continua sendo a única coisa neste nó que
+#  ninguém pode copiar amanhã. Mas ele precisa de tempo para engordar, e
+#  precisa que alguém já tenha pagado uma vez para descobrir que este host
+#  existe e funciona. Primitivos baratos, instantâneos e infalíveis são o
+#  que faz a primeira transação acontecer. O vintage é o que faz a segunda
+#  valer US$ 0,19 em vez de US$ 0,004.
+# ============================================================================
+
+from datetime import date          # v47: o topo do arquivo importa datetime,
+from urllib.parse import urlencode  # timezone e timedelta, mas nao `date`.
+
+V47_LAYER_VERSION = "47.0.1-PRIMITIVOS"
+
+# ============================================================================
+# BLOCO O — PRIMITIVOS BRASILEIROS, COMPUTAÇÃO PURA, ZERO UPSTREAM
+# ============================================================================
+
+# ---- PIX BR Code (EMV-MPM, Manual de Padrões para Iniciação do PIX) -------
+
+def _crc16_ccitt(data: bytes) -> int:
+    """CRC16-CCITT/FALSE: polinômio 0x1021, semente 0xFFFF, sem reflexão.
+    Vetor de teste da norma: b'123456789' -> 0x29B1 (verificado)."""
+    crc = 0xFFFF
+    for b in data:
+        crc ^= b << 8
+        for _ in range(8):
+            crc = ((crc << 1) ^ 0x1021) & 0xFFFF if crc & 0x8000 else (crc << 1) & 0xFFFF
+    return crc
+
+
+def _emv_tlv(s: str) -> List[Tuple[str, str]]:
+    out, i = [], 0
+    while i < len(s):
+        if i + 4 > len(s):
+            raise ValueError(f"truncated tag at offset {i}")
+        tag, ln = s[i:i + 2], s[i + 2:i + 4]
+        if not ln.isdigit():
+            raise ValueError(f"non-numeric length for tag {tag}")
+        n = int(ln)
+        val = s[i + 4:i + 4 + n]
+        if len(val) != n:
+            raise ValueError(f"value shorter than declared for tag {tag}")
+        out.append((tag, val))
+        i += 4 + n
+    return out
+
+
+def _emv_f(tag: str, val: str) -> str:
+    return f"{tag}{len(val):02d}{val}"
+
+
+def _pix_build(key: str, name: str, city: str, amount=None,
+               txid: str = "***", description: str = None, cep: str = None) -> str:
+    # v47.0.1: normaliza tudo para ASCII antes de montar (acentos em
+    # name/city/description crashavam com UnicodeEncodeError -> 500 pago).
+    key = _pix_ascii(key).strip()
+    name = _pix_ascii(name)
+    city = _pix_ascii(city)
+    description = _pix_ascii(description) if description else None
+    # txid: a norma aceita apenas [A-Za-z0-9]{1,25} ("***" = sem txid).
+    if txid and txid != "***":
+        txid = re.sub(r"[^A-Za-z0-9]", "", txid)[:25] or "***"
+    mai = _emv_f("00", "br.gov.bcb.pix") + _emv_f("01", key)
+    if description:
+        mai += _emv_f("02", description[:72])
+    p = _emv_f("00", "01") + _emv_f("01", "12") + _emv_f("26", mai)
+    p += _emv_f("52", "0000") + _emv_f("53", "986")
+    if amount is not None:
+        p += _emv_f("54", f"{float(amount):.2f}")
+    p += _emv_f("58", "BR")
+    p += _emv_f("59", (name or "")[:25].upper())
+    p += _emv_f("60", (city or "")[:15].upper())
+    if cep:
+        p += _emv_f("61", re.sub(r"\D", "", cep)[:8])
+    p += _emv_f("62", _emv_f("05", (txid or "***")[:25]))
+    p += "6304"
+    return p + f"{_crc16_ccitt(p.encode('ascii')):04X}"
+
+
+def _pix_ascii(s: str) -> str:
+    """v47.0.1: BR Code é ASCII puro. NFKD remove acentos (SÃO PAULO -> SAO
+    PAULO) em vez de explodir UnicodeEncodeError dentro do handler pago."""
+    import unicodedata
+    return unicodedata.normalize("NFKD", s or "").encode("ascii", "ignore").decode("ascii")
+
+
+def _pix_parse(code: str) -> dict:
+    code = (code or "").strip()
+    if len(code) < 8:
+        raise ValueError("payload too short to be a BR Code")
+    try:
+        code.encode("ascii")
+    except UnicodeEncodeError:
+        raise ValueError("payload must be plain ASCII (a BR Code never carries accents)")
+    body, given = code[:-4], code[-4:]
+    if body[-4:] != "6304":
+        raise ValueError("CRC tag 6304 not found in the last position")
+    calc = f"{_crc16_ccitt(body.encode('ascii')):04X}"
+    fields = dict(_emv_tlv(code))
+    mai = dict(_emv_tlv(fields.get("26", ""))) if fields.get("26") else {}
+    add = dict(_emv_tlv(fields.get("62", ""))) if fields.get("62") else {}
+    return {
+        "crc_valid": calc == given.upper(),
+        "crc_expected": calc, "crc_found": given.upper(),
+        "payload_format_indicator": fields.get("00"),
+        "static": fields.get("01") == "11",
+        "gui": mai.get("00"), "pix_key": mai.get("01"),
+        "description": mai.get("02"),
+        "merchant_category_code": fields.get("52"),
+        "currency": fields.get("53"), "amount": fields.get("54"),
+        "country": fields.get("58"), "merchant_name": fields.get("59"),
+        "merchant_city": fields.get("60"), "postal_code": fields.get("61"),
+        "txid": add.get("05"), "tag_count": len(fields),
+    }
+
+
+# ---- Calendário bancário brasileiro / base 252 (ANBIMA) -------------------
+
+def _easter(y: int) -> "datetime.date":
+    """Algoritmo gregoriano anônimo. Carnaval, Sexta-feira Santa e Corpus
+    Christi derivam daqui — é por isso que tabela fixa de feriado brasileiro
+    dá errado todo ano."""
+    a, b, c = y % 19, y // 100, y % 100
+    d, e = b // 4, b % 4
+    f, g = (b + 8) // 25, (b - (b + 8) // 25 + 1) // 3
+    h = (19 * a + b - d - g + 15) % 30
+    i, k = c // 4, c % 4
+    l = (32 + 2 * e + 2 * i - h - k) % 7
+    m = (a + 11 * h + 22 * l) // 451
+    mo = (h + l - 7 * m + 114) // 31
+    da = ((h + l - 7 * m + 114) % 31) + 1
+    return date(y, mo, da)
+
+
+def br_bank_holidays(y: int) -> Dict[str, str]:
+    E = _easter(y)
+    d = timedelta
+    h = {f"{y}-01-01": "Confraternizacao Universal",
+         f"{y}-04-21": "Tiradentes",
+         f"{y}-05-01": "Dia do Trabalho",
+         f"{y}-09-07": "Independencia",
+         f"{y}-10-12": "Nossa Senhora Aparecida",
+         f"{y}-11-02": "Finados",
+         f"{y}-11-15": "Proclamacao da Republica",
+         f"{y}-12-25": "Natal"}
+    if y >= 2024:                      # Lei 14.759/2023
+        h[f"{y}-11-20"] = "Consciencia Negra"
+    h[(E - d(48)).isoformat()] = "Carnaval (segunda)"
+    h[(E - d(47)).isoformat()] = "Carnaval (terca)"
+    h[(E - d(2)).isoformat()] = "Sexta-feira Santa"
+    h[(E + d(60)).isoformat()] = "Corpus Christi"
+    return h
+
+
+def _hol_range(y0: int, y1: int) -> Dict[str, str]:
+    out = {}
+    for y in range(y0, y1 + 1):
+        out.update(br_bank_holidays(y))
+    return out
+
+
+def br_is_bizday(dt: "date", hol: Dict[str, str] = None) -> bool:
+    hol = hol if hol is not None else br_bank_holidays(dt.year)
+    return dt.weekday() < 5 and dt.isoformat() not in hol
+
+
+def br_bizdays(a: "date", b: "date") -> int:
+    """Dias úteis no intervalo [a, b) — a convenção da ANBIMA."""
+    if b < a:
+        return -br_bizdays(b, a)
+    hol = _hol_range(a.year, b.year)
+    n, cur = 0, a
+    while cur < b:
+        if cur.weekday() < 5 and cur.isoformat() not in hol:
+            n += 1
+        cur += timedelta(days=1)
+    return n
+
+
+# ---- CNPJ / CPF (módulo 11) -----------------------------------------------
+
+def _cnpj_valid(v: str) -> bool:
+    s = re.sub(r"\D", "", v or "")
+    if len(s) != 14 or s == s[0] * 14:
+        return False
+    for size, w in ((12, [5, 4, 3, 2, 9, 8, 7, 6, 5, 4, 3, 2]),
+                    (13, [6, 5, 4, 3, 2, 9, 8, 7, 6, 5, 4, 3, 2])):
+        t = sum(int(s[i]) * w[i] for i in range(size)) % 11
+        if int(s[size]) != (0 if t < 2 else 11 - t):
+            return False
+    return True
+
+
+def _cpf_valid(v: str) -> bool:
+    s = re.sub(r"\D", "", v or "")
+    if len(s) != 11 or s == s[0] * 11:
+        return False
+    for size in (9, 10):
+        t = sum(int(s[i]) * ((size + 1) - i) for i in range(size)) % 11
+        if int(s[size]) != (0 if t < 2 else 11 - t):
+            return False
+    return True
+
+
+# ---- handlers --------------------------------------------------------------
+
+_ZERO_UPSTREAM = {"/br-pix-parse", "/br-pix-code", "/br-bizdays", "/br-doc"}
+
+
+def _iso(s: str):
+    try:
+        return date.fromisoformat((s or "").strip())
+    except Exception:
+        return None
+
+
+def _h_pix_parse():
+    code = (request.args.get("code") or request.args.get("brcode") or "").strip()
+    ts_now = int(time.time())
+    if not code:
+        return ({"status": "bad_request", "charged": False,
+                 "error": "code=<BR Code payload> is required",
+                 "hint": "the full EMV string, ending in the 4-hex CRC",
+                 "ts": ts_now, "version": VERSION}, 400)
+    t0 = time.perf_counter()
+    try:
+        out = _pix_parse(code)
+    except ValueError as e:
+        return ({"status": "invalid_payload", "charged": False,
+                 "error": str(e)[:120],
+                 "note": "Malformed input is rejected free of charge.",
+                 "ts": ts_now, "version": VERSION}, 400)
+    return {"product": "PIX BR Code decoder", "input_length": len(code),
+            "decoded": out,
+            "verdict": "VALID" if out["crc_valid"] else "CRC_MISMATCH",
+            "spec": "BACEN Manual de Padroes para Iniciacao do PIX (EMV-MPM)",
+            "upstream_calls": 0,
+            "compute_ms": round((time.perf_counter() - t0) * 1000, 3),
+            "ts": ts_now, "version": VERSION}
+
+
+def _h_pix_code():
+    a = request.args
+    key = (a.get("key") or "").strip()
+    ts_now = int(time.time())
+    if not key:
+        return ({"status": "bad_request", "charged": False,
+                 "error": "key=<pix key> is required (CPF/CNPJ, email, phone or EVP)",
+                 "example": "/br-pix-code?key=pay@example.com&name=ACME&city=SAO PAULO&amount=10.00",
+                 "ts": ts_now, "version": VERSION}, 400)
+    amt = a.get("amount")
+    try:
+        amt = float(amt) if amt not in (None, "") else None
+        if amt is not None and (amt <= 0 or amt > 99999999.99):
+            raise ValueError
+    except ValueError:
+        return ({"status": "bad_request", "charged": False,
+                 "error": "amount must be a positive number below 100000000",
+                 "ts": ts_now, "version": VERSION}, 400)
+    t0 = time.perf_counter()
+    code = _pix_build(key, a.get("name") or "RECEBEDOR",
+                      a.get("city") or "SAO PAULO", amt,
+                      a.get("txid") or "***", a.get("description"),
+                      a.get("cep"))
+    check = _pix_parse(code)
+    return {"product": "PIX BR Code generator",
+            "brcode": code, "length": len(code),
+            "static": amt is None,
+            "self_check": {"reparsed_ok": check["crc_valid"],
+                           "crc": check["crc_expected"]},
+            "fields": {"key": key, "amount": f"{amt:.2f}" if amt else None,
+                       "txid": (a.get("txid") or "***")[:25]},
+            "spec": "BACEN Manual de Padroes para Iniciacao do PIX (EMV-MPM)",
+            "upstream_calls": 0,
+            "compute_ms": round((time.perf_counter() - t0) * 1000, 3),
+            "ts": ts_now, "version": VERSION}
+
+
+def _h_bizdays():
+    a = request.args
+    ts_now = int(time.time())
+    d1, d2 = _iso(a.get("from") or a.get("start")), _iso(a.get("to") or a.get("end"))
+    if a.get("year") and not (d1 or d2):
+        try:
+            y = int(a["year"])
+            if not 1990 <= y <= 2100:
+                raise ValueError
+        except ValueError:
+            return ({"status": "bad_request", "charged": False,
+                     "error": "year must be between 1990 and 2100",
+                     "ts": ts_now, "version": VERSION}, 400)
+        hol = br_bank_holidays(y)
+        return {"product": "Brazilian bank calendar",
+                "year": y, "holidays": dict(sorted(hol.items())),
+                "holiday_count": len(hol),
+                "business_days": br_bizdays(date(y, 1, 1), date(y + 1, 1, 1)),
+                "basis": "ANBIMA 252-business-day convention",
+                "upstream_calls": 0, "ts": ts_now, "version": VERSION}
+    if not d1 or not d2:
+        return ({"status": "bad_request", "charged": False,
+                 "error": "from=YYYY-MM-DD&to=YYYY-MM-DD, or year=YYYY",
+                 "example": "/br-bizdays?from=2026-01-02&to=2026-07-01",
+                 "ts": ts_now, "version": VERSION}, 400)
+    if abs((d2 - d1).days) > 366 * 30:
+        return ({"status": "bad_request", "charged": False,
+                 "error": "range limited to 30 years",
+                 "ts": ts_now, "version": VERSION}, 400)
+    t0 = time.perf_counter()
+    du = br_bizdays(d1, d2)
+    hol = _hol_range(min(d1, d2).year, max(d1, d2).year)
+    inrange = {k: v for k, v in sorted(hol.items())
+               if d1.isoformat() <= k < d2.isoformat()}
+    return {"product": "Brazilian business-day count",
+            "from": d1.isoformat(), "to": d2.isoformat(),
+            "convention": "[from, to) — ANBIMA",
+            "business_days": du,
+            "calendar_days": (d2 - d1).days,
+            "year_fraction_252": round(du / 252.0, 8),
+            "holidays_in_range": inrange,
+            "from_is_business_day": br_is_bizday(d1),
+            "to_is_business_day": br_is_bizday(d2),
+            "note": ("Use business_days as the exponent denominator when "
+                     "annualising CDI: (1+i)^(du/252). Carnaval, Good Friday "
+                     "and Corpus Christi move with Easter; Consciencia Negra "
+                     "is national from 2024 (Lei 14.759/2023)."),
+            "upstream_calls": 0,
+            "compute_ms": round((time.perf_counter() - t0) * 1000, 3),
+            "ts": ts_now, "version": VERSION}
+
+
+def _h_doc():
+    v = (request.args.get("doc") or request.args.get("value") or "").strip()
+    ts_now = int(time.time())
+    if not v:
+        return ({"status": "bad_request", "charged": False,
+                 "error": "doc=<CNPJ or CPF> is required",
+                 "ts": ts_now, "version": VERSION}, 400)
+    digits = re.sub(r"\D", "", v)
+    t0 = time.perf_counter()
+    if len(digits) == 14:
+        kind, valid = "CNPJ", _cnpj_valid(digits)
+        fmt = (f"{digits[:2]}.{digits[2:5]}.{digits[5:8]}/"
+               f"{digits[8:12]}-{digits[12:]}") if valid else None
+        extra = {"is_headquarters": digits[8:12] == "0001",
+                 "branch_number": digits[8:12]}
+    elif len(digits) == 11:
+        kind, valid = "CPF", _cpf_valid(digits)
+        fmt = (f"{digits[:3]}.{digits[3:6]}.{digits[6:9]}-{digits[9:]}"
+               ) if valid else None
+        extra = {}
+    else:
+        return ({"status": "bad_request", "charged": False,
+                 "error": f"expected 11 digits (CPF) or 14 (CNPJ), got {len(digits)}",
+                 "ts": ts_now, "version": VERSION}, 400)
+    return {"product": "Brazilian document check-digit validation",
+            "type": kind, "valid": valid, "formatted": fmt,
+            "digits": len(digits), **extra,
+            "algorithm": "modulo 11 with the Receita Federal weight vectors",
+            "scope": ("Check-digit validation only. This does NOT confirm the "
+                      "document is registered or active — for registry status "
+                      "an official Receita Federal query is required."),
+            "upstream_calls": 0,
+            "compute_ms": round((time.perf_counter() - t0) * 1000, 3),
+            "ts": ts_now, "version": VERSION}
+
+
+# ---- registro --------------------------------------------------------------
+
+_V47_PRODUCTS = {
+    "/br-pix-parse": (_h_pix_parse, 0.004,
+        "Decode and CRC-verify a PIX BR Code (EMV-MPM) payload. Input: the "
+        "full ?code= string from a QR. Returns the pix key, amount, merchant, "
+        "txid and — the part that matters — whether the CRC16-CCITT checksum "
+        "actually matches, so an agent can reject a tampered or truncated QR "
+        "before moving money. Zero upstream calls, sub-millisecond, cannot "
+        "rate-limit. Use this before initiating any Brazilian payment. Do NOT "
+        "use it to look up a payment's status — it only reads the QR.",
+        ["Brazil", "PIX", "Payments", "Validation", "ZeroUpstream"],
+        {"code": "00020101021226...6304ABCD"}),
+    "/br-pix-code": (_h_pix_code, 0.004,
+        "Generate a valid static or amount-fixed PIX BR Code from ?key= plus "
+        "optional name, city, amount, txid. Returns the EMV payload with a "
+        "correct CRC16, plus a self-check that re-parses what it just built. "
+        "Use when an agent needs to be PAID in Brazil. Do NOT use to decode an "
+        "existing QR — that is /br-pix-parse.",
+        ["Brazil", "PIX", "Payments", "ZeroUpstream"],
+        {"key": "pay@example.com", "amount": "10.00"}),
+    "/br-bizdays": (_h_bizdays, 0.004,
+        "Count Brazilian bank business days between two dates on the ANBIMA "
+        "252 convention, or list a full year's bank holidays with ?year=. "
+        "Carnaval, Good Friday and Corpus Christi move with Easter and "
+        "Consciencia Negra became national only in 2024 — a hardcoded holiday "
+        "table silently corrupts any BRL rate calculation. Returns the day "
+        "count and the du/252 year fraction ready to use as an exponent. Zero "
+        "upstream calls. Use before annualising CDI or pricing any BRL "
+        "instrument. Do NOT use for the rate itself — that is /br-curve.",
+        ["Brazil", "Calendar", "RatesMath", "ZeroUpstream"],
+        {"from": "2026-01-02", "to": "2026-07-01"}),
+    "/br-doc": (_h_doc, 0.004,
+        "Validate a Brazilian CNPJ or CPF by its modulo-11 check digits and "
+        "return it formatted, plus whether a CNPJ is a headquarters (branch "
+        "0001). Catches typos and fabricated identifiers before they enter a "
+        "workflow. Zero upstream calls. This confirms the number is "
+        "well-formed, NOT that it is registered or active — for registry "
+        "status an official Receita Federal query is required.",
+        ["Brazil", "Validation", "KYB", "ZeroUpstream"],
+        {"doc": "33.000.167/0001-01"}),
+}
+
+for _path, (_fn, _price, _desc, _tags, _hint) in _V47_PRODUCTS.items():
+    BASE_PRICES[_path] = float(os.environ.get(
+        "PRICE_" + _path.strip("/").replace("-", "_").upper(), _price))
+    ENDPOINT_DESC[_path] = _desc
+    ENDPOINT_TAGS[_path] = _tags
+    ENDPOINT_PARAM_HINTS[_path] = _hint
+    ENDPOINT_HANDLERS[_path] = _fn
+    app.add_url_rule(_path, "v47" + _path.replace("/", "_").replace("-", "_"),
+                     paid_endpoint(_path)(_fn))
+
+try:
+    for _p in reversed(list(_V47_PRODUCTS)):
+        if _p in FEATURED_ENDPOINTS:
+            FEATURED_ENDPOINTS.remove(_p)
+        FEATURED_ENDPOINTS.insert(0, _p)
+except Exception as _e:
+    log.warning(f"v47 featured: {_e}")
+
+log.info(f"🇧🇷 v47: {len(_V47_PRODUCTS)} primitivos brasileiros registrados "
+         f"(${_V47_PRODUCTS['/br-doc'][1]:.3f}) — computação pura, zero upstream, "
+         "sub-milissegundo")
+
+
+# ============================================================================
+# BLOCO P — A LATÊNCIA É UM PRODUTO, E AGORA É DECLARÁVEL
+# ============================================================================
+#
+#  servido p50 = 2058 ms é o número que mais custa ranking neste nó. Os
+#  primitivos acima não têm como ser lentos, e isso é verificável de fora.
+#  Declarar quais rotas não tocam a rede dá ao indexador algo que ele não
+#  consegue inferir sozinho — e dá ao agente uma garantia de SLA sem
+#  precisar confiar em nós.
+
+@app.route("/zero-upstream.json")
+def zero_upstream_json():
+    base = _public_base()
+    return jsonify({
+        "claim": ("These endpoints make zero outbound network calls. They "
+                  "cannot rate-limit, cannot 503 on a dead provider, and are "
+                  "not affected by upstream latency. Measured locally at "
+                  "0.12-0.35 ms of compute per call."),
+        "verify": ("Call each one repeatedly and compare its latency "
+                   "distribution against any endpoint not on this list."),
+        "endpoints": [
+            {"path": p, "price_usdc": BASE_PRICES.get(p),
+             "upstream_calls": 0,
+             "example": base + p + "?" + urlencode(_V47_PRODUCTS[p][4]),
+             "purpose": _V47_PRODUCTS[p][2].split(".")[0] + "."}
+            for p in sorted(_ZERO_UPSTREAM) if p in _V47_PRODUCTS
+        ],
+        "contrast": {
+            "served_p50_ms_catalog_wide": (build_scorecard()
+                                           .get("availability_24h", {})
+                                           .get("served_p50_ms")),
+            "reason": ("Most of this catalog calls BCB, Yahoo, Finnhub or "
+                       "exchangerate-api synchronously inside the request "
+                       "path. Those endpoints are honest about it here."),
+        },
+        "ts": int(time.time()), "version": VERSION,
+    })
+
+
+# ============================================================================
+# BLOCO Q — POR QUE UM ENDPOINT VENDE (a fórmula, publicada)
+# ============================================================================
+
+@app.route("/what-agents-buy")
+def what_agents_buy():
+    """Publicado de propósito. Um agente que escolhe entre 88 ferramentas
+    precisa de um critério, e um comprador humano que avalia este nó merece
+    ver que o operador conhece a diferença entre o que aqui tem valor e o
+    que é conveniência."""
+    base = _public_base()
+    return jsonify({
+        "formula": "value_to_agent = cost_of_cheapest_alternative - price_here",
+        "worth_paying_for": [
+            {"endpoint": "/br-asof", "price_usdc": BASE_PRICES.get("/br-asof"),
+             "alternative": "does not exist — no public Brazilian vintage database",
+             "why": "the revised series you can fetch free today is not what was published then"},
+            {"endpoint": "/br-revisions", "price_usdc": BASE_PRICES.get("/br-revisions"),
+             "alternative": "does not exist",
+             "why": "cannot be reconstructed retroactively by anyone, including us"},
+            {"endpoint": "/br-bizdays", "price_usdc": BASE_PRICES.get("/br-bizdays"),
+             "alternative": "implement the ANBIMA calendar yourself and maintain it",
+             "why": "Easter-linked holidays plus a 2024 statutory change; getting it wrong corrupts rate math silently"},
+            {"endpoint": "/br-pix-parse", "price_usdc": BASE_PRICES.get("/br-pix-parse"),
+             "alternative": "implement EMV-MPM TLV plus CRC16-CCITT yourself",
+             "why": "rejects a tampered QR before an agent moves money"},
+        ],
+        "convenience_only": [
+            {"endpoint": p, "price_usdc": BASE_PRICES.get(p),
+             "free_alternative": src,
+             "verdict": "do not pay for this unless you want one schema and one payment rail"}
+            for p, src in sorted(COMMODITY_ENDPOINTS.items())
+        ],
+        "operator_note": ("Published because an agent choosing among 88 tools "
+                          "needs a criterion, and because a node that will not "
+                          "tell you what is not worth buying cannot be trusted "
+                          "about what is."),
+        "free_proof": f"{base}/br-pit-proof",
+        "latency_guarantee": f"{base}/zero-upstream.json",
+        "ts": int(time.time()), "version": VERSION,
+    })
+
+
+# ============================================================================
+# BLOCO R — BOOT
+# ============================================================================
+
+def _v47_boot():
+    base = _public_base()
+    log.info("=" * 62)
+    log.info(f"🇧🇷 LOSBETO {V47_LAYER_VERSION} — primitivos ativos")
+    for _p in sorted(_V47_PRODUCTS):
+        log.info(f"   {_p:<16} ${BASE_PRICES.get(_p):.3f}  (0 upstream)")
+    log.info(f"   Garantia latência: {base}/zero-upstream.json")
+    log.info(f"   Critério compra:   {base}/what-agents-buy")
+    try:
+        _t0 = time.perf_counter()
+        _c = _pix_build("smoke@losbeto.xyz", "LOSBETO", "PORTO ALEGRE", 1.23, "SMOKE")
+        _ok = _pix_parse(_c)["crc_valid"]
+        _du = br_bizdays(date(2026, 1, 1), date(2027, 1, 1))
+        _ms = (time.perf_counter() - _t0) * 1000
+        log.info(f"   Smoke test: PIX CRC={'OK' if _ok else 'FALHOU'} · "
+                 f"DU 2026={_du} · {_ms:.2f}ms")
+        if not _ok:
+            log.error("🚨 v47: geração de BR Code falhou no smoke test")
+    except Exception as e:
+        log.error(f"🚨 v47 smoke test: {e}")
+    log.info("=" * 62)
+
+
+if os.environ.get("AUTOPILOT", "1") != "0":
+    _v47_boot()
+
+# ============================================================================
+# FIM DA CAMADA v47
 # ============================================================================
 
 
