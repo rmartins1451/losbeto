@@ -87,7 +87,7 @@ from typing import Any, Optional, Dict, List, Tuple
 # 0. CONFIGURAÇÃO E AUTO-SETUP
 # ============================================================================
 
-VERSION = "46.0.2-SCORECARD"  # v46.0.2: scorecard não conta mais 402 correto como falha (availability x served_rate) | v46.0.1: /live e /dash leem revenue_split  # v45 da revisão externa + ajustes Kimi: no-store /why-buy, aviso persistência PIT, hero landing PIT, CTA prova grátis  # input schema do POST p/ x402scan + porta GET didatica | v44.9.0: /llm + /v1/chat/completions | v44.8.2: receipts algorand
+VERSION = "46.0.3-SCORECARD"  # v46.0.3: boot log lia chaves antigas (None) + backfill movido p/ thread pós-boot (deploy abre a porta mais rápido, menos 502) | v46.0.2: availability x served_rate | v46.0.1: /live e /dash leem revenue_split  # v45 da revisão externa + ajustes Kimi: no-store /why-buy, aviso persistência PIT, hero landing PIT, CTA prova grátis  # input schema do POST p/ x402scan + porta GET didatica | v44.9.0: /llm + /v1/chat/completions | v44.8.2: receipts algorand
 BRAND_NAME = "Losbeto"
 # v44.4.0: reposicionamento Brasil-primeiro. "Cross-asset market data" compete
 # com CoinGecko e cem nós iguais; "BCB + B3 normalizado em inglês" não compete
@@ -19564,10 +19564,10 @@ def _v46_boot():
     if _v46_started:
         return
     _v46_started = True
-    try:
-        pit_backfill_from_archive()
-    except Exception as e:
-        log.warning(f"v46 backfill: {e}")
+    # v46.0.3: o backfill NÃO roda mais na importação. Com --preload, todo
+    # trabalho de importação acontece ANTES do gunicorn abrir a porta —
+    # cada segundo aqui é um 502 a mais na janela do deploy. Vai para a
+    # thread pós-boot (abaixo), que roda com o nó já respondendo.
     base = _public_base()
     log.info("=" * 62)
     log.info(f"📊 LOSBETO {V46_LAYER_VERSION} — camada do avaliador ativa")
@@ -19589,10 +19589,18 @@ def _v46_boot():
         # atrasaria o healthcheck do Railway.
         time.sleep(25)
         try:
+            pit_backfill_from_archive()
+        except Exception as e:
+            log.warning(f"v46 backfill: {e}")
+        try:
             _sc = build_scorecard()
             _av = _sc.get("availability_24h", {})
-            log.info(f"📊 v46 latência 24h: p50={_av.get('p50_ms')}ms "
-                     f"p95={_av.get('p95_ms')}ms · sucesso={_av.get('success_rate')}")
+            # v46.0.3: as chaves mudaram na 46.0.2 (served_* / availability) —
+            # a linha lia os nomes antigos e logava None mesmo com dados.
+            log.info(f"📊 v46 disponibilidade 24h: {_av.get('availability')} · "
+                     f"servido p50={_av.get('served_p50_ms')}ms "
+                     f"p95={_av.get('served_p95_ms')}ms · "
+                     f"probe p50={(_av.get('probe_response') or {}).get('p50_ms')}ms")
             _pit = _sc.get("differentiated_asset", {})
             log.info(f"📐 v46 arquivo PIT: {_pit.get('observations')} observações "
                      f"em {_pit.get('days_covered')} dia(s), desde "
