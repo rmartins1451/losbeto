@@ -106,6 +106,21 @@ timestamp does not depend on trusting us.
 
 ---
 
+## For indexers and QoS scorers
+
+If you are ScoutScore, EntRoute, x402scan, x402-list, BlockRun or any other
+service that probes and ranks x402 nodes, these are for you:
+
+| Surface | What it gives you |
+|---|---|
+| `/scorecard.json` | Signed: 24h p50/p95 latency, success rate, 402-challenge cost, traffic mix, organic-vs-operator revenue |
+| `/.well-known/fidelity.json` | Deterministic probe recipe per endpoint — exact free URL, required response fields, what "healthy" means |
+| `/bazaar-status` | Whether this node has settled on Base via the CDP facilitator |
+| `X-Scorecard` / `X-Fidelity` | Headers on every response, so you never need a second request to find them |
+
+Free probes never charge. A paid route that hits an unexpected internal error
+degrades to a 402 rather than a 500 — the resource is still for sale.
+
 ## Revenue transparency
 
 `GET /.well-known/honest-revenue.json` — signed, and it separates:
