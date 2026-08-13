@@ -27,6 +27,9 @@ curl https://api.losbeto.xyz/br-pit-proof
 # free — what the paid endpoints actually cost and why
 curl https://api.losbeto.xyz/why-buy
 
+# free — the buying criterion, published: what is worth paying for here and what is not
+curl https://api.losbeto.xyz/what-agents-buy
+
 # paid — IPCA as it was known on 5 Aug 2026 (not as revised since)
 curl https://api.losbeto.xyz/br-asof?series=ipca_12m_pct&date=2026-08-05
 # -> HTTP 402 with the payment challenge; pay and repeat
@@ -61,7 +64,7 @@ Get a credit key with one on-chain payment: `POST https://api.losbeto.xyz/buy-cr
 
 ---
 
-## The products
+## The archive products (the moat)
 
 | Endpoint | Price | What you get |
 |---|---|---|
@@ -74,9 +77,27 @@ Get a credit key with one on-chain payment: `POST https://api.losbeto.xyz/buy-cr
 Series tracked: `selic_meta_pct`, `cdi_daily_pct`, `ipca_12m_pct`, `igpm_month_pct`,
 `usd_brl_ptax`, `eur_brl`.
 
+## The Brazilian primitives (zero upstream, sub-millisecond)
+
+Pure computation over Brazilian specifications — no external API in the request path,
+no rate limit, no provider outage, priced for loops:
+
+| Endpoint | Price | What you get |
+|---|---|---|
+| `/br-pix-parse?code=` | $0.004 | Decode and CRC16-verify a PIX BR Code (EMV-MPM). Rejects a tampered or truncated QR *before* an agent moves money |
+| `/br-pix-code?key=&name=&city=` | $0.004 | Generate a valid static PIX BR Code with correct CRC16, self-checked by re-parsing |
+| `/br-bizdays?from=&to=` (or `?year=`) | $0.004 | Bank business days on the ANBIMA 252 convention — Easter-linked holidays and the 2024 Consciência Negra change included, `du/252` year fraction ready as an exponent |
+| `/br-doc?doc=` | $0.004 | CNPJ/CPF modulo-11 check-digit validation, formatted output, headquarters branch detection |
+
+The spec-level traps these absorb: CRC16-CCITT/FALSE (poly `0x1021`, seed `0xFFFF`),
+Carnaval/Corpus Christi moving with Easter, and Consciência Negra becoming a national
+holiday only in 2024. Getting any of them wrong silently corrupts a rate calculation or
+makes a QR refused at the register. Verifiable from outside: `GET /zero-upstream.json`
+declares which routes never touch the network.
+
 The node also exposes ~80 other endpoints (crypto, FX, commodities, equities). Those are
-convenience wrappers over public sources — see `/why-buy`, where we tell you plainly which
-ones you should *not* pay for.
+convenience wrappers over public sources — see `/what-agents-buy`, where we publish the
+formula and tell you plainly which ones you should *not* pay for.
 
 ---
 
@@ -106,6 +127,13 @@ timestamp does not depend on trusting us.
 
 ---
 
+## For agents: start at the manifest
+
+`GET /agents.json` (also at `/.well-known/agents.json`) — the
+[agents.json](https://agents.json) manifest: outcome-based flows with exact parameters,
+payment networks, the free tier, and pointers to the OpenAPI contract, the x402 manifest,
+the scorecard and the fidelity recipes. CORS open, cached 1h.
+
 ## For indexers and QoS scorers
 
 If you are ScoutScore, EntRoute, x402scan, x402-list, BlockRun or any other
@@ -113,13 +141,17 @@ service that probes and ranks x402 nodes, these are for you:
 
 | Surface | What it gives you |
 |---|---|
-| `/scorecard.json` | Signed: 24h p50/p95 latency, success rate, 402-challenge cost, traffic mix, organic-vs-operator revenue |
+| `/agents.json` | agents.json manifest — flows, payment networks, free tier |
+| `/scorecard.json` | Signed: 24h availability, p50/p95 latency, 402-challenge cost, traffic mix, organic-vs-operator revenue |
 | `/.well-known/fidelity.json` | Deterministic probe recipe per endpoint — exact free URL, required response fields, what "healthy" means |
-| `/bazaar-status` | Whether this node has settled on Base via the CDP facilitator |
+| `/zero-upstream.json` | Which endpoints make zero outbound calls (cannot rate-limit or 503 on a provider) |
+| `/bazaar-status` | Whether this node has settled on Base via the CDP facilitator (2,200+ settlements) |
 | `X-Scorecard` / `X-Fidelity` | Headers on every response, so you never need a second request to find them |
 
 Free probes never charge. A paid route that hits an unexpected internal error
-degrades to a 402 rather than a 500 — the resource is still for sale.
+degrades to a 402 rather than a 500 — the resource is still for sale. The OpenAPI and
+Swagger specs carry a stable `ETag` and answer `304` — no need to re-download 130 KB
+between probes.
 
 ## Revenue transparency
 
