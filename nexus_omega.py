@@ -87,7 +87,7 @@ from typing import Any, Optional, Dict, List, Tuple
 # 0. CONFIGURAÇÃO E AUTO-SETUP
 # ============================================================================
 
-VERSION = "47.0.1-PRIMITIVOS"  # v47.0.1: PIX ascii-safe (acentos nao derrubam mais) + ETag/304 no openapi/swagger  # v46.0.4: /agents.json (demanda real: 5 IPs/7d pedindo) | v46.0.3: boot log + backfill pós-boot | v46.0.2: availability x served_rate  # v46.0.3: boot log lia chaves antigas (None) + backfill movido p/ thread pós-boot (deploy abre a porta mais rápido, menos 502) | v46.0.2: availability x served_rate | v46.0.1: /live e /dash leem revenue_split  # v45 da revisão externa + ajustes Kimi: no-store /why-buy, aviso persistência PIT, hero landing PIT, CTA prova grátis  # input schema do POST p/ x402scan + porta GET didatica | v44.9.0: /llm + /v1/chat/completions | v44.8.2: receipts algorand
+VERSION = "47.0.2-PRIMITIVOS"  # v47.0.2: setdefaulttimeout(60) anti-travamento | v47.0.1: PIX ascii-safe + ETag/304 na spec | v46.0.4: /agents.json
 BRAND_NAME = "Losbeto"
 # v44.4.0: reposicionamento Brasil-primeiro. "Cross-asset market data" compete
 # com CoinGecko e cem nós iguais; "BCB + B3 normalizado em inglês" não compete
@@ -665,6 +665,14 @@ def _ensure_deps():
         subprocess.check_call([sys.executable, "-m", "pip", "install", "--quiet", *missing])
 
 _ensure_deps()
+
+# v47.0.2: todo socket sem timeout explícito morre em 60s. Uma fonte pendurada
+# (BCB/Yahoo/Finnhub que não responde) segurava a thread para sempre; com 16
+# threads no pool (2 workers × 8) bastavam 16 chamadas assim para o nó INTEIRO
+# parar de responder — TLS abre e zero bytes voltam, derrubando até /ip e
+# /ready. Padrão observado em produção em 13/08.
+import socket as _socket
+_socket.setdefaulttimeout(60)
 
 import requests
 import base58
@@ -19830,7 +19838,7 @@ if os.environ.get("AUTOPILOT", "1") != "0":
 from datetime import date          # v47: o topo do arquivo importa datetime,
 from urllib.parse import urlencode  # timezone e timedelta, mas nao `date`.
 
-V47_LAYER_VERSION = "47.0.1-PRIMITIVOS"
+V47_LAYER_VERSION = "47.0.2-PRIMITIVOS"
 
 # ============================================================================
 # BLOCO O — PRIMITIVOS BRASILEIROS, COMPUTAÇÃO PURA, ZERO UPSTREAM
