@@ -1,18 +1,28 @@
 # ============================================================================
 # LOSBETO — railway.toml (v47.0.3-SYNC)
 #
-# A MUDANÇA DESTA VERSÃO: --worker-class sync --workers 4 --timeout 45
+# DUAS MUDANÇAS DESTA VERSÃO:
 #
-# Por quê: com gthread (2 workers × 8 threads), uma thread travada numa fonte
-# externa/DNS NUNCA era reciclada — o worker seguia mandando heartbeat e o
-# gunicorn nunca o reiniciava. 16 threads travadas = nó morto até restart
-# manual ("Application failed to respond"). Com sync, cada worker atende UMA
-# requisição: se ela passar de 45s, o master MATA o worker e forja outro na
-# hora (--preload = fork instantâneo). Travamento permanente deixa de existir.
+# 1. [build] builder = NIXPACKS — CORREÇÃO DO BUILD QUEBRADO (13/08 21:48).
+#    O Railway trocou o builder padrão para "railpack", que instala Python via
+#    "mise" — e o mise agora exige "GitHub artifact attestations". O Python
+#    3.11.9 (do .python-version) NÃO TEM attestation → build morre antes de
+#    começar. O último build bom (12/08) usou NIXPACKS. Fixando aqui, voltamos
+#    exatamente ao caminho que funcionava.
+#    (Se um dia quiser migrar para railpack: basta mudar .python-version para
+#    3.12 — versão nova tem attestation e o código é testado em 3.12.)
 #
-# Se o seu railway.toml atual tiver outras seções/linhas ([build] etc.),
-# MANTENHA-as — a única linha que precisa mudar é a startCommand.
+# 2. startCommand com --worker-class sync --workers 4 --timeout 45.
+#    Com gthread (2×8), uma thread travada numa fonte externa/DNS NUNCA era
+#    reciclada — o worker seguia mandando heartbeat e o gunicorn nunca o
+#    reiniciava. 16 threads travadas = nó morto até restart manual
+#    ("Application failed to respond"). Com sync, cada worker atende UMA
+#    requisição: se ela passar de 45s, o master MATA o worker e forja outro
+#    na hora (--preload = fork instantâneo). Travamento permanente acabou.
 # ============================================================================
+
+[build]
+builder = "NIXPACKS"
 
 [deploy]
 startCommand = "gunicorn --worker-class sync --workers 4 --preload --timeout 45 --graceful-timeout 20 --keep-alive 30 --max-requests 5000 --max-requests-jitter 500 --bind 0.0.0.0:$PORT nexus_omega:app"
