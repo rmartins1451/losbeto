@@ -1,45 +1,30 @@
-[build]
-builder = "NIXPACKS"
+# ============================================================================
+# LOSBETO — railway.toml (v47.0.3-SYNC)
+#
+# A MUDANÇA DESTA VERSÃO: --worker-class sync --workers 4 --timeout 45
+#
+# Por quê: com gthread (2 workers × 8 threads), uma thread travada numa fonte
+# externa/DNS NUNCA era reciclada — o worker seguia mandando heartbeat e o
+# gunicorn nunca o reiniciava. 16 threads travadas = nó morto até restart
+# manual ("Application failed to respond"). Com sync, cada worker atende UMA
+# requisição: se ela passar de 45s, o master MATA o worker e forja outro na
+# hora (--preload = fork instantâneo). Travamento permanente deixa de existir.
+#
+# Se o seu railway.toml atual tiver outras seções/linhas ([build] etc.),
+# MANTENHA-as — a única linha que precisa mudar é a startCommand.
+# ============================================================================
 
 [deploy]
-# v39 — DUAS MUDANÇAS CRÍTICAS
-#
-# 1) --max-requests 1000 → 20000
-#    Com 1000, o gunicorn reciclava worker a cada poucos minutos (os logs de
-#    produção mostram dois restarts em 15 min). Como o lock de background
-#    migra para o worker novo, TODO loop recomeçava do zero — e qualquer
-#    loop com sleep longo nunca chegava ao fim. O relatório diário
-#    (sleep 86400) literalmente nunca foi enviado. O código v39 já persiste
-#    o carimbo em disco, mas reciclar menos evita o problema na raiz.
-#
-# 2) --preload
-#    Carrega o módulo uma vez antes do fork. Sem isso, cada worker refaz o
-#    boot inteiro (wallets, migrações de SQLite, registro de suítes).
-#
-# 3) --graceful-timeout maior: uma liquidação x402 em curso não pode ser
-#    morta no meio; settle enviado sem resposta = venda perdida e cliente
-#    cobrado sem receber.
-startCommand = "gunicorn --worker-class gthread --workers 2 --threads 8 --preload --timeout 120 --graceful-timeout 90 --keep-alive 30 --max-requests 20000 --max-requests-jitter 2000 --bind 0.0.0.0:$PORT nexus_omega:app"
+startCommand = "gunicorn --worker-class sync --workers 4 --preload --timeout 45 --graceful-timeout 20 --keep-alive 30 --max-requests 5000 --max-requests-jitter 500 --bind 0.0.0.0:$PORT nexus_omega:app"
 healthcheckPath = "/ready"
 healthcheckTimeout = 60
-restartPolicyType = "on_failure"
-restartPolicyMaxRetries = 5
+restartPolicyType = "ON_FAILURE"
+restartPolicyMaxRetries = 10
 
-# ATENÇÃO — VOLUME PERSISTENTE
-#
-# O código usa DATA_DIR, caindo em /data se existir e em ~/.nexus_omega se não.
-# Sem um volume montado em /data, o diretório é EFÊMERO: todo redeploy apaga
-# créditos comprados, API keys ativas, referrals, receipts e o ledger inteiro.
-# Alguém compra um week-pass de $9.99, você faz deploy, a chave dele evapora.
-#
-# COMO FAZER:
-#   1. No projeto, tecle Ctrl+K (Cmd+K no Mac) e digite "volume"
-#      — ou clique com o botão direito no canvas do projeto.
-#   2. Escolha ESTE serviço e defina Mount path: /data
-#   3. Em Variables, adicione: DATA_DIR=/data
-#   4. Redeploy.
-#
-# CONFIRME depois com:
-#   curl https://api.losbeto.xyz/health/storage
-#   → {"persistent": true, "writable": true, "verdict": "OK — dados sobrevivem..."}
-#   Enquanto devolver 503 com "EFÊMERO", ainda não está resolvido.
+# Notas:
+# - --timeout 45: sobra para os endpoints de IA mais longos (~20-30s); o socket
+#   interno desiste em 25s (setdefaulttimeout no código), então a requisição
+#   falha graciosamente ANTES do worker ser morto.
+# - --max-requests 5000: recicla workers periodicamente (proteção anti-vazamento).
+# - Memória: 4 workers compartilham a maior parte da RAM via fork+preload.
+#   Se a aba Metrics mostrar folga, pode subir para --workers 6.

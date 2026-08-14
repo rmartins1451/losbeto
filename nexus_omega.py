@@ -87,7 +87,7 @@ from typing import Any, Optional, Dict, List, Tuple
 # 0. CONFIGURAÇÃO E AUTO-SETUP
 # ============================================================================
 
-VERSION = "47.0.2-PRIMITIVOS"  # v47.0.2: setdefaulttimeout(60) anti-travamento | v47.0.1: PIX ascii-safe + ETag/304 na spec | v46.0.4: /agents.json
+VERSION = "47.0.3-SYNC"  # v47.0.3: workers sync auto-recuperáveis + socket 25s + aliases A2A | v47.0.2: setdefaulttimeout anti-travamento | v47.0.1: PIX ascii-safe + ETag/304 na spec
 BRAND_NAME = "Losbeto"
 # v44.4.0: reposicionamento Brasil-primeiro. "Cross-asset market data" compete
 # com CoinGecko e cem nós iguais; "BCB + B3 normalizado em inglês" não compete
@@ -671,8 +671,13 @@ _ensure_deps()
 # threads no pool (2 workers × 8) bastavam 16 chamadas assim para o nó INTEIRO
 # parar de responder — TLS abre e zero bytes voltam, derrubando até /ip e
 # /ready. Padrão observado em produção em 13/08.
+# v47.0.3: 60s → 25s. Com workers SYNC e --timeout 45 (railway.toml), o socket
+# TEM que desistir antes do worker ser morto: a requisição falha graciosamente
+# (dado "indisponível") em vez de derrubar o processo. E o que o socket não
+# cobre (ex.: getaddrinfo/DNS travado) o gunicorn cobre: passou de 45s, o
+# master mata o worker e forja outro na hora — fim do travamento permanente.
 import socket as _socket
-_socket.setdefaulttimeout(60)
+_socket.setdefaulttimeout(25)
 
 import requests
 import base58
@@ -13556,8 +13561,13 @@ def _resources_alias():
     /resource). Apontam para o catálogo em vez de devolver 404."""
     return x402_resources()
 
+# v47.0.3: sondas A2A pediram variantes sem .json e com underscore
+# (/.well-known/agent-card, /well_known/agent_json — visto no radar de demanda)
+# e tomavam 404. Mesma resposta, sem custo.
 @app.route("/.well-known/agent-card.json")
+@app.route("/.well-known/agent-card")
 @app.route("/.well-known/agent.json")
+@app.route("/well_known/agent_json")
 def manifest_agent():
     base = _public_base()
     return jsonify({
@@ -19838,7 +19848,7 @@ if os.environ.get("AUTOPILOT", "1") != "0":
 from datetime import date          # v47: o topo do arquivo importa datetime,
 from urllib.parse import urlencode  # timezone e timedelta, mas nao `date`.
 
-V47_LAYER_VERSION = "47.0.2-PRIMITIVOS"
+V47_LAYER_VERSION = "47.0.3-SYNC"
 
 # ============================================================================
 # BLOCO O — PRIMITIVOS BRASILEIROS, COMPUTAÇÃO PURA, ZERO UPSTREAM
