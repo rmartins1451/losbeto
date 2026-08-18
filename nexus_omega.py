@@ -87,7 +87,7 @@ from typing import Any, Optional, Dict, List, Tuple
 # 0. CONFIGURAÇÃO E AUTO-SETUP
 # ============================================================================
 
-VERSION = "47.1.0-GROQ-SELFHEAL"  # v47.0.3: workers sync auto-recuperáveis + socket 25s + aliases A2A | v47.0.2: setdefaulttimeout anti-travamento | v47.0.1: PIX ascii-safe + ETag/304 na spec
+VERSION = "47.2.0-REASONING-FIX"  # v47.0.3: workers sync auto-recuperáveis + socket 25s + aliases A2A | v47.0.2: setdefaulttimeout anti-travamento | v47.0.1: PIX ascii-safe + ETag/304 na spec
 BRAND_NAME = "Losbeto"
 # v44.4.0: reposicionamento Brasil-primeiro. "Cross-asset market data" compete
 # com CoinGecko e cem nós iguais; "BCB + B3 normalizado em inglês" não compete
@@ -2423,6 +2423,21 @@ def groq_model() -> str:
     return "openai/gpt-oss-120b"  # substituto oficial do llama-3.3-70b
 
 
+def _groq_payload(modelo: str, prompt: str, max_tokens: int, temperature: float) -> dict:
+    """v47.2.0: monta o pedido Groq a prova de reasoners.
+    - piso de 512 tokens: gpt-oss/qwen3 raciocinam ANTES de responder; com
+      max_tokens baixo (o probe usa 8!) o raciocinio come tudo e a resposta
+      vem vazia com HTTP 200 — foi a queda silenciosa de 16/08.
+    - reasoning_effort=low nos gpt-oss: resposta direta, sem queimar TPD."""
+    p = {"model": modelo,
+         "messages": [{"role": "user", "content": prompt}],
+         "max_tokens": max(int(max_tokens), 512),
+         "temperature": temperature}
+    if "gpt-oss" in modelo:
+        p["reasoning_effort"] = "low"
+    return p
+
+
 def _groq_esquece():
     """Zera o cache quando a API avisa que o modelo foi descomissionado."""
     global _GROQ_RESOLVED
@@ -2522,12 +2537,23 @@ class LLM:
                 r = requests.post("https://api.groq.com/openai/v1/chat/completions",
                     headers={"Authorization": f"Bearer {GROQ_KEY}",
                              "Content-Type": "application/json"},
-                    json={"model": _gm,
-                          "messages": [{"role": "user", "content": prompt}],
-                          "max_tokens": max_tokens, "temperature": temperature},
+                    json=_groq_payload(_gm, prompt, max_tokens, temperature),
                     timeout=25)
                 if r.ok:
-                    return r.json()["choices"][0]["message"]["content"], None
+                    # v47.2.0: reasoners podem devolver content vazio quando o
+                    # raciocinio come todo o orcamento. Se vier vazio, sobe o
+                    # teto e tenta de novo UMA vez antes de desistir.
+                    _txt = r.json()["choices"][0]["message"].get("content") or ""
+                    if not _txt.strip() and max_tokens < 1024:
+                        log.warning(f"Groq '{_gm}': resposta vazia com max_tokens={max_tokens}; retentando com folga")
+                        r = requests.post("https://api.groq.com/openai/v1/chat/completions",
+                            headers={"Authorization": f"Bearer {GROQ_KEY}",
+                                     "Content-Type": "application/json"},
+                            json=_groq_payload(_gm, prompt, 1024, temperature),
+                            timeout=25)
+                        if r.ok:
+                            _txt = r.json()["choices"][0]["message"].get("content") or ""
+                    return (_txt, None) if _txt.strip() else (None, "resposta vazia (reasoning comeu os tokens)")
                 _corpo = r.text[:200].lower()
                 if (r.status_code in (400, 404) and _tent == 0
                         and ("decommission" in _corpo or "model" in _corpo)):
@@ -2540,12 +2566,19 @@ class LLM:
 
         def _try_gemini():
             _gm = gemini_model()          # v39.6: descoberto, não fixo
+            # v47.2.0: os flash atuais "pensam" (thinking) antes de responder.
+            # Com maxOutputTokens baixo o thinking consome tudo e o texto vem
+            # vazio com HTTP 200 — mesma queda silenciosa do Groq. Piso de 512
+            # e thinkingBudget=0 (flash) devolvem resposta direta.
+            _cfg = {"maxOutputTokens": max(int(max_tokens), 512),
+                    "temperature": temperature}
+            if "flash" in _gm:
+                _cfg["thinkingConfig"] = {"thinkingBudget": 0}
             r = requests.post(
                 f"https://generativelanguage.googleapis.com/v1beta/models/"
                 f"{_gm}:generateContent?key={GEMINI_KEY}",
                 json={"contents": [{"parts": [{"text": prompt}]}],
-                      "generationConfig": {"maxOutputTokens": max_tokens,
-                                           "temperature": temperature}},
+                      "generationConfig": _cfg},
                 timeout=25)
             if r.ok:
                 j = r.json()
@@ -19934,7 +19967,7 @@ if os.environ.get("AUTOPILOT", "1") != "0":
 from datetime import date          # v47: o topo do arquivo importa datetime,
 from urllib.parse import urlencode  # timezone e timedelta, mas nao `date`.
 
-V47_LAYER_VERSION = "47.1.0-GROQ-SELFHEAL"
+V47_LAYER_VERSION = "47.2.0-REASONING-FIX"
 
 # ============================================================================
 # BLOCO O — PRIMITIVOS BRASILEIROS, COMPUTAÇÃO PURA, ZERO UPSTREAM
