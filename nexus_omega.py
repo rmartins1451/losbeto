@@ -87,7 +87,7 @@ from typing import Any, Optional, Dict, List, Tuple
 # 0. CONFIGURAÇÃO E AUTO-SETUP
 # ============================================================================
 
-VERSION = "47.0.3-SYNC"  # v47.0.3: workers sync auto-recuperáveis + socket 25s + aliases A2A | v47.0.2: setdefaulttimeout anti-travamento | v47.0.1: PIX ascii-safe + ETag/304 na spec
+VERSION = "47.1.0-GROQ-SELFHEAL"  # v47.0.3: workers sync auto-recuperáveis + socket 25s + aliases A2A | v47.0.2: setdefaulttimeout anti-travamento | v47.0.1: PIX ascii-safe + ETag/304 na spec
 BRAND_NAME = "Losbeto"
 # v44.4.0: reposicionamento Brasil-primeiro. "Cross-asset market data" compete
 # com CoinGecko e cem nós iguais; "BCB + B3 normalizado em inglês" não compete
@@ -2123,7 +2123,10 @@ def is_geo_blocked(ip: str) -> bool:
 # env = troca sem redeploy quando um provedor descontinua algo.
 DEEPSEEK_MODEL = os.environ.get("DEEPSEEK_MODEL", "deepseek-chat")
 CLAUDE_MODEL   = os.environ.get("CLAUDE_MODEL",   "claude-sonnet-4-5")
-GROQ_MODEL     = os.environ.get("GROQ_MODEL",     "llama-3.3-70b-versatile")
+GROQ_MODEL     = os.environ.get("GROQ_MODEL",     "").strip()
+# v47.1.0: sem default fixo. Vazio = descoberta automatica via /models.
+# Registro: llama-3.3-70b-versatile foi DESCOMISSIONADO pela Groq em
+# 2026-08-16 e derrubou a sintese por 2 dias. Modelo fixo nunca mais.
 # v39.6: sem default. Vazio = descoberta automática via ListModels.
 GEMINI_MODEL   = os.environ.get("GEMINI_MODEL",   "").strip()
 
@@ -2256,7 +2259,7 @@ def llm_health_report() -> dict:
                                 "last_error": _LLM_LAST_ERROR.get(p, "")}
                             for p in cfg if time.time() < _LLM_DOWN_UNTIL.get(p, 0)},
             "models": {"deepseek": DEEPSEEK_MODEL, "claude": CLAUDE_MODEL,
-                       "groq": GROQ_MODEL,
+                       "groq": (groq_model() if GROQ_KEY else "(sem chave)"),
                        "gemini": GEMINI_MODEL or gemini_model()},
         }
 
@@ -2356,6 +2359,77 @@ def gemini_model() -> str:
     return "gemini-flash-latest"
 
 
+# ---------------------------------------------------------------------------
+# v47.1.0 — DESCOBERTA DE MODELO GROQ EM TEMPO DE EXECUCAO
+#
+# Mesma licao do Gemini (v39.6), agora para o Groq: modelo fixo morre sem
+# aviso. A API /models devolve os modelos que ESTA chave pode usar; o node
+# escolhe o melhor por preferencia e cacheia. Quando a Groq aposentar o
+# proximo, o 400 de "decommissioned" limpa o cache e a proxima chamada ja
+# vai com o modelo novo (ver _try_groq). Zero deploy, zero madrugada caido.
+# ---------------------------------------------------------------------------
+_GROQ_RESOLVED: Optional[str] = None
+_GROQ_RESOLVED_AT = 0.0
+_GROQ_LOCK = threading.Lock()
+GROQ_DISCOVERY_TTL = int(os.environ.get("GROQ_DISCOVERY_TTL", "21600"))  # 6 h
+
+# Raciocinio forte primeiro (gpt-oss-120b e o substituto oficial do
+# llama-3.3-70b), depois alternativas rapidas/baratas. Filtra o que nao
+# serve para chat de texto (audio, visao, guardas, embeddings).
+_GROQ_PREF = ("gpt-oss-120b", "qwen3.6-27b", "qwen3-32b", "gpt-oss-20b",
+              "llama-3.3", "llama-3.1", "llama", "qwen", "gpt-oss", "gemma")
+
+
+def _groq_pick(ids: List[str]) -> Optional[str]:
+    limpos = [i for i in ids if not any(
+        t in i.lower() for t in ("whisper", "tts", "embed", "guard",
+                                 "moderation", "orpheus", "vision", "audio",
+                                 "playai", "compound"))]
+    for pref in _GROQ_PREF:
+        for i in limpos:
+            if pref in i:
+                return i
+    return limpos[0] if limpos else None
+
+
+def groq_model() -> str:
+    """Modelo Groq a usar agora. Descobre 1x e cacheia por GROQ_DISCOVERY_TTL."""
+    global _GROQ_RESOLVED, _GROQ_RESOLVED_AT
+    fixo = os.environ.get("GROQ_MODEL", "").strip()
+    if fixo:
+        return fixo
+    with _GROQ_LOCK:
+        if _GROQ_RESOLVED and (time.time() - _GROQ_RESOLVED_AT) < GROQ_DISCOVERY_TTL:
+            return _GROQ_RESOLVED
+    if not GROQ_KEY:
+        return "openai/gpt-oss-120b"
+    try:
+        r = requests.get("https://api.groq.com/openai/v1/models",
+                         headers={"Authorization": f"Bearer {GROQ_KEY}"},
+                         timeout=12)
+        if r.ok:
+            ids = [m.get("id", "") for m in (r.json().get("data") or [])]
+            escolhido = _groq_pick(ids)
+            if escolhido:
+                with _GROQ_LOCK:
+                    _GROQ_RESOLVED = escolhido
+                    _GROQ_RESOLVED_AT = time.time()
+                log.info("Groq: %d modelos disponiveis p/ esta chave; usando '%s'",
+                         len(ids), escolhido)
+                return escolhido
+        log.warning(f"Groq ListModels HTTP {r.status_code}: {r.text[:140]}")
+    except Exception as e:
+        log.warning(f"Groq ListModels: {e}")
+    return "openai/gpt-oss-120b"  # substituto oficial do llama-3.3-70b
+
+
+def _groq_esquece():
+    """Zera o cache quando a API avisa que o modelo foi descomissionado."""
+    global _GROQ_RESOLVED
+    with _GROQ_LOCK:
+        _GROQ_RESOLVED = None
+
+
 LLM_SMALL_TOKENS = int(os.environ.get("LLM_SMALL_TOKENS", "300"))
 _LLM_ORDER_ENV = [x.strip().lower() for x in
                   os.environ.get("LLM_ORDER", "").split(",") if x.strip()]
@@ -2440,17 +2514,29 @@ class LLM:
             return None, f"HTTP {r.status_code}: {r.text[:160]}"
 
         def _try_groq():
-            r = requests.post("https://api.groq.com/openai/v1/chat/completions",
-                headers={"Authorization": f"Bearer {GROQ_KEY}",
-                         "Content-Type": "application/json"},
-                json={"model": GROQ_MODEL,
-                      "messages": [{"role": "user", "content": prompt}],
-                      "max_tokens": max_tokens, "temperature": temperature},
-                timeout=25)
-            if r.ok:
-                return r.json()["choices"][0]["message"]["content"], None
-            # 429 aqui é quase sempre TPD (tokens por dia), não RPM.
-            return None, f"HTTP {r.status_code}: {r.text[:160]}"
+            # v47.1.0: modelo descoberto em runtime + auto-recuperacao. Se a
+            # Groq disser que o modelo foi descomissionado, zera o cache e
+            # tenta UMA vez mais ja com o modelo recem-descoberto.
+            for _tent in range(2):
+                _gm = groq_model()
+                r = requests.post("https://api.groq.com/openai/v1/chat/completions",
+                    headers={"Authorization": f"Bearer {GROQ_KEY}",
+                             "Content-Type": "application/json"},
+                    json={"model": _gm,
+                          "messages": [{"role": "user", "content": prompt}],
+                          "max_tokens": max_tokens, "temperature": temperature},
+                    timeout=25)
+                if r.ok:
+                    return r.json()["choices"][0]["message"]["content"], None
+                _corpo = r.text[:200].lower()
+                if (r.status_code in (400, 404) and _tent == 0
+                        and ("decommission" in _corpo or "model" in _corpo)):
+                    log.warning(f"Groq: modelo '{_gm}' descomissionado — redescobrindo")
+                    _groq_esquece()
+                    continue
+                # 429 aqui é quase sempre TPD (tokens por dia), não RPM.
+                return None, f"HTTP {r.status_code}: {r.text[:160]}"
+            return None, "modelo descomissionado e redescoberta falhou"
 
         def _try_gemini():
             _gm = gemini_model()          # v39.6: descoberto, não fixo
@@ -19848,7 +19934,7 @@ if os.environ.get("AUTOPILOT", "1") != "0":
 from datetime import date          # v47: o topo do arquivo importa datetime,
 from urllib.parse import urlencode  # timezone e timedelta, mas nao `date`.
 
-V47_LAYER_VERSION = "47.0.3-SYNC"
+V47_LAYER_VERSION = "47.1.0-GROQ-SELFHEAL"
 
 # ============================================================================
 # BLOCO O — PRIMITIVOS BRASILEIROS, COMPUTAÇÃO PURA, ZERO UPSTREAM
