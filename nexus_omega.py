@@ -87,7 +87,7 @@ from typing import Any, Optional, Dict, List, Tuple
 # 0. CONFIGURAÇÃO E AUTO-SETUP
 # ============================================================================
 
-VERSION = "47.2.0-REASONING-FIX"  # v47.0.3: workers sync auto-recuperáveis + socket 25s + aliases A2A | v47.0.2: setdefaulttimeout anti-travamento | v47.0.1: PIX ascii-safe + ETag/304 na spec
+VERSION = "47.3.0-STABILITY"  # v47.0.3: workers sync auto-recuperáveis + socket 25s + aliases A2A | v47.0.2: setdefaulttimeout anti-travamento | v47.0.1: PIX ascii-safe + ETag/304 na spec
 BRAND_NAME = "Losbeto"
 # v44.4.0: reposicionamento Brasil-primeiro. "Cross-asset market data" compete
 # com CoinGecko e cem nós iguais; "BCB + B3 normalizado em inglês" não compete
@@ -2307,8 +2307,14 @@ GEMINI_DISCOVERY_TTL = int(os.environ.get("GEMINI_DISCOVERY_TTL", "21600"))  # 6
 
 # Ordem de preferência por prefixo. Flash antes de Pro: cota gratuita maior e
 # latência menor; "lite" por último, é o degrau de qualidade mais baixo.
-_GEMINI_PREF = ("flash-latest", "3.1-flash", "3-flash", "2.5-flash",
-                "flash", "3.1-pro", "3-pro", "pro-latest", "flash-lite")
+# v47.3.0: nome FECHADO antes do alias "-latest". O gemini-flash-latest
+# aponta sempre para o modelo mais disputado do free tier e vivia em
+# 503/429 (quota) nos logs de ago/2026; o 2.5-flash tem cota própria
+# documentada (1.500 RPD free) e bem menos concorrência. Aliases e lite
+# ficam como último recurso, não como primeira escolha.
+_GEMINI_PREF = ("2.5-flash", "3.5-flash", "3.1-flash", "3-flash",
+                "flash", "flash-latest",
+                "3.1-pro", "3-pro", "2.5-pro", "pro-latest", "flash-lite")
 
 
 def _gemini_pick(nomes: List[str]) -> Optional[str]:
@@ -2319,9 +2325,15 @@ def _gemini_pick(nomes: List[str]) -> Optional[str]:
         t in n for t in ("embedding", "aqa", "imagen", "veo", "tts",
                          "image", "audio", "vision", "learnlm", "gemma"))]
     for pref in _GEMINI_PREF:
-        for n in limpos:
-            if pref in n:
-                return n
+        # v47.3.0: "lite" nunca casa por acidente com pref não-lite, e entre
+        # candidatos do mesmo pref a versão estável ganha da "-preview".
+        candidatos = [n for n in limpos
+                      if pref in n and ("lite" not in n or "lite" in pref)]
+        estaveis = [n for n in candidatos if "preview" not in n]
+        if estaveis:
+            return estaveis[0]
+        if candidatos:
+            return candidatos[0]
     return limpos[0] if limpos else None
 
 
@@ -2721,38 +2733,61 @@ RAG_STORE = RAG(RAG_DB_PATH)
 # 10. BRAIN — Todos os 42 endpoints monetizados
 # ============================================================================
 
-# --- v23: OFAC-SDN loader (cache disco 24h) ---------------------------------
+# --- v47.3.0: OFAC-SDN loader NUNCA bloqueia uma requisição paga ------------
+# Bug real de produção (ago/2026): a v47.2 baixava a lista síncrona com
+# timeout=40 DENTRO do request; quando o servidor da OFAC engatava, o
+# gunicorn matava o worker aos 45s (WORKER TIMEOUT no /whale-dossier).
+# Agora: responde imediatamente com o cache (memória ou disco) e o download
+# acontece em thread de fundo. Sem cache ainda? Responde "check-unavailable"
+# e a lista chega na próxima chamada — degradação honesta, worker vivo.
 _OFAC_CACHE = {"ts": 0, "text": ""}
+_OFAC_LOCK = threading.Lock()
+_OFAC_REFRESHING = {"on": False}
 
-def _ofac_sdn_text() -> str:
-    if _OFAC_CACHE["text"] and time.time() - _OFAC_CACHE["ts"] < 86400:
-        return _OFAC_CACHE["text"]
-    disk = HOME_DIR / "ofac_sdn.csv"
+def _ofac_download_bg():
+    """Baixa a lista em segundo plano; nunca roda dentro de uma request."""
+    if _OFAC_REFRESHING["on"]:
+        return
+    _OFAC_REFRESHING["on"] = True
     try:
-        if disk.exists() and time.time() - disk.stat().st_mtime < 86400:
-            _OFAC_CACHE["text"] = disk.read_text(errors="ignore")
-            _OFAC_CACHE["ts"] = disk.stat().st_mtime
-            return _OFAC_CACHE["text"]
         r = requests.get(
             "https://sanctionslistservice.ofac.treas.gov/api/PublicationPreview/exports/SDN.CSV",
-            timeout=40)
+            timeout=(5, 20))
         if r.ok and len(r.text) > 20000:
             try:
-                disk.write_text(r.text)
+                (HOME_DIR / "ofac_sdn.csv").write_text(r.text)
             except Exception:
                 pass
-            _OFAC_CACHE["text"] = r.text
-            _OFAC_CACHE["ts"] = int(time.time())
-            return r.text
+            with _OFAC_LOCK:
+                _OFAC_CACHE["text"] = r.text
+                _OFAC_CACHE["ts"] = int(time.time())
+            log.info(f"🛡️ OFAC-SDN atualizada em background ({len(r.text)//1024} KB)")
     except Exception as e:
-        log.warning(f"ofac sdn download: {e}")
-    if not _OFAC_CACHE["text"] and disk.exists():
+        log.warning(f"ofac sdn download (bg): {e}")
+    finally:
+        _OFAC_REFRESHING["on"] = False
+
+def _ofac_sdn_text() -> str:
+    now = time.time()
+    if _OFAC_CACHE["text"]:
+        if now - _OFAC_CACHE["ts"] >= 86400:
+            threading.Thread(target=_ofac_download_bg, daemon=True).start()
+        return _OFAC_CACHE["text"]
+    disk = HOME_DIR / "ofac_sdn.csv"
+    if disk.exists():
         try:
-            _OFAC_CACHE["text"] = disk.read_text(errors="ignore")
-            _OFAC_CACHE["ts"] = int(disk.stat().st_mtime)
+            txt = disk.read_text(errors="ignore")
+            if txt:
+                with _OFAC_LOCK:
+                    _OFAC_CACHE["text"] = txt
+                    _OFAC_CACHE["ts"] = int(disk.stat().st_mtime)
+                if now - _OFAC_CACHE["ts"] >= 86400:
+                    threading.Thread(target=_ofac_download_bg, daemon=True).start()
+                return txt
         except Exception:
             pass
-    return _OFAC_CACHE["text"]
+    threading.Thread(target=_ofac_download_bg, daemon=True).start()
+    return ""
 
 
 class Brain:
@@ -4606,12 +4641,29 @@ class Brain:
 
     @staticmethod
     def whale_dossier():
-        whales = Brain.whale_alert().get("whales_24h", [])[:10]
-        smart = Brain.smart_money().get("institutional_wallets", [])[:10]
-        holders = (Brain.holder_concentration()
+        # v47.3.0: orçamento de tempo por request. A v47.2 chamava quatro
+        # subprodutos pesados em sequência e qualquer fonte externa lenta
+        # estourava os 45s do gunicorn — WORKER TIMEOUT real em produção
+        # (GET /whale-dossier, ago/2026). Agora cada etapa só roda se houver
+        # folga; sem folga, o cliente recebe nota honesta em vez de um 500.
+        _t0 = time.time()
+        _ORCAMENTO_S = 25.0
+
+        def _etapa(nome, fn):
+            if time.time() - _t0 > _ORCAMENTO_S:
+                return {"note": f"{nome} skipped — time budget",
+                        "retry": "chame o endpoint dedicado"}
+            try:
+                return fn()
+            except Exception as _e:
+                return {"note": f"{nome} indisponível: {_e}"}
+
+        whales = _etapa("whales", lambda: Brain.whale_alert().get("whales_24h", [])[:10])
+        smart = _etapa("smart_money", lambda: Brain.smart_money().get("institutional_wallets", [])[:10])
+        holders = (_etapa("holder_concentration", Brain.holder_concentration)
                    if hasattr(Brain, "holder_concentration")
                    else {"note": "holder concentration unavailable"})
-        sanctions = Brain.sanctions() if hasattr(Brain, 'sanctions') else {"note": "sanctions unavailable"}
+        sanctions = _etapa("sanctions", Brain.sanctions) if hasattr(Brain, 'sanctions') else {"note": "sanctions unavailable"}
         return {
             "product": "whale-dossier",
             "whales": whales,
@@ -7839,7 +7891,7 @@ def sitemap_xml():
             "/.well-known/x402.json", "/.well-known/mcp.json", "/.well-known/agent.json",
             "/llms.txt", "/bazaar.json", "/sample", "/get-pricing", "/ip",
             "/receipts", "/launch-risk-preview", "/credits-status",
-            "/skill.md", "/terms", "/jobs"]
+            "/skill.md", "/terms", "/privacy", "/jobs"]
     for ep in BASE_PRICES: urls.append(ep)
     body = ['<?xml version="1.0" encoding="UTF-8"?>',
             '<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">']
@@ -13297,6 +13349,65 @@ def terms_page():
                 f"<p style='margin-top:24px'><a style='color:#7af' href='/'>home</a> · "
                 f"<a style='color:#7af' href='/about'>about/contact</a> · "
                 f"<a style='color:#7af' href='/receipts'>receipts</a></p>"
+                f"</body></html>")
+        return app.response_class(html, mimetype="text/html")
+    return jsonify(payload)
+
+
+# ============================================================================
+# 21e. /privacy (v47.3.0) — 3 IPs distintos pediram /privacy em 7 dias no
+#      funil de demanda e ele não existia. Diretórios e compradores
+#      institucionais verificam política de privacidade antes de integrar;
+#      mesma lógica do /terms (v44.2.0) que fechou o checklist do x402-list.
+# ============================================================================
+
+@app.route("/privacy")
+@app.route("/privacy-policy")
+def privacy_page():
+    base = _public_base()
+    payload = {
+        "service": SERVICE_NAME,
+        "version": VERSION,
+        "effective": "2026-08-21",
+        "privacy": {
+            "no_accounts": ("No sign-ups, no accounts, no passwords. You pay per call "
+                            "with USDC via x402 — the payment IS the authentication."),
+            "what_we_log": ("Caller IP, requested path, user-agent and payment metadata "
+                            "(tx hash, network, amount), kept for operations, abuse "
+                            "prevention and the public transparency pages (/receipts, /live)."),
+            "on_chain_nature": ("Payments settle on public blockchains (Base, Solana, "
+                                "Algorand). Transaction hashes and wallet addresses are "
+                                "inherently public — that is a property of the networks, "
+                                "not a choice of this node."),
+            "what_we_never_do": ("We never ask for private keys or seed phrases, never "
+                                 "custody user funds, never sell or share request logs "
+                                 "with third parties, never run analytics trackers or cookies."),
+            "third_party_sources": ("Responses aggregate public data from third-party APIs "
+                                    "(exchanges, central banks, LLM providers). Queries may "
+                                    "be forwarded to those providers to produce an answer."),
+            "retention": ("Operational logs rotate automatically; payment receipts are kept "
+                          "as proof of service and are public at " + base + "/receipts."),
+            "contact": base + "/about",
+        },
+        "ts": int(time.time()),
+    }
+    quer_json = ("application/json" in request.headers.get("Accept", "")
+                 or request.args.get("format") == "json")
+    if not quer_json:
+        rows = "".join(
+            f"<tr><td style='padding:10px;border:1px solid #333;vertical-align:top'>"
+            f"<b>{k.replace('_',' ').title()}</b></td>"
+            f"<td style='padding:10px;border:1px solid #333'>{v}</td></tr>"
+            for k, v in payload["privacy"].items())
+        html = (f"<html><head><title>Privacy — {BRAND_NAME}</title></head>"
+                f"<body style='background:#0a0a0f;color:#ddd;font-family:monospace;"
+                f"max-width:820px;margin:40px auto;padding:0 16px'>"
+                f"<h1>{BRAND_EMOJI} {BRAND_NAME} — Privacy Policy</h1>"
+                f"<p>Effective: 2026-08-21 · Version {VERSION}</p>"
+                f"<table style='border-collapse:collapse;width:100%'>{rows}</table>"
+                f"<p style='margin-top:24px'><a style='color:#7af' href='/'>home</a> · "
+                f"<a style='color:#7af' href='/terms'>terms</a> · "
+                f"<a style='color:#7af' href='/about'>about/contact</a></p>"
                 f"</body></html>")
         return app.response_class(html, mimetype="text/html")
     return jsonify(payload)
@@ -19967,7 +20078,7 @@ if os.environ.get("AUTOPILOT", "1") != "0":
 from datetime import date          # v47: o topo do arquivo importa datetime,
 from urllib.parse import urlencode  # timezone e timedelta, mas nao `date`.
 
-V47_LAYER_VERSION = "47.2.0-REASONING-FIX"
+V47_LAYER_VERSION = "47.3.0-STABILITY"
 
 # ============================================================================
 # BLOCO O — PRIMITIVOS BRASILEIROS, COMPUTAÇÃO PURA, ZERO UPSTREAM
