@@ -87,7 +87,7 @@ from typing import Any, Optional, Dict, List, Tuple
 # 0. CONFIGURAÇÃO E AUTO-SETUP
 # ============================================================================
 
-VERSION = "47.3.0-STABILITY"  # v47.0.3: workers sync auto-recuperáveis + socket 25s + aliases A2A | v47.0.2: setdefaulttimeout anti-travamento | v47.0.1: PIX ascii-safe + ETag/304 na spec
+VERSION = "47.3.1-HUMAN-402"  # v47.0.3: workers sync auto-recuperáveis + socket 25s + aliases A2A | v47.0.2: setdefaulttimeout anti-travamento | v47.0.1: PIX ascii-safe + ETag/304 na spec
 BRAND_NAME = "Losbeto"
 # v44.4.0: reposicionamento Brasil-primeiro. "Cross-asset market data" compete
 # com CoinGecko e cem nós iguais; "BCB + B3 normalizado em inglês" não compete
@@ -5158,6 +5158,9 @@ def _bazaar_blob(endpoint: str) -> dict:
                 },
                 "required": ["input"]},
             "description": desc,
+            "title": endpoint.strip("/").replace("-", " ").title() + " — Losbeto",
+            "tags": _service_tags(endpoint),
+            "provider": {"name": SERVICE_NAME, "url": _public_base()},
         }
     props = {k: {"type": "string", "description": _PARAM_DESC.get(k, f"{k} parameter")}
              for k in params}
@@ -5180,6 +5183,12 @@ def _bazaar_blob(endpoint: str) -> dict:
             },
             "required": ["input"]},
         "description": desc,
+        # v47.3.1: spec x402 v2 aceita title/tags/provider no bloco bazaar e
+        # buscas por tag só casam com quem declara (docs Kobaru/Bazaar). É
+        # aditivo — validadores antigos ignoram o que não conhecem.
+        "title": endpoint.strip("/").replace("-", " ").title() + " — Losbeto",
+        "tags": _service_tags(endpoint),
+        "provider": {"name": SERVICE_NAME, "url": _public_base()},
     }
 
 # ---------------------------------------------------------------------------
@@ -19496,6 +19505,54 @@ def _v46_scorecard_header(resp):
 CHALLENGE_CACHE_TTL = int(os.environ.get("CHALLENGE_CACHE_TTL", "45"))
 _chal_cache: Dict[str, tuple] = {}
 _chal_lock = threading.Lock()
+def _render_402_html(endpoint: str) -> str:
+    """v47.3.1 — A PÁGINA QUE CONVERTE O HUMANO.
+    Telemetria real: ~15 iPhones/dia batem em endpoints pagos vindos do
+    x402scan e recebiam um JSON cru de protocolo (navegador não paga x402).
+    Agora o humano recebe uma página: o produto, o preço, a amostra grátis
+    e o botão que ELE consegue usar (/buy-credits). Máquina e SDK continuam
+    recebendo o JSON 402 puro — esta rota só dispara para navegador real."""
+    base = _public_base()
+    try:
+        preco = get_dynamic_price(endpoint)
+    except Exception:
+        preco = 0.01
+    desc = ENDPOINT_DESC.get(endpoint, f"Losbeto — {endpoint}")
+    return f"""<html><head><title>{endpoint} — {BRAND_NAME}</title>
+<meta name="viewport" content="width=device-width,initial-scale=1"></head>
+<body style="background:#0a0a0f;color:#ddd;font-family:-apple-system,Segoe UI,Roboto,sans-serif;max-width:760px;margin:0 auto;padding:32px 18px">
+<p style="color:#7af;letter-spacing:2px;font-size:12px">HTTP 402 · PAYMENT REQUIRED</p>
+<h1 style="margin:4px 0">{BRAND_EMOJI} {endpoint}</h1>
+<p style="color:#aaa;line-height:1.5">{desc}</p>
+<p style="font-size:28px;margin:18px 0"><b>${preco:.3f}</b> <span style="color:#888;font-size:14px">USDC · per call · Base / Solana / Algorand</span></p>
+<p style="line-height:1.6">This endpoint is sold <b>machine-to-machine</b> via the
+<a style="color:#7af" href="https://www.x402.org">x402 protocol</a> — an AI agent pays
+and receives the data in the same HTTP exchange. Browsers cannot sign that payment,
+so here are your options as a human:</p>
+<table style="border-collapse:collapse;width:100%;margin:18px 0">
+<tr><td style="padding:12px;border:1px solid #333"><b>1. Try it free</b><br>
+<span style="color:#aaa">Real data, delayed ~15 min</span></td>
+<td style="padding:12px;border:1px solid #333;text-align:right">
+<a style="color:#0a0a0f;background:#7af;padding:8px 14px;text-decoration:none;border-radius:6px" href="{endpoint}?preview=1">free preview</a></td></tr>
+<tr><td style="padding:12px;border:1px solid #333"><b>2. Buy credits — $0.99 once, get $1.25</b><br>
+<span style="color:#aaa">One on-chain payment, then call any endpoint with a simple key. No wallet-agent needed per call.</span></td>
+<td style="padding:12px;border:1px solid #333;text-align:right">
+<a style="color:#0a0a0f;background:#7af;padding:8px 14px;text-decoration:none;border-radius:6px" href="/buy-credits">buy credits</a></td></tr>
+<tr><td style="padding:12px;border:1px solid #333"><b>3. Give it to your AI agent</b><br>
+<span style="color:#aaa">Paste this into ChatGPT, Claude or any x402-aware agent:</span><br>
+<code style="color:#7af;font-size:12px;word-break:break-all">{base}{endpoint} — pay via x402, manifest at {base}/.well-known/x402.json</code></td>
+<td style="padding:12px;border:1px solid #333;text-align:right">
+<a style="color:#0a0a0f;background:#7af;padding:8px 14px;text-decoration:none;border-radius:6px" href="/.well-known/x402.json">manifest</a></td></tr>
+</table>
+<p style="margin-top:22px;font-size:13px"><a style="color:#7af" href="/">catalog</a> ·
+<a style="color:#7af" href="/sample">free samples</a> ·
+<a style="color:#7af" href="/get-pricing">pricing</a> ·
+<a style="color:#7af" href="/receipts">receipts</a> ·
+<a style="color:#7af" href="/terms">terms</a> ·
+<a style="color:#7af" href="/privacy">privacy</a></p>
+</body></html>"""
+
+
 _v46_build_402_orig = _build_402
 
 
@@ -19503,6 +19560,16 @@ def _build_402(endpoint: str):                      # noqa: F811
     """Desafio 402 servido de memória por CHALLENGE_CACHE_TTL segundos.
     O conteúdo só muda quando o preço muda; com 22 mil sondagens/dia, montar
     o payload do zero toda vez é trabalho puro para o ranking de latência."""
+    # v47.3.1: humano em navegador recebe PÁGINA, não JSON cru. Os scanners
+    # e SDKs passam direto (o _wants_html exige UA de navegador real +
+    # Accept: text/html e exclui scanners nomeados) e o cache de desafio
+    # continua intacto para máquinas.
+    try:
+        if _wants_html():
+            return app.response_class(_render_402_html(endpoint),
+                                      status=402, mimetype="text/html")
+    except Exception:
+        pass
     now = time.time()
     with _chal_lock:
         hit = _chal_cache.get(endpoint)
@@ -20078,7 +20145,7 @@ if os.environ.get("AUTOPILOT", "1") != "0":
 from datetime import date          # v47: o topo do arquivo importa datetime,
 from urllib.parse import urlencode  # timezone e timedelta, mas nao `date`.
 
-V47_LAYER_VERSION = "47.3.0-STABILITY"
+V47_LAYER_VERSION = "47.3.1-HUMAN-402"
 
 # ============================================================================
 # BLOCO O — PRIMITIVOS BRASILEIROS, COMPUTAÇÃO PURA, ZERO UPSTREAM
