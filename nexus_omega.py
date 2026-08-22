@@ -87,7 +87,7 @@ from typing import Any, Optional, Dict, List, Tuple
 # 0. CONFIGURAÇÃO E AUTO-SETUP
 # ============================================================================
 
-VERSION = "47.3.1-HUMAN-402"  # v47.0.3: workers sync auto-recuperáveis + socket 25s + aliases A2A | v47.0.2: setdefaulttimeout anti-travamento | v47.0.1: PIX ascii-safe + ETag/304 na spec
+VERSION = "47.4.0-DEMAND-DRIVEN"  # v47.0.3: workers sync auto-recuperáveis + socket 25s + aliases A2A | v47.0.2: setdefaulttimeout anti-travamento | v47.0.1: PIX ascii-safe + ETag/304 na spec
 BRAND_NAME = "Losbeto"
 # v44.4.0: reposicionamento Brasil-primeiro. "Cross-asset market data" compete
 # com CoinGecko e cem nós iguais; "BCB + B3 normalizado em inglês" não compete
@@ -13423,6 +13423,41 @@ def privacy_page():
 
 
 # ============================================================================
+# 21f. /.well-known/oauth-protected-resource (v47.4.0) — RFC 9728.
+#      4 pedidos de 2 IPs em 7 dias no funil de demanda: são clientes MCP
+#      (Claude & cia.) fazendo a descoberta de autorização ANTES de conectar
+#      no /mcp. A spec MCP exige este documento; sem ele o cliente aborta a
+#      integração em silêncio. Não rodamos OAuth — o pagamento É a auth
+#      (x402) ou a chave de crédito (X-API-Key) — então o documento declara
+#      isso com honestidade em vez de fingir um authorization server.
+# ============================================================================
+
+@app.route("/.well-known/oauth-protected-resource")
+@app.route("/.well-known/oauth-protected-resource/<path:sub>")
+def oauth_protected_resource(sub: str = ""):
+    base = _public_base()
+    resource = base + ("/" + sub.strip("/") if sub else "/mcp")
+    return jsonify({
+        "resource": resource,
+        "resource_name": SERVICE_NAME,
+        "bearer_methods_supported": ["header"],
+        "scopes_supported": [],
+        # Lista vazia DE PROPÓSITO: não operamos um authorization server
+        # OAuth. Declarar um falso faria o cliente iniciar um fluxo que não
+        # existe. O campo está presente (a spec o exige) e vazio (a verdade).
+        "authorization_servers": [],
+        "resource_documentation": base + "/llms.txt",
+        "auth_model": {
+            "primary": "x402 — HTTP 402 challenge paid in USDC (Base/Solana/Algorand); no tokens, no accounts",
+            "alternative": "prepaid credit key sent as X-API-Key header — get one at " + base + "/buy-credits",
+            "manifest": base + "/.well-known/x402.json",
+        },
+        "mcp_protocol_version": MCP_PROTOCOL_VERSION,
+        "ts": int(time.time()),
+    })
+
+
+# ============================================================================
 # 22. LIVE CHAT (v36) — atendimento humano no meio de um mercado de máquinas.
 #
 #     A telemetria mostrou o que ninguém esperava: os avaliadores são
@@ -14530,7 +14565,11 @@ _UA_NAMED_SCANNER = re.compile(
     r"(x402scan|bazaar|agentic\.market|glama|smithery|mcpay|nevermined|"
     r"registry|indexer|crawler|spider|scanner|censys|shodan|masscan|nuclei|"
     r"zgrab|uptime|pingdom|datadog|newrelic|prometheus|zabbix|statuscake|"
-    r"betteruptime|hetrixtools)", re.I)
+    # v47.4.0: três bots estavam sendo contados como HUMANO no funil —
+    # ZeroBot (zero.xyz, 872 hits/dia), heritrix (crawler do Internet
+    # Archive, 9 previews/dia) e hermes-contact-discovery. Métrica honesta
+    # vale mais do que funil inflado: eles nunca pagam.
+    r"betteruptime|hetrixtools|zerobot|heritrix|hermes-contact)", re.I)
 
 # Genéricos: bibliotecas HTTP e bots sem identidade. Podem ser qualquer coisa,
 # mas na prática são automação de catálogo.
@@ -20145,7 +20184,7 @@ if os.environ.get("AUTOPILOT", "1") != "0":
 from datetime import date          # v47: o topo do arquivo importa datetime,
 from urllib.parse import urlencode  # timezone e timedelta, mas nao `date`.
 
-V47_LAYER_VERSION = "47.3.1-HUMAN-402"
+V47_LAYER_VERSION = "47.4.0-DEMAND-DRIVEN"
 
 # ============================================================================
 # BLOCO O — PRIMITIVOS BRASILEIROS, COMPUTAÇÃO PURA, ZERO UPSTREAM
