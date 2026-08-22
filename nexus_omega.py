@@ -87,7 +87,7 @@ from typing import Any, Optional, Dict, List, Tuple
 # 0. CONFIGURAÇÃO E AUTO-SETUP
 # ============================================================================
 
-VERSION = "47.4.0-DEMAND-DRIVEN"  # v47.0.3: workers sync auto-recuperáveis + socket 25s + aliases A2A | v47.0.2: setdefaulttimeout anti-travamento | v47.0.1: PIX ascii-safe + ETag/304 na spec
+VERSION = "47.5.0-HONEST-CLAIMS"  # v47.0.3: workers sync auto-recuperáveis + socket 25s + aliases A2A | v47.0.2: setdefaulttimeout anti-travamento | v47.0.1: PIX ascii-safe + ETag/304 na spec
 BRAND_NAME = "Losbeto"
 # v44.4.0: reposicionamento Brasil-primeiro. "Cross-asset market data" compete
 # com CoinGecko e cem nós iguais; "BCB + B3 normalizado em inglês" não compete
@@ -6995,7 +6995,7 @@ class Premium:
 
         brief = {"product": "Global Morning Brief", "date": day, "ts": ts,
                  "snapshot": snapshot, "synthesis": synthesis,
-                 "coverage": "forex + commodities + equities + crypto + macro (x402 exclusive)",
+                 "coverage": "forex + commodities + equities + crypto + macro (deep Brazil coverage)",
                  "provider": "Losbeto/Premium", "version": VERSION,
                  "disclaimer": "Research, not financial advice."}
         _premium_db_put(f"brief:{day}", brief)
@@ -7580,7 +7580,7 @@ def sales_agent():
              "Five flagship endpoints in a single request — highest value per transaction."),
         _opt("/br-brief", "🇧🇷", "Brazil coverage",
              "BCB macro + B3 equities + AI strategist read",
-             "The only Brazil-focused product on x402. Nobody else carries BCB or B3."),
+             "Brazil central-bank macro and B3 equities, with a depth nobody matches: point-in-time vintages and signed daily archives."),
         _opt("/global-morning-brief", "🌍", "Global markets",
              "Cross-asset morning brief",
              "Forex, commodities, equities, crypto and macro closed by an AI strategist."),
@@ -8935,10 +8935,10 @@ settles a few cents in USDC per request and gets clean JSON back.</p>
 <div id="human">
 </div></div>
 <section class="band alt"><div class="wrap"><div id="human">
-<h2 id="top">Brazil — the coverage nobody else has</h2>
+<h2 id="top">Brazil — the deepest coverage on x402</h2>
 <p class="lede">Central-bank macro, B3 equities and the real interest rate,
 assembled for an international desk. These four are where most of this node's
-revenue actually comes from, and they exist in no other x402 catalog.</p>
+revenue actually comes from, assembled with point-in-time vintages and signed daily archives — a depth rarely found on x402.</p>
 <div class="grid">
   <a class="card" href="/br-brief?preview=1"><span class="p">__P_BRIEF_BR__</span>
     <h3>Brazil Brief <em>flagship</em></h3>
@@ -9027,8 +9027,8 @@ tools = get_langchain_tools()   <span class="c"># free delayed data</span></pre>
 </div></section>
 <section class="band alt"><div class="wrap">
 <h2>Only here</h2>
-<p class="lede">Four products that exist in no other x402 catalog, because they
-need a data source nobody outside Brazil assembles.</p>
+<p class="lede">Four Brazil products built on point-in-time archives, because they
+need a data pipeline assembled inside Brazil.</p>
 <div class="grid">
   <div class="gcard"><h3>Brazil agricultural parity<span class="bz">exclusive</span></h3>
     <p>Soybeans, corn and arabica coffee in the Brazilian 60kg bag — official
@@ -9687,7 +9687,7 @@ def ip_echo():
             "name": SERVICE_NAME,
             "what": (f"{len(BASE_PRICES)} pay-per-call market-data endpoints for "
                      "AI agents — multi-oracle consensus, forex, equities, "
-                     "commodities, crypto and exclusive Brazil macro (BCB/B3). "
+                     "commodities, crypto and deep Brazil macro coverage (BCB/B3). "
                      "USDC on Base + Solana via x402."),
             "free": {"six_samples_one_call": f"{base}/try",
                      "first_realtime_call": f"{base}/welcome",
@@ -12310,7 +12310,7 @@ BRASIL_SUITE = {
     "/br-equity": (_br_equity_handler, 0.02,
         "B3 equity or Ibovespa quote (?symbol=PETR4|VALE3|ITUB4|IBOV): price in BRL "
         "with daily change, plus the USD equivalent converted at the official BCB "
-        "PTAX rate. Brazilian equities are absent from every other x402 catalog.",
+        "PTAX rate. Brazilian equities with official-PTAX USD conversion — rare on x402.",
         ["Brazil", "Equities", "GlobalMarkets"], {"symbol": "PETR4"}),
     "/br-brief": (_br_brief_handler, 0.25,
         "Brazil in global context, written for an international desk: BCB macro, the "
@@ -12593,8 +12593,7 @@ def _br_agro_handler():
             "coverage": ("Brazil is the world's largest exporter of soybeans, "
                          "coffee, sugar and beef. These are the domestic spot "
                          "prices that set export parity, published by the "
-                         "central bank and absent from every other x402 "
-                         "catalog."),
+                         "central bank — coverage rarely available on x402."),
             "methodology": ("Official BCB/SGS series, one HTTP call per series, "
                             "fetched in parallel and sorted by date rather than "
                             "array order. Each series declares its own code and "
@@ -12654,7 +12653,7 @@ def _br_curve_handler():
             "why_it_matters": ("The Brazilian real rate is one of the largest "
                               "carry signals in emerging markets. Every "
                               "cross-asset desk positioning in BRL prices it "
-                              "first, and no other x402 service publishes it."),
+                              "first — few x402 services publish it with the Fisher relation."),
             "ts": ts, "provider": "Losbeto/Brasil", "version": VERSION}
 
 
@@ -12665,7 +12664,7 @@ BRASIL_SUITE["/br-agro"] = (
     "USD at the official PTAX rate, plus export-parity equivalents in the CBOT "
     "bushel and ICE cents-per-pound units. Brazil is the world's largest "
     "exporter of soybeans, coffee, sugar and beef; these are the domestic "
-    "prices that set the export gap, and they exist in no other x402 catalog.",
+    "prices that set the export gap, with export-parity conversions rarely found on x402.",
     ["Brazil", "Commodities", "Agriculture"], {"format": "json"})
 
 BRASIL_SUITE["/br-curve"] = (
@@ -17810,12 +17809,18 @@ def mcp_registry_server_json():
         "$schema": ("https://static.modelcontextprotocol.io/schemas/"
                     "2025-12-11/server.schema.json"),
         "name": MCP_SERVER_NAME,
+        # v47.4.1: o Registry oficial REJEITA description >100 chars (422).
+        # A ficha completa continua em /llms.txt e /.well-known/mcp.json;
+        # aqui vai só a linha de vitrine.
         "description": (
             "Cross-asset market data for AI agents: forex, equities, "
-            "commodities, US and Brazil macro (BCB/B3), SEC filings and "
-            "crypto. Free delayed samples over MCP; real-time per call in "
-            "USDC over x402, no API key and no signup."),
+            "Brazil macro (BCB/B3), crypto."),
         "version": _semver_clean(VERSION),
+        # v47.5.0: ficha completa para o listing do Registry — título de
+        # vitrine, homepage e ícone (todos opcionais no schema 2025-12-11).
+        "title": "Losbeto — Market Data for AI Agents",
+        "websiteUrl": base,
+        "icons": [{"src": f"{base}/favicon.png", "mimeType": "image/png"}],
         "repository": {
             "url": "https://github.com/rmartins1451/losbeto",
             "source": "github",
@@ -20184,7 +20189,7 @@ if os.environ.get("AUTOPILOT", "1") != "0":
 from datetime import date          # v47: o topo do arquivo importa datetime,
 from urllib.parse import urlencode  # timezone e timedelta, mas nao `date`.
 
-V47_LAYER_VERSION = "47.4.0-DEMAND-DRIVEN"
+V47_LAYER_VERSION = "47.5.0-HONEST-CLAIMS"
 
 # ============================================================================
 # BLOCO O — PRIMITIVOS BRASILEIROS, COMPUTAÇÃO PURA, ZERO UPSTREAM
