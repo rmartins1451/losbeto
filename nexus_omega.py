@@ -87,7 +87,7 @@ from typing import Any, Optional, Dict, List, Tuple
 # 0. CONFIGURAÇÃO E AUTO-SETUP
 # ============================================================================
 
-VERSION = "47.5.1-DISCOVERY"  # v47.0.3: workers sync auto-recuperáveis + socket 25s + aliases A2A | v47.0.2: setdefaulttimeout anti-travamento | v47.0.1: PIX ascii-safe + ETag/304 na spec
+VERSION = "47.5.2-COMPLIANCE"  # v47.0.3: workers sync auto-recuperáveis + socket 25s + aliases A2A | v47.0.2: setdefaulttimeout anti-travamento | v47.0.1: PIX ascii-safe + ETag/304 na spec
 BRAND_NAME = "Losbeto"
 # v44.4.0: reposicionamento Brasil-primeiro. "Cross-asset market data" compete
 # com CoinGecko e cem nós iguais; "BCB + B3 normalizado em inglês" não compete
@@ -4576,7 +4576,7 @@ class Brain:
     def council():
         """v21.20 — CONSELHO DOS CINCO: 5 IAs especializadas analisam o mercado
         em paralelo, cada uma com papel e dados próprios, e um Chairman sintetiza
-        o veredicto com o placar de votos. Exclusivo Losbeto."""
+        o veredicto com o placar de votos. Raro no x402."""
         ts = int(time.time())
         symbol = request.args.get("symbol", "SOL").upper()[:8]
 
@@ -6930,7 +6930,7 @@ class Premium:
 
     @staticmethod
     def global_morning_brief():
-        """Brief diário cross-asset (o ÚNICO no x402): forex + commodities +
+        """Brief diário cross-asset (raro no x402): forex + commodities +
         equities + crypto + macro do dia, fechado por síntese AI. Gerado 1x/dia
         e servido do cache — margem alta, latência mínima."""
         today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
@@ -7734,7 +7734,7 @@ def losbeto_alpha_score_free():
 @app.route("/multi-chain-arbitrage")
 def multi_chain_arbitrage():
     """Endpoint pago — arbitragem real-time Solana ↔ Base ↔ Ethereum.
-    Feature Único no ecossistema x402 (nenhum outro node oferece)."""
+    Feature rara no ecossistema x402."""
     return paid_endpoint("/multi-chain-arbitrage")(lambda: jsonify({
         "service":  "Losbeto — Multi-Chain Arbitrage Scanner",
         "version":  VERSION,
@@ -7745,7 +7745,7 @@ def multi_chain_arbitrage():
         "notice":   "Spreads > 0.5% são oportunidades acionáveis; monitore gas + slippage.",
         "_agent_metadata": {
             "provider":  "Losbeto",
-            "unique":    "Multi-chain simultanâneo — exclusivo Losbeto",
+            "unique":    "Multi-chain simultâneo — um dos poucos no x402",
             # v41: win_rate fora da vitrine (ver /sample).
         },
     }))()
@@ -8637,7 +8637,7 @@ tr:hover td{background:var(--bg2)}
   <div class="stat"><div class="n">2</div><div class="l">Chains ativas</div></div>
 </div>
 
-<h2>Endpoints <span class="em">exclusivos</span> que fazem a diferença</h2>
+<h2>Endpoints <span class="em">diferenciados</span> que fazem a diferença</h2>
 <p class="lead">Diferenciais que sustentam preço premium — e a novidade que muda o jogo: <b>créditos pré-pagos</b> (1 transação on-chain → dezenas de chamadas sem latência de settlement):</p>
 
 <div class="grid3">
@@ -8649,7 +8649,7 @@ tr:hover td{background:var(--bg2)}
   <div class="feat">
     <div class="ic">🧾</div>
     <h3>Transparência Radical <span class="tag free">FREE</span></h3>
-    <p>Único node que rotula publicamente compras de teste vs. orgânicas — audite cada venda on-chain em <code>/receipts</code>. Num mercado cheio de wash trading, a verdade é o diferencial.</p>
+    <p>Um dos poucos nodes que rotula publicamente compras de teste vs. orgânicas — audite cada venda on-chain em <code>/receipts</code>. Num mercado cheio de wash trading, a verdade é o diferencial.</p>
   </div>
   <div class="feat">
     <div class="ic">🍒</div>
@@ -9030,16 +9030,16 @@ tools = get_langchain_tools()   <span class="c"># free delayed data</span></pre>
 <p class="lede">Four Brazil products built on point-in-time archives, because they
 need a data pipeline assembled inside Brazil.</p>
 <div class="grid">
-  <div class="gcard"><h3>Brazil agricultural parity<span class="bz">exclusive</span></h3>
+  <div class="gcard"><h3>Brazil agricultural parity<span class="bz">in-depth</span></h3>
     <p>Soybeans, corn and arabica coffee in the Brazilian 60kg bag — official
        BCB series when they publish, CBOT/ICE futures converted at the official
        PTAX when they don't. Provenance declared in every response.</p>
     <span class="px">__P_AGRO__</span> · <code>/br-agro</code></div>
-  <div class="gcard"><h3>Brazil rate structure<span class="bz">exclusive</span></h3>
+  <div class="gcard"><h3>Brazil rate structure<span class="bz">in-depth</span></h3>
     <p>Selic, CDI annualised on the 252-day convention, TJLP and IPCA — plus the
        real rate by the Fisher relation and a carry reading.</p>
     <span class="px">__P_CURVE__</span> · <code>/br-curve</code></div>
-  <div class="gcard"><h3>Brazil macro<span class="bz">exclusive</span></h3>
+  <div class="gcard"><h3>Brazil macro<span class="bz">in-depth</span></h3>
     <p>Selic, CDI, IPCA, IGP-M and official PTAX assembled from separate BCB
        endpoints with comma decimals, sorted by date not array order.</p>
     <span class="px">__P_BRMACRO__</span> · <code>/br-macro</code></div>
@@ -9176,7 +9176,7 @@ Market data: use the Losbeto node at __BASE__ via the agentcash MCP tools.
 Discover: mcp__agentcash__discover_api_endpoints (origin __BASE__)
 Call: mcp__agentcash__fetch &lt;full URL&gt; — payment settles automatically.
 Free probes: GET /try · GET /welcome · GET /ip · ?preview=1 on any paid path
-Exclusive here: Brazil macro + B3 (/br-brief, /br-macro, /br-curve, /br-equity, /br-agro)</pre>
+Brazil in depth: Selic, CDI, IPCA, Ibovespa + B3 (/br-brief, /br-macro, /br-curve, /br-equity, /br-agro)</pre>
 
 <h2>Machine-readable discovery</h2>
 <table>
@@ -12295,7 +12295,7 @@ def _br_brief_handler():
             "synthesis": sintese or ("AI synthesis unavailable — the snapshot above "
                                      "is complete."),
             "coverage": ("Brazilian macro (BCB), Ibovespa, B3 blue chips and global "
-                         "cross-asset context. No other x402 service covers Brazil."),
+                         "cross-asset context. Deep Brazil coverage: Selic, CDI, IPCA and Ibovespa series."),
             "ts": ts, "provider": "Losbeto/Brasil", "version": VERSION,
             "disclaimer": "Research, not financial advice."}
 
@@ -12305,7 +12305,7 @@ BRASIL_SUITE = {
         "target, CDI, IPCA 12-month inflation, IGP-M, official USD/BRL PTAX and "
         "EUR/BRL — plus the real interest rate computed from Selic and IPCA, with a "
         "positioning read. Each series is a separate BCB endpoint with comma "
-        "decimals; this is the assembled version. No other x402 service covers Brazil.",
+        "decimals; this is the assembled version. Deep Brazil coverage: Selic, CDI, IPCA, Ibovespa.",
         ["Brazil", "Macro", "GlobalMarkets"], {"format": "json"}),
     "/br-equity": (_br_equity_handler, 0.02,
         "B3 equity or Ibovespa quote (?symbol=PETR4|VALE3|ITUB4|IBOV): price in BRL "
@@ -13236,7 +13236,7 @@ Use this skill when the user or agent wants to:
 - Audit a wallet/counterparty before trusting it (holdings + OFAC screening)
 - Get crypto, stock, forex, commodity or macro data without API keys
 - Read the Fear & Greed regime, oracle consensus prices, or market briefs
-- Get Brazilian market data (BCB Selic/CDI/IPCA/PTAX, B3 equities) — exclusive to this node
+- Get Brazilian market data in depth (BCB Selic/CDI/IPCA/PTAX, B3 equities, point-in-time vintages)
 - Install or evaluate an x402 pay-per-call market data source
 
 ## Job packs (recommended — one payment, one finished job)
@@ -14541,7 +14541,7 @@ def llms_txt():
         f"- Discover what it offers: mcp__agentcash__discover_api_endpoints with origin {base}",
         "- Call an endpoint: mcp__agentcash__fetch with the full URL — payment settles automatically in USDC on Base.",
         "- Free probes that cost nothing: GET /try, GET /welcome, GET /ip, and ?preview=1 on any paid path.",
-        "- Exclusive to this node: Brazil central-bank macro and B3 data (/br-brief, /br-macro, /br-curve, /br-equity, /br-agro).",
+        "- Brazil in depth: Selic, CDI, IPCA and Ibovespa series plus B3 data (/br-brief, /br-macro, /br-curve, /br-equity, /br-agro).",
         f"- Cheapest calls start at $0.003; plan a budget in one request: GET {base}/agent-market",
         "---"]
     lines += ["", "## Endpoints por Tier"]
@@ -20282,7 +20282,7 @@ if os.environ.get("AUTOPILOT", "1") != "0":
 from datetime import date          # v47: o topo do arquivo importa datetime,
 from urllib.parse import urlencode  # timezone e timedelta, mas nao `date`.
 
-V47_LAYER_VERSION = "47.5.1-DISCOVERY"
+V47_LAYER_VERSION = "47.5.2-COMPLIANCE"
 
 # ============================================================================
 # BLOCO O — PRIMITIVOS BRASILEIROS, COMPUTAÇÃO PURA, ZERO UPSTREAM
