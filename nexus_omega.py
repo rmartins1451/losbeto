@@ -87,7 +87,7 @@ from typing import Any, Optional, Dict, List, Tuple
 # 0. CONFIGURAÇÃO E AUTO-SETUP
 # ============================================================================
 
-VERSION = "47.5.0-HONEST-CLAIMS"  # v47.0.3: workers sync auto-recuperáveis + socket 25s + aliases A2A | v47.0.2: setdefaulttimeout anti-travamento | v47.0.1: PIX ascii-safe + ETag/304 na spec
+VERSION = "47.5.1-DISCOVERY"  # v47.0.3: workers sync auto-recuperáveis + socket 25s + aliases A2A | v47.0.2: setdefaulttimeout anti-travamento | v47.0.1: PIX ascii-safe + ETag/304 na spec
 BRAND_NAME = "Losbeto"
 # v44.4.0: reposicionamento Brasil-primeiro. "Cross-asset market data" compete
 # com CoinGecko e cem nós iguais; "BCB + B3 normalizado em inglês" não compete
@@ -13433,6 +13433,7 @@ def privacy_page():
 
 @app.route("/.well-known/oauth-protected-resource")
 @app.route("/.well-known/oauth-protected-resource/<path:sub>")
+@app.route("/mcp/.well-known/oauth-protected-resource")
 def oauth_protected_resource(sub: str = ""):
     base = _public_base()
     resource = base + ("/" + sub.strip("/") if sub else "/mcp")
@@ -13454,6 +13455,98 @@ def oauth_protected_resource(sub: str = ""):
         "mcp_protocol_version": MCP_PROTOCOL_VERSION,
         "ts": int(time.time()),
     })
+
+
+# ============================================================================
+# 21g. DESCOBERTA MCP COMPLETA (v47.5.1) — a demanda chegou pelos canais
+#      novos: 5 IPs distintos pedindo /mcp/.well-known/oauth-* e
+#      /.well-known/mcp/server-card.json em 7 dias (clientes MCP reais fazendo
+#      discovery depois da publicação no Registry). Implementa SEP-1649
+#      (server card) e SEP-1960 (manifest), com os headers que as specs
+#      exigem: CORS aberto, nosniff e cache de 1h.
+# ============================================================================
+
+def _discovery_headers(resp):
+    resp.headers["Access-Control-Allow-Origin"] = "*"
+    resp.headers["Access-Control-Allow-Methods"] = "GET"
+    resp.headers["Access-Control-Allow-Headers"] = "Content-Type"
+    resp.headers["X-Content-Type-Options"] = "nosniff"
+    resp.headers["Cache-Control"] = "public, max-age=3600"
+    return resp
+
+def _server_card_doc() -> dict:
+    base = _public_base()
+    return {
+        # SEP-1649 (MCP Server Cards) — campos obrigatórios primeiro
+        "$schema": "https://modelcontextprotocol.io/schemas/server-card/v1.0",
+        "version": "1.0",
+        "protocolVersion": MCP_PROTOCOL_VERSION,
+        "serverInfo": {
+            "name": "losbeto",
+            "title": "Losbeto — Market Data for AI Agents",
+            "version": _semver_clean(VERSION),
+        },
+        "description": ("x402-paid market intelligence: forex, equities, "
+                        "commodities, Brazil macro (BCB/B3) and crypto."),
+        "iconUrl": f"{base}/favicon.png",
+        "documentationUrl": f"{base}/llms.txt",
+        "transport": {"type": "streamable-http", "endpoint": "/mcp"},
+        "capabilities": {"tools": {}},
+        # autenticação honesta: o pagamento x402 É a credencial; amostras
+        # atrasadas são abertas, chave de crédito via X-API-Key.
+        "auth": {"type": "x402-or-apikey",
+                 "note": ("Free delayed samples need no auth. Real-time calls "
+                          "are paid per call in USDC via x402 (Base/Solana/"
+                          "Algorand) or with a prepaid X-API-Key credit from "
+                          "/buy-credits. No OAuth server is operated."),
+                 "protected_resource": f"{base}/.well-known/oauth-protected-resource"},
+    }
+
+@app.route("/.well-known/mcp/server-card.json")
+@app.route("/mcp/.well-known/server-card.json")
+def mcp_server_card():
+    return _discovery_headers(jsonify(_server_card_doc()))
+
+def _mcp_manifest_doc() -> dict:
+    base = _public_base()
+    return {
+        # SEP-1960 (manifest de enumeração de endpoints)
+        "mcp_version": MCP_PROTOCOL_VERSION,
+        "endpoints": [{
+            "url": f"{base}/mcp",
+            "transport": "streamable-http",
+            "capabilities": ["tools"],
+            "auth": {"type": "x402-or-apikey",
+                     "note": "No OAuth. Pay per call (x402) or X-API-Key credit."},
+        }],
+        "server_card": f"{base}/.well-known/mcp/server-card.json",
+        "provider": {"name": SERVICE_NAME, "url": base},
+        "ts": int(time.time()),
+    }
+
+@app.route("/.well-known/mcp")
+@app.route("/mcp/.well-known/mcp")
+def mcp_manifest():
+    return _discovery_headers(jsonify(_mcp_manifest_doc()))
+
+@app.route("/.well-known/oauth-authorization-server")
+@app.route("/mcp/.well-known/oauth-authorization-server")
+def oauth_authorization_server():
+    """RFC 8414 — honesto por construção: NÃO operamos um authorization
+    server OAuth. Servir o documento declarando isso (em vez de 404) encerra
+    a descoberta do cliente sem erro e sem fingir endpoints que não existem."""
+    base = _public_base()
+    return _discovery_headers(jsonify({
+        "issuer": base,
+        "authorization_endpoint": None,
+        "token_endpoint": None,
+        "grant_types_supported": [],
+        "note": ("This server does not operate OAuth. Authentication is the "
+                 "payment itself (x402 USDC) or a prepaid X-API-Key credit — "
+                 "see " + base + "/buy-credits"),
+        "documentation": base + "/llms.txt",
+        "ts": int(time.time()),
+    }))
 
 
 # ============================================================================
@@ -14568,7 +14661,7 @@ _UA_NAMED_SCANNER = re.compile(
     # ZeroBot (zero.xyz, 872 hits/dia), heritrix (crawler do Internet
     # Archive, 9 previews/dia) e hermes-contact-discovery. Métrica honesta
     # vale mais do que funil inflado: eles nunca pagam.
-    r"betteruptime|hetrixtools|zerobot|heritrix|hermes-contact)", re.I)
+    r"betteruptime|hetrixtools|zerobot|heritrix|hermes-contact|semrushbot)", re.I)
 
 # Genéricos: bibliotecas HTTP e bots sem identidade. Podem ser qualquer coisa,
 # mas na prática são automação de catálogo.
@@ -20189,7 +20282,7 @@ if os.environ.get("AUTOPILOT", "1") != "0":
 from datetime import date          # v47: o topo do arquivo importa datetime,
 from urllib.parse import urlencode  # timezone e timedelta, mas nao `date`.
 
-V47_LAYER_VERSION = "47.5.0-HONEST-CLAIMS"
+V47_LAYER_VERSION = "47.5.1-DISCOVERY"
 
 # ============================================================================
 # BLOCO O — PRIMITIVOS BRASILEIROS, COMPUTAÇÃO PURA, ZERO UPSTREAM
