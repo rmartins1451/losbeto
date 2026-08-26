@@ -87,7 +87,7 @@ from typing import Any, Optional, Dict, List, Tuple
 # 0. CONFIGURAÇÃO E AUTO-SETUP
 # ============================================================================
 
-VERSION = "47.6.0-FINAL"  # v47.0.3: workers sync auto-recuperáveis + socket 25s + aliases A2A | v47.0.2: setdefaulttimeout anti-travamento | v47.0.1: PIX ascii-safe + ETag/304 na spec
+VERSION = "47.6.1-DISCOVERY2"  # v47.0.3: workers sync auto-recuperáveis + socket 25s + aliases A2A | v47.0.2: setdefaulttimeout anti-travamento | v47.0.1: PIX ascii-safe + ETag/304 na spec
 BRAND_NAME = "Losbeto"
 # v44.4.0: reposicionamento Brasil-primeiro. "Cross-asset market data" compete
 # com CoinGecko e cem nós iguais; "BCB + B3 normalizado em inglês" não compete
@@ -8508,6 +8508,34 @@ def owners_manifest():
     })
     resp.headers["Access-Control-Allow-Origin"] = "*"
     resp.headers["X-Content-Type-Options"] = "nosniff"
+    resp.headers["Cache-Control"] = "public, max-age=3600"
+    return resp
+
+
+@app.route("/mcp.json")
+def mcp_json_root():
+    """v47.6.1: descritor MCP na raiz — clientes que já conhecem o padrão
+    server-card pedem /mcp.json diretamente (2 IPs em 7d)."""
+    return mcp_server_card()
+
+
+@app.route("/agents.txt")
+def agents_txt():
+    """v47.6.1: versão texto puro do catálogo — pedida por 2 IPs em 7d.
+    Agentes que parseiam texto/llms.txt em vez de JSON."""
+    base = _public_base()
+    linhas = [
+        "# Losbeto — machine-readable catalog (text)",
+        f"# base: {base}",
+        f"# version: {VERSION}",
+        "# payment: x402 (USDC on Base, Solana, Algorand) — HTTP 402 challenge per call",
+        "# free: ?preview=1 on every endpoint · /try tasting menu · /welcome first realtime call",
+        "",
+    ]
+    for p in sorted(BASE_PRICES):
+        linhas.append(f"{p} ${BASE_PRICES[p]:.3f}")
+    resp = app.response_class("\n".join(linhas) + "\n", mimetype="text/plain")
+    resp.headers["Access-Control-Allow-Origin"] = "*"
     resp.headers["Cache-Control"] = "public, max-age=3600"
     return resp
 
@@ -20289,7 +20317,7 @@ if os.environ.get("AUTOPILOT", "1") != "0":
 from datetime import date          # v47: o topo do arquivo importa datetime,
 from urllib.parse import urlencode  # timezone e timedelta, mas nao `date`.
 
-V47_LAYER_VERSION = "47.6.0-FINAL"
+V47_LAYER_VERSION = "47.6.1-DISCOVERY2"
 
 # ============================================================================
 # BLOCO O — PRIMITIVOS BRASILEIROS, COMPUTAÇÃO PURA, ZERO UPSTREAM
