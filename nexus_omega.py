@@ -87,7 +87,7 @@ from typing import Any, Optional, Dict, List, Tuple
 # 0. CONFIGURAÇÃO E AUTO-SETUP
 # ============================================================================
 
-VERSION = "47.5.2-COMPLIANCE"  # v47.0.3: workers sync auto-recuperáveis + socket 25s + aliases A2A | v47.0.2: setdefaulttimeout anti-travamento | v47.0.1: PIX ascii-safe + ETag/304 na spec
+VERSION = "47.6.0-FINAL"  # v47.0.3: workers sync auto-recuperáveis + socket 25s + aliases A2A | v47.0.2: setdefaulttimeout anti-travamento | v47.0.1: PIX ascii-safe + ETag/304 na spec
 BRAND_NAME = "Losbeto"
 # v44.4.0: reposicionamento Brasil-primeiro. "Cross-asset market data" compete
 # com CoinGecko e cem nós iguais; "BCB + B3 normalizado em inglês" não compete
@@ -8476,6 +8476,49 @@ def x402list_proof():
                         mimetype="text/plain")
     return Response(tok + "\n", mimetype="text/plain")
 
+
+@app.route("/.well-known/owners.json")
+@app.route("/mcp/.well-known/owners.json")
+def owners_manifest():
+    """v47.6.0: manifesto de propriedade do nó — quem opera e quais carteiras
+    recebem. Clientes MCP/x402 pedem isso na descoberta pós-Registry para
+    verificar identidade do operador. Dados 100% públicos (as carteiras já
+    aparecem em todo desafio 402 e em /receipts)."""
+    base = _public_base()
+    resp = jsonify({
+        "version": "1.0",
+        "service": "Losbeto",
+        "domain": base.split("://")[-1],
+        "operator": {
+            "name": "Losbeto",
+            "contact": f"{base}/info",
+            "repository": "https://github.com/rmartins1451/losbeto",
+        },
+        "payment_addresses": {
+            "solana": os.environ.get("SOLANA_WALLET_ADDRESS", ""),
+            "base_evm": os.environ.get("BASE_PAYTO_EVM", ""),
+            "algorand": os.environ.get("ALGORAND_WALLET_ADDRESS", ""),
+        },
+        "verification": {
+            "mcp_registry": "io.github.rmartins1451/losbeto",
+            "server_card": f"{base}/.well-known/mcp/server-card.json",
+            "x402list_proof": f"{base}/.well-known/x402list.txt",
+        },
+        "ts": int(time.time()),
+    })
+    resp.headers["Access-Control-Allow-Origin"] = "*"
+    resp.headers["X-Content-Type-Options"] = "nosniff"
+    resp.headers["Cache-Control"] = "public, max-age=3600"
+    return resp
+
+
+@app.route("/.well-known/x402list.txt<path:rest>")
+def x402list_proof_trailing(rest):
+    """v47.6.0: clientes malformados concatenam a URL inteira ao path
+    (/.well-known/x402list.txthttps://...). Serve o mesmo token."""
+    return x402list_proof()
+
+
 @app.route("/bazaar.json")
 def bazaar_manifest():
     base = _public_base()
@@ -11849,51 +11892,52 @@ LIVE_HTML = r"""<!doctype html><html lang="en"><head>
 <title>Losbeto — live node telemetry</title>
 <meta name="description" content="Live x402 node telemetry: real settlements, evaluations and probes as they happen. No mock data.">
 <style>
-:root{--bg:#000;--g:#00ff41;--g2:#008f11;--dim:#0a5c1f;--warn:#ffb000;--mono:'SF Mono',Menlo,Consolas,monospace}
+:root{--bg:#0b0e14;--card:#12161f;--line:#1f2633;--txt:#e6e9ef;--dim:#8b94a7;--acc:#3b82f6;--ok:#22c55e;--warn:#f59e0b}
 *{box-sizing:border-box;margin:0;padding:0}
-html,body{height:100%}
-body{background:var(--bg);color:var(--g);font:13px/1.5 var(--mono);overflow-x:hidden}
-#rain{position:fixed;inset:0;z-index:0;opacity:.28}
-.ui{position:relative;z-index:1;max-width:960px;margin:0 auto;padding:22px 18px 60px}
+body{background:var(--bg);color:var(--txt);font:14px/1.6 -apple-system,'Segoe UI',Roboto,Helvetica,Arial,sans-serif}
+.ui{max-width:960px;margin:0 auto;padding:28px 18px 60px}
 .bar{display:flex;justify-content:space-between;align-items:baseline;gap:14px;flex-wrap:wrap;
-     border-bottom:1px solid var(--dim);padding-bottom:10px;margin-bottom:22px}
-.bar h1{font-size:15px;font-weight:600;letter-spacing:.14em;text-transform:uppercase}
-.bar a{color:var(--g2);text-decoration:none;margin-left:14px;font-size:12px}
-.bar a:hover{color:var(--g)}
-.blink{animation:b 1.1s steps(2) infinite}@keyframes b{50%{opacity:.15}}
-.grid{display:grid;gap:10px;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));margin-bottom:24px}
-.kpi{border:1px solid var(--dim);padding:12px;background:rgba(0,255,65,.03)}
-.kpi .l{color:var(--g2);font-size:10px;letter-spacing:.12em;text-transform:uppercase}
-.kpi .v{font-size:24px;font-weight:600;margin-top:4px;letter-spacing:-.02em}
-.kpi .s{color:var(--g2);font-size:10.5px;margin-top:2px}
-h2{font-size:10px;letter-spacing:.16em;text-transform:uppercase;color:var(--g2);
-   margin:26px 0 10px;border-bottom:1px solid var(--dim);padding-bottom:5px}
-table{width:100%;border-collapse:collapse;font-size:12px}
-td{padding:5px 0;border-bottom:1px solid rgba(10,92,31,.4)}
-td:last-child{text-align:right;color:var(--g2)}
-.bars{display:flex;align-items:flex-end;gap:3px;height:56px;margin-bottom:6px}
-.bars i{flex:1;background:linear-gradient(180deg,var(--g),var(--g2));min-height:2px;display:block}
-.note{color:var(--g2);font-size:11px;margin-top:8px}
+     border-bottom:1px solid var(--line);padding-bottom:14px;margin-bottom:24px}
+.bar h1{font-size:17px;font-weight:650;letter-spacing:.02em}
+.bar h1 span{color:var(--acc)}
+.bar nav a{color:var(--dim);text-decoration:none;margin-left:14px;font-size:13px}
+.bar nav a:hover{color:var(--txt)}
+.live-dot{display:inline-block;width:8px;height:8px;border-radius:50%;background:var(--ok);margin-right:7px}
+.grid{display:grid;gap:10px;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));margin-bottom:8px}
+.kpi{border:1px solid var(--line);border-radius:10px;padding:14px;background:var(--card)}
+.kpi .l{color:var(--dim);font-size:11px;letter-spacing:.08em;text-transform:uppercase}
+.kpi .v{font-size:26px;font-weight:650;margin-top:4px;letter-spacing:-.02em}
+.kpi .s{color:var(--dim);font-size:11.5px;margin-top:2px}
+h2{font-size:11px;letter-spacing:.12em;text-transform:uppercase;color:var(--dim);
+   margin:28px 0 10px;border-bottom:1px solid var(--line);padding-bottom:6px}
+table{width:100%;border-collapse:collapse;font-size:13px}
+td{padding:6px 0;border-bottom:1px solid var(--line)}
+td:last-child{text-align:right;color:var(--dim)}
+.mix{display:flex;height:10px;border-radius:6px;overflow:hidden;margin:4px 0 8px;background:var(--line)}
+.mix i{display:block;height:100%}
+.legend{font-size:12px;color:var(--dim)}
+.legend b{color:var(--txt);font-weight:600}
+.note{color:var(--dim);font-size:12px;margin-top:8px}
 .warn{color:var(--warn)}
-footer{color:var(--g2);font-size:11px;margin-top:30px;border-top:1px solid var(--dim);padding-top:12px}
-footer a{color:var(--g2)}
+.ok{color:var(--ok)}
+footer{color:var(--dim);font-size:12px;margin-top:34px;border-top:1px solid var(--line);padding-top:14px}
+footer a{color:var(--acc);text-decoration:none}
 </style></head><body>
-<canvas id="rain"></canvas>
 <div class="ui">
   <div class="bar">
-    <h1>losbeto :: live<span class="blink">_</span></h1>
-    <div>
+    <h1><span class="live-dot"></span>losbeto <span>:: live</span></h1>
+    <nav>
       <a href="/">home</a><a href="/try">try free</a>
       <a href="/receipts">receipts</a><a href="/health/providers">health</a>
       <a href="/x402-resources">catalog</a>
-    </div>
+    </nav>
   </div>
 
   <div class="grid" id="kpi"></div>
 
   <h2>traffic composition · 24h</h2>
-  <div class="bars" id="bars"></div>
-  <div class="note" id="barsnote"></div>
+  <div class="mix" id="mix"></div>
+  <div class="legend" id="mixnote"></div>
 
   <h2>evaluators — who tested before paying</h2>
   <table id="pv"><tbody></tbody></table>
@@ -11905,39 +11949,14 @@ footer a{color:var(--g2)}
   <table id="hp"><tbody></tbody></table>
 
   <footer>
-    Every number here is read from this node's own ledger — no mock data, no
+    Every number here is read from this node&rsquo;s own ledger — no mock data, no
     projections. Operator test purchases are labelled as such at
     <a href="/receipts">/receipts</a>.
     <span id="ts"></span>
   </footer>
 </div>
 <script>
-// ---- matrix rain: cada glifo é um evento real do nó (ver pushEvents) -------
-(function(){
-  var cv=document.getElementById('rain'),cx=cv.getContext('2d'),W,H,cols,drops,queue=[];
-  var CH='0123456789ABCDEF$402x'.split('');
-  function size(){W=cv.width=innerWidth;H=cv.height=innerHeight;
-    cols=Math.floor(W/14);drops=Array(cols).fill(0).map(()=>Math.random()*-H);}
-  size();addEventListener('resize',size);
-  window.pushEvents=function(n){for(var i=0;i<n;i++)queue.push(1);};
-  function draw(){
-    cx.fillStyle='rgba(0,0,0,.075)';cx.fillRect(0,0,W,H);
-    cx.font='13px monospace';
-    for(var i=0;i<cols;i++){
-      var hot=queue.length>0&&Math.random()<.06;
-      if(hot)queue.pop();
-      cx.fillStyle=hot?'#c9ffd8':'#00ff41';
-      cx.fillText(CH[Math.floor(Math.random()*CH.length)],i*14,drops[i]);
-      drops[i]+=hot?26:14;
-      if(drops[i]>H&&Math.random()>.975)drops[i]=0;
-    }
-    requestAnimationFrame(draw);
-  }
-  draw();
-})();
-
-var prev=null;
-function n(x){return (x===undefined||x===null)?'—':x;}
+function n(x){return (x===undefined||x===null)?'\u2014':x;}
 function esc(s){return String(s).replace(/</g,'&lt;');}
 
 async function tick(){
@@ -11945,63 +11964,51 @@ async function tick(){
     var r=await fetch('/live/api',{cache:'no-store'});
     var j=await r.json();
     var s=j.stats||{};
-    // KPIs — só o que o ledger sabe
     document.getElementById('kpi').innerHTML=[
-      ['settlements 24h',s.paid_24h,'on-chain · incl. operator'],
-      ['organic revenue 24h','$'+(((s.revenue_truth_24h||{}).organic_usdc)||0).toFixed(4),'USDC · operator-funded excluded'],
+      ['settlements 24h',s.paid_24h,'on-chain \u00b7 incl. operator'],
+      ['organic revenue 24h','$'+(((s.revenue_truth_24h||{}).organic_usdc)||0).toFixed(4),'USDC \u00b7 operator-funded excluded'],
       ['evaluators 24h',s.previews_24h,'free preview calls'],
-      ['probes 24h',s.probes_24h,'scanners · do not buy'],
+      ['probes 24h',s.probes_24h,'scanners \u00b7 do not buy'],
       ['unique payers',s.buyers,'incl. operator wallets'],
       ['endpoints',j.endpoints,'monetized']
     ].map(function(k){return '<div class="kpi"><div class="l">'+k[0]+
       '</div><div class="v">'+n(k[1])+'</div><div class="s">'+k[2]+'</div></div>';}).join('');
 
-    // composição do tráfego
     var pr=s.probes_24h||0,pv=s.previews_24h||0,pd=s.paid_24h||0,tot=pr+pv+pd||1;
-    var seg=[['probes',pr],['evaluations',pv],['settlements',pd]];
-    document.getElementById('bars').innerHTML=seg.map(function(x){
-      var h=Math.max(2,Math.round(x[1]/tot*56));
-      return '<i style="height:'+h+'px" title="'+x[0]+': '+x[1]+'"></i>';}).join('')
-      + Array(30).fill('<i style="height:2px;opacity:.25"></i>').join('');
-    document.getElementById('barsnote').innerHTML=
-      seg.map(function(x){return x[0]+' '+x[1]+' ('+(x[1]/tot*100).toFixed(1)+'%)';}).join(' · ')
+    var seg=[['probes',pr,'#3f4a5e'],['evaluations',pv,'#3b82f6'],['settlements',pd,'#22c55e']];
+    document.getElementById('mix').innerHTML=seg.map(function(x){
+      var w=Math.max(0.5,x[1]/tot*100);
+      return '<i style="width:'+w+'%;background:'+x[2]+'" title="'+x[0]+': '+x[1]+'"></i>';}).join('');
+    document.getElementById('mixnote').innerHTML=
+      seg.map(function(x){return '<b>'+x[0]+'</b> '+x[1]+' ('+(x[1]/tot*100).toFixed(1)+'%)';}).join(' \u00b7 ')
       + ' — probes are catalog scanners and QoS monitors; they never buy.';
 
-    // avaliadores
     document.getElementById('pv').querySelector('tbody').innerHTML=
       (s.preview_uas||[]).slice(0,6).map(function(u){
-        return '<tr><td>'+esc(u.ua.slice(0,54))+'</td><td>'+u.hits+' · '+u.ips+' ip</td></tr>';
+        return '<tr><td>'+esc(u.ua.slice(0,54))+'</td><td>'+u.hits+' \u00b7 '+u.ips+' ip</td></tr>';
       }).join('')||'<tr><td>no evaluations in the window</td><td></td></tr>';
 
-    // demanda não atendida
     document.getElementById('dm').querySelector('tbody').innerHTML=
       (s.demand_404||[]).slice(0,6).map(function(d){
-        var tag=d.kind==='resolved'?'✓ live now':(d.kind==='alias_candidate'?'alias exists':'not built');
-        return '<tr><td>'+esc(d.path)+'</td><td>'+d.ips+' ip · '+tag+'</td></tr>';
+        var tag=d.kind==='resolved'?'<span class="ok">live now</span>':(d.kind==='alias_candidate'?'alias exists':'not built');
+        return '<tr><td>'+esc(d.path)+'</td><td>'+d.ips+' ip \u00b7 '+tag+'</td></tr>';
       }).join('')||'<tr><td>nothing requested outside the catalog</td><td></td></tr>';
 
-    // saúde das fontes
     var md=(j.health&&j.health.market_data)||{};
     var rows=Object.keys(md).map(function(k){
       var v=md[k];
-      return '<tr><td>'+esc(k)+'</td><td>'+(v.live?'live · '+esc(v.source):'<span class="warn">down</span>')+'</td></tr>';
+      return '<tr><td>'+esc(k)+'</td><td>'+(v.live?'<span class="ok">live</span> \u00b7 '+esc(v.source):'<span class="warn">down</span>')+'</td></tr>';
     });
     rows.push('<tr><td>ai synthesis</td><td>'+(j.health&&j.health.ai&&j.health.ai.live?
-      'live':'<span class="warn">down</span>')+'</td></tr>');
-    rows.push('<tr><td>premium_ready</td><td>'+(j.health&&j.health.premium_ready?'true':
+      '<span class="ok">live</span>':'<span class="warn">down</span>')+'</td></tr>');
+    rows.push('<tr><td>premium_ready</td><td>'+(j.health&&j.health.premium_ready?'<span class="ok">true</span>':
       '<span class="warn">false — premium returns 503, no charge</span>')+'</td></tr>');
     document.getElementById('hp').querySelector('tbody').innerHTML=rows.join('');
 
-    // chuva reage a atividade nova
-    if(prev!==null){
-      var d=(pr-prev.pr)+(pv-prev.pv)*6+(pd-prev.pd)*40;
-      if(d>0)pushEvents(Math.min(d,140));
-    }
-    prev={pr:pr,pv:pv,pd:pd};
-    document.getElementById('ts').textContent=' · updated '+new Date().toLocaleTimeString();
+    document.getElementById('ts').textContent=' \u00b7 updated '+new Date().toLocaleTimeString();
   }catch(e){}
 }
-tick();setInterval(tick,15000);
+tick();setInterval(tick,30000);
 </script></body></html>"""
 
 # ============================================================================
@@ -20282,7 +20289,7 @@ if os.environ.get("AUTOPILOT", "1") != "0":
 from datetime import date          # v47: o topo do arquivo importa datetime,
 from urllib.parse import urlencode  # timezone e timedelta, mas nao `date`.
 
-V47_LAYER_VERSION = "47.5.2-COMPLIANCE"
+V47_LAYER_VERSION = "47.6.0-FINAL"
 
 # ============================================================================
 # BLOCO O — PRIMITIVOS BRASILEIROS, COMPUTAÇÃO PURA, ZERO UPSTREAM
