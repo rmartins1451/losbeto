@@ -87,7 +87,7 @@ from typing import Any, Optional, Dict, List, Tuple
 # 0. CONFIGURAÇÃO E AUTO-SETUP
 # ============================================================================
 
-VERSION = "47.6.1-DISCOVERY2"  # v47.0.3: workers sync auto-recuperáveis + socket 25s + aliases A2A | v47.0.2: setdefaulttimeout anti-travamento | v47.0.1: PIX ascii-safe + ETag/304 na spec
+VERSION = "47.6.2-MPP"  # v47.0.3: workers sync auto-recuperáveis + socket 25s + aliases A2A | v47.0.2: setdefaulttimeout anti-travamento | v47.0.1: PIX ascii-safe + ETag/304 na spec
 BRAND_NAME = "Losbeto"
 # v44.4.0: reposicionamento Brasil-primeiro. "Cross-asset market data" compete
 # com CoinGecko e cem nós iguais; "BCB + B3 normalizado em inglês" não compete
@@ -8538,6 +8538,44 @@ def agents_txt():
     resp.headers["Access-Control-Allow-Origin"] = "*"
     resp.headers["Cache-Control"] = "public, max-age=3600"
     return resp
+
+
+@app.route("/.well-known/mpp")
+@app.route("/.well-known/mpp.json")
+def mpp_discovery():
+    """v47.6.2: MPP (Machine Payments Protocol — Stripe/Tempo, IETF draft).
+    Agentes que falam MPP sondam este path para descobrir métodos de pagamento.
+    Respondemos honestamente: este nó liquida via x402 (USDC on-chain); o
+    manifesto aponta os endpoints e declara x402 como método, no espírito
+    multi-protocolo recomendado (um endpoint pode anunciar os dois)."""
+    base = _public_base()
+    endpoints = [{"path": p, "method": "GET",
+                  "price": {"amount": f"{BASE_PRICES[p]:.6f}", "currency": "USD"},
+                  "response_type": "sync"}
+                 for p in sorted(BASE_PRICES)]
+    resp = jsonify({
+        "version": "1.0",
+        "provider": "losbeto",
+        "description": "Cross-asset market data for AI agents. Settlement via "
+                       "x402 (USDC on Base, Solana, Algorand) — HTTP 402 "
+                       "challenge with JSON body per x402 v2.",
+        "endpoints": endpoints,
+        "payment_methods": ["x402"],
+        "x402_manifest": f"{base}/.well-known/x402.json",
+        "mcp_server_card": f"{base}/.well-known/mcp/server-card.json",
+        "ts": int(time.time()),
+    })
+    resp.headers["Access-Control-Allow-Origin"] = "*"
+    resp.headers["X-Content-Type-Options"] = "nosniff"
+    resp.headers["Cache-Control"] = "public, max-age=3600"
+    return resp
+
+
+@app.route("/.well-known/payment-manifest")
+def payment_manifest_alias():
+    """v47.6.2: alias — alguns scanners pedem o manifesto de pagamento neste
+    path (2 IPs em 7d). Serve o mesmo documento x402."""
+    return manifest_x402()
 
 
 @app.route("/.well-known/x402list.txt<path:rest>")
@@ -20317,7 +20355,7 @@ if os.environ.get("AUTOPILOT", "1") != "0":
 from datetime import date          # v47: o topo do arquivo importa datetime,
 from urllib.parse import urlencode  # timezone e timedelta, mas nao `date`.
 
-V47_LAYER_VERSION = "47.6.1-DISCOVERY2"
+V47_LAYER_VERSION = "47.6.2-MPP"
 
 # ============================================================================
 # BLOCO O — PRIMITIVOS BRASILEIROS, COMPUTAÇÃO PURA, ZERO UPSTREAM
