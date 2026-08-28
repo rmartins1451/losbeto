@@ -87,7 +87,7 @@ from typing import Any, Optional, Dict, List, Tuple
 # 0. CONFIGURAÇÃO E AUTO-SETUP
 # ============================================================================
 
-VERSION = "47.6.3-STIPEND"  # v47.0.3: workers sync auto-recuperáveis + socket 25s + aliases A2A | v47.0.2: setdefaulttimeout anti-travamento | v47.0.1: PIX ascii-safe + ETag/304 na spec
+VERSION = "47.6.4-FUNNEL"  # v47.0.3: workers sync auto-recuperáveis + socket 25s + aliases A2A | v47.0.2: setdefaulttimeout anti-travamento | v47.0.1: PIX ascii-safe + ETag/304 na spec
 BRAND_NAME = "Losbeto"
 # v44.4.0: reposicionamento Brasil-primeiro. "Cross-asset market data" compete
 # com CoinGecko e cem nós iguais; "BCB + B3 normalizado em inglês" não compete
@@ -1108,10 +1108,13 @@ class LedgerV10:
                 previews = c.execute("SELECT COUNT(*) FROM requests WHERE ts>? AND kind='preview'",
                                      (now - 86400,)).fetchone()[0]
                 probes = c.execute(
-                    "SELECT COUNT(*) FROM requests WHERE ts>? AND (kind='probe' OR kind='')",
+                    "SELECT COUNT(*) FROM requests WHERE ts>? AND (kind='probe' OR kind='' "
+                    "OR kind='challenge402')", (now - 86400,)).fetchone()[0]
+                challenges = c.execute(
+                    "SELECT COUNT(*) FROM requests WHERE ts>? AND kind='challenge402'",
                     (now - 86400,)).fetchone()[0]
             except Exception:
-                previews, probes = 0, reqs
+                previews, probes, challenges = 0, reqs, 0
             paid_total = c.execute("SELECT COUNT(*) FROM revenue").fetchone()[0]
             # v24.5: QUEM está sondando — separa scanner conhecido de cliente novo
             try:
@@ -1188,6 +1191,7 @@ class LedgerV10:
             "poi_multiplier": round(self.get_poi_multiplier(), 3),
             "previews_24h":   previews,
             "probes_24h":     probes,
+            "challenges_24h": challenges,
             "top_uas":        top_uas,
             "preview_uas":    preview_uas,
             "preview_blocked_24h": preview_blocked,
@@ -6628,7 +6632,7 @@ def paid_endpoint(path):
 
             if not sig:
                 LEDGER.log_request(path, False, int((time.time() - t0) * 1000), ip,
-                                    kind="probe", ua=request.headers.get("User-Agent",""), params=_clean_params())
+                                    kind="challenge402", ua=request.headers.get("User-Agent",""), params=_clean_params())
                 return _build_402(path)
 
             # ====== CORREÇÃO APLICADA (HEADERS PRESERVADOS) ======
@@ -20365,7 +20369,7 @@ if os.environ.get("AUTOPILOT", "1") != "0":
 from datetime import date          # v47: o topo do arquivo importa datetime,
 from urllib.parse import urlencode  # timezone e timedelta, mas nao `date`.
 
-V47_LAYER_VERSION = "47.6.3-STIPEND"
+V47_LAYER_VERSION = "47.6.4-FUNNEL"
 
 # ============================================================================
 # BLOCO O — PRIMITIVOS BRASILEIROS, COMPUTAÇÃO PURA, ZERO UPSTREAM
