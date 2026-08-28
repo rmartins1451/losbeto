@@ -87,7 +87,7 @@ from typing import Any, Optional, Dict, List, Tuple
 # 0. CONFIGURAÇÃO E AUTO-SETUP
 # ============================================================================
 
-VERSION = "47.6.2-MPP"  # v47.0.3: workers sync auto-recuperáveis + socket 25s + aliases A2A | v47.0.2: setdefaulttimeout anti-travamento | v47.0.1: PIX ascii-safe + ETag/304 na spec
+VERSION = "47.6.3-STIPEND"  # v47.0.3: workers sync auto-recuperáveis + socket 25s + aliases A2A | v47.0.2: setdefaulttimeout anti-travamento | v47.0.1: PIX ascii-safe + ETag/304 na spec
 BRAND_NAME = "Losbeto"
 # v44.4.0: reposicionamento Brasil-primeiro. "Cross-asset market data" compete
 # com CoinGecko e cem nós iguais; "BCB + B3 normalizado em inglês" não compete
@@ -5447,6 +5447,16 @@ def _build_402(endpoint: str):
         "accepts":    accepts,
         # v39.7: a alternativa mais barata, no momento exato da decisão.
         "alternatives": _subscription_offer(endpoint, amount_usdc),
+        # v47.6.3 (parceria stipend.sh): agente SEM carteira recebe o caminho
+        # para se equipar sozinho. JSON estático — nada chama casa, nenhum
+        # beacon. A 3ª linha é deliberada: qualquer carteira EIP-3009 serve.
+        "no_wallet": {
+            "install": "npx -y stipend",
+            "docs":    "https://stipend.sh/skill.md",
+            "any_wallet_works": "You do not need this one. Any address that "
+                                "can sign an EIP-3009 authorisation on Base "
+                                "works here.",
+        },
         # v1 backward compat: alguns scanners (x402scan legacy) esperam paymentRequirements
         "paymentRequirements": {
             "scheme":            payment_req.get("scheme", "exact"),
@@ -20355,7 +20365,7 @@ if os.environ.get("AUTOPILOT", "1") != "0":
 from datetime import date          # v47: o topo do arquivo importa datetime,
 from urllib.parse import urlencode  # timezone e timedelta, mas nao `date`.
 
-V47_LAYER_VERSION = "47.6.2-MPP"
+V47_LAYER_VERSION = "47.6.3-STIPEND"
 
 # ============================================================================
 # BLOCO O — PRIMITIVOS BRASILEIROS, COMPUTAÇÃO PURA, ZERO UPSTREAM
