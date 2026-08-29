@@ -87,7 +87,7 @@ from typing import Any, Optional, Dict, List, Tuple
 # 0. CONFIGURAÇÃO E AUTO-SETUP
 # ============================================================================
 
-VERSION = "47.6.4-FUNNEL"  # v47.0.3: workers sync auto-recuperáveis + socket 25s + aliases A2A | v47.0.2: setdefaulttimeout anti-travamento | v47.0.1: PIX ascii-safe + ETag/304 na spec
+VERSION = "47.7.0-PROOF"  # v47.0.3: workers sync auto-recuperáveis + socket 25s + aliases A2A | v47.0.2: setdefaulttimeout anti-travamento | v47.0.1: PIX ascii-safe + ETag/304 na spec
 BRAND_NAME = "Losbeto"
 # v44.4.0: reposicionamento Brasil-primeiro. "Cross-asset market data" compete
 # com CoinGecko e cem nós iguais; "BCB + B3 normalizado em inglês" não compete
@@ -18636,6 +18636,76 @@ except Exception as _e:
     log.warning(f"v45 receipts override: {_e}")
 
 
+# ---------------------------------------------------------------------------
+# v47.7.0-PROOF — A CEREJA: /funnel.json, o funil do paywall PÚBLICO E ASSINADO
+#
+# Ninguém no ecossistema x402 publica o próprio funil: quantos 402 saem,
+# quantos voltam pagando, quantos pagadores são carteiras VISTAS PELA
+# PRIMEIRA VEZ depois de uma data de referência. É o número que o stipend.sh
+# pediu para medir a conversão do bloco no_wallet — e vira mais uma prova
+# de transparência auditável, no espírito do honest-revenue.
+# ---------------------------------------------------------------------------
+
+@app.route("/funnel.json")
+@app.route("/.well-known/funnel.json")
+def funnel_json():
+    st = LEDGER.stats() or {}
+    # pagadores cuja PRIMEIRA liquidação no ledger é recente (= converteram
+    # depois do bloco no_wallet entrar no ar — a métrica que o Matt pediu)
+    ref = int(os.environ.get("FUNNEL_REF_TS", "0") or 0)  # defina no Railway
+    new_payers = []
+    try:
+        with LEDGER._conn() as c:
+            rows = c.execute(
+                "SELECT payer, MIN(ts) first_ts, COUNT(*) n, SUM(amount) amt "
+                "FROM revenue WHERE payer<>'' GROUP BY payer").fetchall()
+        new_payers = [
+            {"payer": r[0], "first_seen": r[1], "calls": r[2],
+             "total_usdc": round(r[3] or 0, 6)}
+            for r in rows if (not ref) or (r[1] >= ref)
+        ]
+        new_payers.sort(key=lambda x: x["first_seen"])
+    except Exception:
+        pass
+    challenges = st.get("challenges_24h", 0)
+    paid_24h = st.get("paid_24h", 0)
+    body = {
+        "node": BRAND_NAME,
+        "url": _public_base(),
+        "generated_at": datetime.now(timezone.utc).isoformat(
+            timespec="seconds").replace("+00:00", "Z"),
+        "window_24h": {
+            "challenges_402_issued": challenges,
+            "settlements": paid_24h,
+            "organic_usdc": (st.get("revenue_truth_24h") or {}).get("organic_usdc", 0),
+            "challenge_to_settlement_pct": round(
+                (paid_24h / challenges * 100) if challenges else 0, 3),
+        },
+        "new_payers_since_ref": {
+            "ref_ts": ref or None,
+            "ref_note": ("set FUNNEL_REF_TS (unix) on Railway to the stipend "
+                         "block deploy time; empty = all payers ever"),
+            "payers": new_payers,
+            "count": len(new_payers),
+        },
+        "stipend_block_live": True,
+        "stipend_ua": "stipend/0.46.1 (+https://stipend.sh)",
+        "receipts": f"{_public_base()}/receipts",
+        "ts": int(time.time()),
+    }
+    blob = json.dumps(body, sort_keys=True, separators=(",", ":"), default=str)
+    body["sha256"] = hashlib.sha256(blob.encode()).hexdigest()
+    try:
+        body["signature"] = base64.b64encode(
+            WALLET.sign(f"losbeto-funnel|{body['sha256']}".encode())).decode()
+        body["signer"] = WALLET.solana_address
+    except Exception as e:
+        body["signature_error"] = str(e)[:60]
+    resp = jsonify(body)
+    resp.headers["Access-Control-Allow-Origin"] = "*"
+    resp.headers["Cache-Control"] = "public, max-age=300"
+    return resp
+
 @app.route("/.well-known/honest-revenue.json")
 def honest_revenue_json():
     """O documento que se manda para um avaliador (Algorand Challenge, CDP,
@@ -20369,7 +20439,7 @@ if os.environ.get("AUTOPILOT", "1") != "0":
 from datetime import date          # v47: o topo do arquivo importa datetime,
 from urllib.parse import urlencode  # timezone e timedelta, mas nao `date`.
 
-V47_LAYER_VERSION = "47.6.4-FUNNEL"
+V47_LAYER_VERSION = "47.7.0-PROOF"
 
 # ============================================================================
 # BLOCO O — PRIMITIVOS BRASILEIROS, COMPUTAÇÃO PURA, ZERO UPSTREAM
