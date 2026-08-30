@@ -87,7 +87,7 @@ from typing import Any, Optional, Dict, List, Tuple
 # 0. CONFIGURAÇÃO E AUTO-SETUP
 # ============================================================================
 
-VERSION = "47.7.0-PROOF"  # v47.0.3: workers sync auto-recuperáveis + socket 25s + aliases A2A | v47.0.2: setdefaulttimeout anti-travamento | v47.0.1: PIX ascii-safe + ETag/304 na spec
+VERSION = "47.7.1-BULLETPROOF"  # v47.0.3: workers sync auto-recuperáveis + socket 25s + aliases A2A | v47.0.2: setdefaulttimeout anti-travamento | v47.0.1: PIX ascii-safe + ETag/304 na spec
 BRAND_NAME = "Losbeto"
 # v44.4.0: reposicionamento Brasil-primeiro. "Cross-asset market data" compete
 # com CoinGecko e cem nós iguais; "BCB + B3 normalizado em inglês" não compete
@@ -18637,7 +18637,7 @@ except Exception as _e:
 
 
 # ---------------------------------------------------------------------------
-# v47.7.0-PROOF — A CEREJA: /funnel.json, o funil do paywall PÚBLICO E ASSINADO
+# v47.7.1-BULLETPROOF — A CEREJA: /funnel.json, o funil do paywall PÚBLICO E ASSINADO
 #
 # Ninguém no ecossistema x402 publica o próprio funil: quantos 402 saem,
 # quantos voltam pagando, quantos pagadores são carteiras VISTAS PELA
@@ -18652,7 +18652,10 @@ def funnel_json():
     st = LEDGER.stats() or {}
     # pagadores cuja PRIMEIRA liquidação no ledger é recente (= converteram
     # depois do bloco no_wallet entrar no ar — a métrica que o Matt pediu)
-    ref = int(os.environ.get("FUNNEL_REF_TS", "0") or 0)  # defina no Railway
+    try:  # defina no Railway como número unix; texto inválido vira 0 (sem 500)
+        ref = int(os.environ.get("FUNNEL_REF_TS", "0") or 0)
+    except (TypeError, ValueError):
+        ref = 0
     new_payers = []
     try:
         with LEDGER._conn() as c:
@@ -20439,7 +20442,7 @@ if os.environ.get("AUTOPILOT", "1") != "0":
 from datetime import date          # v47: o topo do arquivo importa datetime,
 from urllib.parse import urlencode  # timezone e timedelta, mas nao `date`.
 
-V47_LAYER_VERSION = "47.7.0-PROOF"
+V47_LAYER_VERSION = "47.7.1-BULLETPROOF"
 
 # ============================================================================
 # BLOCO O — PRIMITIVOS BRASILEIROS, COMPUTAÇÃO PURA, ZERO UPSTREAM
