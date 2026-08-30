@@ -87,7 +87,7 @@ from typing import Any, Optional, Dict, List, Tuple
 # 0. CONFIGURAÇÃO E AUTO-SETUP
 # ============================================================================
 
-VERSION = "47.7.1-BULLETPROOF"  # v47.0.3: workers sync auto-recuperáveis + socket 25s + aliases A2A | v47.0.2: setdefaulttimeout anti-travamento | v47.0.1: PIX ascii-safe + ETag/304 na spec
+VERSION = "47.8.0-VENDEDORA"  # v47.0.3: workers sync auto-recuperáveis + socket 25s + aliases A2A | v47.0.2: setdefaulttimeout anti-travamento | v47.0.1: PIX ascii-safe + ETag/304 na spec
 BRAND_NAME = "Losbeto"
 # v44.4.0: reposicionamento Brasil-primeiro. "Cross-asset market data" compete
 # com CoinGecko e cem nós iguais; "BCB + B3 normalizado em inglês" não compete
@@ -17289,6 +17289,126 @@ def llm_watchdog_loop():
         time.sleep(300)
 
 
+# ============================================================================
+# v47.8.0-VENDEDORA — ACP SELLER EMBUTIDO (o vendedor sai do PC e mora no nó)
+#
+# Antes: vendedor-acp.js rodava no Windows do operador — PC desligou, loja
+# fechou. Agora o próprio nó é o vendedor: thread de fundo (file-lock já
+# garante 1 worker) que conversa com o marketplace Virtuals ACP via SDK
+# oficial Python, aceita jobs, executa o produto chamando os PRÓPRIOS
+# endpoints (via PARTNER_KEY — mesma qualidade do catálogo) e entrega
+# on-chain. Ativação 100% por env vars; sem config, o nó nem nota.
+#
+#   Railway → Variables:
+#     ACP_SELLER=1                      liga/desliga
+#     ACP_WALLET_PRIVATE_KEY=0x...      chave da carteira whitelisted do agente
+#     ACP_AGENT_WALLET_ADDRESS=0x...    carteira do agente (0xd459...)
+#     ACP_ENTITY_ID=<id>                session entity key id
+# ============================================================================
+
+ACP_OFFERS = {
+    # nome da oferta no ACP -> (endpoint interno, descrição entregue)
+    "br-market-brief": ("/br-brief",  "Brazil market brief"),
+    "token-research":  ("/token-intel", "Token research"),
+    "wallet-audit":    ("/wallet-scan", "Wallet audit"),
+}
+_ACP_POLL_S = 20
+_ACP_SEEN: set = set()
+
+
+def _acp_cfg():
+    if os.environ.get("ACP_SELLER", "") != "1":
+        return None
+    pk = os.environ.get("ACP_WALLET_PRIVATE_KEY", "").strip()
+    agent = os.environ.get("ACP_AGENT_WALLET_ADDRESS", "").strip()
+    ent = os.environ.get("ACP_ENTITY_ID", "").strip()
+    if not (pk and agent and ent):
+        log.warning("🏪 ACP_SELLER=1 mas faltam ACP_WALLET_PRIVATE_KEY / "
+                    "ACP_AGENT_WALLET_ADDRESS / ACP_ENTITY_ID — vendedor OFF")
+        return None
+    return pk, agent, ent
+
+
+def _acp_run_product(offer_name: str, requirements: str) -> str:
+    """Executa o produto vendido chamando o próprio nó (qualidade idêntica
+    à do catálogo — o ACP revende o que o x402 já serve)."""
+    ep, desc = ACP_OFFERS.get(offer_name, ("/br-brief", "market brief"))
+    base = _public_base()
+    r = requests.get(f"{base}{ep}", headers={"X-Partner-Key": PARTNER_KEY},
+                     timeout=(5, 50))
+    if r.status_code != 200:
+        raise RuntimeError(f"produto {ep} respondeu {r.status_code}")
+    dados = r.json()
+    return json.dumps({"offer": offer_name, "product": desc,
+                       "delivered_by": f"{base}{ep}",
+                       "report": dados}, ensure_ascii=False)[:12000]
+
+
+def acp_seller_loop():
+    cfg = _acp_cfg()
+    if not cfg:
+        return
+    try:
+        from virtuals_acp.client import VirtualsACP
+        from virtuals_acp.contract_clients.contract_client_v2 import (
+            ACPContractClientV2)
+    except Exception as e:
+        log.warning(f"🏪 SDK virtuals-acp ausente ({e}) — vendedor OFF. "
+                    f"Adicione 'virtuals-acp' ao requirements.txt")
+        return
+    pk, agent_addr, entity_id = cfg
+    try:
+        client = VirtualsACP(
+            acp_contract_clients=ACPContractClientV2(
+                wallet_private_key=pk,
+                agent_wallet_address=agent_addr,
+                entity_id=entity_id),
+            on_new_task=None)
+        log.info(f"🏪 ACP vendedor ONLINE no nó — agente {agent_addr[:10]}… "
+                 f"ofertas: {', '.join(ACP_OFFERS)}")
+    except Exception as e:
+        log.error(f"🏪 ACP init falhou: {e}")
+        return
+
+    def _tratar(job):
+        try:
+            jid = getattr(job, "id", None) or getattr(job, "job_id", None)
+            if jid in _ACP_SEEN:
+                return
+            memo = (job.memos[-1] if getattr(job, "memos", None) else None)
+            memo_id = getattr(memo, "id", None)
+            phase = str(getattr(job, "phase", "")).lower()
+            offer = getattr(job, "name", "") or getattr(job, "offering", "") or ""
+            reqs = str(getattr(job, "service_requirement", "") or "")
+            if "request" in phase or "negotiat" in phase:
+                client.respond_job(jid, memo_id, True,
+                                   "Accepted — delivering shortly.")
+                log.info(f"🏪 job {jid} aceito ({offer})")
+            elif "transact" in phase or "paid" in phase:
+                entrega = _acp_run_product(offer, reqs)
+                client.deliver_job(jid, entrega)
+                _ACP_SEEN.add(jid)
+                log.info(f"🏪 job {jid} ENTREGUE ({offer}, "
+                         f"{len(entrega)} chars)")
+                try:
+                    LEDGER.log_request("/acp-seller", True, 0, "acp",
+                                       kind="paid", ua="virtuals-acp",
+                                       params=offer)
+                except Exception:
+                    pass
+        except Exception as e:
+            log.error(f"🏪 job falhou: {str(e)[:120]}")
+
+    while True:
+        try:
+            jobs = client.get_active_jobs() or []
+            for j in jobs:
+                _tratar(j)
+        except Exception as e:
+            log.error(f"🏪 poll ACP: {str(e)[:120]}")
+        time.sleep(_ACP_POLL_S)
+
+
 _BG_STARTED = False
 def _start_background_once():
     """Inicia TODOS os loops de background exatamente uma vez por container.
@@ -17329,6 +17449,7 @@ def _start_background_once():
     threading.Thread(target=demand_watch_loop, daemon=True).start()
     threading.Thread(target=autopilot_report_loop, daemon=True).start()
     threading.Thread(target=llm_watchdog_loop, daemon=True).start()
+    threading.Thread(target=acp_seller_loop, daemon=True).start()
     log.info("✅ Autopilot: loops de background ativos neste worker")
 
 def run_server():
@@ -18637,7 +18758,7 @@ except Exception as _e:
 
 
 # ---------------------------------------------------------------------------
-# v47.7.1-BULLETPROOF — A CEREJA: /funnel.json, o funil do paywall PÚBLICO E ASSINADO
+# v47.8.0-VENDEDORA — A CEREJA: /funnel.json, o funil do paywall PÚBLICO E ASSINADO
 #
 # Ninguém no ecossistema x402 publica o próprio funil: quantos 402 saem,
 # quantos voltam pagando, quantos pagadores são carteiras VISTAS PELA
@@ -20442,7 +20563,7 @@ if os.environ.get("AUTOPILOT", "1") != "0":
 from datetime import date          # v47: o topo do arquivo importa datetime,
 from urllib.parse import urlencode  # timezone e timedelta, mas nao `date`.
 
-V47_LAYER_VERSION = "47.7.1-BULLETPROOF"
+V47_LAYER_VERSION = "47.8.0-VENDEDORA"
 
 # ============================================================================
 # BLOCO O — PRIMITIVOS BRASILEIROS, COMPUTAÇÃO PURA, ZERO UPSTREAM
