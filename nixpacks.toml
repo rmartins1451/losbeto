@@ -1,0 +1,11 @@
+[phases.setup]
+nixPkgs = ["python311", "gcc", "nodejs_22"]
+
+[phases.install]
+cmds = [
+  "python -m venv --copies /opt/venv && . /opt/venv/bin/activate && pip install -r requirements.txt",
+  "npm i -g @virtuals-protocol/acp-cli"
+]
+
+[start]
+cmd = ". /opt/venv/bin/activate && gunicorn --worker-class sync --workers 4 --preload --timeout 45 --graceful-timeout 20 --keep-alive 30 --max-requests 5000 --max-requests-jitter 500 --bind 0.0.0.0:$PORT nexus_omega:app"
