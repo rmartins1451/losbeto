@@ -87,7 +87,7 @@ from typing import Any, Optional, Dict, List, Tuple
 # 0. CONFIGURAÇÃO E AUTO-SETUP
 # ============================================================================
 
-VERSION = "47.9.2-ESMFIX"  # v47.0.3: workers sync auto-recuperáveis + socket 25s + aliases A2A | v47.0.2: setdefaulttimeout anti-travamento | v47.0.1: PIX ascii-safe + ETag/304 na spec
+VERSION = "47.9.3-SIGNERXRAY"  # v47.0.3: workers sync auto-recuperáveis + socket 25s + aliases A2A | v47.0.2: setdefaulttimeout anti-travamento | v47.0.1: PIX ascii-safe + ETag/304 na spec
 BRAND_NAME = "Losbeto"
 # v44.4.0: reposicionamento Brasil-primeiro. "Cross-asset market data" compete
 # com CoinGecko e cem nós iguais; "BCB + B3 normalizado em inglês" não compete
@@ -17292,7 +17292,7 @@ def llm_watchdog_loop():
 
 
 # ============================================================================
-# v47.9.2-ESMFIX — ACP SELLER OFICIAL RODANDO NO RAILWAY (via CLI oficial)
+# v47.9.3-SIGNERXRAY — ACP SELLER OFICIAL RODANDO NO RAILWAY (via CLI oficial)
 #
 # Substitui o módulo SDK (modelo antigo de auth, dormente). Estratégia:
 # o nó orquestra a CLI OFICIAL @virtuals-protocol/acp-cli (instalada no
@@ -17323,7 +17323,10 @@ def _acp_env():
     # a CLI morre com ERR_REQUIRE_ESM em @account-kit/infra
     _no = (env.get("NODE_OPTIONS") or "")
     if "require-module" not in _no:
-        env["NODE_OPTIONS"] = (_no + " --experimental-require-module").strip()
+        _no = (_no + " --experimental-require-module").strip()
+    if "--no-warnings" not in _no:
+        _no = (_no + " --no-warnings").strip()  # warning escondia o erro real
+    env["NODE_OPTIONS"] = _no
     return env
 
 
@@ -17407,8 +17410,29 @@ def _acp_ensure_auth():
 
 
 def _acp_ensure_agent():
+    """Devolve o agent_id ativo, ou None se a conta logada não for dona
+    do agente (sessão é limpa para forçar re-login com a conta certa)."""
     agent_id = os.environ.get("ACP_AGENT_ID", _ACP_AGENT_ID_DEFAULT).strip()
-    _acp_run(["agent", "use", "--agent-id", agent_id, "--json"], timeout=30)
+    rc, out, err = _acp_run(["agent", "use", "--agent-id", agent_id,
+                             "--json"], timeout=30)
+    if rc == 0:
+        log.warning(f"🏪 ACP agent ativo: {agent_id}")
+        return agent_id
+    log.error(f"🏪 agent use FALHOU rc={rc}: out={out[:200]} err={err[:300]}")
+    rc2, out2, err2 = _acp_run(["agent", "list", "--json"], timeout=30)
+    log.error(f"🏪 agentes desta conta: out={out2[:500]} err={err2[:200]}")
+    blob = (out2 or "")
+    if rc2 == 0 and blob and agent_id not in blob:
+        try:
+            import shutil as _sh
+            _sh.rmtree(_ACP_CFG_DIR, ignore_errors=True)
+            os.makedirs(_ACP_CFG_DIR, exist_ok=True)
+        except Exception:
+            pass
+        log.error("🏪 CONTA ERRADA — esta conta não tem o agente 0xd459. "
+                  "Sessão limpa! Aguarde o NOVO link de login e entre com "
+                  "a conta DONA do agente (losbeto_u7q1@agents.world)")
+        return None
     return agent_id
 
 
@@ -17417,16 +17441,16 @@ def _acp_ensure_signer(agent_id):
                              "--chain-id", "8453", "--json"], timeout=40)
     if rc == 0:
         return True
-    if "NO_SIGNER" not in (out + err):
-        log.warning(f"acp signer probe: {(err or out)[:150]}")
+    log.warning(f"acp signer probe rc={rc}: out={out[:250]} err={err[:350]}")
     log.warning("🔗 ACP SIGNER — gerando link de aprovação")
-    rc, out, _ = _acp_run(["agent", "add-signer", "--agent-id", agent_id,
-                           "--no-wait", "--policy", "restricted", "--json"],
-                          timeout=40)
+    rc, out, err = _acp_run(["agent", "add-signer", "--agent-id", agent_id,
+                             "--no-wait", "--policy", "restricted", "--json"],
+                            timeout=40)
     j = _acp_json(out) or {}
     url, rid, pub = j.get("signerUrl"), j.get("requestId"), j.get("publicKey")
     if not url:
-        log.error(f"add-signer falhou: {out[:150]}")
+        log.error(f"add-signer falhou rc={rc}: out={out[:250]} "
+                  f"err={err[:350]}")
         return False
     for _ in range(30):  # link expira em 5 min
         log.warning(f"🔗🔗 APROVE O SIGNER (5 min!): {url}")
@@ -17538,6 +17562,10 @@ def acp_railway_seller_loop():
     try:
         _acp_ensure_auth()  # loop até logar
         agent_id = _acp_ensure_agent()
+        while not agent_id:  # conta errada → sessão limpa → re-login
+            time.sleep(30)
+            _acp_ensure_auth()
+            agent_id = _acp_ensure_agent()
         while not _acp_ensure_signer(agent_id):
             log.warning("🔗 signer expirou/falhou — link NOVO em 60s")
             time.sleep(60)
@@ -18911,7 +18939,7 @@ except Exception as _e:
 
 
 # ---------------------------------------------------------------------------
-# v47.9.2-ESMFIX — A CEREJA: /funnel.json, o funil do paywall PÚBLICO E ASSINADO
+# v47.9.3-SIGNERXRAY — A CEREJA: /funnel.json, o funil do paywall PÚBLICO E ASSINADO
 #
 # Ninguém no ecossistema x402 publica o próprio funil: quantos 402 saem,
 # quantos voltam pagando, quantos pagadores são carteiras VISTAS PELA
@@ -20716,7 +20744,7 @@ if os.environ.get("AUTOPILOT", "1") != "0":
 from datetime import date          # v47: o topo do arquivo importa datetime,
 from urllib.parse import urlencode  # timezone e timedelta, mas nao `date`.
 
-V47_LAYER_VERSION = "47.9.2-ESMFIX"
+V47_LAYER_VERSION = "47.9.3-SIGNERXRAY"
 
 # ============================================================================
 # BLOCO O — PRIMITIVOS BRASILEIROS, COMPUTAÇÃO PURA, ZERO UPSTREAM
