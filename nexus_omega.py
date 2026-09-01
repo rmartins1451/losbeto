@@ -87,7 +87,7 @@ from typing import Any, Optional, Dict, List, Tuple
 # 0. CONFIGURAÇÃO E AUTO-SETUP
 # ============================================================================
 
-VERSION = "47.8.0-VENDEDORA"  # v47.0.3: workers sync auto-recuperáveis + socket 25s + aliases A2A | v47.0.2: setdefaulttimeout anti-travamento | v47.0.1: PIX ascii-safe + ETag/304 na spec
+VERSION = "47.9.0-SERVIDOR"  # v47.0.3: workers sync auto-recuperáveis + socket 25s + aliases A2A | v47.0.2: setdefaulttimeout anti-travamento | v47.0.1: PIX ascii-safe + ETag/304 na spec
 BRAND_NAME = "Losbeto"
 # v44.4.0: reposicionamento Brasil-primeiro. "Cross-asset market data" compete
 # com CoinGecko e cem nós iguais; "BCB + B3 normalizado em inglês" não compete
@@ -17289,124 +17289,247 @@ def llm_watchdog_loop():
         time.sleep(300)
 
 
+
+
 # ============================================================================
-# v47.8.0-VENDEDORA — ACP SELLER EMBUTIDO (o vendedor sai do PC e mora no nó)
+# v47.9.0-SERVIDOR — ACP SELLER OFICIAL RODANDO NO RAILWAY (via CLI oficial)
 #
-# Antes: vendedor-acp.js rodava no Windows do operador — PC desligou, loja
-# fechou. Agora o próprio nó é o vendedor: thread de fundo (file-lock já
-# garante 1 worker) que conversa com o marketplace Virtuals ACP via SDK
-# oficial Python, aceita jobs, executa o produto chamando os PRÓPRIOS
-# endpoints (via PARTNER_KEY — mesma qualidade do catálogo) e entrega
-# on-chain. Ativação 100% por env vars; sem config, o nó nem nota.
+# Substitui o módulo SDK (modelo antigo de auth, dormente). Estratégia:
+# o nó orquestra a CLI OFICIAL @virtuals-protocol/acp-cli (instalada no
+# build via nixpacks.toml) em subprocessos. A sessão (token + signer P256)
+# mora em /data/acp-cli — volume persistente do Railway, sobrevive a
+# redeploys. Bootstrap é UMA VEZ: a thread imprime os links nos logs do
+# Railway; o operador clica (login + aprovar signer) e nunca mais.
 #
-#   Railway → Variables:
-#     ACP_SELLER=1                      liga/desliga
-#     ACP_WALLET_PRIVATE_KEY=0x...      chave da carteira whitelisted do agente
-#     ACP_AGENT_WALLET_ADDRESS=0x...    carteira do agente (0xd459...)
-#     ACP_ENTITY_ID=<id>                session entity key id
+#   Variables: ACP_SELLER=1 · ACP_AGENT_ID=<uuid do agente 0xd459...>
 # ============================================================================
 
-ACP_OFFERS = {
-    # nome da oferta no ACP -> (endpoint interno, descrição entregue)
-    "br-market-brief": ("/br-brief",  "Brazil market brief"),
-    "token-research":  ("/token-intel", "Token research"),
-    "wallet-audit":    ("/wallet-scan", "Wallet audit"),
-}
-_ACP_POLL_S = 20
-_ACP_SEEN: set = set()
+_ACP_CFG_DIR = "/data/acp-cli"
+_ACP_AGENT_ID_DEFAULT = "01a04598-1418-78d1-a728-98fc5118910a"  # 0xd459…f45b
+_ACP_EVENTS_FILE = "/data/acp-cli/events.jsonl"
+_ACP_DRAIN_S = 6
+_ACP_PRICES = {"token-research": "0.2", "br-market-brief": "0.15",
+               "wallet-audit": "0.15"}
+_ACP_ENDPOINT = {"token-research": "/token-intel",
+                 "br-market-brief": "/br-brief",
+                 "wallet-audit": "/wallet-scan"}
+_ACP_STATE = {"listener": None, "budget_set": set(), "submitted": set()}
 
 
-def _acp_cfg():
-    if os.environ.get("ACP_SELLER", "") != "1":
-        return None
-    pk = os.environ.get("ACP_WALLET_PRIVATE_KEY", "").strip()
-    agent = os.environ.get("ACP_AGENT_WALLET_ADDRESS", "").strip()
-    ent = os.environ.get("ACP_ENTITY_ID", "").strip()
-    if not (pk and agent and ent):
-        log.warning("🏪 ACP_SELLER=1 mas faltam ACP_WALLET_PRIVATE_KEY / "
-                    "ACP_AGENT_WALLET_ADDRESS / ACP_ENTITY_ID — vendedor OFF")
-        return None
-    return pk, agent, ent
+def _acp_env():
+    env = dict(os.environ)
+    env["ACP_CONFIG_DIR"] = _ACP_CFG_DIR
+    return env
 
 
-def _acp_run_product(offer_name: str, requirements: str) -> str:
-    """Executa o produto vendido chamando o próprio nó (qualidade idêntica
-    à do catálogo — o ACP revende o que o x402 já serve)."""
-    ep, desc = ACP_OFFERS.get(offer_name, ("/br-brief", "market brief"))
-    base = _public_base()
-    r = requests.get(f"{base}{ep}", headers={"X-Partner-Key": PARTNER_KEY},
-                     timeout=(5, 50))
+def _acp_cli_ok():
+    import shutil
+    return shutil.which("acp") is not None
+
+
+def _acp_run(args, timeout=45):
+    """Roda a CLI e devolve (returncode, stdout, stderr). Nunca levanta."""
+    import subprocess
+    try:
+        p = subprocess.run(["acp"] + args, env=_acp_env(),
+                           capture_output=True, text=True, timeout=timeout)
+        return p.returncode, (p.stdout or "").strip(), (p.stderr or "").strip()
+    except Exception as e:
+        return 99, "", str(e)[:200]
+
+
+def _acp_json(out):
+    try:
+        s = out.find("{"); e = out.rfind("}")
+        if s >= 0 and e > s:
+            return json.loads(out[s:e+1])
+        s = out.find("["); e = out.rfind("]")
+        if s >= 0 and e > s:
+            return json.loads(out[s:e+1])
+    except Exception:
+        pass
+    return None
+
+
+def _acp_ensure_auth():
+    """Garante login. Se não autenticado, imprime o link nos logs do
+    Railway (operador clica uma vez) e espera a conclusão."""
+    rc, out, err = _acp_run(["agent", "whoami", "--json"], timeout=30)
+    if rc == 0:
+        return True
+    log.warning("🔗 ACP LOGIN NECESSÁRIO — iniciando fluxo (uma vez só)")
+    rc, out, _ = _acp_run(["configure", "start", "--json"], timeout=30)
+    j = _acp_json(out) or {}
+    url, rid = j.get("url"), j.get("requestId")
+    if not url or not rid:
+        log.error(f"acp configure start falhou: {out[:150]} {err[:100]}")
+        return False
+    for _ in range(60):  # até ~10 min esperando o clique
+        log.warning(f"🔗🔗 CLIQUE PARA LOGAR ACP: {url}")
+        rc, out, _ = _acp_run(["configure", "complete",
+                               "--request-id", rid, "--json"], timeout=30)
+        j = _acp_json(out) or {}
+        if j.get("status") == "authenticated":
+            log.warning(f"✅ ACP autenticado: {j.get('walletAddress','')}")
+            return True
+        time.sleep(10)
+    return False
+
+
+def _acp_ensure_agent():
+    agent_id = os.environ.get("ACP_AGENT_ID", _ACP_AGENT_ID_DEFAULT).strip()
+    _acp_run(["agent", "use", "--agent-id", agent_id, "--json"], timeout=30)
+    return agent_id
+
+
+def _acp_ensure_signer(agent_id):
+    rc, out, err = _acp_run(["wallet", "sign-message", "--message", "ping",
+                             "--chain-id", "8453", "--json"], timeout=40)
+    if rc == 0:
+        return True
+    if "NO_SIGNER" not in (out + err):
+        log.warning(f"acp signer probe: {(err or out)[:150]}")
+    log.warning("🔗 ACP SIGNER — gerando link de aprovação")
+    rc, out, _ = _acp_run(["agent", "add-signer", "--agent-id", agent_id,
+                           "--no-wait", "--policy", "restricted", "--json"],
+                          timeout=40)
+    j = _acp_json(out) or {}
+    url, rid, pub = j.get("signerUrl"), j.get("requestId"), j.get("publicKey")
+    if not url:
+        log.error(f"add-signer falhou: {out[:150]}")
+        return False
+    for _ in range(30):  # link expira em 5 min
+        log.warning(f"🔗🔗 APROVE O SIGNER (5 min!): {url}")
+        rc, out, _ = _acp_run(["agent", "signer-status", "--agent-id", agent_id,
+                               "--request-id", rid or "", "--public-key",
+                               pub or "", "--json"], timeout=30)
+        j = _acp_json(out) or {}
+        if j.get("status") == "completed":
+            log.warning("✅ ACP signer aprovado e persistido em /data")
+            return True
+        time.sleep(10)
+    return False
+
+
+def _acp_do_work(job_id, chain_id, requirement_text):
+    """Executa o produto no PRÓPRIO nó e submete o deliverable."""
+    req_low = (requirement_text or "").lower()
+    offer = next((k for k in _ACP_ENDPOINT if k in req_low), "br-market-brief")
+    ep = _ACP_ENDPOINT[offer]
+    params = {}
+    import re as _re
+    m = _re.search(r"0x[0-9a-fA-F]{40}", requirement_text or "")
+    if m and ep == "/wallet-scan":
+        params["address"] = m.group(0)
+    m2 = _re.search(r"\b([A-Z]{2,6})\b", requirement_text or "")
+    if m2 and ep == "/token-intel":
+        params["token"] = m2.group(1)
+    r = requests.get(f"{_public_base()}{ep}", params=params,
+                     headers={"X-Partner-Key": PARTNER_KEY}, timeout=(5, 50))
     if r.status_code != 200:
-        raise RuntimeError(f"produto {ep} respondeu {r.status_code}")
-    dados = r.json()
-    return json.dumps({"offer": offer_name, "product": desc,
-                       "delivered_by": f"{base}{ep}",
-                       "report": dados}, ensure_ascii=False)[:12000]
-
-
-def acp_seller_loop():
-    cfg = _acp_cfg()
-    if not cfg:
-        return
-    try:
-        from virtuals_acp.client import VirtualsACP
-        from virtuals_acp.contract_clients.contract_client_v2 import (
-            ACPContractClientV2)
-    except Exception as e:
-        log.warning(f"🏪 SDK virtuals-acp ausente ({e}) — vendedor OFF. "
-                    f"Adicione 'virtuals-acp' ao requirements.txt")
-        return
-    pk, agent_addr, entity_id = cfg
-    try:
-        client = VirtualsACP(
-            acp_contract_clients=ACPContractClientV2(
-                wallet_private_key=pk,
-                agent_wallet_address=agent_addr,
-                entity_id=entity_id),
-            on_new_task=None)
-        log.info(f"🏪 ACP vendedor ONLINE no nó — agente {agent_addr[:10]}… "
-                 f"ofertas: {', '.join(ACP_OFFERS)}")
-    except Exception as e:
-        log.error(f"🏪 ACP init falhou: {e}")
-        return
-
-    def _tratar(job):
+        raise RuntimeError(f"produto {ep} -> {r.status_code}")
+    deliverable = json.dumps({"offer": offer, "by": _public_base() + ep,
+                              "report": r.json()}, ensure_ascii=False)[:11000]
+    rc, out, err = _acp_run(["provider", "submit", "--job-id", str(job_id),
+                             "--deliverable", deliverable,
+                             "--chain-id", str(chain_id), "--json"],
+                            timeout=60)
+    if rc == 0:
+        log.warning(f"🏪 ACP job {job_id} ENTREGUE ({offer}, "
+                    f"{len(deliverable)} chars)")
         try:
-            jid = getattr(job, "id", None) or getattr(job, "job_id", None)
-            if jid in _ACP_SEEN:
-                return
-            memo = (job.memos[-1] if getattr(job, "memos", None) else None)
-            memo_id = getattr(memo, "id", None)
-            phase = str(getattr(job, "phase", "")).lower()
-            offer = getattr(job, "name", "") or getattr(job, "offering", "") or ""
-            reqs = str(getattr(job, "service_requirement", "") or "")
-            if "request" in phase or "negotiat" in phase:
-                client.respond_job(jid, memo_id, True,
-                                   "Accepted — delivering shortly.")
-                log.info(f"🏪 job {jid} aceito ({offer})")
-            elif "transact" in phase or "paid" in phase:
-                entrega = _acp_run_product(offer, reqs)
-                client.deliver_job(jid, entrega)
-                _ACP_SEEN.add(jid)
-                log.info(f"🏪 job {jid} ENTREGUE ({offer}, "
-                         f"{len(entrega)} chars)")
-                try:
-                    LEDGER.log_request("/acp-seller", True, 0, "acp",
-                                       kind="paid", ua="virtuals-acp",
-                                       params=offer)
-                except Exception:
-                    pass
-        except Exception as e:
-            log.error(f"🏪 job falhou: {str(e)[:120]}")
+            LEDGER.log_request("/acp-seller", True, 0, "railway-acp",
+                               kind="paid", ua="acp-cli/railway", params=offer)
+        except Exception:
+            pass
+    else:
+        log.error(f"🏪 submit job {job_id} falhou: {(err or out)[:150]}")
+    return rc == 0
+def _acp_handle_event(ev):
+    jid = ev.get("jobId"); chain = ev.get("chainId", 8453)
+    status = str(ev.get("status", ""))
+    tools = ev.get("availableTools") or []
+    roles = ev.get("roles") or []
+    if "provider" not in roles:
+        return
+    entry = ev.get("entry") or {}
+    content = entry.get("content") or ""
+    if "setBudget" in tools and jid not in _ACP_STATE["budget_set"]:
+        offer = next((k for k in _ACP_PRICES if k in content.lower()),
+                     "br-market-brief")
+        price = _ACP_PRICES[offer]
+        rc, out, err = _acp_run(["provider", "set-budget", "--job-id",
+                                 str(jid), "--amount", price,
+                                 "--chain-id", str(chain), "--json"],
+                                timeout=45)
+        if rc == 0:
+            _ACP_STATE["budget_set"].add(jid)
+            log.warning(f"🏪 ACP job {jid}: budget ${price} ({offer})")
+        else:
+            log.error(f"🏪 set-budget {jid}: {(err or out)[:150]}")
+    elif "submit" in tools and jid not in _ACP_STATE["submitted"]:
+        if not content:  # requirement pode ter vindo em evento anterior
+            rc, out, _ = _acp_run(["job", "history", "--job-id", str(jid),
+                                   "--chain-id", str(chain), "--json"],
+                                  timeout=30)
+            hist = _acp_json(out) or {}
+            msgs = hist.get("messages") or []
+            content = next((m.get("content", "") for m in msgs
+                            if m.get("contentType") == "requirement"), "")
+        if _acp_do_work(jid, chain, content):
+            _ACP_STATE["submitted"].add(jid)
 
+
+def _acp_start_listener():
+    """Um listener por arquivo (regra da CLI). Reinicia se morrer."""
+    import subprocess
+    lp = _ACP_STATE.get("listener")
+    if lp and lp.poll() is None:
+        return
+    try:
+        os.makedirs(_ACP_CFG_DIR, exist_ok=True)
+        _ACP_STATE["listener"] = subprocess.Popen(
+            ["acp", "events", "listen", "--output", _ACP_EVENTS_FILE,
+             "--json"], env=_acp_env(),
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        log.warning("🏪 ACP listener de eventos ativo (Railway)")
+    except Exception as e:
+        log.error(f"🏪 listener ACP falhou: {str(e)[:120]}")
+
+
+def acp_railway_seller_loop():
+    if os.environ.get("ACP_SELLER", "") != "1":
+        return
+    if not _acp_cli_ok():
+        log.warning("🏪 ACP_SELLER=1 mas a CLI 'acp' não está no PATH — "
+                    "confira se o nixpacks.toml está no repositório")
+        return
+    time.sleep(20)  # deixa o gunicorn subir primeiro
+    try:
+        if not _acp_ensure_auth():
+            return
+        agent_id = _acp_ensure_agent()
+        if not _acp_ensure_signer(agent_id):
+            return
+        log.warning("🏪🏪 VENDEDOR ACP NO RAILWAY — ONLINE E ARMADO")
+    except Exception as e:
+        log.error(f"🏪 bootstrap ACP: {str(e)[:150]}")
+        return
     while True:
         try:
-            jobs = client.get_active_jobs() or []
-            for j in jobs:
-                _tratar(j)
+            _acp_start_listener()
+            rc, out, _ = _acp_run(["events", "drain", "--file",
+                                   _ACP_EVENTS_FILE, "--limit", "10",
+                                   "--json"], timeout=30)
+            j = _acp_json(out) or {}
+            for ev in (j.get("events") or []):
+                try:
+                    _acp_handle_event(ev)
+                except Exception as e:
+                    log.error(f"🏪 evento ACP: {str(e)[:120]}")
         except Exception as e:
-            log.error(f"🏪 poll ACP: {str(e)[:120]}")
-        time.sleep(_ACP_POLL_S)
+            log.error(f"🏪 drain ACP: {str(e)[:120]}")
+        time.sleep(_ACP_DRAIN_S)
 
 
 _BG_STARTED = False
@@ -17449,7 +17572,7 @@ def _start_background_once():
     threading.Thread(target=demand_watch_loop, daemon=True).start()
     threading.Thread(target=autopilot_report_loop, daemon=True).start()
     threading.Thread(target=llm_watchdog_loop, daemon=True).start()
-    threading.Thread(target=acp_seller_loop, daemon=True).start()
+    threading.Thread(target=acp_railway_seller_loop, daemon=True).start()
     log.info("✅ Autopilot: loops de background ativos neste worker")
 
 def run_server():
@@ -18758,7 +18881,7 @@ except Exception as _e:
 
 
 # ---------------------------------------------------------------------------
-# v47.8.0-VENDEDORA — A CEREJA: /funnel.json, o funil do paywall PÚBLICO E ASSINADO
+# v47.9.0-SERVIDOR — A CEREJA: /funnel.json, o funil do paywall PÚBLICO E ASSINADO
 #
 # Ninguém no ecossistema x402 publica o próprio funil: quantos 402 saem,
 # quantos voltam pagando, quantos pagadores são carteiras VISTAS PELA
@@ -20563,7 +20686,7 @@ if os.environ.get("AUTOPILOT", "1") != "0":
 from datetime import date          # v47: o topo do arquivo importa datetime,
 from urllib.parse import urlencode  # timezone e timedelta, mas nao `date`.
 
-V47_LAYER_VERSION = "47.8.0-VENDEDORA"
+V47_LAYER_VERSION = "47.9.0-SERVIDOR"
 
 # ============================================================================
 # BLOCO O — PRIMITIVOS BRASILEIROS, COMPUTAÇÃO PURA, ZERO UPSTREAM
