@@ -87,7 +87,7 @@ from typing import Any, Optional, Dict, List, Tuple
 # 0. CONFIGURAÇÃO E AUTO-SETUP
 # ============================================================================
 
-VERSION = "47.9.0-SERVIDOR"  # v47.0.3: workers sync auto-recuperáveis + socket 25s + aliases A2A | v47.0.2: setdefaulttimeout anti-travamento | v47.0.1: PIX ascii-safe + ETag/304 na spec
+VERSION = "47.9.1-LOGINLINK"  # v47.0.3: workers sync auto-recuperáveis + socket 25s + aliases A2A | v47.0.2: setdefaulttimeout anti-travamento | v47.0.1: PIX ascii-safe + ETag/304 na spec
 BRAND_NAME = "Losbeto"
 # v44.4.0: reposicionamento Brasil-primeiro. "Cross-asset market data" compete
 # com CoinGecko e cem nós iguais; "BCB + B3 normalizado em inglês" não compete
@@ -17292,7 +17292,7 @@ def llm_watchdog_loop():
 
 
 # ============================================================================
-# v47.9.0-SERVIDOR — ACP SELLER OFICIAL RODANDO NO RAILWAY (via CLI oficial)
+# v47.9.1-LOGINLINK — ACP SELLER OFICIAL RODANDO NO RAILWAY (via CLI oficial)
 #
 # Substitui o módulo SDK (modelo antigo de auth, dormente). Estratégia:
 # o nó orquestra a CLI OFICIAL @virtuals-protocol/acp-cli (instalada no
@@ -17352,28 +17352,53 @@ def _acp_json(out):
 
 
 def _acp_ensure_auth():
-    """Garante login. Se não autenticado, imprime o link nos logs do
-    Railway (operador clica uma vez) e espera a conclusão."""
-    rc, out, err = _acp_run(["agent", "whoami", "--json"], timeout=30)
-    if rc == 0:
-        return True
-    log.warning("🔗 ACP LOGIN NECESSÁRIO — iniciando fluxo (uma vez só)")
-    rc, out, _ = _acp_run(["configure", "start", "--json"], timeout=30)
-    j = _acp_json(out) or {}
-    url, rid = j.get("url"), j.get("requestId")
-    if not url or not rid:
-        log.error(f"acp configure start falhou: {out[:150]} {err[:100]}")
-        return False
-    for _ in range(60):  # até ~10 min esperando o clique
-        log.warning(f"🔗🔗 CLIQUE PARA LOGAR ACP: {url}")
-        rc, out, _ = _acp_run(["configure", "complete",
-                               "--request-id", rid, "--json"], timeout=30)
-        j = _acp_json(out) or {}
-        if j.get("status") == "authenticated":
-            log.warning(f"✅ ACP autenticado: {j.get('walletAddress','')}")
+    """Garante login. Imprime o link nos logs do Railway (operador clica
+    uma vez). Se falhar ou expirar, gera link NOVO automaticamente."""
+    import re as _re2
+    while True:
+        rc, out, err = _acp_run(["agent", "whoami", "--json"], timeout=30)
+        if rc == 0:
             return True
-        time.sleep(10)
-    return False
+        log.warning("🔗 ACP LOGIN NECESSÁRIO — iniciando fluxo (uma vez só)")
+        url = rid = None
+        for _tent in range(3):
+            rc, out, err2 = _acp_run(["configure", "start", "--json"],
+                                     timeout=45)
+            j = _acp_json(out) or {}
+            url, rid = j.get("url"), j.get("requestId")
+            blob = (out or "") + "\n" + (err2 or "")
+            if not url:
+                m = _re2.search(
+                    r"https://[A-Za-z0-9.-]+/acp/auth/[A-Za-z0-9/?=&_.-]+",
+                    blob)
+                if m:
+                    url = m.group(0)
+            if not rid:
+                m = _re2.search(r"requestId[=:\"]+([0-9a-f]{32})", blob)
+                if m:
+                    rid = m.group(1)
+            if url and rid:
+                break
+            log.error(f"acp configure start falhou rc={rc} "
+                      f"tentativa={_tent+1}: out={out[:200]} "
+                      f"err={err2[:300]}")
+            time.sleep(15)
+        if not url or not rid:
+            log.error("🔗 ACP login sem URL — nova tentativa em 120s")
+            time.sleep(120)
+            continue
+        for _ in range(60):  # até ~10 min esperando o clique
+            log.warning(f"🔗🔗 CLIQUE PARA LOGAR ACP: {url}")
+            rc, out, _ = _acp_run(["configure", "complete",
+                                   "--request-id", rid, "--json"],
+                                  timeout=30)
+            j = _acp_json(out) or {}
+            if j.get("status") == "authenticated":
+                log.warning(f"✅ ACP autenticado: "
+                            f"{j.get('walletAddress','')}")
+                return True
+            time.sleep(10)
+        log.warning("🔗 link de login expirou sem clique — gerando NOVO")
 
 
 def _acp_ensure_agent():
@@ -17506,11 +17531,11 @@ def acp_railway_seller_loop():
         return
     time.sleep(20)  # deixa o gunicorn subir primeiro
     try:
-        if not _acp_ensure_auth():
-            return
+        _acp_ensure_auth()  # loop até logar
         agent_id = _acp_ensure_agent()
-        if not _acp_ensure_signer(agent_id):
-            return
+        while not _acp_ensure_signer(agent_id):
+            log.warning("🔗 signer expirou/falhou — link NOVO em 60s")
+            time.sleep(60)
         log.warning("🏪🏪 VENDEDOR ACP NO RAILWAY — ONLINE E ARMADO")
     except Exception as e:
         log.error(f"🏪 bootstrap ACP: {str(e)[:150]}")
@@ -18881,7 +18906,7 @@ except Exception as _e:
 
 
 # ---------------------------------------------------------------------------
-# v47.9.0-SERVIDOR — A CEREJA: /funnel.json, o funil do paywall PÚBLICO E ASSINADO
+# v47.9.1-LOGINLINK — A CEREJA: /funnel.json, o funil do paywall PÚBLICO E ASSINADO
 #
 # Ninguém no ecossistema x402 publica o próprio funil: quantos 402 saem,
 # quantos voltam pagando, quantos pagadores são carteiras VISTAS PELA
@@ -20686,7 +20711,7 @@ if os.environ.get("AUTOPILOT", "1") != "0":
 from datetime import date          # v47: o topo do arquivo importa datetime,
 from urllib.parse import urlencode  # timezone e timedelta, mas nao `date`.
 
-V47_LAYER_VERSION = "47.9.0-SERVIDOR"
+V47_LAYER_VERSION = "47.9.1-LOGINLINK"
 
 # ============================================================================
 # BLOCO O — PRIMITIVOS BRASILEIROS, COMPUTAÇÃO PURA, ZERO UPSTREAM
