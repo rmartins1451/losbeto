@@ -87,7 +87,7 @@ from typing import Any, Optional, Dict, List, Tuple
 # 0. CONFIGURAÇÃO E AUTO-SETUP
 # ============================================================================
 
-VERSION = "47.9.1-LOGINLINK"  # v47.0.3: workers sync auto-recuperáveis + socket 25s + aliases A2A | v47.0.2: setdefaulttimeout anti-travamento | v47.0.1: PIX ascii-safe + ETag/304 na spec
+VERSION = "47.9.2-ESMFIX"  # v47.0.3: workers sync auto-recuperáveis + socket 25s + aliases A2A | v47.0.2: setdefaulttimeout anti-travamento | v47.0.1: PIX ascii-safe + ETag/304 na spec
 BRAND_NAME = "Losbeto"
 # v44.4.0: reposicionamento Brasil-primeiro. "Cross-asset market data" compete
 # com CoinGecko e cem nós iguais; "BCB + B3 normalizado em inglês" não compete
@@ -17292,7 +17292,7 @@ def llm_watchdog_loop():
 
 
 # ============================================================================
-# v47.9.1-LOGINLINK — ACP SELLER OFICIAL RODANDO NO RAILWAY (via CLI oficial)
+# v47.9.2-ESMFIX — ACP SELLER OFICIAL RODANDO NO RAILWAY (via CLI oficial)
 #
 # Substitui o módulo SDK (modelo antigo de auth, dormente). Estratégia:
 # o nó orquestra a CLI OFICIAL @virtuals-protocol/acp-cli (instalada no
@@ -17319,6 +17319,11 @@ _ACP_STATE = {"listener": None, "budget_set": set(), "submitted": set()}
 def _acp_env():
     env = dict(os.environ)
     env["ACP_CONFIG_DIR"] = _ACP_CFG_DIR
+    # Node <22.12 (nixpacks) exige a flag p/ require() de ESM — sem ela
+    # a CLI morre com ERR_REQUIRE_ESM em @account-kit/infra
+    _no = (env.get("NODE_OPTIONS") or "")
+    if "require-module" not in _no:
+        env["NODE_OPTIONS"] = (_no + " --experimental-require-module").strip()
     return env
 
 
@@ -18906,7 +18911,7 @@ except Exception as _e:
 
 
 # ---------------------------------------------------------------------------
-# v47.9.1-LOGINLINK — A CEREJA: /funnel.json, o funil do paywall PÚBLICO E ASSINADO
+# v47.9.2-ESMFIX — A CEREJA: /funnel.json, o funil do paywall PÚBLICO E ASSINADO
 #
 # Ninguém no ecossistema x402 publica o próprio funil: quantos 402 saem,
 # quantos voltam pagando, quantos pagadores são carteiras VISTAS PELA
@@ -20711,7 +20716,7 @@ if os.environ.get("AUTOPILOT", "1") != "0":
 from datetime import date          # v47: o topo do arquivo importa datetime,
 from urllib.parse import urlencode  # timezone e timedelta, mas nao `date`.
 
-V47_LAYER_VERSION = "47.9.1-LOGINLINK"
+V47_LAYER_VERSION = "47.9.2-ESMFIX"
 
 # ============================================================================
 # BLOCO O — PRIMITIVOS BRASILEIROS, COMPUTAÇÃO PURA, ZERO UPSTREAM
