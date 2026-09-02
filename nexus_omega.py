@@ -21680,6 +21680,50 @@ log.warning("🍒 v47.9.5-RADAR ativo: isca $0.02 em /br-macro-snapshot · "
             "auto-atendimento (alias em até 6h) · placa de graduação ACP")
 
 
+# ============================================================================
+# v47.9.6-VITRINE — demanda medida em produção, respondida no mesmo dia.
+# O painel de demanda mostrou (7d):
+#   · /.well-known/anvita-verification.txt — 3 IPs (marketplace Anvita quer
+#     verificar a propriedade do domínio; token via env, mesmo padrão do
+#     x402list.txt — sem token configurado responde 404 honesto)
+#   · /.well-known/agent-directory.json — 2 IPs (o catálogo no caminho
+#     well-known, convenção que os orquestradores esperam)
+#   · /healt — 2 IPs (typo clássico de /health; 308, zero custo)
+# ============================================================================
+
+VERSION = "47.9.6-VITRINE"
+
+
+@app.route("/.well-known/anvita-verification.txt")
+def anvita_verification():
+    """Prova de propriedade para o marketplace Anvita (mesmo fluxo do
+    x402-list: eles emitem um token no cadastro → publicamos aqui via env
+    ANVITA_VERIFICATION → o verificador deles faz GET e compara)."""
+    tok = os.environ.get("ANVITA_VERIFICATION", "").strip()
+    if not tok:
+        return Response("anvita verification not configured\n", status=404,
+                        mimetype="text/plain")
+    return Response(tok + "\n", mimetype="text/plain")
+
+
+@app.route("/.well-known/agent-directory.json")
+def agent_directory_wellknown():
+    """O catálogo também no caminho well-known — mesma resposta, dois nomes."""
+    return agent_directory_json()
+
+
+@app.route("/healt")
+@app.route("/healthz")
+def health_typos():
+    """Typo medido no radar (/healt, 2 IPs) + convenção k8s (/healthz)."""
+    from flask import redirect as _redir
+    return _redir("/health", code=308)
+
+
+log.warning("🏪 v47.9.6-VITRINE: anvita-verification (env) · "
+            "well-known/agent-directory.json · /healt→/health")
+
+
 if __name__ == "__main__":
     cli()
 else:
