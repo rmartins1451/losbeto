@@ -21294,6 +21294,392 @@ if os.environ.get("AUTOPILOT", "1") != "0":
 # ============================================================================
 
 
+# ============================================================================
+# v47.9.5-RADAR — O VENDEDOR QUE SE ABASTECE SOZINHO
+#
+# O radar de demanda original (v29.1) só AVISAVA no Telegram: "3+ IPs
+# pediram X". Esta camada FECHA O CICLO sem intervenção humana, no caso
+# seguro: quando a demanda repetida é um ALIAS (o produto existe, o cliente
+# chamou por outro nome), a rota-espelho é criada sozinha — redirect 308
+# preservando a query string —, persistida em /data e anunciada no
+# Telegram. O grito do mercado vira prateleira em até 6h.
+# Regra de ouro MANTIDA: nunca inventar dado — o auto-atendimento só
+# aponta para produtos que JÁ existem e estão no ar.
+#
+# + /br-macro-snapshot ($0.02) — a isca de volume: sweet spot $0.01–0.05 do
+#   x402, feita para farmar SUCCESSFUL_JOB_COUNT / UNIQUE_BUYER_COUNT no
+#   ranking do ACP e converter os ~26 avaliadores/dia do funil.
+# + /agent-directory.json — o catálogo que máquinas pediram (23 hits/7d).
+# + /.well-known/x402.sig — o selo Ed25519 que 11 IPs distintos procuraram.
+# + ACP: roteiro de requisitos ampliado (pediu Selic/IPCA → snapshot) e
+#   placa de graduação: conta entregas e avisa quando bater 10 jobs.
+# ============================================================================
+
+VERSION = "47.9.5-RADAR"
+
+# --- 1. /br-macro-snapshot — a isca de $0.02 --------------------------------
+
+def _br_macro_snapshot_handler():
+    """As 6 séries oficiais do BCB numa chamada só, no preço de volume."""
+    m = _collect_br_macro()
+
+    def _v(k):
+        d = m.get(k) or {}
+        return d.get("value") if d.get("ok") else None
+
+    selic, ipca = _v("selic_meta_pct"), _v("ipca_12m_pct")
+    if selic is None and ipca is None and _v("usd_brl_ptax") is None:
+        return ({"status": "upstream_unavailable", "charged": False,
+                 "retry_after_s": 60, "ts": int(time.time()),
+                 "version": VERSION}, 503)
+    return {
+        "product":        "BR Macro Snapshot",
+        "selic_meta_pct": selic,
+        "cdi_daily_pct":  _v("cdi_daily_pct"),
+        "ipca_12m_pct":   ipca,
+        "igpm_month_pct": _v("igpm_month_pct"),
+        "usd_brl_ptax":   _v("usd_brl_ptax"),
+        "eur_brl":        _v("eur_brl"),
+        "real_rate_pct":  (round(selic - ipca, 2)
+                           if selic is not None and ipca is not None else None),
+        "series_as_of":   {k: (m.get(k) or {}).get("date") for k in BCB_SERIES},
+        "source":  "Banco Central do Brasil (BCB/SGS + PTAX) — official",
+        "ts":      int(time.time()),
+        "version": VERSION,
+        "disclaimer": "Research, not financial advice.",
+    }
+
+BASE_PRICES["/br-macro-snapshot"] = float(
+    os.environ.get("PRICE_BR_MACRO_SNAPSHOT", "0.02"))
+ENDPOINT_DESC["/br-macro-snapshot"] = (
+    "Brazil's six official macro series in one cheap call — Selic target, daily "
+    "CDI, IPCA 12-month inflation, IGP-M, official USD/BRL PTAX and EUR/BRL — plus "
+    "the ex-post real interest rate, straight from the Central Bank of Brazil "
+    "(BCB/SGS). The only machine-payable Brazilian macro feed on x402. Built for "
+    "agents that need a BR risk read before trading BRL, B3 equities or LatAm "
+    "baskets. $0.02 discovery price.")
+ENDPOINT_TAGS["/br-macro-snapshot"] = ["Brazil", "Macro", "Selic", "IPCA", "Official"]
+ENDPOINT_PARAM_HINTS["/br-macro-snapshot"] = {"format": "json"}
+ENDPOINT_HANDLERS["/br-macro-snapshot"] = _br_macro_snapshot_handler
+app.add_url_rule("/br-macro-snapshot", "br_macro_snapshot",
+                 paid_endpoint("/br-macro-snapshot")(_br_macro_snapshot_handler))
+
+# --- 2. /agent-directory.json — o catálogo que as máquinas pediram ----------
+
+@app.route("/agent-directory.json")
+def agent_directory_json():
+    """Diretório máquina-legível: quem somos, o que vendemos, como pagar,
+    como contratar via ACP. Responde à demanda medida no radar (23 hits/7d)."""
+    base = _public_base()
+    paid = []
+    for ep in sorted(BASE_PRICES):
+        try:
+            desc = ENDPOINT_DESC.get(ep)
+            if not desc:   # sem descrição não é vitrine (mesma regra do manifesto)
+                continue
+            try:
+                price = round(get_dynamic_price(ep), 6)
+            except Exception:
+                price = round(BASE_PRICES[ep], 6)
+            paid.append({
+                "endpoint":    ep,
+                "price_usdc":  price,
+                "description": desc[:220],
+                "tags":        ENDPOINT_TAGS.get(ep, []),
+                "free_sample": f"{base}{ep}?preview=1",
+            })
+        except Exception:
+            continue
+    return jsonify({
+        "directory": "Losbeto — agent-directory",
+        "version":   VERSION,
+        "ts":        int(time.time()),
+        "identity": {
+            "name":         "Losbeto",
+            "base":         base,
+            "agent_wallet": "0xd459df9bae699fa2a465603d4186d7e327b8f45b",
+            "solana_key":   WALLET.solana_address,
+            "signed_catalog": f"{base}/.well-known/x402.sig",
+        },
+        "how_to_buy": {
+            "x402":    "GET any paid endpoint — the 402 challenge carries price, asset and payTo. Pay USDC (Base/Solana/Algorand), retry with proof.",
+            "preview": "Append ?preview=1 to any paid endpoint for a free delayed sample.",
+            "first_call_free": f"{base}/welcome",
+        },
+        "acp": {
+            "agent_id":  _ACP_AGENT_ID_DEFAULT,
+            "hire":      "Virtuals ACP — app.virtuals.io",
+            "offerings": [{"name": k, "price_usdc": float(v),
+                           "served_by": _ACP_ENDPOINT.get(k)}
+                          for k, v in _ACP_PRICES.items()],
+        },
+        "paid_endpoints":  paid,
+        "discovery": {
+            "x402_manifest": f"{base}/.well-known/x402.json",
+            "agent_card":    f"{base}/.well-known/agent.json",
+            "agentic":       f"{base}/.well-known/agentic.json",
+            "mcp":           f"{base}/.well-known/mcp.json",
+        },
+        "sla": {"delivery_max_min": 60, "uptime_target": "99.5%"},
+    })
+
+# --- 3. /.well-known/x402.sig — o selo assinado do catálogo ------------------
+
+@app.route("/.well-known/x402.sig")
+def x402_sig():
+    """Catálogo ASSINADO Ed25519: quem tem a pubkey do nó verifica que esta
+    lista de preços/endpoints é autêntica e não adulterada por proxy. Era a
+    2ª demanda real do radar (12 hits, 11 IPs distintos em 7d)."""
+    base = _public_base()
+    catalog = {}
+    for ep in sorted(BASE_PRICES):
+        if ENDPOINT_DESC.get(ep):
+            catalog[ep] = round(BASE_PRICES[ep], 6)
+    payload = {
+        "issuer":       "Losbeto",
+        "base":         base,
+        "agent_wallet": "0xd459df9bae699fa2a465603d4186d7e327b8f45b",
+        "ts":           int(time.time()),
+        "catalog":      catalog,
+    }
+    canonical = json.dumps(payload, separators=(",", ":"), sort_keys=True)
+    sig = base64.b64encode(WALLET.sign(canonical.encode())).decode()
+    return jsonify({
+        "payload":   payload,
+        "canonical": canonical,
+        "signature": {
+            "algorithm":  "Ed25519",
+            "public_key": WALLET.solana_address,
+            "signature":  sig,
+            "verify": ("nacl.signing.VerifyKey(base58_decode(public_key))"
+                       ".verify(canonical.encode(), base64_decode(signature))"),
+        },
+    })
+
+# --- 4. RADAR AUTO-ATENDIMENTO — aliases criados sozinhos --------------------
+
+_RADAR_ALIASES_FILE = "/data/radar_aliases.json"
+_RADAR_AUTO_IPS     = int(os.environ.get("RADAR_AUTO_IPS", "3"))
+_RADAR_MAX_ALIASES  = int(os.environ.get("RADAR_MAX_ALIASES", "60"))
+# Alvos permitidos: produto pago do catálogo OU endpoint gratuito conhecido.
+_RADAR_FREE_OK = ("/welcome", "/try", "/sample", "/health", "/ip",
+                  "/receipts", "/agent-directory.json", "/losbeto-alpha")
+_AUTO_ALIASES: dict = {}
+
+
+def _radar_alias_load():
+    try:
+        with open(_RADAR_ALIASES_FILE) as f:
+            d = json.load(f)
+        if isinstance(d, dict):
+            _AUTO_ALIASES.update(d)
+            if d:
+                log.info(f"🍒 radar: {len(d)} aliases auto-criados restaurados de /data")
+    except Exception:
+        pass
+
+
+def _radar_alias_save():
+    try:
+        os.makedirs(os.path.dirname(_RADAR_ALIASES_FILE), exist_ok=True)
+        with open(_RADAR_ALIASES_FILE, "w") as f:
+            json.dump(_AUTO_ALIASES, f, ensure_ascii=False, indent=1)
+    except Exception as e:
+        log.debug(f"radar save: {e}")
+
+
+def _radar_safe_path(p: str) -> bool:
+    return bool(re.fullmatch(r"/[A-Za-z0-9._~/-]{1,60}", p or "")) \
+        and ".." not in p and p != "/" \
+        and not p.startswith("/.well-known") \
+        and not _is_scan_noise(p)
+
+
+def _radar_safe_target(t: str) -> bool:
+    return bool(t) and t != "/" and _route_now_live(t) \
+        and not _is_scan_noise(t) \
+        and (t in BASE_PRICES or t in _RADAR_FREE_OK)
+
+
+def _radar_autofulfill_cycle() -> list:
+    """Um ciclo do auto-atendimento. Retorna a lista de aliases criados
+    (a simulação local chama isto diretamente, sem o sleep do loop)."""
+    criados = []
+    try:
+        with LEDGER._conn() as c:
+            linhas = c.execute(
+                "SELECT endpoint, COUNT(*) n, COUNT(DISTINCT ip) ips "
+                "FROM requests WHERE ts>? AND kind='notfound' "
+                "GROUP BY endpoint HAVING ips >= ? "
+                "ORDER BY ips DESC LIMIT 10",
+                (int(time.time()) - 7 * 86400, _RADAR_AUTO_IPS)).fetchall()
+    except Exception as e:
+        log.debug(f"radar query: {e}")
+        return criados
+    for path, n, ips in linhas:
+        try:
+            if len(_AUTO_ALIASES) >= _RADAR_MAX_ALIASES:
+                break
+            if path in _AUTO_ALIASES or not _radar_safe_path(path):
+                continue
+            if _route_now_live(path):
+                continue          # já existe rota de verdade — não sombrear
+            cls = _demand_classify(path)
+            if cls["kind"] != "alias_candidate" or not cls["closest"]:
+                continue          # produto novo continua decidido pelo humano
+            target = cls["closest"][0]
+            # _suggest_paths devolve URL absoluta — normaliza para path
+            _b = _public_base()
+            if target.startswith(_b):
+                target = target[len(_b):] or "/"
+            if not _radar_safe_target(target):
+                continue
+            _AUTO_ALIASES[path] = {"target": target, "ts": int(time.time()),
+                                   "hits": n, "ips": ips}
+            _radar_alias_save()
+            criados.append((path, target, ips))
+            log.warning(f"🍒 AUTO-ATENDIMENTO: {path} → {target} ({ips} IPs/7d)")
+            _notify_telegram(
+                f"🍒 *AUTO-ATENDIMENTO DO RADAR*\n\n"
+                f"Demanda real: `{path}` — {n} pedidos de {ips} IPs em 7d.\n"
+                f"A loja respondeu sozinha: `{path}` agora leva a `{target}`.\n"
+                f"Sem código novo, sem deploy. A cereja foi plantada. 🍒")
+        except Exception as e:
+            log.debug(f"radar cycle {path}: {e}")
+    # poda: alias cujo caminho virou rota de verdade sai do mapa
+    try:
+        for p in [p for p in list(_AUTO_ALIASES) if _route_now_live(p)]:
+            _AUTO_ALIASES.pop(p, None)
+            _radar_alias_save()
+            log.info(f"🍒 radar: alias {p} removido — rota real existe agora")
+    except Exception:
+        pass
+    return criados
+
+
+def demand_autofulfill_loop():
+    """v47.9.5: ciclo fechado da demanda. A máquina pede → o sistema conta →
+    a loja SE ABASTECE (no caso seguro: apelido para produto que já existe)."""
+    time.sleep(600)   # deixa o tráfego acumular após o boot
+    while True:
+        try:
+            _radar_autofulfill_cycle()
+        except Exception as e:
+            log.debug(f"demand_autofulfill: {e}")
+        time.sleep(6 * 3600)
+
+
+@app.before_request
+def _radar_alias_dispatch():
+    """Despachante das rotas-espelho. Roda em TODA requisição mas só age se o
+    caminho for um alias auto-criado E ainda não existir rota real para ele
+    (um deploy futuro que construa o caminho de verdade vence o alias)."""
+    try:
+        p = request.path
+        a = _AUTO_ALIASES.get(p)
+        if not a and p != "/" and p.endswith("/"):
+            a = _AUTO_ALIASES.get(p.rstrip("/"))
+        if not a:
+            return None
+        if _route_now_live(p):
+            return None          # rota real existe — o alias aposenta
+        from flask import redirect as _redir
+        qs = request.query_string.decode()
+        return _redir(a["target"] + (("?" + qs) if qs else ""), code=308)
+    except Exception:
+        return None
+
+
+_radar_alias_load()
+threading.Thread(target=demand_autofulfill_loop, daemon=True,
+                 name="v4795-radar").start()
+
+# --- 5. ACP — roteiro ampliado + placa de graduação --------------------------
+
+_ACP_ENDPOINT["br-macro-snapshot"] = "/br-macro-snapshot"
+_ACP_MACRO_KW = ("selic", "ipca", "ptax", "cdi", "igpm", "juros br",
+                 "macro brasil", "brazil macro", "brazilian macro", "br-macro")
+_ACP_DELIVERED_FILE = "/data/acp-cli/delivered.json"
+
+
+def _acp_track_delivery(job_id):
+    """Placa de graduação: conta entregas únicas e apita nos marcos rumo aos
+    10 jobs que liberam o botão Graduate (Butler + aba A2A de produção)."""
+    try:
+        s = set()
+        try:
+            with open(_ACP_DELIVERED_FILE) as f:
+                d = json.load(f)
+                s = set(str(x) for x in (d if isinstance(d, list) else []))
+        except Exception:
+            pass
+        s.add(str(job_id))
+        os.makedirs(os.path.dirname(_ACP_DELIVERED_FILE), exist_ok=True)
+        with open(_ACP_DELIVERED_FILE, "w") as f:
+            json.dump(sorted(s), f)
+        n = len(s)
+        if n in (1, 3, 5, 7, 9):
+            _notify_telegram(
+                f"📦 *ACP*: {n} entregas concluídas — faltam {max(10 - n, 0)} "
+                f"para pedir a *GRADUAÇÃO* (Butler + aba A2A).")
+        elif n >= 10:
+            _notify_telegram(
+                "🎓 *10 JOBS ENTREGUES!* Abra app.virtuals.io → seu agente → "
+                "*Graduate*. O Butler e a vitrine A2A de produção passam a te "
+                "recomendar automaticamente.")
+    except Exception as e:
+        log.debug(f"acp track: {e}")
+
+
+def _acp_do_work(job_id, chain_id, requirement_text):
+    """v47.9.5 — substitui a v47.9.4 (Python resolve o nome global na hora da
+    chamada, então _acp_handle_event passa a usar ESTA versão):
+    · pediu Selic/IPCA/PTAX → entrega o snapshot macro de $0.02
+    · entrega com sucesso → _acp_track_delivery (placa de graduação)"""
+    req_low = (requirement_text or "").lower()
+    offer = next((k for k in _ACP_ENDPOINT if k in req_low), None)
+    if offer is None:
+        offer = ("br-macro-snapshot"
+                 if any(k in req_low for k in _ACP_MACRO_KW)
+                 else "br-market-brief")
+    ep = _ACP_ENDPOINT.get(offer, "/br-brief")
+    params = {}
+    import re as _re
+    m = _re.search(r"0x[0-9a-fA-F]{40}", requirement_text or "")
+    if m and ep == "/wallet-scan":
+        params["address"] = m.group(0)
+    m2 = _re.search(r"\b([A-Z]{2,6})\b", requirement_text or "")
+    if m2 and ep == "/token-intel":
+        params["token"] = m2.group(1)
+    r = requests.get(f"{_public_base()}{ep}", params=params,
+                     headers={"X-Partner-Key": PARTNER_KEY}, timeout=(5, 50))
+    if r.status_code != 200:
+        raise RuntimeError(f"produto {ep} -> {r.status_code}")
+    deliverable = json.dumps({"offer": offer, "by": _public_base() + ep,
+                              "report": r.json()}, ensure_ascii=False)[:11000]
+    rc, out, err = _acp_run(["provider", "submit", "--job-id", str(job_id),
+                             "--deliverable", deliverable,
+                             "--chain-id", str(chain_id), "--json"],
+                            timeout=60)
+    if rc == 0:
+        log.warning(f"🏪 ACP job {job_id} ENTREGUE ({offer}, "
+                    f"{len(deliverable)} chars)")
+        _acp_track_delivery(job_id)
+        try:
+            LEDGER.log_request("/acp-seller", True, 0, "railway-acp",
+                               kind="paid", ua="acp-cli/railway", params=offer)
+        except Exception:
+            pass
+    else:
+        log.error(f"🏪 submit job {job_id} falhou: {(err or out)[:150]}")
+    return rc == 0
+
+
+log.warning("🍒 v47.9.5-RADAR ativo: isca $0.02 em /br-macro-snapshot · "
+            "/agent-directory.json · /.well-known/x402.sig · radar "
+            "auto-atendimento (alias em até 6h) · placa de graduação ACP")
+
+
 if __name__ == "__main__":
     cli()
 else:
