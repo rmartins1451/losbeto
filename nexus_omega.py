@@ -9943,7 +9943,12 @@ def manifest_x402():
     MIXED_METHOD = {"/bootstrap-trust"}
 
     def _resource(path: str, method: str = "GET"):
-        ch = _build_402(path).get_json()
+        # v47.9.7: silent=True + guarda — o manifesto NUNCA mais morre por
+        # content-type inesperado; no pior caso o endpoint é omitido, jamais
+        # o catálogo inteiro.
+        ch = _build_402(path).get_json(silent=True)
+        if not ch:
+            return None
         accepts = ch.get("accepts") or []
         if not accepts:
             return None
@@ -13617,8 +13622,9 @@ def mcp_manifest():
     return _discovery_headers(jsonify(_mcp_manifest_doc()))
 
 @app.route("/.well-known/oauth-authorization-server")
+@app.route("/.well-known/oauth-authorization-server/<path:sub>")  # v47.9.7: RFC 8414 path-suffix — clientes MCP de /mcp sondam .../oauth-authorization-server/mcp (5 ips no ledger de demanda)
 @app.route("/mcp/.well-known/oauth-authorization-server")
-def oauth_authorization_server():
+def oauth_authorization_server(sub: str = ""):
     """RFC 8414 — honesto por construção: NÃO operamos um authorization
     server OAuth. Servir o documento declarando isso (em vez de 404) encerra
     a descoberta do cliente sem erro e sem fingir endpoints que não existem."""
@@ -20176,7 +20182,13 @@ def _build_402(endpoint: str):                      # noqa: F811
     # Accept: text/html e exclui scanners nomeados) e o cache de desafio
     # continua intacto para máquinas.
     try:
-        if _wants_html():
+        # v47.9.7 FIX CRÍTICO: a página HTML só pode sair quando o request
+        # ATUAL é para o PRÓPRIO endpoint (humano visitando /stock-quote).
+        # Sem o `request.path == endpoint`, um navegador pedindo o MANIFESTO
+        # (/.well-known/x402.json) fazia _wants_html()=True e TODO _build_402
+        # interno devolvia HTML → get_json()=None → os 93 endpoints eram
+        # pulados e o catálogo ia ao ar com resources: [] (vitrine vazia).
+        if _wants_html() and request.path == endpoint:
             return app.response_class(_render_402_html(endpoint),
                                       status=402, mimetype="text/html")
     except Exception:
@@ -21691,7 +21703,18 @@ log.warning("🍒 v47.9.5-RADAR ativo: isca $0.02 em /br-macro-snapshot · "
 #   · /healt — 2 IPs (typo clássico de /health; 308, zero custo)
 # ============================================================================
 
-VERSION = "47.9.6-VITRINE"
+VERSION = "47.9.7-MANIFESTO"
+# v47.9.7-MANIFESTO — a vitrine que esvaziava sozinha:
+#   1) _build_402 (wrapper v46): página HTML de humano só quando
+#      request.path == endpoint. Antes, QUALQUER navegador pedindo o
+#      manifesto recebia resources: [] — os 93 produtos sumiam da vitrine
+#      para exatamente o público que mais avalia (humanos + indexadores
+#      com UA de browser). Reproduzido: browser→0, máquina→92.
+#   2) _resource: get_json(silent=True) + guarda — catálogo nunca mais
+#      morre por content-type.
+#   3) /.well-known/oauth-authorization-server/<sub> — RFC 8414 path
+#      suffix: clientes MCP sondavam .../mcp e levavam 404 (5 ips no
+#      ledger de demanda) → descoberta de auth morria antes da conexão.
 
 
 @app.route("/.well-known/anvita-verification.txt")
