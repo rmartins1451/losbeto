@@ -5357,8 +5357,9 @@ def _subscription_offer(endpoint: str, unit_price: float) -> Optional[dict]:
     }
 
 
-def _build_402(endpoint: str):
-    amount_usdc = get_dynamic_price(endpoint)
+def _build_402(endpoint: str, price_override: float = None):
+    # v48.1: price_override serve UM desafio promocional (1ª compra reativa).
+    amount_usdc = price_override if price_override else get_dynamic_price(endpoint)
     amount_atomic_sol = str(int(amount_usdc * 10 ** USDC_DECIMALS))
     amount_atomic_base = str(int(amount_usdc * 10 ** 6))
     base = _public_base()
@@ -5517,6 +5518,7 @@ def _build_402(endpoint: str):
                             "openai_compatible": True,
                             "price_usd": f"{globals().get('LLM_PROXY_PRICE', 0.005):.4f}",
                             "status": f"{base}/llm/status",
+                            "try_free": f"{base}/llm/free?q=your+prompt",
                             "note": ("Flagship: pay-per-call LLM inference — change "
                                      "base_url in any OpenAI SDK. The same wallet "
                                      "buys every data primitive in this catalog.")},
@@ -6404,6 +6406,74 @@ def _welcome_redeem(token: str, path: str, handler, t0: float, ip: str):
         f"via x402, or {base}/buy-credits ($1 -> $1.25 balance).")
     return resp
 
+
+# ---------------------------------------------------------------------------
+# v48.1.0-REACTIVE — ESCADA DE DESCONTO EM TEMPO REAL (o "não perder vendas").
+# Telemetria própria (11/set): ~5-8 avaliadores externos/dia batem no 402,
+# veem o preço e SOMEM — conversão avaliador→pagante = 0%. O nó agora reage
+# sozinho: na 3ª visualização do MESMO endpoint pelo MESMO IP em 24h, serve
+# UM desafio com 50% de desconto (piso $0.001), uma vez por (IP,endpoint)/dia.
+# O desafio com desconto é o que fica no _challenge_remember → _verify_payment
+# cota o valor cotado (v39) e o settle fecha no preço promocional. Custo
+# máximo: 50% de UMA primeira compra por endpoint por IP por dia.
+_RLADDER_FRACTION  = float(os.environ.get("PROMO_FIRST_BUYER_FRACTION", "0.5"))
+_RLADDER_MIN_VIEWS = int(os.environ.get("PROMO_MIN_402_VIEWS", "3"))
+_RLADDER_FLOOR     = 0.001
+
+def _rladder_state(ip, path):
+    day = time.strftime("%Y-%m-%d", time.gmtime())
+    k = f"rl:{day}:{ip}:{path}"
+    try:
+        with LEDGER.lock, LEDGER._conn() as c:
+            c.execute("CREATE TABLE IF NOT EXISTS llm_usage (k TEXT PRIMARY KEY, n INTEGER)")
+            c.execute("INSERT INTO llm_usage(k,n) VALUES(?,1) "
+                      "ON CONFLICT(k) DO UPDATE SET n=n+1", (k,))
+            views = int(c.execute("SELECT n FROM llm_usage WHERE k=?", (k,)).fetchone()[0])
+        promo = LEDGER.cache_get(f"rlp:{day}:{ip}:{path}", 86400)
+        return views, bool(promo)
+    except Exception:
+        return 1, False
+
+def _rladder_mark_promo(ip, path):
+    day = time.strftime("%Y-%m-%d", time.gmtime())
+    try:
+        LEDGER.cache_set(f"rlp:{day}:{ip}:{path}", {"served": True})
+    except Exception:
+        pass
+
+def _reactive_402(path, ip):
+    price = get_dynamic_price(path)
+    views, already = _rladder_state(ip, path)
+    if views >= _RLADDER_MIN_VIEWS and not already and price > _RLADDER_FLOOR:
+        _rladder_mark_promo(ip, path)
+        offer = max(round(price * _RLADDER_FRACTION, 4), _RLADDER_FLOOR)
+        r = _build_402(path, price_override=offer)
+        try:
+            body = r.get_json()
+            body["promo"] = {
+                "first_purchase_offer": True,
+                "discount": f"{int((1 - _RLADDER_FRACTION) * 100)}%",
+                "price_usd_now": offer, "price_usd_regular": round(price, 4),
+                "valid_seconds": 3600, "one_per_day": True,
+                "why": ("You evaluated this endpoint repeatedly without buying. "
+                        "This node reacts in real time: one discounted "
+                        "challenge, one purchase, then prices return to normal.")}
+            r.set_data(json.dumps(body))
+        except Exception:
+            pass
+        log.info(f"🏷 promo reativa: {path} p/ {ip} — {views} views 402, ${offer:.4f}")
+        return r
+    r = _build_402(path)
+    if views == 2 and not already and price > _RLADDER_FLOOR:
+        try:
+            body = r.get_json()
+            body["price_reactivity"] = ("This node discounts first purchases in "
+                                        "real time for evaluators on the fence.")
+            r.set_data(json.dumps(body))
+        except Exception:
+            pass
+    return r
+
 def paid_endpoint(path):
     def deco(handler):
         def wrapped():
@@ -6640,7 +6710,7 @@ def paid_endpoint(path):
             if not sig:
                 LEDGER.log_request(path, False, int((time.time() - t0) * 1000), ip,
                                     kind="challenge402", ua=request.headers.get("User-Agent",""), params=_clean_params())
-                return _build_402(path)
+                return _reactive_402(path, ip)   # v48.1: reatividade de preço
 
             # ====== CORREÇÃO APLICADA (HEADERS PRESERVADOS) ======
             ok, reason, info = _verify_payment(path, sig)
@@ -11351,6 +11421,98 @@ def llm_status():
 app.add_url_rule("/v1/models", "llm_models", llm_models, methods=["GET"])
 app.add_url_rule("/llm/status", "llm_status", llm_status, methods=["GET"])
 
+# ---------------------------------------------------------------------------
+# v48.1.0 — FREEMIUM DO FLAGSHIP (padrão OpenRouter: o grátis cria o hábito,
+# o pago remove o teto). 128 tokens, caps por IP e globais — custo ~zero no
+# free tier e NUNCA compete com o pago (16x mais tokens, POST OpenAI, caps
+# maiores). O avaliador sai com a resposta E o preço do upgrade na mesma tela.
+LLM_FREE_PER_DAY        = int(os.environ.get("LLM_FREE_PER_DAY", "5"))
+LLM_FREE_GLOBAL_PER_DAY = int(os.environ.get("LLM_FREE_GLOBAL_PER_DAY", "200"))
+
+def llm_free():
+    q = (request.args.get("q") or "").strip()[:2000]
+    base = _public_base()
+    if not q:
+        return jsonify({"error": "missing-q",
+                        "how": f"GET {base}/llm/free?q=your+question",
+                        "paid_full_version": f"{base}/llm?q=... (2048 tokens, x402 ${LLM_PROXY_PRICE})",
+                        "ts": int(time.time())}), 400
+    day = time.strftime("%Y-%m-%d", time.gmtime())
+    ip = (request.headers.get("X-Forwarded-For", request.remote_addr or "")).split(",")[0].strip() or "unknown"
+    g = _llm_db_read(f"fg:{day}")
+    k = _llm_db_read(f"fk:{day}:{ip}")
+    if g >= LLM_FREE_GLOBAL_PER_DAY or k >= LLM_FREE_PER_DAY:
+        return jsonify({"error": "free-tier-exhausted",
+                        "free_per_ip_per_day": LLM_FREE_PER_DAY,
+                        "free_global_per_day": LLM_FREE_GLOBAL_PER_DAY,
+                        "resets": "00:00 UTC",
+                        "paid_no_caps": {"endpoint": f"{base}/llm?q=...",
+                                         "price_usd": LLM_PROXY_PRICE,
+                                         "openai_compatible": f"{base}/v1/chat/completions"},
+                        "ts": int(time.time())}), 429
+    if not llm_healthy():
+        return _llm_proxy_down()
+    ans = LLM.ask(q, max_tokens=128, temperature=0.3, cache=False)
+    if not ans:
+        return _llm_proxy_down()
+    _llm_db_bump(f"fg:{day}")
+    _llm_db_bump(f"fk:{day}:{ip}")
+    return jsonify({"answer": ans, "free_tier": True,
+                    "free_calls_left_today": max(0, LLM_FREE_PER_DAY - k - 1),
+                    "upgrade": {"paid_endpoint": f"{base}/llm?q=...",
+                                "openai_compatible": f"{base}/v1/chat/completions",
+                                "price_usd_per_call": LLM_PROXY_PRICE,
+                                "paid_gives": "2048 tokens (16x), POST + OpenAI SDK, 200 calls/day per key"},
+                    "ts": int(time.time()), "provider": "Losbeto/LLMProxy"})
+
+app.add_url_rule("/llm/free", "llm_free", llm_free, methods=["GET"])
+
+# ---------------------------------------------------------------------------
+# v48.1.0 — CONCIERGE DE INTEGRAÇÃO (IA, grátis, cap 30/dia global).
+# "Como eu pago?" respondido na hora, no idioma da pergunta — o avaliador
+# não vai embora esperando o operador acordar. Fallback estático se a cadeia
+# de LLM estiver em quarentena (suporte nunca tira 503).
+_INTEGRATE_SYSTEM = (
+    "You are the integration concierge of the Losbeto x402 node "
+    "(https://api.losbeto.xyz). Answer in the language of the question, max "
+    "120 words, concrete. Facts: payment is x402 (HTTP 402), USDC on Base "
+    "(eip155:8453), Solana or Algorand; the 402 body carries 'accepts' with "
+    "payTo/amount and 'no_wallet' instructions; any EIP-3009 wallet works; "
+    "'npx -y stipend' installs an agent wallet; one FREE real call via GET "
+    "/welcome then the X-Welcome-Token header; free samples via ?preview=1 "
+    "on any paid path; LLM gateway: POST /v1/chat/completions is "
+    "OpenAI-compatible (change base_url only), $0.005/call, free trial at "
+    "/llm/free; npm SDKs: losbeto-llm and losbeto-mcp; catalog: /llms.txt. "
+    "Always end with the exact next step.")
+
+def integrate_help():
+    q = (request.args.get("q") or "").strip()[:1000]
+    base = _public_base()
+    if not q:
+        return jsonify({"error": "missing-q",
+                        "how": f"GET {base}/integrate?q=how+do+I+pay",
+                        "ts": int(time.time())}), 400
+    day = time.strftime("%Y-%m-%d", time.gmtime())
+    if _llm_db_read(f"ig:{day}") >= 30:
+        return jsonify({"error": "daily-cap", "docs": f"{base}/llms.txt",
+                        "resets": "00:00 UTC", "ts": int(time.time())}), 429
+    ans = None
+    if llm_healthy():
+        ans = LLM.ask(_INTEGRATE_SYSTEM + "\n\nQuestion: " + q,
+                      max_tokens=280, temperature=0.2, cache=False)
+    if not ans:
+        ans = ("Pay per call via x402: GET any paid path, read the 402 body's "
+               "'accepts' (USDC on Base/Solana/Algorand), sign with any "
+               "EIP-3009 wallet and resend with the PAYMENT-SIGNATURE header. "
+               "No wallet? Run: npx -y stipend. One free real call: GET "
+               "/welcome. Full catalog: /llms.txt")
+    _llm_db_bump(f"ig:{day}")
+    return jsonify({"answer": ans, "free": True, "docs": f"{base}/llms.txt",
+                    "ts": int(time.time())})
+
+app.add_url_rule("/integrate", "integrate_help", integrate_help, methods=["GET"])
+
+
 @app.route("/.well-known/ard.json")
 def ard_json():
     """v48: 12 hits/7d de 5 IPs nesta rota (padrão em emergência; spec pública
@@ -14804,6 +14966,9 @@ def llms_txt():
         f"FREE: GET {base}/v1/models (model list) · GET {base}/llm/status (live backend telemetry + beta caps)",
         f"Beta caps: {LLM_DAILY_KEY_CAP} calls/day per key, {LLM_DAILY_GLOBAL_CAP}/day global (free-tier backends, honest limits; paid tiers lift them).",
         "One wallet buys inference + every data primitive below — the two biggest x402 use cases on a single node.",
+        f"FREE trial: GET {base}/llm/free?q=... — real answer, {LLM_FREE_PER_DAY} calls/day per IP, no wallet.",
+        f"Integration concierge (AI, free): GET {base}/integrate?q=how+do+I+pay",
+        "First-purchase reactivity: evaluators on the fence receive one time-boxed discounted challenge automatically.",
         "",
         "> WIN RATE: {:.1f}% | POI: {:.2f}x | CHAINS: {}{}".format(
             LEDGER.win_rate(), LEDGER.get_poi_multiplier(),
@@ -21975,6 +22140,20 @@ log.warning("🚀 v48.0.0-LLM-FIRST — gateway LLM é o flagship: caps beta "
             "(%s/key, %s/global), /v1/models, /llm/status, ard.json, "
             "402 cross-sell, llms.txt LLM-first",
             LLM_DAILY_KEY_CAP, LLM_DAILY_GLOBAL_CAP)
+
+# ============================================================================
+# v48.1.0-REACTIVE (11/set/2026) — o nó que REAGE para não perder a venda:
+#   1) Escada de desconto em tempo real: 3º 402 sem pagar (mesmo IP+endpoint,
+#      24h) → 1 desafio a 50% (piso $0.001), 1x/dia, settle fecha no preço
+#      promocional via _challenge_remember (v39).
+#   2) Freemium do flagship: GET /llm/free (128 tokens, 5/dia por IP,
+#      200/dia global) — o padrão OpenRouter aplicado ao x402.
+#   3) Concierge de integração com IA: GET /integrate?q=... (cap 30/dia,
+#      fallback estático se a cadeia LLM estiver em quarentena).
+VERSION = "48.1.0-REACTIVE"
+log.warning("🏷 v48.1.0-REACTIVE — promo de 1ª compra em tempo real no 402 · "
+            "/llm/free (freemium %s/dia) · /integrate (concierge IA)",
+            LLM_FREE_PER_DAY)
 
 
 if __name__ == "__main__":
