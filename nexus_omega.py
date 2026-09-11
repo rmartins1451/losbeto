@@ -2906,7 +2906,7 @@ class Brain:
         top = Market.top_coins(5)
         fg = Market.fear_greed()
         ctx = "\n".join([f"{c['symbol'].upper()}: ${c.get('current_price')} "
-                         f"({c.get('price_change_percentage_24h',0):.1f}% 24h)"
+                         f"({(c.get('price_change_percentage_24h') or 0):.1f}% 24h)"
                          for c in top])
         memory = RAG_STORE.retrieve("market analysis btc eth sol", k=3)
         memory_str = "\n".join([f"- {m[1][:120]}" for m in memory])
@@ -3043,7 +3043,7 @@ class Brain:
         topic = request.args.get("topic", "BTC outlook 30 days")
         fg = Market.fear_greed()
         top = Market.top_coins(5)
-        ctx = "\n".join([f"{c['symbol'].upper()}: {c.get('price_change_percentage_7d_in_currency', 0):.1f}% 7d"
+        ctx = "\n".join([f"{c['symbol'].upper()}: {(c.get('price_change_percentage_7d_in_currency') or 0):.1f}% 7d"
                          for c in top])
         memory = RAG_STORE.retrieve(topic, k=4)
         memory_str = "\n".join([f"- {m[1][:150]}" for m in memory])
@@ -3108,8 +3108,8 @@ class Brain:
         regime = Brain.regime()
         anom = Brain.anomalias()
         ctx = "\n".join([f"{c['symbol'].upper()}: ${c.get('current_price')} "
-                         f"({c.get('price_change_percentage_24h',0):.1f}%/24h, "
-                         f"{c.get('price_change_percentage_7d_in_currency',0):.1f}%/7d)"
+                         f"({(c.get('price_change_percentage_24h') or 0):.1f}%/24h, "
+                         f"{(c.get('price_change_percentage_7d_in_currency') or 0):.1f}%/7d)"
                          for c in top])
         memory = RAG_STORE.retrieve("crypto market trend", k=4)
         memory_str = "\n".join([f"- {m[1][:150]}" for m in memory])
@@ -3579,7 +3579,7 @@ class Brain:
                              "liquidity — volume this detached from depth is often manufactured.")
         if abs(chg.get("h24") or 0) > 40:
             penalty += _flag("extreme_move_24h", "medium", 10,
-                             f"{chg.get('h24'):+.1f}% in 24h — elevated reversal risk.")
+                             f"{(chg.get('h24') or 0):+.1f}% in 24h — elevated reversal risk.")
         risk_score = max(0, score - penalty)
         grade = ("A" if risk_score >= 85 else "B" if risk_score >= 70
                  else "C" if risk_score >= 50 else "D" if risk_score >= 30 else "F")
@@ -4558,7 +4558,7 @@ class Brain:
         if not brief:
             brief = (f"Risk {score}/100 ({verdict}). "
                      + ("Mint authority NOT renounced. " if checks.get("mint_authority_renounced") is False else "")
-                     + (f"Liquidity ${checks.get('liquidity_usd', 0):,}. " if "liquidity_usd" in checks else "")
+                     + (f"Liquidity ${(checks.get('liquidity_usd') or 0):,}. " if "liquidity_usd" in checks else "")
                      + ("No socials found. " if checks.get("has_socials") is False else "")
                      + ("Recommendation: AVOID." if score >= 55 else
                         "Recommendation: WATCH." if score >= 35 else
@@ -16523,7 +16523,7 @@ class TelegramBot:
                     if not r2.ok:
                         log.error(f"TG send falhou 2x: {r2.text[:160]}")
             except Exception as e:
-                log.warning(f"TG send: {e}")
+                log.warning(f"TG send: {str(e).replace(self.token, '***')}")
 
     def _split(self, text: str):
         text = str(text)
@@ -16557,7 +16557,7 @@ class TelegramBot:
                     continue
                 self._handle(msg)
         except Exception as e:
-            log.warning(f"TG poll: {e}")
+            log.warning(f"TG poll: {str(e).replace(self.token, '***')}")
 
     def _handle_button(self, cq):
         try:
@@ -16922,7 +16922,7 @@ def rag_ingest_loop():
             content = (f"Market snapshot {datetime.utcnow().isoformat()}: "
                        f"F&G={fg.get('value')} regime={regime.get('regime')} "
                        f"Top: " + ", ".join(
-                           f"{c['symbol'].upper()}={c.get('price_change_percentage_24h', 0):.1f}%"
+                           f"{c['symbol'].upper()}={(c.get('price_change_percentage_24h') or 0):.1f}%"
                            for c in top[:10]))
             RAG_STORE.ingest("snapshot", content)
         except Exception as e:
@@ -21703,7 +21703,7 @@ log.warning("🍒 v47.9.5-RADAR ativo: isca $0.02 em /br-macro-snapshot · "
 #   · /healt — 2 IPs (typo clássico de /health; 308, zero custo)
 # ============================================================================
 
-VERSION = "47.9.7-MANIFESTO"
+VERSION = "47.9.8-NO-NONE"  # v47.9.8: corrige crashes f-string com None (CoinGecko null) no /relatorio, /analise, rag-loop e /launch-risk; redige token do Telegram nos logs de erro
 # v47.9.7-MANIFESTO — a vitrine que esvaziava sozinha:
 #   1) _build_402 (wrapper v46): página HTML de humano só quando
 #      request.path == endpoint. Antes, QUALQUER navegador pedindo o
