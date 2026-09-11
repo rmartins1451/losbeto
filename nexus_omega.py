@@ -5513,6 +5513,13 @@ def _build_402(endpoint: str):
             "cheapest_paid": _cheapest_paid(base),
             "credits": {"endpoint": f"{base}/buy-credits",
                         "deal": "$1 -> $1.25 balance, zero settlement latency"},
+            "llm_gateway": {"endpoint": f"{base}/v1/chat/completions",
+                            "openai_compatible": True,
+                            "price_usd": f"{globals().get('LLM_PROXY_PRICE', 0.005):.4f}",
+                            "status": f"{base}/llm/status",
+                            "note": ("Flagship: pay-per-call LLM inference — change "
+                                     "base_url in any OpenAI SDK. The same wallet "
+                                     "buys every data primitive in this catalog.")},
             "docs": f"{base}/llms.txt"},
     }
     # v21 FIX: base64 padrão (não URL-safe) — scanners usam b64decode padrão.
@@ -8900,8 +8907,8 @@ def _is_bot(ua: str) -> bool:
 
 CLEAN_LANDING = r"""<!doctype html><html lang="en"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Losbeto — cross-asset market data for AI agents</title>
-<meta name="description" content="Pay-per-call market data for AI agents: multi-oracle price consensus, sentiment consensus, forex, equities, commodities, Brazil macro (BCB/B3) and crypto. No API keys, no accounts. USDC on Base, Solana and Algorand via x402.">
+<title>Losbeto — LLM inference + cross-asset market data for AI agents (x402)</title>
+<meta name="description" content="OpenAI-compatible LLM gateway at $0.005/call — change base_url, pay in USDC. Plus pay-per-call market data: multi-oracle price consensus, sentiment, forex, equities, commodities, Brazil macro (BCB/B3) and crypto. No API keys, no accounts. USDC on Base, Solana and Algorand via x402.">
 <link rel="canonical" href="__BASE__/">
 <meta property="og:type" content="website">
 <meta property="og:title" content="Losbeto — cross-asset market data for AI agents">
@@ -9025,8 +9032,10 @@ footer a{color:var(--dim)}
 </div></header>
 
 <section class="band" id="hero"><div class="wrap">
-<h1>Market data <em>agents pay for</em>, one call at a time.</h1>
-<p class="sub">Brazil central-bank macro and B3 equities, US equities, forex,
+<h1>LLM inference + market data <em>agents pay for</em>, one call at a time.</h1>
+<p class="sub">OpenAI-compatible LLM gateway at $0.005/call — point any SDK at
+/v1/chat/completions and pay per call in USDC. Plus Brazil central-bank
+macro and B3 equities, US equities, forex,
 commodities, global macro and crypto. No API keys, no accounts — your agent
 settles a few cents in USDC per request and gets clean JSON back.</p>
 <div class="cta">
@@ -10991,6 +11000,103 @@ _LLM_PROXY_MAX_PROMPT_CHARS = 16000
 _LLM_PROXY_SAMPLE_Q = ("Give a one-paragraph briefing on current crypto market "
                        "sentiment, naming one bullish and one bearish signal.")
 
+
+# ---------------------------------------------------------------------------
+# v48.0.0-LLM-FIRST — GUARD-RAILS DE CUSTO (instalados ANTES da divulgação).
+# Medição 11/set/2026 (API x402-list): o #1 do ecossistema fatura ~90% de todo
+# o volume medido vendendo EXATAMENTE este produto (gateway LLM x402) — com
+# backend PAGO. Aqui o backend é free tier (Groq ~14,4K req/dia; Gemini 1,5K
+# RPD, e já vimos 429-quarentena nos logs): sem teto, o primeiro comprador
+# real derruba a cadeia para todos. Caps honestos de lançamento, configuráveis
+# por env, contados no SQLite do LEDGER — compartilhado entre os 4 workers do
+# gunicorn e persistente a restart (volume /data).
+LLM_DAILY_GLOBAL_CAP = int(os.environ.get("LLM_DAILY_GLOBAL_CAP", "3000"))
+LLM_DAILY_KEY_CAP    = int(os.environ.get("LLM_DAILY_KEY_CAP", "200"))
+_LLM_USE_MEM  = defaultdict(int)
+_LLM_USE_LOCK = threading.Lock()
+
+def _llm_db_bump(k):
+    """Incremento atômico via SQLite (statement único → seguro entre workers).
+    Degrada para memória se o DB falhar — o guard-rail nunca derruba a rota."""
+    try:
+        with LEDGER.lock, LEDGER._conn() as c:
+            c.execute("CREATE TABLE IF NOT EXISTS llm_usage (k TEXT PRIMARY KEY, n INTEGER)")
+            c.execute("INSERT INTO llm_usage(k,n) VALUES(?,1) "
+                      "ON CONFLICT(k) DO UPDATE SET n=n+1", (k,))
+            return int(c.execute("SELECT n FROM llm_usage WHERE k=?", (k,)).fetchone()[0])
+    except Exception:
+        with _LLM_USE_LOCK:
+            _LLM_USE_MEM[k] += 1
+            return _LLM_USE_MEM[k]
+
+def _llm_db_read(k):
+    try:
+        with LEDGER._conn() as c:
+            c.execute("CREATE TABLE IF NOT EXISTS llm_usage (k TEXT PRIMARY KEY, n INTEGER)")
+            r = c.execute("SELECT n FROM llm_usage WHERE k=?", (k,)).fetchone()
+            return int(r[0]) if r else 0
+    except Exception:
+        with _LLM_USE_LOCK:
+            return _LLM_USE_MEM.get(k, 0)
+
+def _llm_client_key():
+    """Identidade do comprador para o cap diário: session-token (retry pago)
+    quando presente; senão IP de borda. Cap por chave impede que UM comprador
+    monopolize a quota gratuita do dia."""
+    tok = (request.headers.get("X-Session-Token") or "")[:40]
+    if tok:
+        return "st:" + tok
+    ip = (request.headers.get("X-Forwarded-For", request.remote_addr or "")
+          ).split(",")[0].strip() or "unknown"
+    return "ip:" + ip
+
+def _llm_retry_after():
+    return int(86400 - (time.time() % 86400)) + 60
+
+def _llm_gate():
+    """None = pode atender. Tupla (resp, 429, headers) = teto atingido.
+    NÃO incrementa: quem conta é _llm_count(), chamado só após sucesso —
+    request rejeitado por cap não consome a quota do comprador."""
+    day = time.strftime("%Y-%m-%d", time.gmtime())
+    g = _llm_db_read(f"g:{day}")
+    k = _llm_db_read(f"k:{day}:{_llm_client_key()}")
+    if g >= LLM_DAILY_GLOBAL_CAP:
+        return (jsonify({"error": "capacity-reached",
+                "message": ("Daily global beta capacity reached — free-tier "
+                            "backends are protected so no single buyer degrades "
+                            "the chain for everyone. Resets 00:00 UTC."),
+                "global_cap_per_day": LLM_DAILY_GLOBAL_CAP,
+                "charged": False,
+                "paid_tiers": "Higher caps ship with paid backends — GET /llm/status",
+                "ts": int(time.time())}), 429,
+                {"Retry-After": str(_llm_retry_after())})
+    if k >= LLM_DAILY_KEY_CAP:
+        return (jsonify({"error": "rate-limited",
+                "message": (f"Beta per-key cap ({LLM_DAILY_KEY_CAP} calls/day) "
+                            "reached. Resets 00:00 UTC. Need volume now? "
+                            "/buy-credits works on every endpoint."),
+                "key_cap_per_day": LLM_DAILY_KEY_CAP,
+                "charged": False,
+                "ts": int(time.time())}), 429,
+                {"Retry-After": str(_llm_retry_after())})
+    return None
+
+def _llm_count():
+    day = time.strftime("%Y-%m-%d", time.gmtime())
+    _llm_db_bump(f"g:{day}")
+    _llm_db_bump(f"k:{day}:{_llm_client_key()}")
+
+def _llm_limits_block():
+    day = time.strftime("%Y-%m-%d", time.gmtime())
+    return {"price_usd_per_call": LLM_PROXY_PRICE, "launch_price": True,
+            "beta_caps": {"per_key_per_day": LLM_DAILY_KEY_CAP,
+                          "global_per_day": LLM_DAILY_GLOBAL_CAP,
+                          "global_used_today": _llm_db_read(f"g:{day}"),
+                          "resets": "00:00 UTC"},
+            "why_caps": ("Honest launch limits: backends are free-tier today. "
+                         "Caps keep the chain alive for every buyer; paid "
+                         "backends lift them. Live telemetry: GET /llm/status")}
+
 # v44.9.1: schema formal do corpo POST — alimenta o 402 (inputSchema), o blob
 # Bazaar (info.input.bodyParams) e a porta didática GET. Era o único warning
 # do registro no x402scan ("missing an input schema").
@@ -11093,9 +11199,13 @@ def llm_quick():
         mt = 300
     if not llm_healthy():
         return _llm_proxy_down()
+    _g = _llm_gate()
+    if _g:
+        return _g
     ans = LLM.ask(q, max_tokens=mt, temperature=0.3, cache=False)
     if not ans:
         return _llm_proxy_down()
+    _llm_count()
     return {"answer": ans,
             "sample_prompt": q == _LLM_PROXY_SAMPLE_Q,
             "max_tokens": mt,
@@ -11103,6 +11213,7 @@ def llm_quick():
                              "multi-provider failover chain and returns the first live "
                              "answer — you never manage API keys again."),
             "openai_compatible": f"{_public_base()}/v1/chat/completions",
+            "limits": _llm_limits_block(),
             "ts": int(time.time()), "provider": "Losbeto/LLMProxy", "version": VERSION}
 
 def llm_chat_completions():
@@ -11140,9 +11251,13 @@ def llm_chat_completions():
         temp = 0.4
     if not llm_healthy():
         return _llm_proxy_down()
+    _g = _llm_gate()
+    if _g:
+        return _g
     ans = LLM.ask(prompt, max_tokens=mt, temperature=temp, cache=False)
     if not ans:
         return _llm_proxy_down()
+    _llm_count()
     est_in, est_out = max(1, len(prompt) // 4), max(1, len(ans) // 4)
     return {"id": "chatcmpl-lsb" + secrets.token_hex(12),
             "object": "chat.completion",
@@ -11155,6 +11270,7 @@ def llm_chat_completions():
                       "total_tokens": est_in + est_out,
                       "note": "character-based estimate (len/4)"},
             "not_supported_yet": ["stream", "tools", "vision"],
+            "limits": _llm_limits_block(),
             "provider": "Losbeto/LLMProxy", "version": VERSION}
 
 BASE_PRICES["/llm"] = LLM_PROXY_PRICE
@@ -11186,9 +11302,85 @@ app.add_url_rule("/v1/chat/completions", "llm_chat_completions",
                  methods=["POST"])
 app.add_url_rule("/v1/chat/completions", "llm_chat_docs",
                  llm_chat_docs, methods=["GET"])
+
+# ---------------------------------------------------------------------------
+# v48.0.0 — DESCOBERTA GRATUITA DO GATEWAY (padrão OpenAI + telemetria honesta)
+def llm_models():
+    """GET /v1/models — shape OpenAI. SDKs chamam isto no boot ao trocar a
+    base_url; sem esta rota, a integração morria no primeiro passo."""
+    rep = llm_health_report()
+    base = _public_base()
+    return jsonify({
+        "object": "list",
+        "data": [{
+            "id": "losbeto-fast", "object": "model", "created": 1757000000,
+            "owned_by": "losbeto",
+            "description": ("Failover alias: the first live provider answers "
+                            "(Groq first for speed, Gemini backup). Any model "
+                            "string is accepted and routed to this alias."),
+            "capability": {"chat": True, "stream": False,
+                           "tools": False, "vision": False},
+            "limits": {"prompt_chars_max": _LLM_PROXY_MAX_PROMPT_CHARS,
+                       "completion_tokens_max_post": 2048,
+                       "completion_tokens_max_get": 512}}],
+        "backends": rep,
+        "x402": {"pay_per_call_usd": LLM_PROXY_PRICE,
+                 "chat_completions": f"{base}/v1/chat/completions",
+                 "get_alternative": f"{base}/llm?q=your+prompt",
+                 "status": f"{base}/llm/status"},
+        "ts": int(time.time())})
+
+def llm_status():
+    """GET /llm/status — telemetria pública do gateway: backends, quarentenas,
+    caps beta e consumo do dia. Confiança machine-readable."""
+    rep = llm_health_report()
+    day = time.strftime("%Y-%m-%d", time.gmtime())
+    return jsonify({
+        "status": "ok" if rep["healthy"] else "degraded",
+        "backends": rep,
+        "price_usd_per_call": LLM_PROXY_PRICE, "launch_price": True,
+        "beta_caps": {"per_key_per_day": LLM_DAILY_KEY_CAP,
+                      "global_per_day": LLM_DAILY_GLOBAL_CAP,
+                      "global_used_today": _llm_db_read(f"g:{day}"),
+                      "resets": "00:00 UTC"},
+        "roadmap": ["paid backends (higher caps, bigger models)",
+                    "streaming", "tool calling"],
+        "ts": int(time.time()), "provider": "Losbeto/LLMProxy",
+        "version": VERSION})
+
+app.add_url_rule("/v1/models", "llm_models", llm_models, methods=["GET"])
+app.add_url_rule("/llm/status", "llm_status", llm_status, methods=["GET"])
+
+@app.route("/.well-known/ard.json")
+def ard_json():
+    """v48: 12 hits/7d de 5 IPs nesta rota (padrão em emergência; spec pública
+    não localizada). Em vez de 404, servimos um descriptor mínimo e válido."""
+    base = _public_base()
+    return jsonify({"agent_resource": {
+        "name": "Losbeto", "version": VERSION, "base_url": base,
+        "protocols": {"x402": f"{base}/.well-known/x402.json",
+                      "mcp": f"{base}/.well-known/mcp.json",
+                      "a2a": f"{base}/.well-known/agent.json",
+                      "openapi": f"{base}/openapi.json",
+                      "llms": f"{base}/llms.txt"},
+        "flagship": {"llm_gateway": f"{base}/v1/chat/completions",
+                     "openai_compatible": True,
+                     "models": f"{base}/v1/models",
+                     "status": f"{base}/llm/status",
+                     "price_usd_per_call": LLM_PROXY_PRICE},
+        "payment": {"scheme": "x402 exact", "asset": "USDC",
+                    "networks": [f"{BASE_CAIP2}",
+                                 f"solana:{SOL_GENESIS}"]},
+        "endpoints": len(BASE_PRICES),
+        "verify": f"{base}/.well-known/verify-manifest"},
+        "ts": int(time.time())})
+
 if "/llm" in FEATURED_ENDPOINTS:
     FEATURED_ENDPOINTS.remove("/llm")
 FEATURED_ENDPOINTS.insert(0, "/llm")
+if "/v1/chat/completions" in FEATURED_ENDPOINTS:
+    FEATURED_ENDPOINTS.remove("/v1/chat/completions")
+FEATURED_ENDPOINTS.insert(1, "/v1/chat/completions")
 log.info("🧠 llm-proxy registrado ($0.005) — GET /llm + POST /v1/chat/completions (OpenAI-compatível)")
 
 
@@ -14593,7 +14785,7 @@ def llms_txt():
     base = _public_base()
     lines = [
         f"# Losbeto v{VERSION}",
-        f"> Multi-chain AI swarm. Solana + Base + TON. {len(BASE_PRICES)} endpoints. Pay-per-call via x402.",
+        f"> OpenAI-compatible LLM gateway (${LLM_PROXY_PRICE:.4f}/call) + {len(BASE_PRICES)} market-data endpoints. Solana + Base + TON. Pay-per-call via x402.",
         "",
         "## TALK TO THE OPERATOR",
         f"Missing an endpoint your agent needs? Open an issue: {FEEDBACK_GITHUB}",
@@ -14605,6 +14797,13 @@ def llms_txt():
         f"GET {_public_base()}/about -> who operates this and how to audit it",
         f"GET {_public_base()}/<any-endpoint>?preview=1  -> real delayed data, free",
         "Every 402 response also carries an inline `upsell.sample` with real output.",
+        "",
+        "## FLAGSHIP — LLM GATEWAY (OpenAI-compatible, pay-per-call)",
+        f"POST {base}/v1/chat/completions — any OpenAI SDK works; change only base_url. Flat ${LLM_PROXY_PRICE:.4f}/call, USDC via x402 (Base, Solana, Algorand).",
+        f"GET  {base}/llm?q=your+prompt — same engine over GET, same price.",
+        f"FREE: GET {base}/v1/models (model list) · GET {base}/llm/status (live backend telemetry + beta caps)",
+        f"Beta caps: {LLM_DAILY_KEY_CAP} calls/day per key, {LLM_DAILY_GLOBAL_CAP}/day global (free-tier backends, honest limits; paid tiers lift them).",
+        "One wallet buys inference + every data primitive below — the two biggest x402 use cases on a single node.",
         "",
         "> WIN RATE: {:.1f}% | POI: {:.2f}x | CHAINS: {}{}".format(
             LEDGER.win_rate(), LEDGER.get_poi_multiplier(),
@@ -16671,11 +16870,11 @@ class TelegramBot:
                                      for k, v in _PREVIEW_SERVED.most_common(3)) or "—"
                 self.send(chat_id,
                     f"📊 *Hoje*\n\n"
-                    f"💰 24h: `${s.get('today_usdc', 0):.4f}` "
+                    f"💰 24h: `${(s.get('today_usdc') or 0):.4f}` "
                     f"({s.get('paid_24h', 0)} pagamentos)\n"
-                    f"⏱ 1h: `${s.get('hour_usdc', 0):.4f}`\n"
+                    f"⏱ 1h: `${(s.get('hour_usdc') or 0):.4f}`\n"
                     f"👥 Compradores únicos: `{s.get('buyers', 0)}`\n"
-                    f"📦 Total acumulado: `${s.get('total_usdc', 0):.4f}`\n\n"
+                    f"📦 Total acumulado: `${(s.get('total_usdc') or 0):.4f}`\n\n"
                     f"👀 Previews servidos (desde o boot): `{previews}`\n"
                     f"   top: {top_prev}\n\n"
                     f"_Preview sem venda é demanda não convertida — veja /demanda._",
@@ -21280,7 +21479,7 @@ def _v47_boot():
     log.info("=" * 62)
     log.info(f"🇧🇷 LOSBETO {V47_LAYER_VERSION} — primitivos ativos")
     for _p in sorted(_V47_PRODUCTS):
-        log.info(f"   {_p:<16} ${BASE_PRICES.get(_p):.3f}  (0 upstream)")
+        log.info(f"   {_p:<16} ${(BASE_PRICES.get(_p) or 0):.3f}  (0 upstream)")
     log.info(f"   Garantia latência: {base}/zero-upstream.json")
     log.info(f"   Critério compra:   {base}/what-agents-buy")
     try:
@@ -21745,6 +21944,37 @@ def health_typos():
 
 log.warning("🏪 v47.9.6-VITRINE: anvita-verification (env) · "
             "well-known/agent-directory.json · /healt→/health")
+
+
+
+
+# ============================================================================
+# v48.0.0-LLM-FIRST (11/set/2026) — A VERSÃO DO FATO NOVO.
+#
+# Diagnóstico (medição própria na API do x402-list, 685 serviços): o #1 do
+# ecossistema fatura ~90% de TODO o volume medido vendendo gateway de LLM
+# OpenAI-compatível via x402 — e o Losbeto JÁ tinha esse produto no ar,
+# enterrado na linha ~80 do catálogo, sem SDK, sem docs e sem guard-rails.
+# Esta versão transforma o /llm em flagship:
+#   1) GUARD-RAILS: caps beta por chave (200/dia) e global (3.000/dia),
+#      contados no SQLite do LEDGER (4 workers + restart-safe), env-tunáveis
+#      (LLM_DAILY_KEY_CAP / LLM_DAILY_GLOBAL_CAP). 429 honesto, nunca cobra
+#      quota de request rejeitado. SEM isto, o 1º comprador real derrubava
+#      o free tier do Groq/Gemini para todos.
+#   2) DESCOBERTA: GET /v1/models (shape OpenAI — SDKs chamam no boot) e
+#      GET /llm/status (telemetria pública: backends, quarentenas, caps).
+#   3) VITRINE: bloco FLAGSHIP no topo do llms.txt; cross-sell llm_gateway
+#      em TODO 402; /v1/chat/completions entra no FEATURED na posição 1;
+#      landing humana passa a liderar com o gateway.
+#   4) /.well-known/ard.json — descriptor mínimo (12 hits/7d medidos; spec
+#      pública não localizada — JSON útil em vez de 404).
+#   5) FIXES: boot-log BASE_PRICES None-safe; stats do Telegram None-safe
+#      (today/hour/total usdc).
+VERSION = "48.0.0-LLM-FIRST"
+log.warning("🚀 v48.0.0-LLM-FIRST — gateway LLM é o flagship: caps beta "
+            "(%s/key, %s/global), /v1/models, /llm/status, ard.json, "
+            "402 cross-sell, llms.txt LLM-first",
+            LLM_DAILY_KEY_CAP, LLM_DAILY_GLOBAL_CAP)
 
 
 if __name__ == "__main__":
