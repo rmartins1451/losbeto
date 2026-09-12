@@ -319,6 +319,17 @@ CREDIT_PLANS = {
                           "bonus": "+25%",
                           "pitch": "Pay $0.99 once, get $1.25 of call credit",
                           "anchor_price": 0.99, "display_price": "$0.99"},
+    # v48.3-PLANS: degraus intermediários — a escada saltava 10× de $0.99 p/
+    # $9.99 e perdia o cliente que queria mais saldo sem assinar. Bônus em
+    # SALDO: o preço unitário público dos endpoints nunca muda.
+    "/buy-credits-5":    {"plan": "credits",  "balance_usd": 6.00,  "ttl_days": 60,
+                          "bonus": "+20%",
+                          "pitch": "Pay $4.99 once, get $6.00 of call credit",
+                          "anchor_price": 4.99, "display_price": "$4.99"},
+    "/buy-credits-25":   {"plan": "credits",  "balance_usd": 33.00, "ttl_days": 90,
+                          "bonus": "+32%",
+                          "pitch": "Pay $24.99 once, get $33.00 of call credit",
+                          "anchor_price": 24.99, "display_price": "$24.99"},
     "/day-pass":         {"plan": "day-pass", "balance_usd": -1,    "ttl_days": 1,
                           "bonus": "unlimited 24h",
                           "pitch": "A full day of unlimited calls, one payment",
@@ -424,6 +435,8 @@ BASE_PRICES = {
     "/starter-pack":     1.000,   # âncora de $1 — primeira compra humana
     # --- CREDIT PLANS (1 tx on-chain → N chamadas via X-API-Key) ---
     "/buy-credits":      0.990,
+    "/buy-credits-5":    4.990,
+    "/buy-credits-25":   24.990,
     "/day-pass":         2.990,
     "/week-pass":        9.990,
     "/subscribe-pro":    9.990,
@@ -567,6 +580,8 @@ ENDPOINT_DESC = {
 
     # ---- Planos de crédito ------------------------------------------------
     "/buy-credits":     "CREDITS: pay $0.99 once and receive $1.25 of call balance (+25% bonus), spent via the X-API-Key header. One on-chain transaction, then zero settlement latency per request.",
+    "/buy-credits-5":   "CREDITS: pay $4.99 once and receive $6.00 of call balance (+20% bonus), valid 60 days, spent via the X-API-Key header. One on-chain transaction, then zero settlement latency per request.",
+    "/buy-credits-25":  "CREDITS: pay $24.99 once and receive $33.00 of call balance (+32% bonus), valid 90 days, spent via the X-API-Key header. One on-chain transaction, then zero settlement latency per request.",
     "/day-pass":        "DAY PASS: unlimited calls to every endpoint for 24 hours. One payment, no per-request settlement, no rate limit.",
     "/week-pass":       "WEEK PASS: unlimited calls to every endpoint for 7 days — the same access as the day pass at roughly half the daily cost. For agents running a full evaluation cycle.",
     "/subscribe-pro":   "PRO: $15 of call balance per month (+50% bonus) for agents in production, with priority routing over free traffic.",
@@ -634,6 +649,8 @@ ENDPOINT_TAGS = {
     "/win-rate-verified":     ["Trust", "Cryptographic", "Featured"],
     "/agent-composable":      ["AI", "Bundle", "Exclusive", "Featured"],
     "/buy-credits":      ["Credits", "Featured"],
+    "/buy-credits-5":    ["Credits", "Featured"],
+    "/buy-credits-25":   ["Credits", "Featured"],
     "/day-pass":         ["Credits", "Pass", "Featured"],
     "/subscribe-pro":    ["Credits", "Subscription"],
     "/subscribe-whale":  ["Credits", "Subscription"],
@@ -4936,7 +4953,8 @@ def _recommended_next(current: str, payer: str, limit: int = 2) -> list:
     bought = _payer_bought(payer)
     bought.add(current)
     skip = {"/subscribe-pro", "/subscribe-whale", "/day-pass", "/week-pass",
-            "/buy-credits", "/starter-pack", "/enterprise"}
+            "/buy-credits", "/buy-credits-5", "/buy-credits-25",
+            "/starter-pack", "/enterprise"}
     cur_tags = set(ENDPOINT_TAGS.get(current, []))
     scored = []
     for ep in BASE_PRICES:
@@ -5256,7 +5274,7 @@ def _challenge_recall(endpoint: str) -> Optional[list]:
 # informação — e é o argumento mais forte que existe, porque é o dinheiro dele.
 _PAYER_SPEND: Dict[str, list] = {}
 _PAYER_LOCK = threading.Lock()
-UPSELL_WINDOW = int(os.environ.get("UPSELL_WINDOW", "86400"))  # 24 h
+UPSELL_WINDOW = int(os.environ.get("UPSELL_WINDOW", "604800"))  # v48.3: 7 dias
 
 
 def _track_spend(payer: str, amount: float) -> None:
@@ -5272,16 +5290,43 @@ def _track_spend(payer: str, amount: float) -> None:
                 _PAYER_SPEND.pop(k, None)
 
 
+def _payer_spend_window(payer: str, window_s: int):
+    """v48.3-PLANS: gasto real do payer lido do LEDGER (SQLite no volume /data,
+    compartilhado entre os 4 workers do gunicorn). A versão original deste
+    motor (v39.7) usava um dict em memória — cada worker via ~1/4 das chamadas
+    do cliente e um redeploy zerava tudo. Cache de 120s por payer."""
+    try:
+        ck = f"psw:{payer[:48]}:{window_s}"
+        cached = LEDGER.cache_get(ck, 120)
+        if cached:
+            return int(cached["calls"]), float(cached["spent"])
+        since = int(time.time()) - window_s
+        with LEDGER.lock, LEDGER._conn() as c:
+            row = c.execute("SELECT COUNT(*), COALESCE(SUM(amount),0) FROM revenue "
+                            "WHERE payer=? AND ts>?", (payer, since)).fetchone()
+        out = (int(row[0]), float(row[1]))
+        LEDGER.cache_set(ck, {"calls": out[0], "spent": out[1]})
+        return out
+    except Exception:
+        return 0, 0.0
+
+
 def _upsell_note(payer: str) -> Optional[dict]:
-    """Só fala quando o número já favorece o cliente. Silêncio caso contrário."""
+    """Só fala quando o número já favorece o cliente. Silêncio caso contrário.
+    v48.3: lê o ledger (não a memória do worker), janela de 7 dias, mínimo de
+    2 chamadas, e nunca recomenda para as wallets do operador."""
     if not payer:
         return None
-    agora = time.time()
-    with _PAYER_LOCK:
-        hist = [x for x in _PAYER_SPEND.get(payer, []) if agora - x[0] < UPSELL_WINDOW]
-    if len(hist) < 3:
+    try:
+        if (payer or "").lower() in OPERATOR_WALLETS:
+            return None
+    except Exception:
+        pass
+    calls, gasto = _payer_spend_window(payer, UPSELL_WINDOW)
+    if calls < 2:
         return None
-    gasto = sum(a for _t, a in hist)
+    hist = [(0, gasto)] * 1  # compat: abaixo só len(hist)/soma importam
+    agora = time.time()
     # v39.7 — CORRIGIDO na verificação: a primeira versão recomendava o plano
     # mais barato que o cliente já tinha ultrapassado, e isso dava conselho
     # ERRADO. Quem gastou $3.15 ouvia "compre credits por $0.99" — mas credits
@@ -5299,14 +5344,14 @@ def _upsell_note(payer: str) -> Optional[dict]:
             economia = gasto - preco
             return {
                 "you_spent_usdc": round(gasto, 4),
-                "calls_in_window": len(hist),
-                "window_hours": UPSELL_WINDOW // 3600,
+                "calls_in_window": calls,
+                "window_days": UPSELL_WINDOW // 86400,
                 "plan": cfg["plan"],
                 "plan_price_usdc": round(preco, 2),
                 "would_have_saved_usdc": round(economia, 4),
                 "buy": f"{_public_base()}{ep}",
-                "message": (f"You have spent ${gasto:.4f} across {len(hist)} calls "
-                            f"in the last {UPSELL_WINDOW // 3600}h. The "
+                "message": (f"You have spent ${gasto:.4f} across {calls} calls "
+                            f"in the last {UPSELL_WINDOW // 86400} days. The "
                             f"{cfg['plan']} plan costs ${preco:.2f} and would "
                             f"have covered all of it with ${economia:.4f} left "
                             f"over — plus no settlement latency."),
@@ -6441,34 +6486,54 @@ def _rladder_mark_promo(ip, path):
     except Exception:
         pass
 
+def _social_proof():
+    """v48.2-SMART: prova social REAL do ledger para o corpo do 402.
+    Cache de 5 min — não pesa em cada desafio. None se indisponível."""
+    try:
+        cached = LEDGER.cache_get("sp:proof", 300)
+        if cached:
+            return cached
+        now = int(time.time())
+        with LEDGER.lock, LEDGER._conn() as c:
+            buyers = c.execute("SELECT COUNT(DISTINCT payer) FROM revenue WHERE payer<>''").fetchone()[0]
+            tx24 = c.execute("SELECT COUNT(*) FROM revenue WHERE ts>?", (now - 86400,)).fetchone()[0]
+        out = {"unique_payers": int(buyers), "settlements_24h": int(tx24),
+               "note": "operator self-tests labelled at /receipts"}
+        LEDGER.cache_set("sp:proof", out)
+        return out
+    except Exception:
+        return None
+
 def _reactive_402(path, ip):
-    price = get_dynamic_price(path)
-    views, already = _rladder_state(ip, path)
-    if views >= _RLADDER_MIN_VIEWS and not already and price > _RLADDER_FLOOR:
-        _rladder_mark_promo(ip, path)
-        offer = max(round(price * _RLADDER_FRACTION, 4), _RLADDER_FLOOR)
-        r = _build_402(path, price_override=offer)
-        try:
-            body = r.get_json()
-            body["promo"] = {
-                "first_purchase_offer": True,
-                "discount": f"{int((1 - _RLADDER_FRACTION) * 100)}%",
-                "price_usd_now": offer, "price_usd_regular": round(price, 4),
-                "valid_seconds": 3600, "one_per_day": True,
-                "why": ("You evaluated this endpoint repeatedly without buying. "
-                        "This node reacts in real time: one discounted "
-                        "challenge, one purchase, then prices return to normal.")}
-            r.set_data(json.dumps(body))
-        except Exception:
-            pass
-        log.info(f"🏷 promo reativa: {path} p/ {ip} — {views} views 402, ${offer:.4f}")
-        return r
+    # v48.2-SMART — o PREÇO PÚBLICO NUNCA VARIA no 402.
+    # A v48.1 servia desafio com 50% off na 3ª sondagem do mesmo IP — mas os
+    # scanners de catálogo (x402-list-monitor: 7.380 hits/dia de 1 IP;
+    # x402-observer: 1.732/dia) atingem o threshold em minutos e INDEXAM o
+    # preço cortado como nosso preço oficial nos marketplaces (OpenSea Bazaar,
+    # x402list, LavoLoop): desvalorização automática e permanente da marca.
+    # Preço que oscila também quebra a confiança de agentes programados para
+    # verificar preço antes de pagar.
+    # O incentivo de 1ª compra agora é BÔNUS PÓS-PAGAMENTO (First-Call Bonus):
+    # paga-se o preço de tabela e ganha-se 1 chamada grátis (crédito atrelado
+    # ao X-Session-Token, 7 dias). Valor agregado, não corte de preço — os
+    # catálogos seguem indexando o preço cheio e o comprador recebe mais.
     r = _build_402(path)
-    if views == 2 and not already and price > _RLADDER_FLOOR:
+    views, _already = _rladder_state(ip, path)
+    if views >= 2:
         try:
             body = r.get_json()
-            body["price_reactivity"] = ("This node discounts first purchases in "
-                                        "real time for evaluators on the fence.")
+            body["first_purchase_bonus"] = {
+                "pay_full_price": True,
+                "bonus": "first payment earns 1 free call to any endpoint",
+                "how": ("Pay the listed price; the X-Session-Token returned "
+                        "then carries 1 bonus call, valid 7 days, any endpoint."),
+                "regular_price_usd": round(get_dynamic_price(path), 4),
+                "price_note": ("Fixed public pricing — this node never discounts. "
+                               "The bonus adds value on top of the listed price."),
+            }
+            sp = _social_proof()
+            if sp:
+                body["network_stats"] = sp
             r.set_data(json.dumps(body))
         except Exception:
             pass
@@ -6707,10 +6772,48 @@ def paid_endpoint(path):
                 _r.status_code = _c
                 return _r
 
+            # v48.2-SMART FCB (consumo): sessão com bônus de 1ª compra serve
+            # sem cobrar. Fica DEPOIS do JWT de retry (300s) e dos gates de
+            # preflight — o crédito só é gasto quando seria chamada paga real.
             if not sig:
+                _fcb_tok = (request.headers.get("X-Session-Token") or "")[:40]
+                if _fcb_tok:
+                    try:
+                        _fcb = LEDGER.cache_get(f"fcb:{_fcb_tok}", 7 * 86400)
+                        if _fcb and int(_fcb.get("n", 0)) > 0:
+                            _r = handler()
+                            # fonte morreu entre o gate e o handler → 503 grátis,
+                            # crédito NÃO é queimado.
+                            if (isinstance(_r, tuple) and len(_r) >= 2
+                                    and isinstance(_r[0], dict)
+                                    and _r[0].get("status") == "unavailable"
+                                    and isinstance(_r[1], int) and _r[1] >= 500):
+                                _resp = jsonify(_r[0]); _resp.status_code = _r[1]
+                                _resp.headers["Retry-After"] = "300"
+                                return _resp
+                            LEDGER.cache_set(f"fcb:{_fcb_tok}", {"n": int(_fcb["n"]) - 1})
+                            from flask import Response as _FR
+                            if isinstance(_r, _FR):
+                                _resp = _r
+                            elif isinstance(_r, tuple):
+                                _resp = jsonify(_r[0])
+                                if len(_r) > 1 and isinstance(_r[1], int):
+                                    _resp.status_code = _r[1]
+                            else:
+                                _resp = jsonify(_r)
+                            _left = max(int(_fcb["n"]) - 1, 0)
+                            _resp.headers["X-Credit-Used"] = "first-call-bonus"
+                            _resp.headers["X-Credit-Left"] = str(_left)
+                            LEDGER.log_request(path, True, int((time.time() - t0) * 1000), ip,
+                                               kind="fcb_bonus", ua=request.headers.get("User-Agent",""),
+                                               params=_clean_params())
+                            log.info(f"🎁 FCB consumido: {path} (restam {_left})")
+                            return _resp
+                    except Exception:
+                        pass
                 LEDGER.log_request(path, False, int((time.time() - t0) * 1000), ip,
                                     kind="challenge402", ua=request.headers.get("User-Agent",""), params=_clean_params())
-                return _reactive_402(path, ip)   # v48.1: reatividade de preço
+                return _reactive_402(path, ip)   # v48.2: preço fixo + bônus pós-compra
 
             # ====== CORREÇÃO APLICADA (HEADERS PRESERVADOS) ======
             ok, reason, info = _verify_payment(path, sig)
@@ -6837,8 +6940,40 @@ def paid_endpoint(path):
                 ).decode()
                 resp.headers["PAYMENT-RESPONSE"]   = settle_b64
                 resp.headers["X-PAYMENT-RESPONSE"] = settle_b64
+                # v48.2-SMART FCB (emissão): 1ª compra deste pagador → o
+                # session token passa a carregar 1 chamada grátis (7 dias).
+                # Preço de tabela intacto; o bônus é valor agregado.
+                try:
+                    _payer = (info.get("payer") or "")[:64]
+                    if _payer and not LEDGER.cache_get(f"fcbp:{_payer}", 400 * 86400):
+                        LEDGER.cache_set(f"fcbp:{_payer}", {"t": int(time.time())})
+                        LEDGER.cache_set(f"fcb:{token[:40]}", {"n": 1})
+                        resp.headers["X-First-Call-Bonus"] = "1-free-call-7d"
+                        log.info(f"🎁 FCB emitido p/ payer {_payer[:16]}… ({path})")
+                except Exception:
+                    pass
+                # v48.3-PLANS: o motor de economia existia desde a v39.7 mas
+                # NUNCA era invocado — definido, corrigido e desligado. Agora
+                # fala no momento exato da entrega, com o gasto real do ledger:
+                # "você já gastou $X — o plano Y teria custado menos". Nunca
+                # corta preço; mostra a matemática do próprio cliente.
+                try:
+                    _tip = _upsell_note(payer)
+                    if _tip:
+                        resp.headers["X-Savings-Tip"] = (
+                            f"plan={_tip['plan']};price_usdc={_tip['plan_price_usdc']};"
+                            f"would_have_saved_usdc={_tip['would_have_saved_usdc']};"
+                            f"buy={_tip['buy']}")
+                        _b = resp.get_json(silent=True)
+                        if isinstance(_b, dict):
+                            _b["savings_tip"] = _tip
+                            resp.set_data(json.dumps(_b))
+                        log.info(f"💡 savings tip p/ payer {str(payer)[:16]}…: "
+                                 f"gastou ${_tip['you_spent_usdc']:.4f} → plano {_tip['plan']}")
+                except Exception:
+                    pass
                 resp.headers["Access-Control-Expose-Headers"] = (
-                    "PAYMENT-RESPONSE,X-PAYMENT-RESPONSE,X-Session-Token,X-Session-TTL")
+                    "PAYMENT-RESPONSE,X-PAYMENT-RESPONSE,X-Session-Token,X-Session-TTL,X-First-Call-Bonus,X-Savings-Tip")
                 resp.headers["X-Session-Token"] = token
                 resp.headers["X-Session-TTL"]   = str(JWT_TTL)
                 return resp
@@ -7609,6 +7744,42 @@ def _credits_payload(endpoint, plan, key, balance_usd, expires, idempotent=False
 for _ep in CREDIT_PLANS:
     app.add_url_rule(_ep, _ep.strip("/").replace("-", "_"),
                      paid_endpoint(_ep)(_credits_purchase_handler(_ep)))
+
+@app.route("/plans")
+def plans_json():
+    """v48.3-PLANS: catálogo de planos em JSON para agentes (o /pricing é HTML
+    para humanos). Break-even calculado contra o preço médio do catálogo —
+    um agente de orçamento decide sem nenhuma chamada extra."""
+    base = _public_base()
+    paid = [p for e, p in BASE_PRICES.items() if e not in CREDIT_PLANS and p > 0]
+    avg = (sum(paid) / len(paid)) if paid else 0.02
+    plans = []
+    for ep, cfg in CREDIT_PLANS.items():
+        preco = BASE_PRICES.get(ep)
+        if not preco:
+            continue
+        ilimitado = cfg["balance_usd"] == -1
+        plans.append({
+            "plan": cfg["plan"], "endpoint": ep, "buy": f"{base}{ep}",
+            "price_usdc": round(preco, 2), "duration_days": cfg["ttl_days"],
+            "grants": ("unlimited calls to every endpoint" if ilimitado
+                       else f"${cfg['balance_usd']:.2f} of call credit"),
+            "bonus": cfg.get("bonus", ""), "pitch": cfg.get("pitch", ""),
+            "break_even_calls_at_avg_price": int(preco / avg) + 1,
+            "how_to_use": ("Pay once via x402; the returned key goes in the "
+                           "X-API-Key header and calls skip settlement (~1ms)."),
+        })
+    plans.sort(key=lambda p: p["price_usdc"])
+    return jsonify({
+        "plans": plans,
+        "catalog_avg_call_usdc": round(avg, 4),
+        "endpoints_covered": len(BASE_PRICES) - len(CREDIT_PLANS),
+        "advice_for_agents": ("If your expected calls x avg price exceed a "
+                              "plan's price, the plan is the rational choice — "
+                              "and settled calls arrive without latency."),
+        "human_readable": f"{base}/pricing",
+        "ts": int(time.time()),
+    })
 
 @app.route("/credits-status")
 def credits_status():
@@ -14373,6 +14544,34 @@ def _resources_alias():
     """v33: convenções de raiz de API pedidas por clientes reais (/v1, /resources,
     /resource). Apontam para o catálogo em vez de devolver 404."""
     return x402_resources()
+
+# v48.2-SMART: registration file no padrão ERC-8004 (Trustless Agents).
+# Concorrentes como agentutility já ostentam "ERC-8004 agentId" no perfil do
+# x402scan — é o passaporte que compradores-agentes verificam antes de pagar.
+# Este arquivo fica pronto para ser o tokenURI ao registrar a identidade
+# on-chain (Base) — o registro é 1 transação na wallet do operador.
+@app.route("/.well-known/erc8004.json")
+def erc8004_registration():
+    base = _public_base()
+    return jsonify({
+        "type": "https://eips.ethereum.org/EIPS/eip-8004#registration-v1",
+        "name": "Losbeto",
+        "description": ("x402-paid market data + OpenAI-compatible LLM gateway "
+                        "for AI agents. Forex, equities, Brazil macro (BCB/B3), "
+                        "crypto. USDC on Base/Solana/Algorand. Fixed public pricing."),
+        "image": f"{base}/favicon.png",
+        "services": [
+            {"name": "web", "endpoint": base},
+            {"name": "MCP", "endpoint": f"{base}/mcp", "version": "2025-06-18"},
+            {"name": "A2A", "endpoint": f"{base}/.well-known/agent.json", "version": "0.3.0"},
+            {"name": "OASF", "endpoint": f"{base}/openapi.json"},
+        ],
+        "x402Support": True,
+        "active": True,
+        "supportedTrust": ["reputation"],
+        "registrations": [],
+        "ts": int(time.time()),
+    })
 
 # v47.0.3: sondas A2A pediram variantes sem .json e com underscore
 # (/.well-known/agent-card, /well_known/agent_json — visto no radar de demanda)
@@ -22155,8 +22354,8 @@ log.warning("🚀 v48.0.0-LLM-FIRST — gateway LLM é o flagship: caps beta "
 #      200/dia global) — o padrão OpenRouter aplicado ao x402.
 #   3) Concierge de integração com IA: GET /integrate?q=... (cap 30/dia,
 #      fallback estático se a cadeia LLM estiver em quarentena).
-VERSION = "48.1.1-REACTIVE"  # hotfix: wrapper v46 do _build_402 agora aceita price_override (500s no promo) + promo fora do cache
-log.warning("🏷 v48.1.0-REACTIVE — promo de 1ª compra em tempo real no 402 · "
+VERSION = "48.3.0-PLANS"  # motor de economia v39.7 LIGADO (existia mas nunca era chamado) e migrado p/ ledger (7d, multi-worker) + degraus de crédito $4.99/$24.99 + /plans machine-readable
+log.warning("🧠 v48.2.0-SMART — preço de tabela fixo + First-Call Bonus pós-compra · "
             "/llm/free (freemium %s/dia) · /integrate (concierge IA)",
             LLM_FREE_PER_DAY)
 
