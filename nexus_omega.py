@@ -20537,7 +20537,7 @@ so here are your options as a human:</p>
 _v46_build_402_orig = _build_402
 
 
-def _build_402(endpoint: str):                      # noqa: F811
+def _build_402(endpoint: str, price_override: float = None):  # noqa: F811 — v48.1.1: encaminha override promocional
     """Desafio 402 servido de memória por CHALLENGE_CACHE_TTL segundos.
     O conteúdo só muda quando o preço muda; com 22 mil sondagens/dia, montar
     o payload do zero toda vez é trabalho puro para o ranking de latência."""
@@ -20557,6 +20557,11 @@ def _build_402(endpoint: str):                      # noqa: F811
                                       status=402, mimetype="text/html")
     except Exception:
         pass
+    # v48.1.1 FIX CRÍTICO: desafio promocional (1ª compra reativa) NUNCA passa
+    # pelo cache — cachear vazaria o desconto para todos os visitantes por
+    # CHALLENGE_CACHE_TTL segundos e quebraria a unicidade da oferta.
+    if price_override:
+        return _v46_build_402_orig(endpoint, price_override)
     now = time.time()
     with _chal_lock:
         hit = _chal_cache.get(endpoint)
@@ -22150,7 +22155,7 @@ log.warning("🚀 v48.0.0-LLM-FIRST — gateway LLM é o flagship: caps beta "
 #      200/dia global) — o padrão OpenRouter aplicado ao x402.
 #   3) Concierge de integração com IA: GET /integrate?q=... (cap 30/dia,
 #      fallback estático se a cadeia LLM estiver em quarentena).
-VERSION = "48.1.0-REACTIVE"
+VERSION = "48.1.1-REACTIVE"  # hotfix: wrapper v46 do _build_402 agora aceita price_override (500s no promo) + promo fora do cache
 log.warning("🏷 v48.1.0-REACTIVE — promo de 1ª compra em tempo real no 402 · "
             "/llm/free (freemium %s/dia) · /integrate (concierge IA)",
             LLM_FREE_PER_DAY)
