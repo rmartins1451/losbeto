@@ -9900,30 +9900,66 @@ def root():
 @app.route("/receipts")
 def receipts_json():
     """Recibos públicos verificáveis — agentes podem auditar vendas reais on-chain
-    antes de comprar. Diferencial de trust: transparência total."""
+    antes de comprar. Diferencial de trust: transparência total.
+
+    v48.3.1: resposta cacheada 180s + paginação ?limit/?offset. A tabela
+    revenue passa de 3,4k liquidações e crawlers consultam esta rota em
+    rajadas (incl. HEAD) — sem cache, cada hit segurava o lock do ledger e
+    disputava worker sync com a rota crítica de pagamento (timeout de 30s
+    observado em produção). Agora 1 query a cada 180s por página; os demais
+    hits são servidos do cache em ms."""
+    try:
+        limit = max(1, min(int(request.args.get("limit", "50")), 200))
+        offset = max(0, int(request.args.get("offset", "0")))
+    except Exception:
+        limit, offset = 50, 0
+    cache_key = f"receipts:v1:{limit}:{offset}"
+    try:
+        cached = LEDGER.cache_get(cache_key, 180)
+        if cached:
+            resp = jsonify(cached)
+            resp.headers["Cache-Control"] = "public, max-age=120"
+            return resp
+    except Exception:
+        pass
     out = []
     try:
         with LEDGER.lock, LEDGER._conn() as _c:
             cur = _c.execute(
                 "SELECT ts, endpoint, amount, tx_sig, chain, payer, source FROM revenue "
                 "WHERE tx_sig IS NOT NULL AND tx_sig != '' "
-                "ORDER BY ts DESC LIMIT 50")
-            for ts_, ep_, amt_, sig_, ch_, payer_, src_ in cur.fetchall():
-                origin = ("operator-test"
-                          if (src_ == "bootstrap" or (payer_ or "").lower() in OPERATOR_WALLETS)
-                          else "organic")
-                out.append({
-                    "ts": ts_, "endpoint": ep_,
-                    "amount_usdc": f"{amt_:.4f}",
-                    "tx": sig_, "chain": ch_,
-                    "origin": origin, "settled_via": src_,
-                    "explorer": (_explorer_url(ch_, sig_)
-                                 if _valid_txid(sig_) else None),
-                })
+                "ORDER BY ts DESC LIMIT ? OFFSET ?", (limit, offset))
+            rows = cur.fetchall()
+            total = _c.execute(
+                "SELECT COUNT(*) FROM revenue "
+                "WHERE tx_sig IS NOT NULL AND tx_sig != ''").fetchone()[0]
+        for ts_, ep_, amt_, sig_, ch_, payer_, src_ in rows:
+            origin = ("operator-test"
+                      if (src_ == "bootstrap" or (payer_ or "").lower() in OPERATOR_WALLETS)
+                      else "organic")
+            out.append({
+                "ts": ts_, "endpoint": ep_,
+                "amount_usdc": f"{amt_:.4f}",
+                "tx": sig_, "chain": ch_,
+                "origin": origin, "settled_via": src_,
+                "explorer": (_explorer_url(ch_, sig_)
+                             if _valid_txid(sig_) else None),
+            })
     except Exception as e:
         return jsonify({"error": str(e)}), 500
-    return jsonify({"receipts": out, "count": len(out),
-                    "note": "Vendas reais liquidadas via facilitator x402 — verifique cada tx on-chain."})
+    base = _public_base()
+    payload = {"receipts": out, "count": len(out),
+               "pagination": {"limit": limit, "offset": offset, "total": total,
+                              "next": (f"{base}/receipts?limit={limit}&offset={offset + limit}"
+                                       if offset + limit < total else None)},
+               "note": "Vendas reais liquidadas via facilitator x402 — verifique cada tx on-chain."}
+    try:
+        LEDGER.cache_set(cache_key, payload)
+    except Exception:
+        pass
+    resp = jsonify(payload)
+    resp.headers["Cache-Control"] = "public, max-age=120"
+    return resp
 
 @app.route("/info")
 def info():
@@ -22354,7 +22390,7 @@ log.warning("🚀 v48.0.0-LLM-FIRST — gateway LLM é o flagship: caps beta "
 #      200/dia global) — o padrão OpenRouter aplicado ao x402.
 #   3) Concierge de integração com IA: GET /integrate?q=... (cap 30/dia,
 #      fallback estático se a cadeia LLM estiver em quarentena).
-VERSION = "48.3.0-PLANS"  # motor de economia v39.7 LIGADO (existia mas nunca era chamado) e migrado p/ ledger (7d, multi-worker) + degraus de crédito $4.99/$24.99 + /plans machine-readable
+VERSION = "48.3.1-PLANS"  # v48.3.1: /receipts com cache 180s + paginação ?limit/?offset (rota pesava com 3,4k+ liquidações e travava worker sync sob rajada de crawlers) | v48.3.0: motor de economia ligado + degraus de crédito + /plans
 log.warning("🧠 v48.2.0-SMART — preço de tabela fixo + First-Call Bonus pós-compra · "
             "/llm/free (freemium %s/dia) · /integrate (concierge IA)",
             LLM_FREE_PER_DAY)
