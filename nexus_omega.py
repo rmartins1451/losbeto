@@ -2325,6 +2325,10 @@ _GEMINI_RESOLVED: Optional[str] = None
 _GEMINI_RESOLVED_AT = 0.0
 _GEMINI_LOCK = threading.Lock()
 GEMINI_DISCOVERY_TTL = int(os.environ.get("GEMINI_DISCOVERY_TTL", "21600"))  # 6 h
+# v48.3.4: modelos que devolveram 404 "no longer available" ficam BANIDOS —
+# o ListModels da chave ainda os lista, então sem esta lista a redescoberta
+# re-escolhia o mesmo nome e o 404 voltava para sempre (loop silencioso).
+_GEMINI_BANNED: set = set()
 
 # Ordem de preferência por prefixo. Flash antes de Pro: cota gratuita maior e
 # latência menor; "lite" por último, é o degrau de qualidade mais baixo.
@@ -2341,6 +2345,8 @@ _GEMINI_PREF = ("2.5-flash", "3.5-flash", "3.1-flash", "3-flash",
 def _gemini_pick(nomes: List[str]) -> Optional[str]:
     """Escolhe o melhor modelo disponível segundo a ordem de preferência."""
     limpos = [n.replace("models/", "") for n in nomes]
+    # v48.3.4: banidos por 404 neste processo nunca voltam a ser escolhidos.
+    limpos = [n for n in limpos if n not in _GEMINI_BANNED]
     # Descarta variantes que não servem para texto simples.
     limpos = [n for n in limpos if not any(
         t in n for t in ("embedding", "aqa", "imagen", "veo", "tts",
@@ -2631,7 +2637,9 @@ class LLM:
                 global _GEMINI_RESOLVED
                 with _GEMINI_LOCK:
                     _GEMINI_RESOLVED = None
-                log.warning(f"Gemini: modelo '{_gm}' retirado — redescobrindo")
+                    _GEMINI_BANNED.add(_gm)  # v48.3.4: anti-loop
+                log.warning(f"Gemini: modelo '{_gm}' retirado — banido, "
+                            "redescobrindo outro")
             return None, f"HTTP {r.status_code} (modelo={_gm}): {r.text[:160]}"
 
         def _try_ollama():
@@ -13675,6 +13683,12 @@ log.info(f"🔗 Apelidos de demanda registrados: {len(ALIAS_ROUTES)} rotas "
          f"({', '.join(ALIAS_ROUTES)}) + /bootstrap-trust/x402 + "
          f"/bootstrap-trust/* (curinga) + /api/v1 (índice grátis)")
 
+# v48.3.4: /docs pedido por 4 IPs distintos no radar (convenção de
+# documentação de API). Aponta para o documento que agentes realmente leem.
+@app.route("/docs")
+def docs_redirect():
+    return redirect("/llms.txt", code=302)
+
 
 # ============================================================================
 # 21b. /br-archive (v44.5.0-ARQUIVO) — o ativo que nenhum concorrente copia.
@@ -22496,7 +22510,7 @@ log.warning("🚀 v48.0.0-LLM-FIRST — gateway LLM é o flagship: caps beta "
 #      200/dia global) — o padrão OpenRouter aplicado ao x402.
 #   3) Concierge de integração com IA: GET /integrate?q=... (cap 30/dia,
 #      fallback estático se a cadeia LLM estiver em quarentena).
-VERSION = "48.3.3-GLOBAL"  # v48.3.2: /receipts ATIVO (_receipts_json_v45) com cache 180s + paginação + leituras SEM LEDGER.lock (fim dos WORKER TIMEOUT horários por crawler) + _payload_shape_ok anti-abuso do facilitator | v48.3.0: motor de economia + degraus de crédito + /plans
+VERSION = "48.3.4-GLOBAL"  # v48.3.2: /receipts ATIVO (_receipts_json_v45) com cache 180s + paginação + leituras SEM LEDGER.lock (fim dos WORKER TIMEOUT horários por crawler) + _payload_shape_ok anti-abuso do facilitator | v48.3.0: motor de economia + degraus de crédito + /plans
 log.warning("🧠 v48.2.0-SMART — preço de tabela fixo + First-Call Bonus pós-compra · "
             "/llm/free (freemium %s/dia) · /integrate (concierge IA)",
             LLM_FREE_PER_DAY)
