@@ -34,6 +34,7 @@ COPY --from=pybuild /opt/venv /opt/venv
 
 WORKDIR /app
 COPY nexus_omega.py .
+COPY start.sh .
 
 # Mesmos ajustes do nixpacks.toml: acp também em /usr/bin e stub de xdg-open
 # (o acp-cli tenta abrir browser no fluxo OAuth; sem o stub ele quebra)
@@ -44,12 +45,7 @@ RUN ln -sf /usr/local/bin/acp /usr/bin/acp \
 ENV PATH="/opt/venv/bin:$PATH" \
     PYTHONUNBUFFERED=1
 
-# Start idêntico ao do nixpacks.toml, mas à prova de runtime:
-# - exec form (JSON): o Railway NÃO envolve shell-form com /bin/sh -c como o
-#   Docker faz — foi isso que derrubou o deploy ("'$PORT' is not a valid
-#   port number": o gunicorn recebeu o texto literal '$PORT').
-# - sh -c explícito: garante a expansão da porta em qualquer runtime.
-# - ${PORT:-8080}: porta padrão se a variável não existir.
-# - exec: o gunicorn vira o PID 1 e recebe o SIGTERM direto do Railway —
-#   o graceful-timeout de 20s passa a funcionar de verdade.
-CMD ["sh", "-c", "exec gunicorn --worker-class sync --workers 4 --preload --timeout 45 --graceful-timeout 20 --keep-alive 30 --max-requests 5000 --max-requests-jitter 500 --bind 0.0.0.0:${PORT:-8080} nexus_omega:app"]
+# Start via script commitado: o comando é a string fixa "sh /app/start.sh" —
+# sem variável para o launcher expandir. Funciona COM ou SEM shell no runtime,
+# e igualmente quando chamado pelo startCommand do railway.toml.
+CMD ["sh", "/app/start.sh"]
