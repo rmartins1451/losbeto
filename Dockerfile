@@ -28,7 +28,6 @@ RUN npm i -g @virtuals-protocol/acp-cli && which acp
 # --- Imagem final: Python 3.11 + runtime Node (o ACP roda como subprocesso)
 FROM python:3.11-slim-bookworm
 COPY --from=nodebuild /usr/local/bin/node /usr/local/bin/node
-COPY --from=nodebuild /usr/local/bin/acp /usr/local/bin/acp
 COPY --from=nodebuild /usr/local/lib/node_modules /usr/local/lib/node_modules
 COPY --from=pybuild /opt/venv /opt/venv
 
@@ -36,11 +35,18 @@ WORKDIR /app
 COPY nexus_omega.py .
 COPY start.sh .
 
-# Mesmos ajustes do nixpacks.toml: acp também em /usr/bin e stub de xdg-open
-# (o acp-cli tenta abrir browser no fluxo OAuth; sem o stub ele quebra)
-RUN ln -sf /usr/local/bin/acp /usr/bin/acp \
+# Ajustes finais:
+# - symlink do acp recriado à mão, RELATIVO e exatamente como o npm -g faria.
+#   NÃO usar COPY para o bin: o BuildKit dereferencia o symlink e copia o JS
+#   como arquivo real em /usr/local/bin — o Node então resolve as deps a
+#   partir de /usr/local/bin e morre com "Cannot find package 'dotenv'"
+#   (bug visto em produção na v48.3.2; reproduzido e corrigido).
+# - stub de xdg-open (o acp-cli tenta abrir browser no fluxo OAuth).
+RUN ln -sf ../lib/node_modules/@virtuals-protocol/acp-cli/dist/bin/acp.js /usr/local/bin/acp \
+ && ln -sf /usr/local/bin/acp /usr/bin/acp \
  && printf '#!/bin/sh\nexit 0\n' > /usr/local/bin/xdg-open \
- && chmod +x /usr/local/bin/xdg-open
+ && chmod +x /usr/local/bin/xdg-open \
+ && /usr/local/bin/acp --version
 
 ENV PATH="/opt/venv/bin:$PATH" \
     PYTHONUNBUFFERED=1
