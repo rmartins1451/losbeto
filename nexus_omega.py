@@ -5093,7 +5093,7 @@ _PARAM_DESC = {
 }
 
 # v44.4.0: nome de serviço alinhado ao fosso (<=32 chars, ASCII — regra Bazaar)
-SERVICE_NAME = os.environ.get("SERVICE_NAME", "Losbeto Brazil Macro & Markets")[:32]
+SERVICE_NAME = os.environ.get("SERVICE_NAME", "Losbeto Market Intelligence")[:32]
 
 def _service_tags(endpoint: str) -> list:
     """v25: até 5 tags, cada uma <=32 chars ASCII imprimível (regra da spec).
@@ -7924,12 +7924,12 @@ def leaderboard():
         leaders = []
     return jsonify({
         "leaderboard": leaders,
-        "your_rank": "Jogue para subir no ranking! Compre créditos e acumule pontos.",
+        "your_rank": "Play to climb the leaderboard — buy credits and earn points.",
         "achievements": [
-            {"name": "First Blood", "desc": "Primeira compra", "reward": "+5% créditos"},
-            {"name": "Whale Hunter", "desc": "10 compras premium", "reward": "+15% desconto"},
-            {"name": "Streak Master", "desc": "7 dias comprando", "reward": "+10% bônus"},
-            {"name": "Global Trader", "desc": "Usou 3 mercados diferentes", "reward": "Acesso antecipado"},
+            {"name": "First Blood", "desc": "First purchase", "reward": "+5% credits"},
+            {"name": "Whale Hunter", "desc": "10 premium purchases", "reward": "+15% discount"},
+            {"name": "Streak Master", "desc": "7 days in a row buying", "reward": "+10% bonus"},
+            {"name": "Global Trader", "desc": "Used 3 different markets", "reward": "Early access"},
         ],
         "ts": ts, "version": VERSION,
     })
@@ -8092,9 +8092,9 @@ def _win_rate_signed():
     sig = base64.b64encode(WALLET.sign(canonical.encode())).decode()
     return jsonify({
         "service":   "Losbeto — Signed Win Rate (heuristic)",
-        "honesty_note": "A assinatura Ed25519 garante a INTEGRIDADE do dado, "
-                        "not the methodology: win_rate is a heuristic signal, "
-                        "baseado em regras, NÃO é P&L auditado.",
+        "honesty_note": "The Ed25519 signature guarantees data INTEGRITY, "
+                        "not the methodology: win_rate is a heuristic, "
+                        "rule-based signal — NOT audited P&L.",
         "version":   VERSION,
         "data":      payload,
         "signature": {
@@ -9025,13 +9025,13 @@ tr:hover td{background:var(--bg2)}
 <div class="hero">
   <div class="badge-live"><span class="pulse"></span>NODE ONLINE — v__V__</div>
   <h1>APIs pagas por AI Agents.<br>Instant. Onchain. Zero setup.</h1>
-  <p class="sub">__EPS__ endpoints monetizados via <b>x402</b> — flagship: <b>macro Brasil point-in-time</b> (IPCA, Selic e PTAX como foram publicados na época, sem look-ahead, assinados Ed25519). Pague por chamada com USDC em <b>Base, Solana ou Algorand</b>, receba em <b>&lt;500ms</b>.</p>
+  <p class="sub">__EPS__ monetized endpoints over <b>x402</b> — real-time crypto, equities, forex, commodities &amp; macro, anchored by a <b>signed point-in-time Brazilian macro archive</b> (IPCA, Selic, PTAX as originally published, no look-ahead, Ed25519). Pay per call with USDC on <b>Base, Solana or Algorand</b>, delivered in <b>&lt;500ms</b>.</p>
   <div class="cta">
-    <a href="/try" class="btn btn-p">🍽️ Degustação grátis — 6 endpoints em 1 chamada →</a>
-    <a href="/br-pit-proof" class="btn btn-s">📐 Prova do arquivo Brasil (grátis) — Merkle + Ed25519</a>
-    <a href="/why-buy" class="btn btn-s">🧭 Por que pagar? (resposta honesta)</a>
-    <a href="/losbeto-alpha-score" class="btn btn-s">⚡ Alpha Score grátis</a>
-    <a href="#creditos" class="btn btn-p" style="background:var(--gold,#f0b90b);box-shadow:0 4px 20px rgba(240,185,11,.3)">💳 Créditos: 1 tx → N chamadas</a>
+    <a href="/try" class="btn btn-p">🍽️ Free tasting — 6 endpoints in 1 call →</a>
+    <a href="/br-pit-proof" class="btn btn-s">📐 Brazil archive proof (free) — Merkle + Ed25519</a>
+    <a href="/why-buy" class="btn btn-s">🧭 Why pay? (honest answer)</a>
+    <a href="/losbeto-alpha-score" class="btn btn-s">⚡ Free Alpha Score</a>
+    <a href="#creditos" class="btn btn-p" style="background:var(--gold,#f0b90b);box-shadow:0 4px 20px rgba(240,185,11,.3)">💳 Credits: 1 tx → N calls</a>
     <a href="/.well-known/x402.json" class="btn btn-s">Ver x402 Manifest</a>
     <a href="/openapi.json" class="btn btn-s">OpenAPI Spec</a>
   </div>
@@ -9044,35 +9044,35 @@ tr:hover td{background:var(--bg2)}
 </div>
 
 <div class="stats">
-  <div class="stat"><div class="n">__EPS__</div><div class="l">Endpoints monetizados</div></div>
-  <div class="stat"><div class="n">&lt;500ms</div><div class="l">Latência média</div></div>
-  <div class="stat"><div class="n">$__MIN__</div><div class="l">Preço mínimo</div></div>
-  <div class="stat"><div class="n">2</div><div class="l">Chains ativas</div></div>
+  <div class="stat"><div class="n">__EPS__</div><div class="l">Monetized endpoints</div></div>
+  <div class="stat"><div class="n">&lt;500ms</div><div class="l">Avg latency</div></div>
+  <div class="stat"><div class="n">$__MIN__</div><div class="l">Minimum price</div></div>
+  <div class="stat"><div class="n">2</div><div class="l">Active chains</div></div>
 </div>
 
-<h2>Endpoints <span class="em">diferenciados</span> que fazem a diferença</h2>
-<p class="lead">Diferenciais que sustentam preço premium — e a novidade que muda o jogo: <b>créditos pré-pagos</b> (1 transação on-chain → dezenas de chamadas sem latência de settlement):</p>
+<h2>Differentiated endpoints <span class="em">worth paying for</span></h2>
+<p class="lead">Differentials that sustain premium pricing — and the game changer: <b>prepaid credits</b> (one on-chain transaction → dozens of calls with zero settlement latency):</p>
 
 <div class="grid3">
   <div class="feat" style="border-color:#7B61FF">
     <div class="ic">🚀</div>
     <h3>Launch Risk Brief <span class="tag hot">FLAGSHIP</span></h3>
-    <p>Risco de lançamento em tempo real: checks on-chain + liquidez DEX + veredicto de IA (AVOID/WATCH/SIZE). Preview grátis em <code>/launch-risk-preview</code> · completo em <code>/launch-risk</code> — preço dinâmico na tabela abaixo</p>
+    <p>Real-time launch risk: on-chain checks + DEX liquidity + AI verdict (AVOID/WATCH/SIZE). Free preview at <code>/launch-risk-preview</code> · full at <code>/launch-risk</code> — dynamic price in the table below</p>
   </div>
   <div class="feat">
     <div class="ic">🧾</div>
-    <h3>Transparência Radical <span class="tag free">FREE</span></h3>
-    <p>Um dos poucos nodes que rotula publicamente compras de teste vs. orgânicas — audite cada venda on-chain em <code>/receipts</code>. Num mercado cheio de wash trading, a verdade é o diferencial.</p>
+    <h3>Radical Transparency <span class="tag free">FREE</span></h3>
+    <p>One of the few nodes that publicly labels test vs. organic purchases — audit every sale on-chain at <code>/receipts</code>. In a market full of wash trading, truth is the edge.</p>
   </div>
   <div class="feat">
     <div class="ic">🍒</div>
     <h3>Losbeto Alpha Score <span class="tag free">FREE</span></h3>
-    <p>Índice composto proprietário 0-100 combinando 4 fatores (Fear&amp;Greed, Regime, Sentimento, Momentum). Preview grátis — versão completa em <code>/alpha-signal</code></p>
+    <p>Proprietary 0-100 composite index combining 4 factors (Fear&amp;Greed, Regime, Sentiment, Momentum). Free preview — full version at <code>/alpha-signal</code></p>
   </div>
   <div class="feat">
     <div class="ic">🔗</div>
     <h3>Multi-Chain Arbitrage <span class="tag hot">HOT</span></h3>
-    <p>Real-time spread Solana ↔ Base ↔ Ethereum. Detecta oportunidades &gt; 0.5% em USDC/USDT/SOL/ETH em &lt; 200ms. <code>/multi-chain-arbitrage</code></p>
+    <p>Real-time spread Solana ↔ Base ↔ Ethereum. Detects &gt; 0.5% opportunities in USDC/USDT/SOL/ETH in &lt; 200ms. <code>/multi-chain-arbitrage</code></p>
   </div>
   <div class="feat">
     <div class="ic">✅</div>
@@ -9106,30 +9106,30 @@ data = x402HTTPClientSync(wallet).get(<span class="s">"__URL__/alpha-signal"</sp
   </table>
 </div>
 
-<h2 id="creditos">💳 Créditos pré-pagos — <span class="em">pague 1x, use N vezes</span></h2>
-<p class="lead">Settlement on-chain por chamada custa 2–5s de latência e uma assinatura a cada request.
-Com créditos você faz <b>uma</b> transação e chama em ~1ms via header <code>X-API-Key</code>. É o modelo que o mercado já validou.</p>
+<h2 id="creditos">💳 Prepaid credits — <span class="em">pay once, call N times</span></h2>
+<p class="lead">Per-call on-chain settlement costs 2–5s of latency and one signature per request.
+With credits you make <b>one</b> transaction and call in ~1ms via the <code>X-API-Key</code> header. The model the market already validated.</p>
 <div class="grid4" style="max-width:1100px;margin:0 auto 10px">
   <div class="feat"><div class="ic">🍒</div><h3>Starter Credits</h3>
-    <p><b>$0.99</b> → saldo de <b>$1.25</b> em chamadas <span class="tag hot">+25% bônus</span></p>
+    <p><b>$0.99</b> → <b>$1.25</b> call balance <span class="tag hot">+25% bonus</span></p>
     <p style="font-size:12px;color:var(--dim)">GET /buy-credits</p></div>
   <div class="feat"><div class="ic">⚡</div><h3>Day Pass</h3>
-    <p><b>$2.99</b> → <b>ilimitado</b> por 24h em todos os endpoints</p>
+    <p><b>$2.99</b> → <b>unlimited</b> for 24h on every endpoint</p>
     <p style="font-size:12px;color:var(--dim)">GET /day-pass</p></div>
   <div class="feat"><div class="ic">🗓️</div><h3>Week Pass</h3>
-    <p><b>$9.99</b> → <b>ilimitado</b> por 7 dias em todos os endpoints</p>
+    <p><b>$9.99</b> → <b>unlimited</b> for 7 days on every endpoint</p>
     <p style="font-size:12px;color:var(--dim)">GET /week-pass</p></div>
-  <div class="feat"><div class="ic">🚀</div><h3>Pro <span class="tag hot">mensal</span></h3>
-    <p><b>$9.99/mês</b> → saldo de <b>$15</b> em chamadas <span class="tag hot">+50% bônus</span></p>
+  <div class="feat"><div class="ic">🚀</div><h3>Pro <span class="tag hot">monthly</span></h3>
+    <p><b>$9.99/mo</b> → <b>$15</b> call balance <span class="tag hot">+50% bonus</span></p>
     <p style="font-size:12px;color:var(--dim)">GET /subscribe-pro</p></div>
-  <div class="feat"><div class="ic">🐋</div><h3>Whale <span class="tag hot">mensal</span></h3>
-    <p><b>$19.99/mês</b> → <b>ilimitado</b> 30 dias + prioridade máxima</p>
+  <div class="feat"><div class="ic">🐋</div><h3>Whale <span class="tag hot">monthly</span></h3>
+    <p><b>$19.99/mo</b> → <b>unlimited</b> 30 days + maximum priority</p>
     <p style="font-size:12px;color:var(--dim)">GET /subscribe-whale</p></div>
-  <div class="feat"><div class="ic">🏛️</div><h3>Founding Agent <span class="tag new">EDIÇÃO DE LANÇAMENTO</span></h3>
-    <p><b>$49.99</b> → saldo de <b>$75</b> em chamadas <span class="tag hot">+50% bônus</span> —
-       o maior bônus do catálogo. Válido por <b>180 dias</b> (a janela mais longa de
-       qualquer plano de saldo) e a key carrega o badge <code>founding</code>,
-       verificável publicamente em <code>/credits-status</code>.</p>
+  <div class="feat"><div class="ic">🏛️</div><h3>Founding Agent <span class="tag new">LAUNCH EDITION</span></h3>
+    <p><b>$49.99</b> → <b>$75</b> call balance <span class="tag hot">+50% bonus</span> —
+       the largest bonus in the catalog. Valid for <b>180 days</b> (the longest
+       window of any balance plan) and the key carries the <code>founding</code>
+       badge, publicly verifiable at <code>/credits-status</code>.</p>
     <p style="font-size:12px;color:var(--dim)">GET /founding-agent</p></div>
 </div>
 <div class="demo-card" style="max-width:900px;margin:0 auto 40px">
@@ -12885,7 +12885,7 @@ def _br_macro_handler():
             cdi_a = round(((1 + cdi_d / 100) ** 252 - 1) * 100, 2)
             m["cdi_annualized_pct"] = {
                 "value": cdi_a, "ok": True, "source": "computed",
-                "description": "CDI anualizado (252 dias úteis, padrão do mercado)",
+                "description": "Annualized CDI (252 business days, market convention)",
                 "formula": "((1+CDI_dia)^252-1)*100", "from_daily": cdi_d}
             vivos["cdi_annualized_pct"] = m["cdi_annualized_pct"]
         except Exception:
@@ -14583,14 +14583,15 @@ def about_operator():
     return jsonify({
         "service": SERVICE_NAME,
         "operator": {
-            "name": "Roberto Martins",
+            "name": "Losbeto Operations",
             "contact": _building_block(),
             "responds": "Every message is read. Endpoints are added on request.",
         },
-        "what_this_is": ("Brazilian macro and B3 equity data for AI agents "
-                         "(BCB/B3, normalized, English) plus global pay-per-call "
-                         "market data over x402: 16-exchange equities, multi-oracle "
-                         "price consensus, sentiment, forex, commodities and crypto. "
+        "what_this_is": ("Real-time market data and AI inference for autonomous "
+                         "agents over x402: 16-exchange equities, multi-oracle "
+                         "price consensus, sentiment, forex, commodities and "
+                         "crypto — plus a proprietary point-in-time Brazilian "
+                         "macro archive (BCB/B3, normalized, English). "
                          "No API keys, no accounts."),
         "audit_us": {
             "labelled_receipts": f"{base}/receipts",
@@ -14629,14 +14630,24 @@ def _resources_alias():
 # Este arquivo fica pronto para ser o tokenURI ao registrar a identidade
 # on-chain (Base) — o registro é 1 transação na wallet do operador.
 @app.route("/.well-known/erc8004.json")
+@app.route("/erc8004.json")
 def erc8004_registration():
     base = _public_base()
+    # v48.3.3: após o mint na Base, setar env ERC8004_AGENT_ID para publicar
+    # o agentId aqui — compradores-agentes conferem esse campo antes de pagar.
+    _regs = []
+    _aid = os.environ.get("ERC8004_AGENT_ID", "").strip()
+    if _aid.isdigit():
+        _regs.append({"agentId": int(_aid),
+                      "agentRegistry": "eip155:8453:0x8004A169FB4a3325136EB29fA0ceB6D2e539a432"})
     return jsonify({
         "type": "https://eips.ethereum.org/EIPS/eip-8004#registration-v1",
         "name": "Losbeto",
         "description": ("x402-paid market data + OpenAI-compatible LLM gateway "
-                        "for AI agents. Forex, equities, Brazil macro (BCB/B3), "
-                        "crypto. USDC on Base/Solana/Algorand. Fixed public pricing."),
+                        "for AI agents, global in scope: forex, equities, "
+                        "commodities, crypto and macro — including a signed "
+                        "point-in-time Brazil macro archive (BCB/B3). "
+                        "USDC on Base/Solana/Algorand. Fixed public pricing."),
         "image": f"{base}/favicon.png",
         "services": [
             {"name": "web", "endpoint": base},
@@ -14647,7 +14658,7 @@ def erc8004_registration():
         "x402Support": True,
         "active": True,
         "supportedTrust": ["reputation"],
-        "registrations": [],
+        "registrations": _regs,
         "ts": int(time.time()),
     })
 
@@ -14679,6 +14690,7 @@ def manifest_agent():
             "examples":    [f"GET {base}{p}"],
         } for p in BASE_PRICES],
     })
+
 
 # v24.9: manifests são o alvo nº1 dos scanners (centenas de /openapi.json por
 # minuto nos logs). Reconstruir a spec de 67 endpoints a cada hit desperdiça
@@ -14754,100 +14766,100 @@ def _build_openapi():
                             "description": "Formato da resposta",
                             "schema": {"type": "string", "enum": ["json"], "default": "json"}}],
         "/regime":        [{"name": "symbol", "in": "query", "required": False,
-                            "description": "Par de trading (ex: BTC/USDC)",
+                            "description": "Trading pair (e.g. BTC/USDC)",
                             "schema": {"type": "string", "example": "BTC/USDC"}}],
         "/mempool":       [{"name": "limit", "in": "query", "required": False,
-                            "description": "Número de transações a retornar",
+                            "description": "Number of transactions to return",
                             "schema": {"type": "integer", "example": 20}}],
         "/anomalias":     [{"name": "threshold", "in": "query", "required": False,
-                            "description": "Limiar de detecção 0.0-1.0",
+                            "description": "Detection threshold 0.0-1.0",
                             "schema": {"type": "number", "example": 0.7}}],
         "/sentiment":     [{"name": "symbol", "in": "query", "required": False,
-                            "description": "Ativo (ex: BTC, ETH, SOL)",
+                            "description": "Asset (e.g. BTC, ETH, SOL)",
                             "schema": {"type": "string", "example": "BTC"}}],
         "/jupiter-swap":  [{"name": "pair", "in": "query", "required": False,
-                            "description": "Par a consultar (ex: SOL/USDC)",
+                            "description": "Pair to query (e.g. SOL/USDC)",
                             "schema": {"type": "string", "example": "SOL/USDC"}}],
         "/analise":       [{"name": "symbol", "in": "query", "required": False,
-                            "description": "Ativo a analisar",
+                            "description": "Asset to analyze",
                             "schema": {"type": "string", "example": "SOL/USDC"}}],
         "/swarm-vote":    [{"name": "proposal", "in": "query", "required": False,
-                            "description": "ID da proposta",
+                            "description": "Proposal ID",
                             "schema": {"type": "string", "example": "prop-001"}}],
         "/rugcheck":      [{"name": "token", "in": "query", "required": False,
-                            "description": "Endereço do token a verificar",
+                            "description": "Token address to check",
                             "schema": {"type": "string", "example": "4k3D..."}}],
         "/sinais":        [{"name": "timeframe", "in": "query", "required": False,
-                            "description": "Timeframe do sinal",
+                            "description": "Signal timeframe",
                             "schema": {"type": "string", "enum": ["1h","4h","1d"], "example": "1h"}}],
         "/defi-yield":    [{"name": "protocol", "in": "query", "required": False,
-                            "description": "Protocolo DeFi (ex: raydium, orca)",
+                            "description": "DeFi protocol (e.g. raydium, orca)",
                             "schema": {"type": "string", "example": "raydium"}}],
         "/deep-think":    [{"name": "question", "in": "query", "required": False,
-                            "description": "Pergunta para análise profunda de IA",
-                            "schema": {"type": "string", "example": "BTC vai subir nas próximas 24h?"}}],
+                            "description": "Question for deep AI analysis",
+                            "schema": {"type": "string", "example": "Will BTC go up in the next 24h?"}}],
         "/pump-monitor":  [{"name": "limit", "in": "query", "required": False,
-                            "description": "Número de tokens a monitorar",
+                            "description": "Number of tokens to monitor",
                             "schema": {"type": "integer", "example": 10}}],
         "/arbitrage":     [{"name": "pair", "in": "query", "required": False,
-                            "description": "Par a verificar arbitragem",
+                            "description": "Pair to check for arbitrage",
                             "schema": {"type": "string", "example": "SOL/USDC"}}],
         "/tg-premium":    [{"name": "format", "in": "query", "required": False,
-                            "description": "Formato do feed",
+                            "description": "Feed format",
                             "schema": {"type": "string", "enum": ["json","text"], "default": "json"}}],
         "/relatorio":     [{"name": "period", "in": "query", "required": False,
-                            "description": "Período do relatório",
+                            "description": "Report period",
                             "schema": {"type": "string", "enum": ["24h","7d","30d"], "example": "24h"}}],
         "/backtest":      [{"name": "strategy", "in": "query", "required": False,
-                            "description": "ID da estratégia a testar",
+                            "description": "Strategy ID to test",
                             "schema": {"type": "string", "example": "momentum_v1"}},
                            {"name": "days", "in": "query", "required": False,
-                            "description": "Dias de histórico",
+                            "description": "Days of history",
                             "schema": {"type": "integer", "example": 30}}],
         "/agent-call":    [{"name": "target", "in": "query", "required": False,
-                            "description": "Endereço do nó alvo",
+                            "description": "Target node address",
                             "schema": {"type": "string", "example": "https://peer.example.com"}}],
         "/onchain-credit":[{"name": "wallet", "in": "query", "required": False,
-                            "description": "Endereço Solana a avaliar",
+                            "description": "Solana address to evaluate",
                             "schema": {"type": "string", "example": "7xKX..."}}],
         "/cross-chain":   [{"name": "pair", "in": "query", "required": False,
-                            "description": "Par cross-chain (ex: SOL-ETH)",
+                            "description": "Cross-chain pair (e.g. SOL-ETH)",
                             "schema": {"type": "string", "example": "SOL-ETH"}}],
         "/whale-alert":   [{"name": "min_usd", "in": "query", "required": False,
-                            "description": "Valor mínimo em USD para alertar",
+                            "description": "Minimum USD value to alert",
                             "schema": {"type": "number", "example": 100000}}],
         "/smart-money":   [{"name": "limit", "in": "query", "required": False,
-                            "description": "Número de wallets a rastrear",
+                            "description": "Number of wallets to track",
                             "schema": {"type": "integer", "example": 10}}],
         "/copytrade":     [{"name": "wallet", "in": "query", "required": False,
-                            "description": "Wallet a copiar",
+                            "description": "Wallet to copy",
                             "schema": {"type": "string", "example": "7xKX..."}}],
         "/market-brief":  [{"name": "focus", "in": "query", "required": False,
-                            "description": "Foco do briefing (macro, btc, sol, rotation)",
+                            "description": "Briefing focus (macro, btc, sol, rotation)",
                             "schema": {"type": "string", "example": "macro"}}],
         "/portfolio-copilot":[{"name": "wallet", "in": "query", "required": False,
-                            "description": "Wallet Solana a diagnosticar",
+                            "description": "Solana wallet to diagnose",
                             "schema": {"type": "string", "example": "7xKX..."}}],
         "/launch-sniper": [{"name": "limit", "in": "query", "required": False,
-                            "description": "Quantidade de launches analisados",
+                            "description": "Number of launches analyzed",
                             "schema": {"type": "integer", "example": 10}}],
         "/whale-dossier": [{"name": "min_usd", "in": "query", "required": False,
-                            "description": "Corte mínimo para fluxo whale",
+                            "description": "Minimum cutoff for whale flow",
                             "schema": {"type": "number", "example": 250000}}],
         "/thesis-engine": [{"name": "symbol", "in": "query", "required": False,
-                            "description": "Ativo principal da tese",
+                            "description": "Main asset of the thesis",
                             "schema": {"type": "string", "example": "SOL"}}],
         "/starter-pack":  [{"name": "wallet", "in": "query", "required": False,
-                            "description": "Wallet opcional para personalizar o pack",
+                            "description": "Optional wallet to personalize the pack",
                             "schema": {"type": "string", "example": "7xKX..."}}],
         "/alpha-signal":  [{"name": "confidence", "in": "query", "required": False,
-                            "description": "Confiança mínima do sinal 0-100",
+                            "description": "Minimum signal confidence 0-100",
                             "schema": {"type": "integer", "example": 75}}],
         "/insider-track": [{"name": "limit", "in": "query", "required": False,
-                            "description": "Número de wallets insider a rastrear",
+                            "description": "Number of insider wallets to track",
                             "schema": {"type": "integer", "example": 5}}],
         "/mev-flow":      [{"name": "limit", "in": "query", "required": False,
-                            "description": "Número de oportunidades MEV",
+                            "description": "Number of MEV opportunities",
                             "schema": {"type": "integer", "example": 5}}],
     }
 
@@ -15091,7 +15103,7 @@ def _build_openapi():
                 "responses": {
                     "200": {"description": "Sucesso",
                             "content": {"application/json": {"schema": {"type": "object"}}}},
-                    "402": {"description": "Payment Required — use protocolo x402"},
+                    "402": {"description": "Payment Required — use the x402 protocol"},
                 },
             }
         }
@@ -15133,10 +15145,10 @@ def _build_openapi():
                         "credits": "Poupe settlement por chamada: compre /buy-credits e use header X-API-Key",
                     },
                     "responses": {
-                        "200": {"description": "chat.completion OpenAI-compatível",
+                        "200": {"description": "OpenAI-compatible chat.completion",
                                 "content": {"application/json": {
                                     "schema": _obs.get("outputSchema", {"type": "object"})}}},
-                        "402": {"description": "Payment Required — use protocolo x402"},
+                        "402": {"description": "Payment Required — use the x402 protocol"},
                     },
                 }
             }
@@ -15158,7 +15170,7 @@ def _build_openapi():
                         "properties": {
                             "positions": {
                                 "type": "array",
-                                "description": "Posições do portfolio",
+                                "description": "Portfolio positions",
                                 "items": {"type": "object",
                                           "required": ["asset", "qty"],
                                           "properties": {
@@ -15178,7 +15190,7 @@ def _build_openapi():
                 "responses": {
                     "200": {"description": "Stress test do portfolio",
                             "content": {"application/json": {"schema": {"type": "object"}}}},
-                    "402": {"description": "Payment Required — use protocolo x402"},
+                    "402": {"description": "Payment Required — use the x402 protocol"},
                 },
             }
 
@@ -15188,13 +15200,14 @@ def _build_openapi():
         "description": f"Multi-chain x402 AI swarm — Solana + Base. {len(BASE_PRICES)} monetized resources.",
         # v23: guidance p/ agentes (campo lido pelo discovery do AgentCash)
         "x-guidance": (
-            "Todas as rotas pagas respondem 402 com requirements x402 v1/v2 "
-            "(Solana e Base). Fluxo: chame sem pagamento → leia o 402 → reenvie "
-            "com header X-PAYMENT (v1) ou PAYMENT-SIGNATURE (v2). Para evitar "
-            "latência de settlement por chamada, compre créditos em /buy-credits "
-            "($1 → saldo $1.25), /day-pass ($2.50 ilimitado 24h) ou /subscribe-pro "
-            "e use o header X-API-Key retornado. Amostras grátis: /sample, "
-            "/losbeto-alpha-score, /launch-risk-preview. Recibos on-chain públicos: /receipts."
+            "All priced routes answer 402 with x402 v1/v2 requirements "
+            "(Solana and Base). Flow: call without payment, read the 402, "
+            "resend with header X-PAYMENT (v1) or PAYMENT-SIGNATURE (v2). To "
+            "skip per-call settlement latency, buy credit at /buy-credits "
+            "($0.99 -> $1.25 balance), /day-pass ($2.99 unlimited 24h) or "
+            "/subscribe-pro, then use the returned X-API-Key header. Free "
+            "samples: /sample, /losbeto-alpha-score, /launch-risk-preview. "
+            "Public on-chain receipts: /receipts."
         ),
     }
     if contact_email:
@@ -15253,7 +15266,7 @@ def llms_txt():
             f", {BASE_CAIP2}" if ENABLE_BASE else ""
         ),
         "",
-        "## Pagar (Multi-Chain)",
+        "## Pay (multi-chain)",
         f"Solana payTo: {RECEIVE_ADDRESS} (network: solana:{SOL_GENESIS})",
     ]
     if ENABLE_BASE and BASE_PAYTO_EVM:
@@ -15263,8 +15276,8 @@ def llms_txt():
     lines += ["", "## Credits (recommended — one transaction, N calls, no settlement latency)"]
     for ep, plan in CREDIT_PLANS.items():
         lines.append(f"- [{base}{ep}] ${BASE_PRICES[ep]:.2f} — {plan['pitch']}")
-    lines.append("Uso: header `X-API-Key: lsk_...` em qualquer endpoint pago. "
-                 "Saldo: GET /credits-status?key=...")
+    lines.append("Usage: header `X-API-Key: lsk_...` on any paid endpoint. "
+                 "Balance: GET /credits-status?key=...")
     # v44.0.8 — bloco colável de system prompt (padrão StableEnrich): os nós
     # que vendem se injetam no prompt do agente do cliente. Colar verbatim.
     lines += ["", "## FOR AGENT OPERATORS — SYSTEM PROMPT BLOCK (paste verbatim)",
@@ -16929,7 +16942,7 @@ async function reload(){
     sigEl.title="Signer (JWT/P2P) — não recebe pagamentos: "+j.signer_address;
   }
 
-  const trustActive = j.stats.paid_24h >= 3;
+  const trustActive = (((j.stats||{}).paid_total!==undefined)?j.stats.paid_total:(j.stats||{}).paid_24h||0) >= 3;
   document.getElementById("trust_alert").classList.toggle("show", !trustActive);
   document.getElementById("trust_ok").classList.toggle("show", trustActive);
 
@@ -20336,9 +20349,11 @@ except Exception as _e:
     log.warning(f"v45 featured: {_e}")
 
 V45_POSITIONING = (
-    "Point-in-time Brazilian macro & market data for AI agents and quants: "
-    "every official series recorded as it was actually published, with the "
-    "full revision trail, Ed25519-signed and Merkle-anchored. "
+    "Machine market intelligence for AI agents and quants, global in scope: "
+    "real-time crypto, equities, forex, commodities and macro — anchored by a "
+    "proprietary point-in-time Brazilian macro archive, every official series "
+    "recorded as it was actually published, with the full revision trail, "
+    "Ed25519-signed and Merkle-anchored. "
     "Not a wrapper around a free API — an archive that only exists because "
     "this node has been watching.")
 
@@ -20785,7 +20800,7 @@ def fidelity_json():
                     "required_response_fields. No guessing, no false negatives."),
         "free_probes_never_charge": True,
         "rate_limit_rpm_per_ip": RL_RPM_IP,
-        "contact_on_failure": "roberto.martins622@gmail.com",
+        "contact_on_failure": "ops@losbeto.xyz",
         "scorecard": f"{base}/scorecard.json",
         "endpoints": specs,
         "generated_at": datetime.now(timezone.utc).isoformat(
@@ -21146,7 +21161,7 @@ def challenge_entry_json():
         },
         "source": "https://github.com/rmartins1451/losbeto",
         "operator": {"name": "Roberto Martins",
-                     "email": "roberto.martins622@gmail.com"},
+                     "email": "ops@losbeto.xyz"},
         "generated_at": datetime.now(timezone.utc).isoformat(
             timespec="seconds").replace("+00:00", "Z"),
         "version": VERSION,
@@ -21188,10 +21203,9 @@ try:
             _d = ENDPOINT_DESC[_ep]
             if "Commodity wrapper" not in _d:
                 ENDPOINT_DESC[_ep] = (
-                    _d.rstrip() + f" [Commodity wrapper over a public source "
-                    f"({_src}) — buy it only for the convenience of one "
-                    f"schema and one payment rail. The differentiated product "
-                    f"here is the Brazilian point-in-time archive: /br-asof.]")
+                    _d.rstrip() + f" [Wrapper over a free public source "
+                    f"({_src}) — you pay for one schema, one payment rail, "
+                    f"signed receipts and monitored uptime.]")
         if _ep in FEATURED_ENDPOINTS:
             FEATURED_ENDPOINTS.remove(_ep)
     log.info(f"🏷 v46: {len(COMMODITY_ENDPOINTS)} endpoints marcados como "
@@ -21265,10 +21279,10 @@ def agents_json():
     base = _public_base()
     resp = jsonify({
         "schema_version": "0.1.0",
-        "info": {"title": f"{BRAND_NAME} — point-in-time Brazilian market data",
+        "info": {"title": f"{BRAND_NAME} — market intelligence for autonomous agents",
                  "description": V45_POSITIONING,
                  "version": VERSION},
-        "contact": {"email": "roberto.martins622@gmail.com", "url": base},
+        "contact": {"email": "ops@losbeto.xyz", "url": base},
         "sources": [{"id": "losbeto-api", "path": f"{base}/openapi.json"}],
         "payment": {
             "protocol": "x402 (HTTP 402 payment challenge)",
@@ -21981,7 +21995,7 @@ def _v47_boot():
     log.info(f"   Critério compra:   {base}/what-agents-buy")
     try:
         _t0 = time.perf_counter()
-        _c = _pix_build("smoke@losbeto.xyz", "LOSBETO", "PORTO ALEGRE", 1.23, "SMOKE")
+        _c = _pix_build("smoke@losbeto.xyz", "LOSBETO", "SAO PAULO", 1.23, "SMOKE")
         _ok = _pix_parse(_c)["crc_valid"]
         _du = br_bizdays(date(2026, 1, 1), date(2027, 1, 1))
         _ms = (time.perf_counter() - _t0) * 1000
@@ -22482,7 +22496,7 @@ log.warning("🚀 v48.0.0-LLM-FIRST — gateway LLM é o flagship: caps beta "
 #      200/dia global) — o padrão OpenRouter aplicado ao x402.
 #   3) Concierge de integração com IA: GET /integrate?q=... (cap 30/dia,
 #      fallback estático se a cadeia LLM estiver em quarentena).
-VERSION = "48.3.2-HARDENING"  # v48.3.2: /receipts ATIVO (_receipts_json_v45) com cache 180s + paginação + leituras SEM LEDGER.lock (fim dos WORKER TIMEOUT horários por crawler) + _payload_shape_ok anti-abuso do facilitator | v48.3.0: motor de economia + degraus de crédito + /plans
+VERSION = "48.3.3-GLOBAL"  # v48.3.2: /receipts ATIVO (_receipts_json_v45) com cache 180s + paginação + leituras SEM LEDGER.lock (fim dos WORKER TIMEOUT horários por crawler) + _payload_shape_ok anti-abuso do facilitator | v48.3.0: motor de economia + degraus de crédito + /plans
 log.warning("🧠 v48.2.0-SMART — preço de tabela fixo + First-Call Bonus pós-compra · "
             "/llm/free (freemium %s/dia) · /integrate (concierge IA)",
             LLM_FREE_PER_DAY)
