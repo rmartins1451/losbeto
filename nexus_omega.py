@@ -5752,6 +5752,40 @@ def _mpp_challenge(endpoint: str, primary: dict) -> str:
     return (f'Payment id="{cid}", realm="losbeto", method="x402", intent="charge", '
             f'request="{blob}", expires="{exp}", description="{desc}"')
 
+def _payload_shape_ok(pdata: dict) -> bool:
+    """v48.3.2 — sanity check LOCAL do paymentPayload decodificado, antes de
+    gastar chamada no facilitator. Um probe mandando {"hello":"world"} em
+    base64 custava 1 verify no CDP + 1 no PayAI por tentativa (rajada de 15
+    em 20s vista em produção) e ocupava o worker em HTTP externo. Lixo óbvio
+    morre aqui, de graça. Formatos legítimos cobertos:
+      EVM (v1/v2):  payload.signature + payload.authorization{}
+      Solana:       payload.transaction (base64 da tx parcialmente assinada)
+      Algorand:     payload.stxn / signedTransaction / txn
+      achatado v1:  signature no topo (sem envelope "payload")
+    Não substitui o facilitator — só barra o que é estruturalmente impossível.
+    """
+    try:
+        if not isinstance(pdata, dict):
+            return False
+        inner = pdata.get("payload")
+        if isinstance(inner, dict) and inner:
+            if inner.get("signature") and isinstance(inner.get("authorization"), dict):
+                return True
+            tx = inner.get("transaction")
+            if isinstance(tx, str) and len(tx) > 100:
+                return True
+            if any(inner.get(k) for k in ("stxn", "signedTransaction", "signedTxn", "txn")):
+                return True
+            return False
+        # envelope sem "payload": formato achatado (signature no topo)
+        if pdata.get("signature") and (pdata.get("authorization")
+                                       or pdata.get("network") or pdata.get("scheme")):
+            return True
+        return False
+    except Exception:
+        return False
+
+
 def _verify_payment(endpoint: str, payment_header: str):
     if not payment_header:
         return False, "missing-header", {}
@@ -5793,6 +5827,14 @@ def _verify_payment(endpoint: str, payment_header: str):
             network = pdata["accepted"]["network"]
     except Exception:
         tx_sig = payment_header.strip()
+
+    # v48.3.2: lixo estrutural NÃO vai ao facilitator — rejeição local, grátis.
+    # (payload só é não-vazio quando o header decodificou como JSON; o fluxo
+    # raw-sig legado v1, não-JSON, segue intocado para verificação on-chain.)
+    if payload and not _payload_shape_ok(payload):
+        log.warning(f"🧯 shape de payload inválido p/ {endpoint} — "
+                    f"rejeitado localmente (anti-abuso facilitator)")
+        return False, "invalid-payload-shape", {}
 
     # v39: o valor registrado é o que foi efetivamente cotado ao cliente.
     _quoted = _challenge_recall(endpoint)
@@ -19423,10 +19465,12 @@ def _self_pay_wallets() -> set:
 
 def _sweep_payers(limit_rows: int = 4000) -> dict:
     """Devolve {payer_lower: n_endpoints_distintos_na_rajada} para pagadores
-    que varreram o catálogo. Lê o ledger direto, sem alterar nada."""
+    que varreram o catálogo. Lê o ledger direto, sem alterar nada.
+    v48.3.2: leitura SEM LEDGER.lock — conexão thread-local + WAL; o lock do
+    app é para escritas. Era ele que travava /receipts sob rajada de crawler."""
     out = {}
     try:
-        with LEDGER.lock, LEDGER._conn() as c:
+        with LEDGER._conn() as c:
             rows = c.execute(
                 "SELECT ts, endpoint, payer FROM revenue "
                 "WHERE payer IS NOT NULL AND payer != '' "
@@ -19482,7 +19526,7 @@ def revenue_split(window_s: int = 0) -> dict:
            "window_seconds": window_s or None}
     try:
         cutoff = int(time.time()) - window_s if window_s else 0
-        with LEDGER.lock, LEDGER._conn() as c:
+        with LEDGER._conn() as c:  # v48.3.2: leitura sem o lock do app (WAL)
             rows = c.execute(
                 "SELECT amount, payer, source FROM revenue WHERE ts > ?",
                 (cutoff,)).fetchall()
@@ -19512,29 +19556,70 @@ def revenue_split(window_s: int = 0) -> dict:
 
 def _receipts_json_v45():
     """Substitui a rota /receipts. Mesma URL, mesma forma — mas nenhum
-    pagamento seu é mais anunciado ao mundo como venda orgânica."""
+    pagamento seu é mais anunciado ao mundo como venda orgânica.
+
+    v48.3.2-HARDENING: a rota morria 45s (WORKER TIMEOUT → SIGKILL) a cada
+    rajada horária de crawlers (HEAD /receipts). Causa: as LEITURAS pegavam
+    LEDGER.lock — o lock Python process-wide que serializa todas as ESCRITAS
+    (16k probes/dia logando request + settles + threads de fundo) — e ainda
+    disparavam o varredor de sweep a cada miss de cache. Em WAL, leitura não
+    precisa do lock do app. Agora: resposta cacheada 180s, paginação
+    ?limit/?offset, leituras sem lock, e stale-on-error como último recurso.
+    """
+    try:
+        limit = max(1, min(int(request.args.get("limit", "50")), 200))
+        offset = max(0, int(request.args.get("offset", "0")))
+    except Exception:
+        limit, offset = 50, 0
+    cache_key = f"receipts:v2:{limit}:{offset}"
+    try:
+        cached = LEDGER.cache_get(cache_key, 180)
+        if cached:
+            resp = jsonify(cached)
+            resp.headers["Cache-Control"] = "public, max-age=120"
+            return resp
+    except Exception:
+        pass
     out = []
     try:
-        with LEDGER.lock, LEDGER._conn() as _c:
-            cur = _c.execute(
+        # leitura SEM LEDGER.lock — conexão thread-local + WAL; o lock do app
+        # existe para escritas, e era ele que travava o worker sob rajada.
+        with LEDGER._conn() as _c:
+            rows = _c.execute(
                 "SELECT ts, endpoint, amount, tx_sig, chain, payer, source "
                 "FROM revenue WHERE tx_sig IS NOT NULL AND tx_sig != '' "
-                "ORDER BY ts DESC LIMIT 50")
-            for ts_, ep_, amt_, sig_, ch_, payer_, src_ in cur.fetchall():
-                origin = classify_payer(payer_ or "", src_ or "")
-                out.append({
-                    "ts": ts_, "endpoint": ep_,
-                    "amount_usdc": f"{float(amt_ or 0):.4f}",
-                    "tx": sig_, "chain": ch_,
-                    "origin": origin, "settled_via": src_,
-                    "explorer": (_explorer_url(ch_, sig_)
-                                 if _valid_txid(sig_) else None),
-                })
+                "ORDER BY ts DESC LIMIT ? OFFSET ?", (limit, offset)).fetchall()
+            total = _c.execute(
+                "SELECT COUNT(*) FROM revenue "
+                "WHERE tx_sig IS NOT NULL AND tx_sig != ''").fetchone()[0]
+        for ts_, ep_, amt_, sig_, ch_, payer_, src_ in rows:
+            origin = classify_payer(payer_ or "", src_ or "")
+            out.append({
+                "ts": ts_, "endpoint": ep_,
+                "amount_usdc": f"{float(amt_ or 0):.4f}",
+                "tx": sig_, "chain": ch_,
+                "origin": origin, "settled_via": src_,
+                "explorer": (_explorer_url(ch_, sig_)
+                             if _valid_txid(sig_) else None),
+            })
+        split = revenue_split()
     except Exception as e:
+        stale = None
+        try:
+            stale = LEDGER.cache_get(cache_key, 30 * 86400)
+        except Exception:
+            pass
+        if stale:
+            resp = jsonify(stale)
+            resp.headers["X-Cache"] = "STALE"
+            return resp
         return jsonify({"error": str(e)}), 500
-    split = revenue_split()
-    return jsonify({
+    base = _public_base()
+    payload = {
         "receipts": out, "count": len(out),
+        "pagination": {"limit": limit, "offset": offset, "total": total,
+                       "next": (f"{base}/receipts?limit={limit}&offset={offset + limit}"
+                                if offset + limit < total else None)},
         "revenue_truth": split,
         "legend": {
             "organic": "paid by a wallet this node does not control",
@@ -19545,7 +19630,14 @@ def _receipts_json_v45():
         },
         "note": ("Every line is verifiable on-chain. Operator-funded traffic "
                  "is labelled as such: only 'organic' is a real customer."),
-    })
+    }
+    try:
+        LEDGER.cache_set(cache_key, payload)
+    except Exception:
+        pass
+    resp = jsonify(payload)
+    resp.headers["Cache-Control"] = "public, max-age=120"
+    return resp
 
 
 try:
@@ -22390,7 +22482,7 @@ log.warning("🚀 v48.0.0-LLM-FIRST — gateway LLM é o flagship: caps beta "
 #      200/dia global) — o padrão OpenRouter aplicado ao x402.
 #   3) Concierge de integração com IA: GET /integrate?q=... (cap 30/dia,
 #      fallback estático se a cadeia LLM estiver em quarentena).
-VERSION = "48.3.1-PLANS"  # v48.3.1: /receipts com cache 180s + paginação ?limit/?offset (rota pesava com 3,4k+ liquidações e travava worker sync sob rajada de crawlers) | v48.3.0: motor de economia ligado + degraus de crédito + /plans
+VERSION = "48.3.2-HARDENING"  # v48.3.2: /receipts ATIVO (_receipts_json_v45) com cache 180s + paginação + leituras SEM LEDGER.lock (fim dos WORKER TIMEOUT horários por crawler) + _payload_shape_ok anti-abuso do facilitator | v48.3.0: motor de economia + degraus de crédito + /plans
 log.warning("🧠 v48.2.0-SMART — preço de tabela fixo + First-Call Bonus pós-compra · "
             "/llm/free (freemium %s/dia) · /integrate (concierge IA)",
             LLM_FREE_PER_DAY)
