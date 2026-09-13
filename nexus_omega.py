@@ -1483,11 +1483,11 @@ class LedgerV10:
                 return None
             if bal is None or bal < 0:  # ilimitado
                 c.execute("UPDATE api_keys SET calls_used=calls_used+1 WHERE key=?", (key,))
-                return {"remaining": -1, "unlimited": True}
+                return {"remaining": -1, "unlimited": True, "expires": exp}
             new_bal = round(bal - cost, 6)
             c.execute("UPDATE api_keys SET balance_usd=?, calls_used=calls_used+1 WHERE key=?",
                       (new_bal, key))
-            return {"remaining": new_bal, "unlimited": False}
+            return {"remaining": new_bal, "unlimited": False, "expires": exp}
 
     def api_key_stats(self):
         with self._conn() as c:
@@ -6752,6 +6752,26 @@ def paid_endpoint(path):
                         resp.headers["X-Credits-Remaining"] = (
                             "unlimited" if used.get("unlimited") else f"{used['remaining']:.6f}")
                         resp.headers["X-Credits-Cost"] = f"{cost:.6f}"
+                        # v48.3.5-RETENTION: a máquina fica sabendo NO
+                        # PROTOCOLO quando o plano expira ou o saldo acaba,
+                        # com o link de renovação — policy engines renovam
+                        # sozinhas, sem humano no loop.
+                        try:
+                            _base = _public_base()
+                            _exp = used.get("expires")
+                            if _exp:
+                                _left_s = int(_exp - time.time())
+                                resp.headers["X-Plan-Expires-In"] = str(_left_s)
+                                if 0 < _left_s < 86400:
+                                    resp.headers["X-Plan-Renew"] = f"{_base}/plans"
+                            if not used.get("unlimited"):
+                                _rem = float(used.get("remaining", 0))
+                                if _rem < 0.10:
+                                    resp.headers["X-Credit-Low"] = (
+                                        f"remaining_usd={_rem:.4f};"
+                                        f"top_up={_base}/buy-credits")
+                        except Exception:
+                            pass
                         return resp
                     except Exception as e:
                         log.error(f"handler {path} (apikey): {e}")
@@ -20814,7 +20834,7 @@ def fidelity_json():
                     "required_response_fields. No guessing, no false negatives."),
         "free_probes_never_charge": True,
         "rate_limit_rpm_per_ip": RL_RPM_IP,
-        "contact_on_failure": "ops@losbeto.xyz",
+        "contact_on_failure": "roberto.martins622@gmail.com",
         "scorecard": f"{base}/scorecard.json",
         "endpoints": specs,
         "generated_at": datetime.now(timezone.utc).isoformat(
@@ -21175,7 +21195,7 @@ def challenge_entry_json():
         },
         "source": "https://github.com/rmartins1451/losbeto",
         "operator": {"name": "Roberto Martins",
-                     "email": "ops@losbeto.xyz"},
+                     "email": "roberto.martins622@gmail.com"},
         "generated_at": datetime.now(timezone.utc).isoformat(
             timespec="seconds").replace("+00:00", "Z"),
         "version": VERSION,
@@ -21296,7 +21316,7 @@ def agents_json():
         "info": {"title": f"{BRAND_NAME} — market intelligence for autonomous agents",
                  "description": V45_POSITIONING,
                  "version": VERSION},
-        "contact": {"email": "ops@losbeto.xyz", "url": base},
+        "contact": {"email": "roberto.martins622@gmail.com", "url": base},
         "sources": [{"id": "losbeto-api", "path": f"{base}/openapi.json"}],
         "payment": {
             "protocol": "x402 (HTTP 402 payment challenge)",
@@ -22510,7 +22530,7 @@ log.warning("🚀 v48.0.0-LLM-FIRST — gateway LLM é o flagship: caps beta "
 #      200/dia global) — o padrão OpenRouter aplicado ao x402.
 #   3) Concierge de integração com IA: GET /integrate?q=... (cap 30/dia,
 #      fallback estático se a cadeia LLM estiver em quarentena).
-VERSION = "48.3.4-GLOBAL"  # v48.3.2: /receipts ATIVO (_receipts_json_v45) com cache 180s + paginação + leituras SEM LEDGER.lock (fim dos WORKER TIMEOUT horários por crawler) + _payload_shape_ok anti-abuso do facilitator | v48.3.0: motor de economia + degraus de crédito + /plans
+VERSION = "48.3.5-RETENTION"  # v48.3.2: /receipts ATIVO (_receipts_json_v45) com cache 180s + paginação + leituras SEM LEDGER.lock (fim dos WORKER TIMEOUT horários por crawler) + _payload_shape_ok anti-abuso do facilitator | v48.3.0: motor de economia + degraus de crédito + /plans
 log.warning("🧠 v48.2.0-SMART — preço de tabela fixo + First-Call Bonus pós-compra · "
             "/llm/free (freemium %s/dia) · /integrate (concierge IA)",
             LLM_FREE_PER_DAY)
