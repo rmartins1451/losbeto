@@ -4827,10 +4827,18 @@ def _cors(resp):
         "Authorization,Content-Type,X-Session-Token"
     )
     resp.headers["Access-Control-Allow-Methods"]  = "GET,POST,OPTIONS,HEAD"
-    resp.headers["Access-Control-Expose-Headers"] = (
-        "WWW-Authenticate,X-PAYMENT-REQUIRED,PAYMENT-REQUIRED,"
-        "X-Session-Token,X-Session-TTL,X-402-Version"
-    )
+    # v48.3.7 FIX: este hook global SOBRESCREVIA o Access-Control-Expose-Headers
+    # que cada caminho montou — o 402 perdia X-Plans/X-Cheapest-Plan, o pago
+    # perdia X-Next-Step/X-Savings-Tip, os créditos perdiam X-Plan-Expires-In/
+    # X-Plan-Renew/X-Credit-Low para qualquer agente em browser. Agora: UNIÃO
+    # da base global com o que a rota expôs (ordem preservada, sem duplicata).
+    _base_expose = ["WWW-Authenticate", "X-PAYMENT-REQUIRED", "PAYMENT-REQUIRED",
+                    "X-Session-Token", "X-Session-TTL", "X-402-Version"]
+    _existing = [h.strip() for h in
+                 (resp.headers.get("Access-Control-Expose-Headers") or "").split(",")
+                 if h.strip()]
+    resp.headers["Access-Control-Expose-Headers"] = ",".join(
+        dict.fromkeys(_base_expose + _existing))
     return resp
 
 @app.before_request
@@ -22573,7 +22581,7 @@ log.warning("🚀 v48.0.0-LLM-FIRST — gateway LLM é o flagship: caps beta "
 #      200/dia global) — o padrão OpenRouter aplicado ao x402.
 #   3) Concierge de integração com IA: GET /integrate?q=... (cap 30/dia,
 #      fallback estático se a cadeia LLM estiver em quarentena).
-VERSION = "48.3.6-CONVERT"  # v48.3.2: /receipts ATIVO (_receipts_json_v45) com cache 180s + paginação + leituras SEM LEDGER.lock (fim dos WORKER TIMEOUT horários por crawler) + _payload_shape_ok anti-abuso do facilitator | v48.3.0: motor de economia + degraus de crédito + /plans
+VERSION = "48.3.7-CONVERT"  # v48.3.2: /receipts ATIVO (_receipts_json_v45) com cache 180s + paginação + leituras SEM LEDGER.lock (fim dos WORKER TIMEOUT horários por crawler) + _payload_shape_ok anti-abuso do facilitator | v48.3.0: motor de economia + degraus de crédito + /plans
 log.warning("🧠 v48.2.0-SMART — preço de tabela fixo + First-Call Bonus pós-compra · "
             "/llm/free (freemium %s/dia) · /integrate (concierge IA)",
             LLM_FREE_PER_DAY)
