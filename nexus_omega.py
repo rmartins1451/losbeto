@@ -5395,6 +5395,14 @@ def _subscription_offer(endpoint: str, unit_price: float) -> Optional[dict]:
             item["includes_mcp_live"] = True
         opcoes.append(item)
     opcoes.sort(key=lambda x: x["price_usdc"])
+    # v48.3.6-CONVERT: marca a opção de break-even mais cedo NESTE endpoint.
+    # Agente de orçamento não compara 8 planos — ele executa o recomendado.
+    if opcoes:
+        _best = min(opcoes, key=lambda x: x["breaks_even_after"])
+        _best["recommended"] = True
+        _best["recommended_reason"] = (
+            f"Earliest break-even at this endpoint's price: from call "
+            f"#{_best['breaks_even_after']} onward you stop paying per call.")
     return {
         "why": ("If your agent will call this more than a handful of times, "
                 "one of these costs less and removes settlement latency "
@@ -5566,7 +5574,11 @@ def _build_402(endpoint: str, price_override: float = None):
                              "note": "One free call = live samples from 6 endpoints."},
             "cheapest_paid": _cheapest_paid(base),
             "credits": {"endpoint": f"{base}/buy-credits",
-                        "deal": "$1 -> $1.25 balance, zero settlement latency"},
+                        "deal": "Pay $0.99 once, get $1.25 of credit (+25%), zero settlement latency"},
+            "plans_catalog": {"endpoint": f"{base}/plans",
+                              "note": ("Machine-readable plan ladder: per-plan "
+                                       "break-even math, value ratio and the "
+                                       "recommended first purchase.")},
             "llm_gateway": {"endpoint": f"{base}/v1/chat/completions",
                             "openai_compatible": True,
                             "price_usd": f"{globals().get('LLM_PROXY_PRICE', 0.005):.4f}",
@@ -5695,6 +5707,19 @@ def _build_402(endpoint: str, price_override: float = None):
         resp.headers["X-Payment-Required-Ref"] = "see PAYMENT-REQUIRED header"
     # v24.5: cliente que só lê headers (muitos agentes) também descobre o preview
     resp.headers["X-Free-Preview"] = f"{base}{endpoint}?preview=1"
+    # v48.3.6-CONVERT: SDKs e crawlers de diretório que só leem HEADERS nunca
+    # viam o bloco alternatives.plans (só existe no corpo). A matemática do
+    # plano mais barato agora viaja em header puro, calculada no preço DESTE
+    # endpoint — a máquina decide sem parsear o corpo.
+    resp.headers["X-Plans"] = f"{base}/plans"
+    if endpoint not in CREDIT_PLANS and amount_usdc > 0:
+        _cheap = min(((BASE_PRICES[ep], ep) for ep in CREDIT_PLANS
+                      if BASE_PRICES.get(ep)), default=None)
+        if _cheap:
+            _be = int(_cheap[0] / amount_usdc) + 1
+            resp.headers["X-Cheapest-Plan"] = (
+                f"price_usdc={_cheap[0]:.2f};breaks_even_after={_be};"
+                f"buy={base}{_cheap[1]}")
     resp.headers["X-402-Version"]      = "1,2"
     resp.headers["X-Node-Id"]          = WALLET.node_id
     resp.headers["X-Accept-Chains"]    = ",".join([a["network"] for a in accepts])
@@ -5708,7 +5733,7 @@ def _build_402(endpoint: str, price_override: float = None):
     # para clientes web (metade das avaliações diárias são navegadores).
     resp.headers["Access-Control-Expose-Headers"] = (
         "PAYMENT-REQUIRED,X-PAYMENT-REQUIRED,WWW-Authenticate,X-Free-Preview,"
-        "X-402-Version,X-Accept-Chains")
+        "X-402-Version,X-Accept-Chains,X-Plans,X-Cheapest-Plan")
     return resp
 
 def _b64url(raw: bytes) -> str:
@@ -6772,6 +6797,12 @@ def paid_endpoint(path):
                                         f"top_up={_base}/buy-credits")
                         except Exception:
                             pass
+                        # v48.3.6 FIX: os headers de retenção (v48.3.5) e de
+                        # saldo iam ao ar SEM Access-Control-Expose-Headers —
+                        # invisíveis para qualquer agente rodando em browser.
+                        resp.headers["Access-Control-Expose-Headers"] = (
+                            "X-Credits-Remaining,X-Credits-Cost,"
+                            "X-Plan-Expires-In,X-Plan-Renew,X-Credit-Low")
                         return resp
                     except Exception as e:
                         log.error(f"handler {path} (apikey): {e}")
@@ -7019,6 +7050,13 @@ def paid_endpoint(path):
                         LEDGER.cache_set(f"fcbp:{_payer}", {"t": int(time.time())})
                         LEDGER.cache_set(f"fcb:{token[:40]}", {"n": 1})
                         resp.headers["X-First-Call-Bonus"] = "1-free-call-7d"
+                        # v48.3.6-CONVERT: a janela de atenção máxima de um
+                        # comprador novo é a primeira entrega. O próximo passo
+                        # viaja NO PROTOCOLO: reusar a sessão agora, e o link
+                        # da escada de planos para quando o volume justificar.
+                        resp.headers["X-Next-Step"] = (
+                            f"session_reuse=X-Session-Token;"
+                            f"plans={_public_base()}/plans")
                         log.info(f"🎁 FCB emitido p/ payer {_payer[:16]}… ({path})")
                 except Exception:
                     pass
@@ -7043,7 +7081,7 @@ def paid_endpoint(path):
                 except Exception:
                     pass
                 resp.headers["Access-Control-Expose-Headers"] = (
-                    "PAYMENT-RESPONSE,X-PAYMENT-RESPONSE,X-Session-Token,X-Session-TTL,X-First-Call-Bonus,X-Savings-Tip")
+                    "PAYMENT-RESPONSE,X-PAYMENT-RESPONSE,X-Session-Token,X-Session-TTL,X-First-Call-Bonus,X-Savings-Tip,X-Next-Step")
                 resp.headers["X-Session-Token"] = token
                 resp.headers["X-Session-TTL"]   = str(JWT_TTL)
                 return resp
@@ -7836,6 +7874,10 @@ def plans_json():
                        else f"${cfg['balance_usd']:.2f} of call credit"),
             "bonus": cfg.get("bonus", ""), "pitch": cfg.get("pitch", ""),
             "break_even_calls_at_avg_price": int(preco / avg) + 1,
+            # v48.3.6-CONVERT: para planos de saldo, quanto de serviço cada
+            # dólar compra (1.26 = +26%). Ilimitados não têm razão finita.
+            "value_ratio": (None if ilimitado
+                            else round(cfg["balance_usd"] / preco, 3)),
             "how_to_use": ("Pay once via x402; the returned key goes in the "
                            "X-API-Key header and calls skip settlement (~1ms)."),
         })
@@ -7847,6 +7889,7 @@ def plans_json():
         "advice_for_agents": ("If your expected calls x avg price exceed a "
                               "plan's price, the plan is the rational choice — "
                               "and settled calls arrive without latency."),
+        "recommended_first_purchase": f"{base}/buy-credits",
         "human_readable": f"{base}/pricing",
         "ts": int(time.time()),
     })
@@ -22530,7 +22573,7 @@ log.warning("🚀 v48.0.0-LLM-FIRST — gateway LLM é o flagship: caps beta "
 #      200/dia global) — o padrão OpenRouter aplicado ao x402.
 #   3) Concierge de integração com IA: GET /integrate?q=... (cap 30/dia,
 #      fallback estático se a cadeia LLM estiver em quarentena).
-VERSION = "48.3.5-RETENTION"  # v48.3.2: /receipts ATIVO (_receipts_json_v45) com cache 180s + paginação + leituras SEM LEDGER.lock (fim dos WORKER TIMEOUT horários por crawler) + _payload_shape_ok anti-abuso do facilitator | v48.3.0: motor de economia + degraus de crédito + /plans
+VERSION = "48.3.6-CONVERT"  # v48.3.2: /receipts ATIVO (_receipts_json_v45) com cache 180s + paginação + leituras SEM LEDGER.lock (fim dos WORKER TIMEOUT horários por crawler) + _payload_shape_ok anti-abuso do facilitator | v48.3.0: motor de economia + degraus de crédito + /plans
 log.warning("🧠 v48.2.0-SMART — preço de tabela fixo + First-Call Bonus pós-compra · "
             "/llm/free (freemium %s/dia) · /integrate (concierge IA)",
             LLM_FREE_PER_DAY)
