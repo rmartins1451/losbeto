@@ -22576,6 +22576,130 @@ log.warning("🚀 v48.0.0-LLM-FIRST — gateway LLM é o flagship: caps beta "
             LLM_DAILY_KEY_CAP, LLM_DAILY_GLOBAL_CAP)
 
 # ============================================================================
+# v48.3.9-FETCH (16/set/2026) — demanda orgânica virada produto, custo zero:
+#   1) /fetch ($0.010): o radar de 7d mostrou 22 pedidos de 2 IPs para
+#      "/fetch" — caminho que NÃO existia. Web-fetch é a primitiva mid-task
+#      clássica (ler doc, abrir link, puxar página além do cutoff do modelo).
+#      Anti-SSRF rigoroso: DNS validado em CADA salto de redirect
+#      (anti-rebinding), só IPs públicos, máx 3 redirects, 256KB, 8s.
+#      Erros são JSON honesto (url_not_allowed/fetch_failed), nunca 500 pago.
+#   2) /dashboard → 308 /dash: 50 pedidos/7d de 4 IPs procurando o painel
+#      pelo nome óbvio. Redirect gratuito, preserva query string.
+# ============================================================================
+
+_FETCH_MAX_BYTES = 256 * 1024
+_FETCH_TIMEOUT_S = 8
+_FETCH_MAX_REDIRECTS = 3
+
+
+def _fetch_url_guard(url: str) -> None:
+    """Anti-SSRF: só http/https, hostname público — cada IP resolvido é
+    validado contra loopback/privado/link-local/reservado/multicast.
+    Levanta ValueError com o motivo; o handler devolve JSON honesto."""
+    from urllib.parse import urlparse
+    p = urlparse((url or "").strip())
+    if p.scheme not in ("http", "https"):
+        raise ValueError("scheme must be http or https")
+    host = (p.hostname or "").lower().rstrip(".")
+    if not host:
+        raise ValueError("missing host")
+    if host == "localhost" or host.endswith((".local", ".internal", ".lan", ".corp")):
+        raise ValueError("internal hostnames are not allowed")
+    try:
+        infos = socket.getaddrinfo(host, p.port or (443 if p.scheme == "https" else 80),
+                                   proto=socket.IPPROTO_TCP)
+    except Exception:
+        raise ValueError("DNS resolution failed")
+    for info in infos:
+        ip = _ipaddr.ip_address(info[4][0])
+        if (ip.is_private or ip.is_loopback or ip.is_link_local
+                or ip.is_multicast or ip.is_reserved or ip.is_unspecified):
+            raise ValueError("target resolves to a non-public IP")
+
+
+def _fetch_handler():
+    """GET /fetch?url=<publica> — busca web paga para agentes. Sem ?url=,
+    busca o nosso /health (demo de conectividade do formato, grátis de custo)."""
+    url = (request.args.get("url") or "").strip()
+    default_used = False
+    if not url:
+        url = f"{_public_base()}/health"
+        default_used = True
+    try:
+        _fetch_url_guard(url)
+    except ValueError as e:
+        return {"error": "url_not_allowed", "reason": str(e), "url": url,
+                "scope": "public http/https only — internal/private ranges refused",
+                "hint": "GET /fetch?url=https://example.com",
+                "provider": "Losbeto", "version": VERSION}
+    headers = {"User-Agent": "Losbeto-Fetch/1.0 (+https://api.losbeto.xyz)",
+               "Accept": "text/html,application/json,text/plain,application/xml,*/*;q=0.8"}
+    try:
+        from urllib.parse import urljoin
+        current, hops = url, 0
+        while True:
+            r = requests.get(current, headers=headers, timeout=_FETCH_TIMEOUT_S,
+                             allow_redirects=False, stream=True)
+            if r.is_redirect and hops < _FETCH_MAX_REDIRECTS and r.headers.get("Location"):
+                nxt = urljoin(current, r.headers["Location"])
+                r.close()
+                _fetch_url_guard(nxt)   # revalida CADA salto (anti-rebinding)
+                current = nxt
+                hops += 1
+                continue
+            break
+        chunks, total = [], 0
+        for chunk in r.iter_content(chunk_size=16384):
+            if chunk:
+                chunks.append(chunk)
+                total += len(chunk)
+                if total >= _FETCH_MAX_BYTES:
+                    break
+        try:
+            r.close()
+        except Exception:
+            pass
+        raw = b"".join(chunks)[:_FETCH_MAX_BYTES]
+        out = {"url": url, "final_url": current, "status": r.status_code,
+               "content_type": (r.headers.get("Content-Type") or "").split(";")[0].strip().lower(),
+               "bytes": len(raw), "truncated": total >= _FETCH_MAX_BYTES,
+               "redirects_followed": hops,
+               "text": raw.decode(r.encoding or "utf-8", errors="replace"),
+               "fetched_at": int(time.time()),
+               "source": "losbeto-fetch/1.0",
+               "hint": f"Bodies are size-capped at {_FETCH_MAX_BYTES // 1024}KB and returned as text.",
+               "provider": "Losbeto", "version": VERSION}
+        if default_used:
+            out["note"] = "No url param — fetched our own /health as a connectivity demo."
+        return out
+    except Exception as e:
+        return {"error": "fetch_failed", "reason": str(e)[:200], "url": url,
+                "hint": "Target may be down, blocking bots, or timed out (8s).",
+                "provider": "Losbeto", "version": VERSION}
+
+
+BASE_PRICES["/fetch"] = 0.010
+ENDPOINT_DESC["/fetch"] = (
+    "Fetch any public web page or API and get it back as clean JSON — status, "
+    "content type, final URL after redirects and the body as text, size-capped. "
+    "The mid-task primitive agents use to read a doc, open a link or pull a "
+    "page beyond their training cutoff.")
+ENDPOINT_TAGS["/fetch"] = ["Utility", "Fetch", "Web"]
+ENDPOINT_PARAM_HINTS["/fetch"] = {"url": "https://example.com"}
+_PARAM_DESC["url"] = "Public http/https URL to fetch (internal/private ranges refused)"
+ENDPOINT_HANDLERS["/fetch"] = _fetch_handler
+app.add_url_rule("/fetch", "fetch", paid_endpoint("/fetch")(_fetch_handler))
+
+
+@app.route("/dashboard")
+def dashboard_alias():
+    """v48.3.9: 50 pedidos/7d (4 IPs) procurando o painel pelo nome óbvio —
+    redirect 308 gratuito preservando a query string."""
+    qs = request.query_string.decode()
+    return redirect(f"/dash{('?' + qs) if qs else ''}", code=308)
+
+
+# ============================================================================
 # v48.1.0-REACTIVE (11/set/2026) — o nó que REAGE para não perder a venda:
 #   1) Escada de desconto em tempo real: 3º 402 sem pagar (mesmo IP+endpoint,
 #      24h) → 1 desafio a 50% (piso $0.001), 1x/dia, settle fecha no preço
@@ -22584,7 +22708,7 @@ log.warning("🚀 v48.0.0-LLM-FIRST — gateway LLM é o flagship: caps beta "
 #      200/dia global) — o padrão OpenRouter aplicado ao x402.
 #   3) Concierge de integração com IA: GET /integrate?q=... (cap 30/dia,
 #      fallback estático se a cadeia LLM estiver em quarentena).
-VERSION = "48.3.8-CONVERT"  # v48.3.2: /receipts ATIVO (_receipts_json_v45) com cache 180s + paginação + leituras SEM LEDGER.lock (fim dos WORKER TIMEOUT horários por crawler) + _payload_shape_ok anti-abuso do facilitator | v48.3.0: motor de economia + degraus de crédito + /plans
+VERSION = "48.3.9-FETCH"  # v48.3.9: /fetch pago ($0.010) — demanda real dos logs 7d (22 pedidos/2 IPs para caminho inexistente), anti-SSRF por salto de redirect, 256KB/8s; /dashboard→/dash 308 (50 pedidos/7d) | base: v48.3.8-CONVERT
 log.warning("🧠 v48.2.0-SMART — preço de tabela fixo + First-Call Bonus pós-compra · "
             "/llm/free (freemium %s/dia) · /integrate (concierge IA)",
             LLM_FREE_PER_DAY)
