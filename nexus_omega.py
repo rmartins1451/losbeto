@@ -9258,7 +9258,7 @@ curl -H "X-API-Key: lsk_..." __BASE__/launch-risk<br><br>
       <img src="https://x402-list.com/badge/losbeto-cross-asset-market-intelligence.svg" alt="Losbeto monitorado no x402-list — uptime 100%, compliance A" height="28">
     </a>
   </div>
-  <div style="margin-top:10px">Losbeto v__V__ — Multi-chain x402 AI trading swarm — Solana : <code style="font-size:10px;color:var(--muted)">__ADDR__</code></div>
+  <div style="margin-top:10px">Losbeto v__V__ — Multi-chain x402 market intelligence node — Base + Solana + Algorand : <code style="font-size:10px;color:var(--muted)">__ADDR__</code></div>
 </div>
 
 </div></body></html>"""
@@ -14759,7 +14759,10 @@ def manifest_agent():
     return jsonify({
         "schemaVersion":  "0.3",
         "name":           "Losbeto",
-        "description":    "Multi-chain x402 AI trading swarm. Solana+Base+TON. Dynamic pricing.",
+        "description":    ("x402-paid market data + OpenAI-compatible LLM gateway for AI "
+                           "agents, global in scope: forex, equities, commodities, crypto "
+                           "and macro — including a signed point-in-time Brazil macro archive "
+                           "(BCB/B3). USDC on Base/Solana/Algorand. Fixed public pricing."),
         "url":            base,
         "version":        VERSION,
         "provider":       {"organization": "Losbeto", "url": base},
@@ -14771,7 +14774,7 @@ def manifest_agent():
             "id":          p.strip("/").replace("-", "_"),
             "name":        ENDPOINT_DESC.get(p, p),
             "description": f"{ENDPOINT_DESC.get(p, p)} - ${get_dynamic_price(p):.4f} USDC",
-            "tags":        ENDPOINT_TAGS.get(p, []) + ["x402", "solana"],
+            "tags":        ENDPOINT_TAGS.get(p, []) + ["x402", "base", "solana"],
             "examples":    [f"GET {base}{p}"],
         } for p in BASE_PRICES],
     })
@@ -22581,7 +22584,7 @@ log.warning("🚀 v48.0.0-LLM-FIRST — gateway LLM é o flagship: caps beta "
 #      200/dia global) — o padrão OpenRouter aplicado ao x402.
 #   3) Concierge de integração com IA: GET /integrate?q=... (cap 30/dia,
 #      fallback estático se a cadeia LLM estiver em quarentena).
-VERSION = "48.3.7-CONVERT"  # v48.3.2: /receipts ATIVO (_receipts_json_v45) com cache 180s + paginação + leituras SEM LEDGER.lock (fim dos WORKER TIMEOUT horários por crawler) + _payload_shape_ok anti-abuso do facilitator | v48.3.0: motor de economia + degraus de crédito + /plans
+VERSION = "48.3.8-CONVERT"  # v48.3.2: /receipts ATIVO (_receipts_json_v45) com cache 180s + paginação + leituras SEM LEDGER.lock (fim dos WORKER TIMEOUT horários por crawler) + _payload_shape_ok anti-abuso do facilitator | v48.3.0: motor de economia + degraus de crédito + /plans
 log.warning("🧠 v48.2.0-SMART — preço de tabela fixo + First-Call Bonus pós-compra · "
             "/llm/free (freemium %s/dia) · /integrate (concierge IA)",
             LLM_FREE_PER_DAY)
