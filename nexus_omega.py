@@ -11802,6 +11802,72 @@ app.add_url_rule("/llm/free", "llm_free", llm_free, methods=["GET"])
 app.add_url_rule("/llm/freePublic", "alias_llm_freepublic", llm_free, methods=["GET"])
 
 # ---------------------------------------------------------------------------
+# v48.3.9.3-KEYDIR — Web Bot Auth: HTTP Message Signatures Directory
+# (draft-meunier-http-message-signatures-directory; IETF Web Bot Auth WG —
+# Cloudflare/OpenAI/Visa-TAP style). Radar: 10 reqs de 6 IPs em 7d — agentes
+# enterprise procuram este well-known para verificar identidade assinada.
+# Servimos a chave Ed25519 PUBLICA do no (a mesma que sela o PIT Brasil) como
+# JWKS, com a resposta assinada (RFC 9421) — prova de que o diretorio e nosso.
+def _wba_thumbprint(x_b64u: str) -> str:
+    canon = json.dumps({"crv": "Ed25519", "kty": "OKP", "x": x_b64u},
+                       separators=(",", ":"), sort_keys=True)
+    return base64.urlsafe_b64encode(
+        hashlib.sha256(canon.encode()).digest()).rstrip(b"=").decode()
+
+@app.route("/.well-known/http-message-signatures-directory")
+def manifest_sig_directory():
+    pub = bytes(getattr(WALLET, "public_key", b""))
+    x = base64.urlsafe_b64encode(pub).rstrip(b"=").decode()
+    kid = _wba_thumbprint(x)
+    body = json.dumps({"keys": [{
+        "kty": "OKP", "crv": "Ed25519", "kid": kid, "x": x,
+        "use": "sig", "alg": "EdDSA"}]}, separators=(",", ":"))
+    host = (request.host or "api.losbeto.xyz").split(":")[0]
+    now = int(time.time())
+    params = (f'("@authority");created={now};expires={now + 300};'
+              f'keyid="{kid}";alg="ed25519";'
+              f'tag="http-message-signatures-directory"')
+    sig_base = f'"@authority": {host}\n"@signature-params": {params}'
+    sig = base64.b64encode(WALLET.sign(sig_base.encode())).decode()
+    resp = app.response_class(
+        body, mimetype="application/http-message-signatures-directory+json")
+    resp.headers["Cache-Control"] = "max-age=86400"
+    resp.headers["Signature-Input"] = f"sig1={params}"
+    resp.headers["Signature"] = f"sig1=:{sig}:"
+    return resp
+
+# /legal + /support — radar: 7 reqs/4 IPs e 7 reqs/2 IPs em 7d. Agentes
+# enterprise fazem due-diligence (termos, contato) antes de integrar. Gratis,
+# honesto, sem PII alem do contato publico ja exposto no README.
+@app.route("/legal")
+def legal_terms():
+    return jsonify({
+        "service": "Losbeto — pay-per-call machine API (x402). No accounts, no API keys to manage: the payment is the auth.",
+        "operator": "Roberto Martins — roberto.martins622@gmail.com",
+        "pricing": "Fixed public list prices advertised in each 402 body; incentives are post-payment only, never pre-payment discounts.",
+        "data_disclaimer": "Market data and AI output are informational; not financial advice.",
+        "transparency": {"receipts": "https://api.losbeto.xyz/receipts",
+                          "honest_revenue": "https://api.losbeto.xyz/.well-known/honest-revenue.json",
+                          "scorecard": "https://api.losbeto.xyz/scorecard.json"},
+        "code_license": "MIT — https://github.com/rmartins1451/losbeto",
+        "ts": int(time.time()), "version": VERSION})
+
+@app.route("/support")
+def support_info():
+    return jsonify({
+        "contact": "roberto.martins622@gmail.com",
+        "issues": "https://github.com/rmartins1451/losbeto/issues",
+        "docs": {"agents": "https://api.losbeto.xyz/agents.json",
+                  "llms_txt": "https://api.losbeto.xyz/llms.txt",
+                  "openapi": "https://api.losbeto.xyz/openapi.json",
+                  "mcp": "https://api.losbeto.xyz/server.json"},
+        "status": {"health": "https://api.losbeto.xyz/health",
+                    "scorecard": "https://api.losbeto.xyz/scorecard.json"},
+        "payment_support": {"receipts": "https://api.losbeto.xyz/receipts",
+                             "tx_debug": "https://api.losbeto.xyz/debug-tx?sig=<signature>"},
+        "ts": int(time.time()), "version": VERSION})
+
+# ---------------------------------------------------------------------------
 # v48.1.0 — CONCIERGE DE INTEGRAÇÃO (IA, grátis, cap 30/dia global).
 # "Como eu pago?" respondido na hora, no idioma da pergunta — o avaliador
 # não vai embora esperando o operador acordar. Fallback estático se a cadeia
@@ -13702,6 +13768,7 @@ log.info(f"🧰 Job Suite registrada: {len(JOB_SUITE)} jobs "
 ALIAS_ROUTES = {
     "/search":             "/web-search",          # convenção universal de busca
     "/x402":               "/x402-audit",          # "audite este nó x402"
+    "/proxy":              "/fetch",              # v48.3.9.3: radar 10 reqs/2 IPs — pago, filtra abuso de open-proxy
     "/api/agent/discover": "/agent-market",        # descoberta de agente
     "/token-research":     "/job/token-research",  # nome óbvio do job
     "/earnings-whisper/x402": "/x402-audit",       # v44.3.3: padrão "{rota}/x402"
@@ -22720,7 +22787,7 @@ def dashboard_alias():
 #      200/dia global) — o padrão OpenRouter aplicado ao x402.
 #   3) Concierge de integração com IA: GET /integrate?q=... (cap 30/dia,
 #      fallback estático se a cadeia LLM estiver em quarentena).
-VERSION = "48.3.9.2-ALIAS"  # v48.3.9.2: alias /llm/freePublic → /llm/free (demanda medida: 7 IPs/7d) | base: v48.3.9.1-GLAMA  # v48.3.9.1: /.well-known/glama.json aceita override via env GLAMA_CLAIM_JSON (claim do Glama por HTTP challenge sem novo deploy de código) | base: v48.3.9-FETCH
+VERSION = "48.3.9.3-KEYDIR"  # v48.3.9.3: /.well-known/http-message-signatures-directory (JWKS Ed25519 assinado RFC9421) + /legal + /support + alias /proxy→/fetch | base: v48.3.9.2-ALIAS  # v48.3.9.2: alias /llm/freePublic → /llm/free (demanda medida: 7 IPs/7d) | base: v48.3.9.1-GLAMA  # v48.3.9.1: /.well-known/glama.json aceita override via env GLAMA_CLAIM_JSON (claim do Glama por HTTP challenge sem novo deploy de código) | base: v48.3.9-FETCH
 log.warning("🧠 v48.2.0-SMART — preço de tabela fixo + First-Call Bonus pós-compra · "
             "/llm/free (freemium %s/dia) · /integrate (concierge IA)",
             LLM_FREE_PER_DAY)
