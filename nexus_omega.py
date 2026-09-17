@@ -12590,6 +12590,12 @@ def manifest_glama():
     o manifest de claim/manutenção do servidor. Formato oficial mínimo:
     $schema + maintainers (github.com/glama.ai — blog 'what-is-glamajson').
     Sem isso o servidor existia no índice deles sem dono verificado."""
+    # v48.3.9.1: claim por HTTP challenge — se GLAMA_CLAIM_JSON estiver setada
+    # (Railway Variables), serve o JSON exato que o Glama mostra no fluxo de
+    # claim, sem precisar de novo deploy de código.
+    _claim = (os.environ.get("GLAMA_CLAIM_JSON") or "").strip()
+    if _claim:
+        return app.response_class(_claim, mimetype="application/json")
     return jsonify({
         "$schema":     "https://glama.ai/mcp/schemas/server.json",
         "maintainers": ["rmartins1451"],
@@ -22708,7 +22714,7 @@ def dashboard_alias():
 #      200/dia global) — o padrão OpenRouter aplicado ao x402.
 #   3) Concierge de integração com IA: GET /integrate?q=... (cap 30/dia,
 #      fallback estático se a cadeia LLM estiver em quarentena).
-VERSION = "48.3.9-FETCH"  # v48.3.9: /fetch pago ($0.010) — demanda real dos logs 7d (22 pedidos/2 IPs para caminho inexistente), anti-SSRF por salto de redirect, 256KB/8s; /dashboard→/dash 308 (50 pedidos/7d) | base: v48.3.8-CONVERT
+VERSION = "48.3.9.1-GLAMA"  # v48.3.9.1: /.well-known/glama.json aceita override via env GLAMA_CLAIM_JSON (claim do Glama por HTTP challenge sem novo deploy de código) | base: v48.3.9-FETCH
 log.warning("🧠 v48.2.0-SMART — preço de tabela fixo + First-Call Bonus pós-compra · "
             "/llm/free (freemium %s/dia) · /integrate (concierge IA)",
             LLM_FREE_PER_DAY)
