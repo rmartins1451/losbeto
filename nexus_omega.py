@@ -11795,6 +11795,12 @@ def llm_free():
 
 app.add_url_rule("/llm/free", "llm_free", llm_free, methods=["GET"])
 
+# v48.3.9.2-ALIAS — radar de demanda (17/09): /llm/freePublic com 7 IPs em 7d.
+# Convenção de nome que agentes tentam p/ achar o freemium; servimos a MESMA
+# view (mesmo cap de 5/dia por IP — sem brecha no rate limit) e o JSON de
+# resposta já carrega o cross-sell p/ o /llm pago. Funil completo.
+app.add_url_rule("/llm/freePublic", "alias_llm_freepublic", llm_free, methods=["GET"])
+
 # ---------------------------------------------------------------------------
 # v48.1.0 — CONCIERGE DE INTEGRAÇÃO (IA, grátis, cap 30/dia global).
 # "Como eu pago?" respondido na hora, no idioma da pergunta — o avaliador
@@ -22714,7 +22720,7 @@ def dashboard_alias():
 #      200/dia global) — o padrão OpenRouter aplicado ao x402.
 #   3) Concierge de integração com IA: GET /integrate?q=... (cap 30/dia,
 #      fallback estático se a cadeia LLM estiver em quarentena).
-VERSION = "48.3.9.1-GLAMA"  # v48.3.9.1: /.well-known/glama.json aceita override via env GLAMA_CLAIM_JSON (claim do Glama por HTTP challenge sem novo deploy de código) | base: v48.3.9-FETCH
+VERSION = "48.3.9.2-ALIAS"  # v48.3.9.2: alias /llm/freePublic → /llm/free (demanda medida: 7 IPs/7d) | base: v48.3.9.1-GLAMA  # v48.3.9.1: /.well-known/glama.json aceita override via env GLAMA_CLAIM_JSON (claim do Glama por HTTP challenge sem novo deploy de código) | base: v48.3.9-FETCH
 log.warning("🧠 v48.2.0-SMART — preço de tabela fixo + First-Call Bonus pós-compra · "
             "/llm/free (freemium %s/dia) · /integrate (concierge IA)",
             LLM_FREE_PER_DAY)
