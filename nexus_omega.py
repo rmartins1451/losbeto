@@ -13768,7 +13768,6 @@ log.info(f"🧰 Job Suite registrada: {len(JOB_SUITE)} jobs "
 ALIAS_ROUTES = {
     "/search":             "/web-search",          # convenção universal de busca
     "/x402":               "/x402-audit",          # "audite este nó x402"
-    "/proxy":              "/fetch",              # v48.3.9.3: radar 10 reqs/2 IPs — pago, filtra abuso de open-proxy
     "/api/agent/discover": "/agent-market",        # descoberta de agente
     "/token-research":     "/job/token-research",  # nome óbvio do job
     "/earnings-whisper/x402": "/x402-audit",       # v44.3.3: padrão "{rota}/x402"
@@ -22768,6 +22767,11 @@ ENDPOINT_PARAM_HINTS["/fetch"] = {"url": "https://example.com"}
 _PARAM_DESC["url"] = "Public http/https URL to fetch (internal/private ranges refused)"
 ENDPOINT_HANDLERS["/fetch"] = _fetch_handler
 app.add_url_rule("/fetch", "fetch", paid_endpoint("/fetch")(_fetch_handler))
+# v48.3.9.4-PROXYFIX: /proxy é alias PAGO do /fetch (mesmo preço — o preço é o
+# filtro anti-abuso de open-proxy). Registrado aqui, DEPOIS do alvo: o loop de
+# ALIAS_ROUTES roda ~9k linhas antes e pulava este alias no boot.
+app.add_url_rule("/proxy", "alias_proxy", paid_endpoint("/fetch")(_fetch_handler),
+                 methods=["GET", "POST"])
 
 
 @app.route("/dashboard")
@@ -22787,7 +22791,7 @@ def dashboard_alias():
 #      200/dia global) — o padrão OpenRouter aplicado ao x402.
 #   3) Concierge de integração com IA: GET /integrate?q=... (cap 30/dia,
 #      fallback estático se a cadeia LLM estiver em quarentena).
-VERSION = "48.3.9.3-KEYDIR"  # v48.3.9.3: /.well-known/http-message-signatures-directory (JWKS Ed25519 assinado RFC9421) + /legal + /support + alias /proxy→/fetch | base: v48.3.9.2-ALIAS  # v48.3.9.2: alias /llm/freePublic → /llm/free (demanda medida: 7 IPs/7d) | base: v48.3.9.1-GLAMA  # v48.3.9.1: /.well-known/glama.json aceita override via env GLAMA_CLAIM_JSON (claim do Glama por HTTP challenge sem novo deploy de código) | base: v48.3.9-FETCH
+VERSION = "48.3.9.4-PROXYFIX"  # v48.3.9.4: /proxy registrado após o alvo /fetch (o loop ALIAS_ROUTES rodava antes e o pulava) | base: v48.3.9.3-KEYDIR  # v48.3.9.3: /.well-known/http-message-signatures-directory (JWKS Ed25519 assinado RFC9421) + /legal + /support + alias /proxy→/fetch | base: v48.3.9.2-ALIAS  # v48.3.9.2: alias /llm/freePublic → /llm/free (demanda medida: 7 IPs/7d) | base: v48.3.9.1-GLAMA  # v48.3.9.1: /.well-known/glama.json aceita override via env GLAMA_CLAIM_JSON (claim do Glama por HTTP challenge sem novo deploy de código) | base: v48.3.9-FETCH
 log.warning("🧠 v48.2.0-SMART — preço de tabela fixo + First-Call Bonus pós-compra · "
             "/llm/free (freemium %s/dia) · /integrate (concierge IA)",
             LLM_FREE_PER_DAY)
