@@ -1,9 +1,29 @@
 # -*- coding: utf-8 -*-
 """
 ================================================================================
- LOSBETO v27.0.0-DISCOVERY — "The Machine Magnet"
+ LOSBETO v48.5.0-FUNIL — "The Last Millimetre"
 ================================================================================
- Upgrade: v26.0.0-MCP  →  v27.0.0-DISCOVERY  (2026-07)
+ Upgrade: v48.4.0-WALLETPAY  →  v48.5.0-FUNIL  (2026-09)
+
+ CAUSA RAIZ DO "0 VENDAS/24h" (lido do próprio ledger do node):
+  Visibilidade RESOLVIDA (16K scanners/dia, trust bootstrap completo,
+  diretórios x402, 96 endpoints). O funil travava no ÚLTIMO MILÍMETRO:
+  ~30 avaliadores reais/24h, 0% de conversão — e 55% deles (iPhone Safari
+  + Android) em MOBILE SEM window.ethereum, onde a ponte /pay/ morria com
+  "No wallet found".
+
+ O QUE A v48.5 CORRIGE:
+  1) CHECKOUT MOBILE — /pay/ sem provider injetado → deep link (MetaMask/
+     Coinbase/Rainbow) que ABRE a wallet app já nesta URL + QR (desktop
+     paga com o celular). A venda não morre mais no "No wallet found".
+  2) DEMANDA MEDIDA ATENDIDA — /blog/ (62 req/7d) e /login (9 req/7d)
+     levavam 404; agora respondem 200 (JSON machine-readable; /login
+     explica o modelo "no login — pay per call").
+  3) VERDADE DO DOCUMENTO — cabeçalho declarava v27; agora declara a
+     versão que roda.
+
+ (o histórico v27+ segue abaixo como contexto)
+================================================================================
 
  CAUSA RAIZ DO "NÃO VENDE" (mesmo com motor x402 correto):
   A v26 tinha protocolo, preço e preview OK — mas em 2026-07 o gargalo mudou:
@@ -22909,9 +22929,8 @@ p.d{color:var(--dim);margin:0 0 20px;font-size:14px}
 .card{background:var(--card);border:1px solid var(--line);border-radius:12px;
       padding:20px 22px;margin-bottom:16px}
 button{width:100%;padding:14px;border-radius:10px;border:none;font-size:15px;
-       font-weight:600;cursor:pointer;background:var(--acc);color:#06120a}
+       font-weight:600;cursor:pointer;background:var(--acc);color:#06120a;margin-bottom:10px}
 button:disabled{opacity:.5;cursor:wait}
-button.sec{background:transparent;border:1px solid var(--line);color:var(--fg)}
 .status{margin-top:14px;font-size:13.5px;color:var(--dim);white-space:pre-wrap;
         word-break:break-word;font-family:var(--mono)}
 .status.err{color:var(--err)}
@@ -22925,158 +22944,148 @@ pre{background:#0d0f13;border:1px solid var(--line);border-radius:8px;
 .badge{display:inline-block;font-size:11px;letter-spacing:.08em;
       text-transform:uppercase;color:var(--acc);border:1px solid var(--line);
       border-radius:999px;padding:3px 11px}
+.walt{display:flex;gap:10px;flex-wrap:wrap;margin-top:6px}
+.walt a{flex:1;min-width:150px;text-align:center;background:#161a20;border:1px solid var(--line);
+        border-radius:10px;padding:13px;font-weight:600;color:var(--fg)}
+.qr{display:block;margin:14px auto 4px;border-radius:10px;border:1px solid var(--line)}
+.or{text-align:center;color:var(--dim);font-size:12px;margin:14px 0 4px;
+    letter-spacing:.1em;text-transform:uppercase}
 </style></head><body><div class="w">
-<div class="top"><a href="/">← losbeto</a><span class="badge">pay with browser wallet</span></div>
+<div class="top"><a href="/">← losbeto</a><span class="badge">one-tap USDC payment</span></div>
 <h1>__ENDPOINT__</h1>
 <p class="d">__DESC__</p>
 <div class="price">$__PRICE__ <span>USDC · Base · one call</span></div>
 
-<div class="card">
-  <button id="btnConnect">Connect wallet</button>
+<div class="card" id="cardInjected" style="display:none">
+  <button id="btnConnect">Pay with browser wallet</button>
   <div id="status" class="status"></div>
-  <div id="result"></div>
 </div>
 
+<div class="card" id="cardMobile" style="display:none">
+  <p style="margin:0 0 10px;font-size:14px;color:var(--dim)">
+    No in-browser wallet here — open this exact payment page inside your wallet app:</p>
+  <div class="walt">
+    <a id="dlMetamask" href="#">MetaMask</a>
+    <a id="dlCoinbase" href="#">Coinbase Wallet</a>
+    <a id="dlRainbow" href="#">Rainbow</a>
+  </div>
+  <div class="or">— or scan with your phone —</div>
+  <img class="qr" id="qrImg" width="180" height="180" alt="Scan to open this payment page"
+       onerror="this.style.display='none'">
+  <p style="text-align:center;font-size:12px;color:var(--dim);margin:4px 0 0">
+    Point your wallet app's scanner at this code</p>
+  <div id="statusM" class="status"></div>
+</div>
+
+<div id="result"></div>
+
 <p class="foot">This signs an on-chain USDC payment authorization
-(EIP-3009 <code>transferWithAuthorization</code>) with your own wallet extension —
+(EIP-3009 <code>transferWithAuthorization</code>) with your own wallet —
 the same thing any x402 client library does. Losbeto never asks for your private
 key and never holds custody of funds; the signed authorization only works for this
 exact amount, this exact endpoint, and expires in a few minutes if unused.
-No wallet installed? <a href="https://metamask.io" target="_blank" rel="noopener">Get MetaMask</a>
-or use <a href="/pricing">an AI agent instead</a>.</p>
+Prefer an AI agent? <a href="/pricing">See the agent flow</a>.</p>
 </div>
 <script>
 const ACCEPT = __ACCEPT_JSON__;
 const ENDPOINT_URL = "__ENDPOINT_URL__";
+const PAGE_URL = "__PAGE_URL__";
 const IS_CREDIT = __IS_CREDIT__;
 const statusEl = document.getElementById('status');
+const statusMEl = document.getElementById('statusM');
 const resultEl = document.getElementById('result');
 const btn = document.getElementById('btnConnect');
 
-function setStatus(msg, cls) {
-  statusEl.textContent = msg;
-  statusEl.className = 'status' + (cls ? (' ' + cls) : '');
+const enc = encodeURIComponent(PAGE_URL);
+const bare = PAGE_URL.replace(/^https?:\/\//, '');
+
+// QR da PRÓPRIA página (abre esta URL no app da wallet do celular).
+// v48.5.0: via api.qrserver.com (API pública de QR) — a URL da página já é
+// pública e não carrega nenhum dado sensível; se o serviço falhar, a imagem
+// some (onerror) e os deep links abaixo seguem funcionando.
+document.getElementById('qrImg').src =
+  'https://api.qrserver.com/v1/create-qr-code/?size=180x180&bgcolor=101217&color=4ade80&qzone=1&data=' + enc;
+
+document.getElementById('dlMetamask').href  = 'https://metamask.app.link/dapp/' + bare;
+document.getElementById('dlCoinbase').href  = 'https://go.cb-w.com/dapp?cb_url=' + enc;
+document.getElementById('dlRainbow').href   = 'https://rnbwapp.com/dapp?url=' + enc;
+
+if (window.ethereum) {
+  document.getElementById('cardInjected').style.display = 'block';
+} else {
+  document.getElementById('cardMobile').style.display = 'block';
+  // v48.5.0 (correção de copy): o pagamento E o resultado acontecem DENTRO
+  // do app da wallet — o browser original não é desbloqueado depois (não há
+  // sessão). A mensagem anterior prometia desbloqueio automático aqui, o que
+  // o fluxo não cumpre; trocada por instrução honesta.
+  statusMEl.textContent = 'Do it all inside the wallet app: open this page there, ' +
+                          'tap pay, and your result shows up on the spot.';
 }
 
-function hex32() {
-  const b = new Uint8Array(32);
-  crypto.getRandomValues(b);
-  return '0x' + Array.from(b).map(x => x.toString(16).padStart(2, '0')).join('');
+function setStatus(msg, cls){ statusEl.textContent=msg; statusEl.className='status'+(cls?(' '+cls):''); }
+function hex32(){ const b=new Uint8Array(32); crypto.getRandomValues(b);
+  return '0x'+Array.from(b).map(x=>x.toString(16).padStart(2,'0')).join(''); }
+
+async function ensureBaseChain(chainIdHex){
+  try{ await window.ethereum.request({method:'wallet_switchEthereumChain',params:[{chainId:chainIdHex}]}); }
+  catch(e){ if(e && e.code===4902){
+    await window.ethereum.request({method:'wallet_addEthereumChain',params:[{chainId:chainIdHex,
+      chainName:'Base',nativeCurrency:{name:'Ether',symbol:'ETH',decimals:18},
+      rpcUrls:['https://mainnet.base.org'],blockExplorerUrls:['https://basescan.org']}]});}
+  else { throw e; } }
 }
 
-async function ensureBaseChain(chainIdHex) {
-  try {
-    await window.ethereum.request({
-      method: 'wallet_switchEthereumChain',
-      params: [{ chainId: chainIdHex }]
-    });
-  } catch (switchErr) {
-    if (switchErr && switchErr.code === 4902) {
-      await window.ethereum.request({
-        method: 'wallet_addEthereumChain',
-        params: [{
-          chainId: chainIdHex,
-          chainName: 'Base',
-          nativeCurrency: { name: 'Ether', symbol: 'ETH', decimals: 18 },
-          rpcUrls: ['https://mainnet.base.org'],
-          blockExplorerUrls: ['https://basescan.org']
-        }]
-      });
-    } else {
-      throw switchErr;
-    }
-  }
-}
-
-async function payAndFetch() {
-  if (!window.ethereum) {
-    setStatus('No browser wallet found. Install MetaMask, Coinbase Wallet or Rabby, then reload this page.', 'err');
-    return;
-  }
+async function payAndFetch(){
+  if(!window.ethereum) return;
   btn.disabled = true;
-  try {
+  try{
     setStatus('Requesting wallet connection…');
-    const accounts = await window.ethereum.request({ method: 'eth_requestAccounts' });
+    const accounts = await window.ethereum.request({method:'eth_requestAccounts'});
     const from = accounts[0];
-
-    const chainId = parseInt(String(ACCEPT.network).split(':')[1], 10);
-    const chainIdHex = '0x' + chainId.toString(16);
+    const chainId = parseInt(String(ACCEPT.network).split(':')[1],10);
+    const chainIdHex = '0x'+chainId.toString(16);
     setStatus('Switching to Base network…');
     await ensureBaseChain(chainIdHex);
-
-    const validBefore = String(Math.floor(Date.now() / 1000) + (ACCEPT.maxTimeoutSeconds || 300));
-    const authorization = {
-      from, to: ACCEPT.payTo, value: ACCEPT.amount,
-      validAfter: "0", validBefore, nonce: hex32()
-    };
-    const domain = {
-      name: (ACCEPT.extra && ACCEPT.extra.name) || 'USD Coin',
-      version: (ACCEPT.extra && ACCEPT.extra.version) || '2',
-      chainId, verifyingContract: ACCEPT.asset
-    };
-    const typedData = {
-      types: {
-        EIP712Domain: [
-          { name: 'name', type: 'string' }, { name: 'version', type: 'string' },
-          { name: 'chainId', type: 'uint256' }, { name: 'verifyingContract', type: 'address' }
-        ],
-        TransferWithAuthorization: [
-          { name: 'from', type: 'address' }, { name: 'to', type: 'address' },
-          { name: 'value', type: 'uint256' }, { name: 'validAfter', type: 'uint256' },
-          { name: 'validBefore', type: 'uint256' }, { name: 'nonce', type: 'bytes32' }
-        ]
-      },
-      primaryType: 'TransferWithAuthorization',
-      domain, message: authorization
-    };
-
+    const validBefore = String(Math.floor(Date.now()/1000)+(ACCEPT.maxTimeoutSeconds||300));
+    const authorization = {from,to:ACCEPT.payTo,value:ACCEPT.amount,validAfter:"0",validBefore,nonce:hex32()};
+    const domain = {name:(ACCEPT.extra&&ACCEPT.extra.name)||'USD Coin',
+                    version:(ACCEPT.extra&&ACCEPT.extra.version)||'2',
+                    chainId,verifyingContract:ACCEPT.asset};
+    const typedData = {types:{
+      EIP712Domain:[{name:'name',type:'string'},{name:'version',type:'string'},
+                    {name:'chainId',type:'uint256'},{name:'verifyingContract',type:'address'}],
+      TransferWithAuthorization:[{name:'from',type:'address'},{name:'to',type:'address'},
+                    {name:'value',type:'uint256'},{name:'validAfter',type:'uint256'},
+                    {name:'validBefore',type:'uint256'},{name:'nonce',type:'bytes32'}]},
+      primaryType:'TransferWithAuthorization',domain,message:authorization};
     setStatus('Waiting for signature in your wallet…');
-    const signature = await window.ethereum.request({
-      method: 'eth_signTypedData_v4',
-      params: [from, JSON.stringify(typedData)]
-    });
-
-    const paymentPayload = {
-      x402Version: 2, scheme: 'exact', network: ACCEPT.network,
-      payload: { signature, authorization },
-      accepted: ACCEPT
-    };
+    const signature = await window.ethereum.request({method:'eth_signTypedData_v4',
+      params:[from,JSON.stringify(typedData)]});
+    const paymentPayload = {x402Version:2,scheme:'exact',network:ACCEPT.network,
+      payload:{signature,authorization},accepted:ACCEPT};
     const header = btoa(JSON.stringify(paymentPayload));
-
     setStatus('Signature captured. Settling payment and fetching your data…');
-    const resp = await fetch(ENDPOINT_URL, {
-      headers: { 'X-PAYMENT': header, 'Accept': 'application/json' }
-    });
-    const body = await resp.json().catch(() => ({}));
-
-    if (!resp.ok) {
-      setStatus('Payment was not accepted: ' + (body.reason || body.error || resp.status) +
-                 '\nNo funds were moved on-chain if this failed before settlement — you can retry.', 'err');
-      btn.disabled = false;
-      return;
-    }
-
-    setStatus('Paid ✓ — settled on Base.', 'ok');
-    if (IS_CREDIT && body.api_key) {
-      resultEl.innerHTML = '<pre>X-API-Key: ' + body.api_key +
-        '<span class="copy" onclick="navigator.clipboard.writeText(\'' + body.api_key + '\')">copy</span>\n\n' +
-        '# use it on any endpoint:\ncurl -H "X-API-Key: ' + body.api_key + '" ' + ENDPOINT_URL.replace('/buy-credits', '/<endpoint>') +
-        '\n\n# or in Claude Code / Cursor:\nclaude mcp add --transport http losbeto ' +
-        ENDPOINT_URL.replace('/buy-credits', '/mcp') + ' --header "X-API-Key: ' + body.api_key + '"</pre>';
+    const resp = await fetch(ENDPOINT_URL,{headers:{'X-PAYMENT':header,'Accept':'application/json'}});
+    const body = await resp.json().catch(()=>({}));
+    if(!resp.ok){
+      setStatus('Payment not accepted: '+(body.reason||body.error||resp.status)+
+                '\nNo funds moved if this failed before settlement — you can retry.','err');
+      btn.disabled=false; return; }
+    setStatus('Paid ✓ — settled on Base.','ok');
+    if(IS_CREDIT && body.api_key){
+      resultEl.innerHTML='<pre>X-API-Key: '+body.api_key+
+        '<span class="copy" onclick="navigator.clipboard.writeText(\''+body.api_key+'\')">copy</span>\n\n'+
+        '# use it on any endpoint:\ncurl -H "X-API-Key: '+body.api_key+'" '+ENDPOINT_URL.replace('/buy-credits','/<endpoint>')+
+        '\n\n# or in Claude Code / Cursor:\nclaude mcp add --transport http losbeto '+
+        ENDPOINT_URL.replace('/buy-credits','/mcp')+' --header "X-API-Key: '+body.api_key+'"</pre>';
     } else {
-      resultEl.innerHTML = '<pre>' + JSON.stringify(body, null, 2).slice(0, 4000) + '</pre>';
+      resultEl.innerHTML='<pre>'+JSON.stringify(body,null,2).slice(0,4000)+'</pre>';
     }
-    btn.textContent = 'Pay again';
-    btn.disabled = false;
-  } catch (e) {
-    setStatus('Error: ' + (e && e.message ? e.message : e), 'err');
-    btn.disabled = false;
-  }
+    btn.textContent='Pay again'; btn.disabled=false;
+  }catch(e){ setStatus('Error: '+(e&&e.message?e.message:e),'err'); btn.disabled=false; }
 }
-
 btn.addEventListener('click', payAndFetch);
-</script>
-</body></html>"""
+</script></body></html>"""
 
 
 def _pay_bridge_handler(raw_endpoint):
@@ -23105,9 +23114,11 @@ def _pay_bridge_handler(raw_endpoint):
                          "hint": "This node's Base chain is not configured."}), 503
     price = get_dynamic_price(ep)
     desc = (ENDPOINT_DESC.get(ep, "") or "").replace('"', "&quot;")[:220]
+    page_url = f"{_public_base()}/pay{ep}"  # v48.5.0: deep link + QR
     html = (_PAY_BRIDGE_HTML
             .replace("__ENDPOINT__", ep)
             .replace("__ENDPOINT_URL__", f"{_public_base()}{ep}")
+            .replace("__PAGE_URL__", page_url)
             .replace("__PRICE__", f"{price:.4f}")
             .replace("__DESC__", desc)
             .replace("__ACCEPT_JSON__", json.dumps(base_accept))
@@ -23135,13 +23146,75 @@ app.add_url_rule("/pay/<path:raw_endpoint>", "pay_bridge", _pay_bridge_handler,
 #      200/dia global) — o padrão OpenRouter aplicado ao x402.
 #   3) Concierge de integração com IA: GET /integrate?q=... (cap 30/dia,
 #      fallback estático se a cadeia LLM estiver em quarentena).
-VERSION = "48.4.0-WALLETPAY"  # v48.4.0: /pay/<endpoint> checkout de carteira de navegador (MetaMask/Coinbase Wallet/Rabby) p/ o ~80% de avaliadores humanos que não tinham NENHUM caminho de compra sem CLI/agente + filtro de ruído de scanner de segredo (/env, /config/*.key) tirado do radar de demanda + banimento de modelo Gemini morto agora persiste entre restarts | base: v48.3.10-COMMERCE  # v48.3.10: /.well-known/acp.json (ACP discovery doc — demanda 8 reqs/4 IPs) | base: v48.3.9.4-PROXYFIX  # v48.3.9.4: /proxy registrado após o alvo /fetch (o loop ALIAS_ROUTES rodava antes e o pulava) | base: v48.3.9.3-KEYDIR  # v48.3.9.3: /.well-known/http-message-signatures-directory (JWKS Ed25519 assinado RFC9421) + /legal + /support + alias /proxy→/fetch | base: v48.3.9.2-ALIAS  # v48.3.9.2: alias /llm/freePublic → /llm/free (demanda medida: 7 IPs/7d) | base: v48.3.9.1-GLAMA  # v48.3.9.1: /.well-known/glama.json aceita override via env GLAMA_CLAIM_JSON (claim do Glama por HTTP challenge sem novo deploy de código) | base: v48.3.9-FETCH
+VERSION = "48.5.0-FUNIL"  # v48.5.0: /pay mobile-first (deep link + QR — fim do "No wallet found" que matava 55% do funil) · /blog/ + /login atendem demanda medida · docstring sincronizado | base: v48.4.0-WALLETPAY  # v48.4.0: /pay/<endpoint> checkout de carteira de navegador (MetaMask/Coinbase Wallet/Rabby) p/ o ~80% de avaliadores humanos que não tinham NENHUM caminho de compra sem CLI/agente + filtro de ruído de scanner de segredo (/env, /config/*.key) tirado do radar de demanda + banimento de modelo Gemini morto agora persiste entre restarts | base: v48.3.10-COMMERCE  # v48.3.10: /.well-known/acp.json (ACP discovery doc — demanda 8 reqs/4 IPs) | base: v48.3.9.4-PROXYFIX  # v48.3.9.4: /proxy registrado após o alvo /fetch (o loop ALIAS_ROUTES rodava antes e o pulava) | base: v48.3.9.3-KEYDIR  # v48.3.9.3: /.well-known/http-message-signatures-directory (JWKS Ed25519 assinado RFC9421) + /legal + /support + alias /proxy→/fetch | base: v48.3.9.2-ALIAS  # v48.3.9.2: alias /llm/freePublic → /llm/free (demanda medida: 7 IPs/7d) | base: v48.3.9.1-GLAMA  # v48.3.9.1: /.well-known/glama.json aceita override via env GLAMA_CLAIM_JSON (claim do Glama por HTTP challenge sem novo deploy de código) | base: v48.3.9-FETCH
 log.warning("🧠 v48.2.0-SMART — preço de tabela fixo + First-Call Bonus pós-compra · "
             "/llm/free (freemium %s/dia) · /integrate (concierge IA)",
             LLM_FREE_PER_DAY)
 log.warning("💳 v48.4.0-WALLETPAY — checkout de carteira de navegador ativo: "
             "%s/pay/<endpoint> (assina EIP-3009 com MetaMask/Coinbase Wallet/Rabby, "
             "zero CLI, zero agente)", _public_base())
+log.warning("🎯 v48.5.0-FUNIL — checkout mobile-first (deep link + QR), "
+            "/blog/ + /login atendidos, docstring sincronizado")
+
+
+# --- v48.5.0-FUNIL: /blog/ e /login — gaps medidos pelo radar ---------------
+# /blog/ tinha 62 req/7d (maioria com rest_route=/batch/v1 = scanner de
+# WordPress, mas o 404 não nos servia nada) e /login 9 req/7d (agentes
+# procurando auth). Responder 200 útil converte scanner em avaliador e
+# explica o modelo: sem conta — o pagamento É a credencial.
+
+@app.route("/blog/")
+@app.route("/blog")
+def blog_index():
+    """Índice machine-readable — quem pede /blog/ quer saber o que este node
+    publica. Entregamos o mapa (todos os links abaixo existem de verdade)."""
+    posts = [
+        {"slug": "why-agents-buy", "title": "What AI agents actually pay for",
+         "url": f"{_public_base()}/what-agents-buy"},
+        {"slug": "why-buy", "title": "Why buy from this node",
+         "url": f"{_public_base()}/why-buy"},
+        {"slug": "honest-revenue", "title": "Honest revenue, on-chain",
+         "url": f"{_public_base()}/.well-known/honest-revenue.json"},
+        {"slug": "proof-of-revenue", "title": "Proof of revenue",
+         "url": f"{_public_base()}/.well-known/proof-of-revenue.json"},
+        {"slug": "pit-proof", "title": "Point-in-time Brazil: the free proof",
+         "url": f"{_public_base()}/br-pit-proof"},
+        {"slug": "scorecard", "title": "Evaluator scorecard",
+         "url": f"{_public_base()}/scorecard.json"},
+    ]
+    if _wants_html():
+        items = "".join(
+            f'<li style="margin:10px 0"><a href="{p["url"]}" style="color:#60a5fa">'
+            f'{p["title"]}</a></li>' for p in posts)
+        return app.response_class(
+            f'<!doctype html><html lang="en"><head><meta charset="utf-8">'
+            f'<meta name="viewport" content="width=device-width,initial-scale=1">'
+            f'<title>Losbeto — index</title></head><body style="background:#0a0b0d;'
+            f'color:#e8eaed;font:15px/1.6 -apple-system,sans-serif;max-width:640px;'
+            f'margin:0 auto;padding:40px 20px"><a href="/" style="color:#60a5fa">← losbeto</a>'
+            f'<h1 style="font-family:monospace;font-size:22px">Published thinking</h1>'
+            f'<ul style="padding-left:20px">{items}</ul></body></html>',
+            mimetype="text/html")
+    return jsonify({"node": BRAND_NAME, "version": VERSION,
+                    "posts": posts, "count": len(posts)})
+
+
+@app.route("/login")
+def login_info():
+    """Agentes batem em /login procurando autenticação. A resposta correta num
+    node x402: não há login — o pagamento por chamada É a credencial."""
+    if _wants_html():
+        return redirect("/pricing", code=302)
+    return jsonify({
+        "auth_model": "x402 — pay per call, no account, no login",
+        "how_to_authenticate": {
+            "pay_per_call": f"{_public_base()}/get-pricing",
+            "browser_wallet_checkout": f"{_public_base()}/pay/<endpoint>",
+            "api_key_credits": f"{_public_base()}/buy-credits",
+        },
+        "note": "There is no username/password. Every paid response is the "
+                "credential. Buy credits once, reuse with X-API-Key.",
+        "version": VERSION}), 200
 
 
 if __name__ == "__main__":
