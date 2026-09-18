@@ -2328,16 +2328,36 @@ GEMINI_DISCOVERY_TTL = int(os.environ.get("GEMINI_DISCOVERY_TTL", "21600"))  # 6
 # v48.3.4: modelos que devolveram 404 "no longer available" ficam BANIDOS —
 # o ListModels da chave ainda os lista, então sem esta lista a redescoberta
 # re-escolhia o mesmo nome e o 404 voltava para sempre (loop silencioso).
-_GEMINI_BANNED: set = set()
+# v48.4.0 FIX: o set era só em memória — cada restart do Railway (todo
+# deploy) esquecia o banimento e repetia a MESMA falha 404 no primeiro
+# request pós-boot (foi exatamente o que aconteceu com 2.5-flash no log de
+# 18/set). Agora persiste em disco, então o node só erra uma vez na vida
+# de cada modelo aposentado, não uma vez por deploy.
+_GEMINI_BANNED_PATH = HOME_DIR / "gemini_banned.json"
+
+def _gemini_banned_load() -> set:
+    try:
+        return set(json.loads(_GEMINI_BANNED_PATH.read_text()))
+    except Exception:
+        return set()
+
+def _gemini_banned_add(nome: str) -> None:
+    banidos = _gemini_banned_load()
+    banidos.add(nome)
+    try:
+        _GEMINI_BANNED_PATH.write_text(json.dumps(sorted(banidos)))
+    except Exception as e:
+        log.debug(f"gemini_banned_add: {e}")
+
+_GEMINI_BANNED: set = _gemini_banned_load()
 
 # Ordem de preferência por prefixo. Flash antes de Pro: cota gratuita maior e
 # latência menor; "lite" por último, é o degrau de qualidade mais baixo.
-# v47.3.0: nome FECHADO antes do alias "-latest". O gemini-flash-latest
-# aponta sempre para o modelo mais disputado do free tier e vivia em
-# 503/429 (quota) nos logs de ago/2026; o 2.5-flash tem cota própria
-# documentada (1.500 RPD free) e bem menos concorrência. Aliases e lite
-# ficam como último recurso, não como primeira escolha.
-_GEMINI_PREF = ("2.5-flash", "3.5-flash", "3.1-flash", "3-flash",
+# v48.4.0: 2.5-flash confirmado morto em produção (404 "no longer available
+# to new users" mesmo aparecendo no ListModels) — rebaixado na preferência
+# em vez de removido, porque uma chave mais antiga pode ainda ter acesso;
+# quem não tiver cai no banimento persistente acima e nunca mais tenta.
+_GEMINI_PREF = ("3.5-flash", "3.1-flash", "3-flash", "2.5-flash",
                 "flash", "flash-latest",
                 "3.1-pro", "3-pro", "2.5-pro", "pro-latest", "flash-lite")
 
@@ -2638,8 +2658,9 @@ class LLM:
                 with _GEMINI_LOCK:
                     _GEMINI_RESOLVED = None
                     _GEMINI_BANNED.add(_gm)  # v48.3.4: anti-loop
-                log.warning(f"Gemini: modelo '{_gm}' retirado — banido, "
-                            "redescobrindo outro")
+                    _gemini_banned_add(_gm)  # v48.4.0: sobrevive a restart
+                log.warning(f"Gemini: modelo '{_gm}' retirado — banido "
+                            "(persistente), redescobrindo outro")
             return None, f"HTTP {r.status_code} (modelo={_gm}): {r.text[:160]}"
 
         def _try_ollama():
@@ -12502,7 +12523,12 @@ _SCAN_NOISE = re.compile(
     r"\.php|admin|backup|dump|\.sql|\.bak|serviceaccount|firebase|"
     r"secrets?\.|config\.(json|yml|yaml)|actuator|/api/v1/(pods|namespaces)|"
     r"\.well-known/(acme|security)|favicon|robots|sitemap|apple-touch|"
-    r"\.map$|\.asp|cgi-bin|xmlrpc|\.svn|docker|kube)", re.I)
+    r"\.map$|\.asp|cgi-bin|xmlrpc|\.svn|docker|kube|"
+    # v48.4.0: observado no radar de demanda classificando sonda de segredo
+    # como "produto novo" (/env, /config/master.key, /appsettings.json) —
+    # são scanners de vazamento de credenciais, não cliente em potencial.
+    r"(^|/)\.?env$|/config/[^/]*\.key$|appsettings(\..*)?\.json$|"
+    r"master\.key$|\.pem$|\.pfx$|\.p12$|\.htpasswd|\.htaccess)", re.I)
 
 def _is_scan_noise(path: str) -> bool:
     return bool(_SCAN_NOISE.search(path or ""))
@@ -16288,10 +16314,14 @@ npx agentcash fetch {base}{path}</pre>
 claude mcp add --transport http losbeto {base}/mcp</pre>
 
 <div class="row">
-  <a class="p" href="/pricing">Plans from $0.99</a>
+  <a class="p" href="/pay{path}">Pay with wallet →</a>
+  <a href="/pricing">Plans from $0.99</a>
   <a href="{path}?format=json">Raw JSON</a>
   <a href="/try">6 more free samples</a>
 </div>
+<p class="d" style="margin-top:10px;font-size:12.5px">"Pay with wallet" works with any
+browser wallet extension (MetaMask, Coinbase Wallet, Rabby) — you sign, you get the
+data back in the same page, no CLI and no agent required.</p>
 </div>
 
 <p class="foot">Every paid endpoint has a free sample like this one.
@@ -21063,11 +21093,15 @@ so here are your options as a human:</p>
 <span style="color:#aaa">Real data, delayed ~15 min</span></td>
 <td style="padding:12px;border:1px solid #333;text-align:right">
 <a style="color:#0a0a0f;background:#7af;padding:8px 14px;text-decoration:none;border-radius:6px" href="{endpoint}?preview=1">free preview</a></td></tr>
-<tr><td style="padding:12px;border:1px solid #333"><b>2. Buy credits — $0.99 once, get $1.25</b><br>
+<tr><td style="padding:12px;border:1px solid #333"><b>2. Pay right now, in this browser</b><br>
+<span style="color:#aaa">Sign with MetaMask/Coinbase Wallet/Rabby — no CLI, no agent, no signup. One click.</span></td>
+<td style="padding:12px;border:1px solid #333;text-align:right">
+<a style="color:#0a0a0f;background:#4ade80;padding:8px 14px;text-decoration:none;border-radius:6px;font-weight:600" href="/pay{endpoint}">pay with wallet</a></td></tr>
+<tr><td style="padding:12px;border:1px solid #333"><b>3. Buy credits — $0.99 once, get $1.25</b><br>
 <span style="color:#aaa">One on-chain payment, then call any endpoint with a simple key. No wallet-agent needed per call.</span></td>
 <td style="padding:12px;border:1px solid #333;text-align:right">
-<a style="color:#0a0a0f;background:#7af;padding:8px 14px;text-decoration:none;border-radius:6px" href="/buy-credits">buy credits</a></td></tr>
-<tr><td style="padding:12px;border:1px solid #333"><b>3. Give it to your AI agent</b><br>
+<a style="color:#0a0a0f;background:#7af;padding:8px 14px;text-decoration:none;border-radius:6px" href="/pay/buy-credits">buy credits</a></td></tr>
+<tr><td style="padding:12px;border:1px solid #333"><b>4. Give it to your AI agent</b><br>
 <span style="color:#aaa">Paste this into ChatGPT, Claude or any x402-aware agent:</span><br>
 <code style="color:#7af;font-size:12px;word-break:break-all">{base}{endpoint} — pay via x402, manifest at {base}/.well-known/x402.json</code></td>
 <td style="padding:12px;border:1px solid #333;text-align:right">
@@ -22823,6 +22857,276 @@ def dashboard_alias():
 
 
 # ============================================================================
+# v48.4.0-WALLETPAY (18/set/2026) — A PONTE QUE FALTA DO OUTRO LADO DO FUNIL.
+#
+# Diagnóstico do próprio node (dashboard + /receipts): 32 avaliações/24h,
+# 0 vendas/24h. E o comentário em _render_402_html já registra a causa desde
+# a v47.3.1: "Browsers cannot sign that payment, so here are your options as
+# a human" — mas a única opção oferecida a esse humano era /buy-credits, que
+# É ELA MESMA um endpoint pago via x402. Ou seja: o humano batia na mesma
+# parede duas vezes. Zero caminho de compra existia para quem chega por
+# navegador sem já ter CLI + carteira fundada configuradas fora daqui — e o
+# próprio radar de UA mostra que ~80% de quem avalia é exatamente esse humano
+# (iPhone Safari, Android, Chrome/Safari desktop).
+#
+# O que esta rota faz: usa a carteira que o humano JÁ TEM instalada no
+# navegador (qualquer provider EIP-1193 — MetaMask, Coinbase Wallet, Rabby)
+# para assinar uma autorização EIP-3009 (transferWithAuthorization) — a MESMA
+# assinatura que qualquer SDK x402 oficial (x402-fetch, AgentCash) produziria
+# — e envia exatamente o mesmo header X-PAYMENT que paid_endpoint() já sabe
+# verificar. Zero mudança no verificador, zero custódia nova, zero chave nova
+# no servidor: o domínio EIP-712 (name/version) e o contrato (asset) vêm do
+# PRÓPRIO accept que _build_402 já gera para Base — se o node mudar de
+# contrato USDC ou de rede um dia, esta página acompanha sozinha.
+#
+# Por que só Base (EVM) nesta primeira versão: EIP-3009 é uma ASSINATURA —
+# sem gas, sem blockhash, sem transação para montar, sem fee payer de
+# terceiro. O scheme "exact" da Solana exige uma transação parcialmente
+# assinada com o feePayer do facilitator (ver extra.feePayer em _build_402);
+# dá para fazer, mas testar contra o fee payer real antes de produção é
+# trabalho para outro patch. Base já é accepts[0] hoje — comentário v25.1:
+# "Base primeiro = cada venda vira uma entrada de catálogo" — então cobrir só
+# Base cobre exatamente a rota que o node já prioriza.
+# ============================================================================
+
+_PAY_BRIDGE_HTML = r"""<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Pay __ENDPOINT__ — Losbeto</title>
+<style>
+:root{--bg:#0a0b0d;--fg:#e8eaed;--dim:#8b9199;--line:#1e2126;--acc:#4ade80;
+      --err:#f87171;--card:#101217;--mono:ui-monospace,SFMono-Regular,Menlo,monospace}
+*{box-sizing:border-box}
+body{background:var(--bg);color:var(--fg);margin:0;
+     font:15px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",Inter,sans-serif}
+.w{max-width:640px;margin:0 auto;padding:28px 20px 60px}
+a{color:#60a5fa;text-decoration:none} a:hover{text-decoration:underline}
+.top{display:flex;justify-content:space-between;align-items:center;
+     padding-bottom:16px;border-bottom:1px solid var(--line)}
+h1{font:600 21px/1.3 var(--mono);margin:20px 0 6px;word-break:break-all}
+p.d{color:var(--dim);margin:0 0 20px;font-size:14px}
+.price{font-size:34px;font-weight:700;margin:6px 0 22px}
+.price span{font-size:14px;color:var(--dim);font-weight:400}
+.card{background:var(--card);border:1px solid var(--line);border-radius:12px;
+      padding:20px 22px;margin-bottom:16px}
+button{width:100%;padding:14px;border-radius:10px;border:none;font-size:15px;
+       font-weight:600;cursor:pointer;background:var(--acc);color:#06120a}
+button:disabled{opacity:.5;cursor:wait}
+button.sec{background:transparent;border:1px solid var(--line);color:var(--fg)}
+.status{margin-top:14px;font-size:13.5px;color:var(--dim);white-space:pre-wrap;
+        word-break:break-word;font-family:var(--mono)}
+.status.err{color:var(--err)}
+.status.ok{color:var(--acc)}
+pre{background:#0d0f13;border:1px solid var(--line);border-radius:8px;
+    padding:13px;overflow-x:auto;font:12.5px/1.6 var(--mono);color:#9ecbff;
+    margin:12px 0 0;white-space:pre-wrap;word-break:break-word}
+.copy{font-size:12px;margin-left:8px;cursor:pointer;color:#60a5fa}
+.foot{color:var(--dim);font-size:12.5px;margin-top:26px;
+      border-top:1px solid var(--line);padding-top:16px}
+.badge{display:inline-block;font-size:11px;letter-spacing:.08em;
+      text-transform:uppercase;color:var(--acc);border:1px solid var(--line);
+      border-radius:999px;padding:3px 11px}
+</style></head><body><div class="w">
+<div class="top"><a href="/">← losbeto</a><span class="badge">pay with browser wallet</span></div>
+<h1>__ENDPOINT__</h1>
+<p class="d">__DESC__</p>
+<div class="price">$__PRICE__ <span>USDC · Base · one call</span></div>
+
+<div class="card">
+  <button id="btnConnect">Connect wallet</button>
+  <div id="status" class="status"></div>
+  <div id="result"></div>
+</div>
+
+<p class="foot">This signs an on-chain USDC payment authorization
+(EIP-3009 <code>transferWithAuthorization</code>) with your own wallet extension —
+the same thing any x402 client library does. Losbeto never asks for your private
+key and never holds custody of funds; the signed authorization only works for this
+exact amount, this exact endpoint, and expires in a few minutes if unused.
+No wallet installed? <a href="https://metamask.io" target="_blank" rel="noopener">Get MetaMask</a>
+or use <a href="/pricing">an AI agent instead</a>.</p>
+</div>
+<script>
+const ACCEPT = __ACCEPT_JSON__;
+const ENDPOINT_URL = "__ENDPOINT_URL__";
+const IS_CREDIT = __IS_CREDIT__;
+const statusEl = document.getElementById('status');
+const resultEl = document.getElementById('result');
+const btn = document.getElementById('btnConnect');
+
+function setStatus(msg, cls) {
+  statusEl.textContent = msg;
+  statusEl.className = 'status' + (cls ? (' ' + cls) : '');
+}
+
+function hex32() {
+  const b = new Uint8Array(32);
+  crypto.getRandomValues(b);
+  return '0x' + Array.from(b).map(x => x.toString(16).padStart(2, '0')).join('');
+}
+
+async function ensureBaseChain(chainIdHex) {
+  try {
+    await window.ethereum.request({
+      method: 'wallet_switchEthereumChain',
+      params: [{ chainId: chainIdHex }]
+    });
+  } catch (switchErr) {
+    if (switchErr && switchErr.code === 4902) {
+      await window.ethereum.request({
+        method: 'wallet_addEthereumChain',
+        params: [{
+          chainId: chainIdHex,
+          chainName: 'Base',
+          nativeCurrency: { name: 'Ether', symbol: 'ETH', decimals: 18 },
+          rpcUrls: ['https://mainnet.base.org'],
+          blockExplorerUrls: ['https://basescan.org']
+        }]
+      });
+    } else {
+      throw switchErr;
+    }
+  }
+}
+
+async function payAndFetch() {
+  if (!window.ethereum) {
+    setStatus('No browser wallet found. Install MetaMask, Coinbase Wallet or Rabby, then reload this page.', 'err');
+    return;
+  }
+  btn.disabled = true;
+  try {
+    setStatus('Requesting wallet connection…');
+    const accounts = await window.ethereum.request({ method: 'eth_requestAccounts' });
+    const from = accounts[0];
+
+    const chainId = parseInt(String(ACCEPT.network).split(':')[1], 10);
+    const chainIdHex = '0x' + chainId.toString(16);
+    setStatus('Switching to Base network…');
+    await ensureBaseChain(chainIdHex);
+
+    const validBefore = String(Math.floor(Date.now() / 1000) + (ACCEPT.maxTimeoutSeconds || 300));
+    const authorization = {
+      from, to: ACCEPT.payTo, value: ACCEPT.amount,
+      validAfter: "0", validBefore, nonce: hex32()
+    };
+    const domain = {
+      name: (ACCEPT.extra && ACCEPT.extra.name) || 'USD Coin',
+      version: (ACCEPT.extra && ACCEPT.extra.version) || '2',
+      chainId, verifyingContract: ACCEPT.asset
+    };
+    const typedData = {
+      types: {
+        EIP712Domain: [
+          { name: 'name', type: 'string' }, { name: 'version', type: 'string' },
+          { name: 'chainId', type: 'uint256' }, { name: 'verifyingContract', type: 'address' }
+        ],
+        TransferWithAuthorization: [
+          { name: 'from', type: 'address' }, { name: 'to', type: 'address' },
+          { name: 'value', type: 'uint256' }, { name: 'validAfter', type: 'uint256' },
+          { name: 'validBefore', type: 'uint256' }, { name: 'nonce', type: 'bytes32' }
+        ]
+      },
+      primaryType: 'TransferWithAuthorization',
+      domain, message: authorization
+    };
+
+    setStatus('Waiting for signature in your wallet…');
+    const signature = await window.ethereum.request({
+      method: 'eth_signTypedData_v4',
+      params: [from, JSON.stringify(typedData)]
+    });
+
+    const paymentPayload = {
+      x402Version: 2, scheme: 'exact', network: ACCEPT.network,
+      payload: { signature, authorization },
+      accepted: ACCEPT
+    };
+    const header = btoa(JSON.stringify(paymentPayload));
+
+    setStatus('Signature captured. Settling payment and fetching your data…');
+    const resp = await fetch(ENDPOINT_URL, {
+      headers: { 'X-PAYMENT': header, 'Accept': 'application/json' }
+    });
+    const body = await resp.json().catch(() => ({}));
+
+    if (!resp.ok) {
+      setStatus('Payment was not accepted: ' + (body.reason || body.error || resp.status) +
+                 '\nNo funds were moved on-chain if this failed before settlement — you can retry.', 'err');
+      btn.disabled = false;
+      return;
+    }
+
+    setStatus('Paid ✓ — settled on Base.', 'ok');
+    if (IS_CREDIT && body.api_key) {
+      resultEl.innerHTML = '<pre>X-API-Key: ' + body.api_key +
+        '<span class="copy" onclick="navigator.clipboard.writeText(\'' + body.api_key + '\')">copy</span>\n\n' +
+        '# use it on any endpoint:\ncurl -H "X-API-Key: ' + body.api_key + '" ' + ENDPOINT_URL.replace('/buy-credits', '/<endpoint>') +
+        '\n\n# or in Claude Code / Cursor:\nclaude mcp add --transport http losbeto ' +
+        ENDPOINT_URL.replace('/buy-credits', '/mcp') + ' --header "X-API-Key: ' + body.api_key + '"</pre>';
+    } else {
+      resultEl.innerHTML = '<pre>' + JSON.stringify(body, null, 2).slice(0, 4000) + '</pre>';
+    }
+    btn.textContent = 'Pay again';
+    btn.disabled = false;
+  } catch (e) {
+    setStatus('Error: ' + (e && e.message ? e.message : e), 'err');
+    btn.disabled = false;
+  }
+}
+
+btn.addEventListener('click', payAndFetch);
+</script>
+</body></html>"""
+
+
+def _pay_bridge_handler(raw_endpoint):
+    """GET /pay/<endpoint> — checkout de navegador para humano com carteira
+    de extensão (MetaMask/Coinbase Wallet/Rabby), sem CLI e sem agente.
+    Reaproveita o desafio (_build_402) já servido a máquinas: mesmo preço,
+    mesmo payTo, mesmo domínio EIP-712 — o verificador (_verify_payment)
+    não muda uma linha."""
+    ep = "/" + (raw_endpoint or "").lstrip("/")
+    if ep not in BASE_PRICES:
+        return jsonify({"error": "unknown_endpoint",
+                         "hint": f"{_public_base()}/get-pricing"}), 404
+    if not (ENABLE_BASE and BASE_PAYTO_EVM):
+        return jsonify({"error": "base_chain_disabled",
+                         "note": "This node has no Base/EVM receive address "
+                                 "configured — browser wallet checkout needs Base."}), 503
+    try:
+        chal = _build_402(ep).get_json() or {}
+    except Exception as e:
+        return jsonify({"error": "challenge_failed", "reason": str(e)[:160]}), 500
+    accepts = chal.get("accepts") or []
+    base_accept = next((a for a in accepts
+                         if str(a.get("network", "")).startswith("eip155")), None)
+    if not base_accept:
+        return jsonify({"error": "no_base_accept",
+                         "hint": "This node's Base chain is not configured."}), 503
+    price = get_dynamic_price(ep)
+    desc = (ENDPOINT_DESC.get(ep, "") or "").replace('"', "&quot;")[:220]
+    html = (_PAY_BRIDGE_HTML
+            .replace("__ENDPOINT__", ep)
+            .replace("__ENDPOINT_URL__", f"{_public_base()}{ep}")
+            .replace("__PRICE__", f"{price:.4f}")
+            .replace("__DESC__", desc)
+            .replace("__ACCEPT_JSON__", json.dumps(base_accept))
+            .replace("__IS_CREDIT__", "true" if ep in CREDIT_PLANS else "false"))
+    try:
+        LEDGER.log_request(ep, True, 0,
+                            request.headers.get("X-Forwarded-For", request.remote_addr or ""),
+                            kind="pay_bridge_view",
+                            ua=request.headers.get("User-Agent", ""), params={})
+    except Exception:
+        pass
+    return app.response_class(html, mimetype="text/html")
+
+
+app.add_url_rule("/pay/<path:raw_endpoint>", "pay_bridge", _pay_bridge_handler,
+                  methods=["GET"])
+
+
+# ============================================================================
 # v48.1.0-REACTIVE (11/set/2026) — o nó que REAGE para não perder a venda:
 #   1) Escada de desconto em tempo real: 3º 402 sem pagar (mesmo IP+endpoint,
 #      24h) → 1 desafio a 50% (piso $0.001), 1x/dia, settle fecha no preço
@@ -22831,10 +23135,13 @@ def dashboard_alias():
 #      200/dia global) — o padrão OpenRouter aplicado ao x402.
 #   3) Concierge de integração com IA: GET /integrate?q=... (cap 30/dia,
 #      fallback estático se a cadeia LLM estiver em quarentena).
-VERSION = "48.3.10-COMMERCE"  # v48.3.10: /.well-known/acp.json (ACP discovery doc — demanda 8 reqs/4 IPs) | base: v48.3.9.4-PROXYFIX  # v48.3.9.4: /proxy registrado após o alvo /fetch (o loop ALIAS_ROUTES rodava antes e o pulava) | base: v48.3.9.3-KEYDIR  # v48.3.9.3: /.well-known/http-message-signatures-directory (JWKS Ed25519 assinado RFC9421) + /legal + /support + alias /proxy→/fetch | base: v48.3.9.2-ALIAS  # v48.3.9.2: alias /llm/freePublic → /llm/free (demanda medida: 7 IPs/7d) | base: v48.3.9.1-GLAMA  # v48.3.9.1: /.well-known/glama.json aceita override via env GLAMA_CLAIM_JSON (claim do Glama por HTTP challenge sem novo deploy de código) | base: v48.3.9-FETCH
+VERSION = "48.4.0-WALLETPAY"  # v48.4.0: /pay/<endpoint> checkout de carteira de navegador (MetaMask/Coinbase Wallet/Rabby) p/ o ~80% de avaliadores humanos que não tinham NENHUM caminho de compra sem CLI/agente + filtro de ruído de scanner de segredo (/env, /config/*.key) tirado do radar de demanda + banimento de modelo Gemini morto agora persiste entre restarts | base: v48.3.10-COMMERCE  # v48.3.10: /.well-known/acp.json (ACP discovery doc — demanda 8 reqs/4 IPs) | base: v48.3.9.4-PROXYFIX  # v48.3.9.4: /proxy registrado após o alvo /fetch (o loop ALIAS_ROUTES rodava antes e o pulava) | base: v48.3.9.3-KEYDIR  # v48.3.9.3: /.well-known/http-message-signatures-directory (JWKS Ed25519 assinado RFC9421) + /legal + /support + alias /proxy→/fetch | base: v48.3.9.2-ALIAS  # v48.3.9.2: alias /llm/freePublic → /llm/free (demanda medida: 7 IPs/7d) | base: v48.3.9.1-GLAMA  # v48.3.9.1: /.well-known/glama.json aceita override via env GLAMA_CLAIM_JSON (claim do Glama por HTTP challenge sem novo deploy de código) | base: v48.3.9-FETCH
 log.warning("🧠 v48.2.0-SMART — preço de tabela fixo + First-Call Bonus pós-compra · "
             "/llm/free (freemium %s/dia) · /integrate (concierge IA)",
             LLM_FREE_PER_DAY)
+log.warning("💳 v48.4.0-WALLETPAY — checkout de carteira de navegador ativo: "
+            "%s/pay/<endpoint> (assina EIP-3009 com MetaMask/Coinbase Wallet/Rabby, "
+            "zero CLI, zero agente)", _public_base())
 
 
 if __name__ == "__main__":
