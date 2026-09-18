@@ -11868,6 +11868,46 @@ def support_info():
         "ts": int(time.time()), "version": VERSION})
 
 # ---------------------------------------------------------------------------
+# v48.3.10-COMMERCE — ACP discovery document (Agentic Commerce Protocol,
+# OpenAI+Stripe; discovery doc /.well-known/acp.json desde abr/2026).
+# Radar: 8 reqs de 4 IPs em 7d — agentes de commerce procuram o que podem
+# COMPRAR aqui. Declaramos: catálogo, planos, rail de pagamento (x402 USDC
+# em 3 chains via CDP) e transports (REST + MCP). UCP já existe (v42); ACP
+# completa o par — ChatGPT/Stripe-style agents e Google-style agents.
+@app.route("/.well-known/acp.json")
+def acp_discovery():
+    return jsonify({
+        "name": "Losbeto",
+        "version": VERSION,
+        "description": ("Pay-per-call machine API for AI agents: LLM inference "
+                         "(OpenAI-compatible) plus cross-asset market data — "
+                         "Brazil macro/B3 point-in-time, US equities, forex, "
+                         "commodities, crypto. No accounts, no API keys: the "
+                         "x402 payment is the auth."),
+        "resources": {
+            "catalog":       "https://api.losbeto.xyz/x402.json",
+            "plans":         "https://api.losbeto.xyz/plans",
+            "product_feed":  "https://api.losbeto.xyz/plans",
+            "openapi":       "https://api.losbeto.xyz/openapi.json",
+            "agents":        "https://api.losbeto.xyz/agents.json",
+            "mcp_manifest":  "https://api.losbeto.xyz/server.json",
+            "ucp_profile":   "https://api.losbeto.xyz/.well-known/ucp"},
+        "payment": {
+            "protocols":  ["x402"],
+            "assets":     ["USDC"],
+            "networks":   ["eip155:8453",
+                            "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp",
+                            "algorand:wGHE2Pwdvd7S12BL5FaOP20EGYesN73ktiC1qzkkit8="],
+            "facilitators": ["https://api.cdp.coinbase.com/platform/v2/x402"],
+            "settlement": "instant, non-custodial — funds land directly in the seller wallet"},
+        "transports": {"rest": "https://api.losbeto.xyz",
+                        "mcp":  "https://api.losbeto.xyz/mcp"},
+        "free_tier": {"llm": "https://api.losbeto.xyz/llm/free?q=... (5 calls/day per IP)",
+                       "samples": "https://api.losbeto.xyz/try"},
+        "contact": "roberto.martins622@gmail.com",
+        "ts": int(time.time())})
+
+# ---------------------------------------------------------------------------
 # v48.1.0 — CONCIERGE DE INTEGRAÇÃO (IA, grátis, cap 30/dia global).
 # "Como eu pago?" respondido na hora, no idioma da pergunta — o avaliador
 # não vai embora esperando o operador acordar. Fallback estático se a cadeia
@@ -22791,7 +22831,7 @@ def dashboard_alias():
 #      200/dia global) — o padrão OpenRouter aplicado ao x402.
 #   3) Concierge de integração com IA: GET /integrate?q=... (cap 30/dia,
 #      fallback estático se a cadeia LLM estiver em quarentena).
-VERSION = "48.3.9.4-PROXYFIX"  # v48.3.9.4: /proxy registrado após o alvo /fetch (o loop ALIAS_ROUTES rodava antes e o pulava) | base: v48.3.9.3-KEYDIR  # v48.3.9.3: /.well-known/http-message-signatures-directory (JWKS Ed25519 assinado RFC9421) + /legal + /support + alias /proxy→/fetch | base: v48.3.9.2-ALIAS  # v48.3.9.2: alias /llm/freePublic → /llm/free (demanda medida: 7 IPs/7d) | base: v48.3.9.1-GLAMA  # v48.3.9.1: /.well-known/glama.json aceita override via env GLAMA_CLAIM_JSON (claim do Glama por HTTP challenge sem novo deploy de código) | base: v48.3.9-FETCH
+VERSION = "48.3.10-COMMERCE"  # v48.3.10: /.well-known/acp.json (ACP discovery doc — demanda 8 reqs/4 IPs) | base: v48.3.9.4-PROXYFIX  # v48.3.9.4: /proxy registrado após o alvo /fetch (o loop ALIAS_ROUTES rodava antes e o pulava) | base: v48.3.9.3-KEYDIR  # v48.3.9.3: /.well-known/http-message-signatures-directory (JWKS Ed25519 assinado RFC9421) + /legal + /support + alias /proxy→/fetch | base: v48.3.9.2-ALIAS  # v48.3.9.2: alias /llm/freePublic → /llm/free (demanda medida: 7 IPs/7d) | base: v48.3.9.1-GLAMA  # v48.3.9.1: /.well-known/glama.json aceita override via env GLAMA_CLAIM_JSON (claim do Glama por HTTP challenge sem novo deploy de código) | base: v48.3.9-FETCH
 log.warning("🧠 v48.2.0-SMART — preço de tabela fixo + First-Call Bonus pós-compra · "
             "/llm/free (freemium %s/dia) · /integrate (concierge IA)",
             LLM_FREE_PER_DAY)
