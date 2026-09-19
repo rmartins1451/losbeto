@@ -1,9 +1,9 @@
 # -*- coding: utf-8 -*-
 """
 ================================================================================
- LOSBETO v48.5.1-LOGO — "The Last Millimetre"
+ LOSBETO v48.6.0-REGISTER — "The Last Millimetre"
 ================================================================================
- Upgrade: v48.5.0-FUNIL  →  v48.5.1-LOGO  (2026-09) — favicon real da marca (moeda-L #4ade80) embutido; placeholder "Ω10" aposentado
+ Upgrade: v48.5.1-LOGO  →  v48.6.0-REGISTER  (2026-09) — /register·/signup·/auth/callback (42 req/7d de máquinas rodando o playbook SaaS) viram porta de venda: POST /register = pacote de entrada $0.99 com api_key no corpo · security.txt RFC 9116 · radar de leads quentes · funil sem bots inflando "humanos"
 
  CAUSA RAIZ DO "0 VENDAS/24h" (lido do próprio ledger do node):
   Visibilidade RESOLVIDA (16K scanners/dia, trust bootstrap completo,
@@ -5636,6 +5636,17 @@ def _build_402(endpoint: str, price_override: float = None):
                             "note": ("Flagship: pay-per-call LLM inference — change "
                                      "base_url in any OpenAI SDK. The same wallet "
                                      "buys every data primitive in this catalog.")},
+            # v48.6.0-REGISTER: 42 pedidos/7d batendo em /register·/signup·
+            # /auth/callback (radar). A porta existe agora — e todo 402 aponta
+            # para ela em JSON puro, no momento exato da decisão de compra.
+            "registration": {"needed": False,
+                             "docs_get": f"{base}/register",
+                             "buy_key_post": f"{base}/register",
+                             "price_usdc": 0.99,
+                             "note": ("No signup required — payment is the credential. "
+                                      "Playbook requires an api_key? POST /register, "
+                                      "answer this same x402 flow, and the response IS "
+                                      "your key pre-loaded with $1.25 of call credit.")},
             "docs": f"{base}/llms.txt"},
     }
     # v21 FIX: base64 padrão (não URL-safe) — scanners usam b64decode padrão.
@@ -12646,6 +12657,45 @@ def demand_watch_loop():
             log.debug(f"demand_watch: {e}")
         time.sleep(3600)
 
+def lead_watch_loop():
+    """v48.6.0-REGISTER — o demand_watch vigia 404 (produto que NÃO temos);
+    este vigia a QUASE-VENDA (produto que TEMOS e não converteu). Um IP que
+    bate N+ vezes no MESMO endpoint pago em 24h — desafio 402 ou preview —
+    sem nenhum kind='paid' na janela é o lead mais quente do funil: a máquina
+    já decidiu QUE quer, falta o COMO. 1 alerta/dia por (ip, endpoint)."""
+    time.sleep(600)
+    avisados = {}
+    limiar = int(os.environ.get("LEAD_ALERT_HITS", "5"))
+    while True:
+        try:
+            corte = int(time.time()) - 86400
+            with LEDGER._conn() as c:
+                linhas = c.execute(
+                    "SELECT ip, endpoint, COUNT(*) n FROM requests "
+                    "WHERE ts>? AND kind IN ('challenge402','preview','preview_blocked') "
+                    "GROUP BY ip, endpoint HAVING n >= ? ORDER BY n DESC LIMIT 10",
+                    (corte, limiar)).fetchall()
+                pagantes = {r[0] for r in c.execute(
+                    "SELECT DISTINCT ip FROM requests WHERE ts>? AND kind='paid'",
+                    (corte,)).fetchall()}
+            agora = time.time()
+            avisados = {k: v for k, v in avisados.items() if agora - v < 86400}
+            for ip, ep, n in linhas:
+                if ip in pagantes or (ip, ep) in avisados or ep not in BASE_PRICES:
+                    continue
+                avisados[(ip, ep)] = agora
+                _notify_telegram(
+                    f"🔥 *LEAD QUENTE — quase-venda*\n\n"
+                    f"IP `{ip}` bateu *{n}×* em `{ep}` (24h) sem liquidar.\n"
+                    f"Preço: ${BASE_PRICES.get(ep, 0):.4f}\n\n"
+                    f"A máquina já decidiu QUE quer — o caminho está no próprio 402 "
+                    f"(amostra grátis + POST /register $0.99 → key). Nada a fazer; "
+                    f"é consciência situacional do funil.")
+                log.info(f"🔥 lead: {ip} -> {ep} ({n}x/24h sem pagar)")
+        except Exception as e:
+            log.debug(f"lead_watch: {e}")
+        time.sleep(3600)
+
 @app.before_request
 def _slash_redirect():
     """v44.0.6: catalog agents request manifest paths WITH a trailing slash
@@ -17372,10 +17422,10 @@ async function reload(){
     [/x402scan|fuchs|x402-observer|x402-trust|trust-prober|forum-labs|carbonmonitor|uptime|pingdom|monitor|healthcheck|preflight402|probe/i,
                                                             "🤖 scanner/monitor de QoS", "muted"],
     [/coinbase|cdp|bazaar|payai|facilitator|agentcash/i,    "🏪 catálogo/facilitator", "muted"],
-    [/semrush|ahrefs|bytespider|gptbot|ccbot|amazonbot|meta-externalagent|crawler|spider|scrapy/i,
+    [/semrush|ahrefs|bytespider|gptbot|ccbot|amazonbot|meta-externalagent|crawler|spider|scrapy|zerobot|heritrix|hermes-contact/i,
                                                             "🕷️ crawler de SEO/IA", "muted"],
     [/^node$|axios|undici|got\/|node-fetch/i,               "🟡 SDK Node — AGENTE ou você", "amber"],
-    [/python-requests|httpx|aiohttp|curl|wget|go-http|okhttp/i,
+    [/python-requests|httpx|aiohttp|curl|wget|go-http|okhttp|java-http/i,
                                                             "🟡 SDK genérico — possível agente", "amber"],
     [/mozilla|chrome|safari|firefox|edg/i,                  "👤 NAVEGADOR HUMANO", "green"],
   ];
@@ -18677,6 +18727,7 @@ def _start_background_once():
     threading.Thread(target=premium_brief_loop, daemon=True).start()
     threading.Thread(target=archive_loop, daemon=True).start()
     threading.Thread(target=demand_watch_loop, daemon=True).start()
+    threading.Thread(target=lead_watch_loop, daemon=True).start()  # v48.6.0-REGISTER
     threading.Thread(target=autopilot_report_loop, daemon=True).start()
     threading.Thread(target=llm_watchdog_loop, daemon=True).start()
     threading.Thread(target=acp_railway_seller_loop, daemon=True).start()
@@ -23267,15 +23318,16 @@ app.add_url_rule("/pay/<path:raw_endpoint>", "pay_bridge", _pay_bridge_handler,
 #      200/dia global) — o padrão OpenRouter aplicado ao x402.
 #   3) Concierge de integração com IA: GET /integrate?q=... (cap 30/dia,
 #      fallback estático se a cadeia LLM estiver em quarentena).
-VERSION = "48.5.1-LOGO"  # v48.5.1: /favicon.png|.ico = PNG 256px moeda-L #4ade80 embutido em base64 (6KB, zero arquivo externo) + /favicon.svg vetorial — aposenta placeholder SVG roxo "Ω10" | base: v48.5.0-FUNIL  # v48.5.0: /pay mobile-first (deep link + QR — fim do "No wallet found" que matava 55% do funil) · /blog/ + /login atendem demanda medida · docstring sincronizado | base: v48.4.0-WALLETPAY  # v48.4.0: /pay/<endpoint> checkout de carteira de navegador (MetaMask/Coinbase Wallet/Rabby) p/ o ~80% de avaliadores humanos que não tinham NENHUM caminho de compra sem CLI/agente + filtro de ruído de scanner de segredo (/env, /config/*.key) tirado do radar de demanda + banimento de modelo Gemini morto agora persiste entre restarts | base: v48.3.10-COMMERCE  # v48.3.10: /.well-known/acp.json (ACP discovery doc — demanda 8 reqs/4 IPs) | base: v48.3.9.4-PROXYFIX  # v48.3.9.4: /proxy registrado após o alvo /fetch (o loop ALIAS_ROUTES rodava antes e o pulava) | base: v48.3.9.3-KEYDIR  # v48.3.9.3: /.well-known/http-message-signatures-directory (JWKS Ed25519 assinado RFC9421) + /legal + /support + alias /proxy→/fetch | base: v48.3.9.2-ALIAS  # v48.3.9.2: alias /llm/freePublic → /llm/free (demanda medida: 7 IPs/7d) | base: v48.3.9.1-GLAMA  # v48.3.9.1: /.well-known/glama.json aceita override via env GLAMA_CLAIM_JSON (claim do Glama por HTTP challenge sem novo deploy de código) | base: v48.3.9-FETCH
+VERSION = "48.6.0-REGISTER"  # v48.6.0: /register·/signup·/auth/callback (demanda medida: 42 req/7d — playbook SaaS "registrar→receber key") · POST /register = /buy-credits $0.99 reempacotado como matrícula (MESMA tabela pública, mesma máquina de créditos idempotente — zero preço novo) · security.txt RFC 9116 (hermes-contact: 456 hits/24h) · lead_watch_loop: IP 5+× no MESMO endpoint pago em 24h sem liquidar → Telegram 1×/dia · dashboard: ZeroBot/heritrix/hermes saem de "humano" → crawler (funil honesto) · 402 upsell ganha ponte "registration" | base: v48.5.1-LOGO  # v48.5.1: /favicon.png|.ico = PNG 256px moeda-L #4ade80 embutido em base64 (6KB, zero arquivo externo) + /favicon.svg vetorial — aposenta placeholder SVG roxo "Ω10" | base: v48.5.0-FUNIL  # v48.5.0: /pay mobile-first (deep link + QR — fim do "No wallet found" que matava 55% do funil) · /blog/ + /login atendem demanda medida · docstring sincronizado | base: v48.4.0-WALLETPAY  # v48.4.0: /pay/<endpoint> checkout de carteira de navegador (MetaMask/Coinbase Wallet/Rabby) p/ o ~80% de avaliadores humanos que não tinham NENHUM caminho de compra sem CLI/agente + filtro de ruído de scanner de segredo (/env, /config/*.key) tirado do radar de demanda + banimento de modelo Gemini morto agora persiste entre restarts | base: v48.3.10-COMMERCE  # v48.3.10: /.well-known/acp.json (ACP discovery doc — demanda 8 reqs/4 IPs) | base: v48.3.9.4-PROXYFIX  # v48.3.9.4: /proxy registrado após o alvo /fetch (o loop ALIAS_ROUTES rodava antes e o pulava) | base: v48.3.9.3-KEYDIR  # v48.3.9.3: /.well-known/http-message-signatures-directory (JWKS Ed25519 assinado RFC9421) + /legal + /support + alias /proxy→/fetch | base: v48.3.9.2-ALIAS  # v48.3.9.2: alias /llm/freePublic → /llm/free (demanda medida: 7 IPs/7d) | base: v48.3.9.1-GLAMA  # v48.3.9.1: /.well-known/glama.json aceita override via env GLAMA_CLAIM_JSON (claim do Glama por HTTP challenge sem novo deploy de código) | base: v48.3.9-FETCH
 log.warning("🧠 v48.2.0-SMART — preço de tabela fixo + First-Call Bonus pós-compra · "
             "/llm/free (freemium %s/dia) · /integrate (concierge IA)",
             LLM_FREE_PER_DAY)
 log.warning("💳 v48.4.0-WALLETPAY — checkout de carteira de navegador ativo: "
             "%s/pay/<endpoint> (assina EIP-3009 com MetaMask/Coinbase Wallet/Rabby, "
             "zero CLI, zero agente)", _public_base())
-log.warning("🎨 v48.5.1-LOGO — favicon da marca (moeda-L #4ade80) embutido; "
-            "placeholder Ω10 aposentado · base FUNIL: checkout mobile, /blog/, /login")
+log.warning("🤖 v48.6.0-REGISTER — /register·/signup·/auth/callback no ar: "
+            "POST /register $0.99 → api_key lsk_ (máquina de créditos) · security.txt · "
+            "radar de leads quentes · base LOGO+FUNIL intacta")
 
 
 # --- v48.5.0-FUNIL: /blog/ e /login — gaps medidos pelo radar ---------------
@@ -23336,6 +23388,76 @@ def login_info():
         "note": "There is no username/password. Every paid response is the "
                 "credential. Buy credits once, reuse with X-API-Key.",
         "version": VERSION}), 200
+
+
+# --- v48.6.0-REGISTER — a porta do playbook SaaS das máquinas ----------------
+# Demanda medida pelo radar (7d): /register 17 req/3 IPs · /auth/callback 14/2 ·
+# /signup 11/3 — agentes rodando o playbook clássico de API (achar endpoint →
+# "registrar" → receber key) e levando 404. A resposta x402-nativa: conta não
+# existe, o pagamento É a credencial. Mas se o playbook EXIGE uma key, ela se
+# compra aqui: POST /register cobra o MESMO pacote de /buy-credits ($0.99 →
+# $1.25 de saldo, +25%) e devolve a key no corpo. Registrar = comprar a entrada.
+def _register_doc():
+    base = _public_base()
+    return {
+        "registration": "not_required",
+        "auth_model": "x402 — the payment is the credential. No account, no form.",
+        "instant_access": {
+            "pay_per_call": "send any documented endpoint, answer the 402, retry with payment",
+            "pricing": f"{base}/get-pricing",
+            "browser_checkout_for_humans": f"{base}/pay/<endpoint>"},
+        "if_your_playbook_requires_an_api_key": {
+            "how": ("POST /register (or /signup) and answer the x402 challenge "
+                    "($0.99). The 200 response IS your api_key, pre-loaded with "
+                    "$1.25 of call credit (+25% bonus, 30 days)."),
+            "method": "POST", "url": f"{base}/register", "price_usdc": 0.99,
+            "use_as": "X-API-Key: <api_key> — zero settlement latency per call",
+            "check_balance": f"{base}/credits-status?key=<api_key>",
+            "bigger_packs": f"{base}/plans"},
+        "free_evaluation": {
+            "one_real_time_call_free": f"{base}/welcome",
+            "six_samples_one_call": f"{base}/try",
+            "delayed_preview_any_endpoint": "?preview=1 on any paid path"},
+        "provider": "Losbeto", "version": VERSION}
+
+@app.route("/register", methods=["GET"])
+@app.route("/signup", methods=["GET"])
+def register_info():
+    if _wants_html():
+        return redirect("/pricing", code=302)
+    return jsonify(_register_doc()), 200
+
+@app.route("/auth/callback", methods=["GET", "POST"])
+def auth_callback_info():
+    # Sonda de OAuth esperando troca de código por token. Não há OAuth aqui —
+    # mesma resposta do /login (JSON para máquina, 302→/pricing para navegador).
+    return login_info()
+
+# A "matrícula": POST paga o pacote de entrada e devolve a key. Reusa a máquina
+# de créditos já provada em produção (emissão idempotente por tx + Telegram).
+# O 402 descreve /buy-credits de propósito: é LITERALMENTE o mesmo produto na
+# mesma tabela pública — outra porta, zero preço especial.
+app.add_url_rule("/register", "register_paid",
+                 paid_endpoint("/buy-credits")(_credits_purchase_handler("/buy-credits")),
+                 methods=["POST"])
+app.add_url_rule("/signup", "signup_paid",
+                 paid_endpoint("/buy-credits")(_credits_purchase_handler("/buy-credits")),
+                 methods=["POST"])
+
+# RFC 9116 — o hermes-contact-discovery (456 hits/24h) e scanners enterprise
+# procuram isto; sem a rota, essa atenção virava 404 e ruído no radar.
+@app.route("/.well-known/security.txt")
+@app.route("/security.txt")
+def security_txt():
+    txt = ("Contact: mailto:roberto.martins622@gmail.com\n"
+           f"Contact: {_public_base()}/support\n"
+           "Expires: " + time.strftime("%Y-%m-%dT%H:%M:%SZ",
+               time.gmtime(time.time() + 180 * 86400)) + "\n"
+           "Preferred-Languages: en, pt\n"
+           f"Canonical: {_public_base()}/.well-known/security.txt\n")
+    r = app.response_class(txt, mimetype="text/plain")
+    r.headers["Cache-Control"] = "public, max-age=86400"
+    return r
 
 
 if __name__ == "__main__":
