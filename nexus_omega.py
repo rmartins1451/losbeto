@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 ================================================================================
- LOSBETO v48.9.2-BRAND — "Become The Default"
+ LOSBETO v48.9.3-TRUST — "Become The Default"
 
  Hotfix de marca: v48.9.1 → v48.9.2 (2026-09) — logo v2 (mesma identidade
  L+órbita, caps redondos, verde #4ade80 exato) embutida como favicon; a marca
@@ -15879,9 +15879,58 @@ def launch_risk_preview():
         "ts": ts, "version": VERSION,
     })
 
+@app.route("/api/health")
 @app.route("/health")
 def health():
     return jsonify({"ok": True, "version": VERSION, "ts": int(time.time())})
+
+
+# ---------------------------------------------------------------------------
+# v48.9.3 — /impressum: página de operador HONESTA (demanda do radar: 5 IPs/7d)
+# Agentes/parceiros europeus procuram impressum por convenção de confiança.
+# Regra permanente: NUNCA fabricar nome legal/endereço. Operador pseudônimo,
+# contato real via canais que existem de verdade.
+# ---------------------------------------------------------------------------
+_IMPRESSUM_HTML = """<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Impressum — Losbeto x402 Node</title>
+<link rel="icon" href="/favicon.svg?v=2">
+<style>
+body{background:#0b0f14;color:#e6edf3;font-family:ui-monospace,Menlo,monospace;
+max-width:760px;margin:40px auto;padding:0 20px;line-height:1.65}
+a{color:#4ADE80} h1{font-size:22px} h2{font-size:15px;color:#4ADE80;margin-top:28px}
+.card{background:#11161d;border:1px solid #223;border-radius:10px;padding:18px 20px}
+img{vertical-align:middle;height:28px;margin-right:8px}
+.small{color:#8b949e;font-size:12px;margin-top:28px}
+</style></head><body>
+<h1><img src="/favicon.svg?v=2" alt="Losbeto">Impressum / Operator</h1>
+<div class="card">
+<h2>Service</h2>
+<p><b>Losbeto</b> — an autonomous, machine-payable API node speaking the
+<b>x402</b> protocol (HTTP 402 micropayments in USDC on Base). Runtime
+catalog, prices and live status: <a href="/">api.losbeto.xyz</a> ·
+<a href="/health">/health</a> · <a href="/.well-known/x402-bazaar">/.well-known/x402-bazaar</a></p>
+<h2>Operator</h2>
+<p>Operated by an independent, pseudonymous developer based in Brazil.
+No company or legal entity is registered for this service. This page is
+published for transparency and agent-trust conventions — it is not a
+German-law Impressum and contains no fabricated legal name or address.</p>
+<h2>Contact</h2>
+<p>· On-node, free: <a href="/chat/send">/chat/send</a> (messages reach the operator)<br>
+· Source &amp; issues: <a href="https://github.com/rmartins1451/losbeto">github.com/rmartins1451/losbeto</a></p>
+<h2>Payments</h2>
+<p>All payments are on-chain USDC transfers on Base, executed by the caller's
+own wallet at the exact price shown in the 402 challenge. On-chain payments
+are final. Free previews: append <code>?preview=1</code> to any endpoint.</p>
+</div>
+<p class="small">Losbeto x402 node · version __VERSION__ · served by the node itself</p>
+</body></html>"""
+
+@app.route("/impressum")
+def impressum():
+    return Response(_IMPRESSUM_HTML.replace("__VERSION__", VERSION),
+                    mimetype="text/html; charset=utf-8")
 
 
 # ===========================================================================
@@ -23661,7 +23710,7 @@ def circle_listing_helper():
 # Discovery API — os dois bloqueadores práticos que restavam para o canal
 # Circle. Código pronto; o resto desta semana é SUBMISSÃO MANUAL, não feature.
 # ============================================================================
-VERSION = "48.9.2-BRAND"  # v48.9.0: /.well-known/function-schemas.json + /.well-known/x402-bazaar(.json) — distribuição por padrão
+VERSION = "48.9.3-TRUST"  # v48.9.3: /api/health alias + /impressum honesto (sinais não atendidos do radar)  # v48.9.0: /.well-known/function-schemas.json + /.well-known/x402-bazaar(.json) — distribuição por padrão
 # (v48.8.0: 402 "error" vira anúncio de 1 linha · /circle-listing com form real + enum real
 # (v48.7.0: GET /circle-listing (campos prontos p/ o Agent Marketplace da Circle, lançado 09/set/2026 — canal de distribuição inteiro que faltava no checklist) + checklist de boot ganha Circle/402 Index/BlockRun | base: v48.6.1-LEADFIX  # v48.6.1: lead_watch_loop parava de confundir varredura de catálogo (mesmo IP, muitos endpoints diferentes) e harness de smoke-test (600+ hits num único endpoint) com lead quente — agora filtra por UA de scanner conhecido, teto de volume plausível p/ avaliação humana e 1 alerta por IP por ciclo · cdp_bazaar_bootstrap_loop checa liquidações VITALÍCIAS em Base antes de avisar que falta BASE_OPERATOR_PRIVATE_KEY (evita o log contradizer o próprio "3526 liquidações, elegível ao Bazaar"da v46) · dashboard separa "trust genérico" (tx_count≥3) de "CDP Bazaar/Base" (>=1 settle em Base) — eram rótulos diferentes escondidos atrás do mesmo badge "✓ completo" | base: v48.6.0-REGISTER  # v48.6.0: /register·/signup·/auth/callback (demanda medida: 42 req/7d — playbook SaaS "registrar→receber key") · POST /register = /buy-credits $0.99 reempacotado como matrícula (MESMA tabela pública, mesma máquina de créditos idempotente — zero preço novo) · security.txt RFC 9116 (hermes-contact: 456 hits/24h) · lead_watch_loop: IP 5+× no MESMO endpoint pago em 24h sem liquidar → Telegram 1×/dia · dashboard: ZeroBot/heritrix/hermes saem de "humano" → crawler (funil honesto) · 402 upsell ganha ponte "registration" | base: v48.5.1-LOGO  # v48.5.1: /favicon.png|.ico = PNG 256px moeda-L #4ade80 embutido em base64 (6KB, zero arquivo externo) + /favicon.svg vetorial — aposenta placeholder SVG roxo "Ω10" | base: v48.5.0-FUNIL  # v48.5.0: /pay mobile-first (deep link + QR — fim do "No wallet found" que matava 55% do funil) · /blog/ + /login atendem demanda medida · docstring sincronizado | base: v48.4.0-WALLETPAY  # v48.4.0: /pay/<endpoint> checkout de carteira de navegador (MetaMask/Coinbase Wallet/Rabby) p/ o ~80% de avaliadores humanos que não tinham NENHUM caminho de compra sem CLI/agente + filtro de ruído de scanner de segredo (/env, /config/*.key) tirado do radar de demanda + banimento de modelo Gemini morto agora persiste entre restarts | base: v48.3.10-COMMERCE  # v48.3.10: /.well-known/acp.json (ACP discovery doc — demanda 8 reqs/4 IPs) | base: v48.3.9.4-PROXYFIX  # v48.3.9.4: /proxy registrado após o alvo /fetch (o loop ALIAS_ROUTES rodava antes e o pulava) | base: v48.3.9.3-KEYDIR  # v48.3.9.3: /.well-known/http-message-signatures-directory (JWKS Ed25519 assinado RFC9421) + /legal + /support + alias /proxy→/fetch | base: v48.3.9.2-ALIAS  # v48.3.9.2: alias /llm/freePublic → /llm/free (demanda medida: 7 IPs/7d) | base: v48.3.9.1-GLAMA  # v48.3.9.1: /.well-known/glama.json aceita override via env GLAMA_CLAIM_JSON (claim do Glama por HTTP challenge sem novo deploy de código) | base: v48.3.9-FETCH
 log.warning("🧠 v48.2.0-SMART — preço de tabela fixo + First-Call Bonus pós-compra · "
@@ -23684,7 +23733,7 @@ log.warning("📣 v48.8.0-ADCOPY — todo 402 agora carrega o campo 'error' escr
 log.warning("🧰 v48.9.0-TOOLKIT — /.well-known/function-schemas.json (OpenAI+Anthropic) "
             "e /.well-known/x402-bazaar(.json) no ar · losbeto-tools PyPI ganha "
             "CrewAI/AutoGen — o node vira ferramenta padrão, não resultado de busca")
-log.warning("🎨 v48.9.2-BRAND — logo v2 no favicon e VISÍVEL nas páginas de pagamento "
+log.warning("🤝 v48.9.3-TRUST — /api/health + /impressum | v48.9.2: logo v2 visível "
             "(/pay + 402 HTML) e na home · links de ícone com cache-buster ?v=2")
 
 
