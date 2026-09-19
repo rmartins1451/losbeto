@@ -1,9 +1,23 @@
 # -*- coding: utf-8 -*-
 """
 ================================================================================
- LOSBETO v48.6.0-REGISTER — "The Last Millimetre"
+ LOSBETO v48.9.0-TOOLKIT — "Become The Default"
 ================================================================================
- Upgrade: v48.5.1-LOGO  →  v48.6.0-REGISTER  (2026-09) — /register·/signup·/auth/callback (42 req/7d de máquinas rodando o playbook SaaS) viram porta de venda: POST /register = pacote de entrada $0.99 com api_key no corpo · security.txt RFC 9116 · radar de leads quentes · funil sem bots inflando "humanos"
+ Upgrade: v48.8.0-ADCOPY  →  v48.9.0-TOOLKIT  (2026-09) — distribuição por
+ PADRÃO, não por busca: /.well-known/function-schemas.json (schemas OpenAI +
+ Anthropic prontos pra colar, gerados do mesmo catálogo curado do pacote
+ losbeto-tools PyPI) · /.well-known/x402-bazaar (+ .json) no formato observado
+ no ecossistema (GoldBean/Conflux) com faixa de preço REAL computada de
+ BASE_PRICES em runtime · pacote losbeto-tools ganhou CrewAI + AutoGen
+
+ Upgrade anterior: v48.7.0-CIRCLE  →  v48.8.0-ADCOPY  (2026-09) — o corpo do 402 ganha o
+ campo top-level "error" escrito como ANÚNCIO de 1 linha (macete systemprompt.io:
+ "your 402 response IS your listing" — é a única string que todo cliente/agregador
+ exibe ao agente na hora da decisão) · /circle-listing corrigido: categoria no
+ ENUM real da Discovery API (FINANCIAL_ANALYSIS) + form de intake direto
+ (forms.gle/7YFzvdmMcn1JH5tF6) + URL de verificação pós-aprovação
+
+ Upgrade anterior: v48.5.1-LOGO  →  v48.6.0-REGISTER  (2026-09) — /register·/signup·/auth/callback (42 req/7d de máquinas rodando o playbook SaaS) viram porta de venda: POST /register = pacote de entrada $0.99 com api_key no corpo · security.txt RFC 9116 · radar de leads quentes · funil sem bots inflando "humanos"
 
  CAUSA RAIZ DO "0 VENDAS/24h" (lido do próprio ledger do node):
   Visibilidade RESOLVIDA (16K scanners/dia, trust bootstrap completo,
@@ -5547,6 +5561,20 @@ def _build_402(endpoint: str, price_override: float = None):
     _challenge_remember(endpoint, accepts)   # v39: usado na liquidação
     payload = {
         "x402Version": 2,
+        # v48.8-ADCOPY: "error" é a string que TODO cliente x402 expõe ao agente
+        # comprador (x402-fetch loga, carteiras/aggregators exibem, a spec v1 a
+        # define como mensagem human-readable opcional). Macete systemprompt.io:
+        # "your 402 response IS your listing" — então esta linha é escrita como
+        # anúncio: preço, prova grátis, chamada grátis e planos. Quem não usa o
+        # campo simplesmente o ignora — custo zero de protocolo.
+        "error": (
+            f"Payment required: {endpoint} is ${amount_usdc:.4f}/call "
+            f"(USDC on Base/Solana/Algorand). "
+            f"{desc.split('.')[0].strip()[:140].replace('\u2014', '-').replace('\u2013', '-').encode('ascii', 'ignore').decode()}. "
+            f"Free delayed sample: GET {base}{endpoint}?preview=1 | "
+            f"1 free real-time call: {base}/welcome | "
+            f"plans from $0.99: {base}/plans"
+        ),
         "resource": {
             "url":         f"{base}{endpoint}",
             "description": desc,
@@ -12662,26 +12690,65 @@ def lead_watch_loop():
     este vigia a QUASE-VENDA (produto que TEMOS e não converteu). Um IP que
     bate N+ vezes no MESMO endpoint pago em 24h — desafio 402 ou preview —
     sem nenhum kind='paid' na janela é o lead mais quente do funil: a máquina
-    já decidiu QUE quer, falta o COMO. 1 alerta/dia por (ip, endpoint)."""
+    já decidiu QUE quer, falta o COMO. 1 alerta/dia por (ip, endpoint).
+
+    v48.6.1 FIX CRÍTICO — a v48.6.0 não filtrava por UA nem por dispersão de
+    endpoint, então um scanner batendo 90x em CADA um de 8 endpoints
+    diferentes (mesmo IP, catálogo inteiro varrido em ordem alfabética —
+    visto ao vivo no log de 19/set) virava OITO alertas 'lead quente'
+    seguidos, e um harness de smoke-test batendo 600x+ em UM único endpoint
+    virava outro. Dois padrões, nenhum é intenção de compra: um é
+    dispersão alta (crawl de catálogo), o outro é volume extremo demais
+    para qualquer avaliação humana real (uma dezena de tentativas legítimas
+    não vira seiscentas). Sem esses dois filtros, o Telegram — o único canal
+    onde um lead real chegaria a tempo — fica inundado e o operador aprende
+    a ignorar. Agora: (1) IP com UA de scanner/bot nomeado nunca alerta;
+    (2) IP tocando muitos endpoints DIFERENTES na janela é dispersão de
+    catálogo, não interesse num produto — suprimido; (3) volume acima de um
+    teto plausível de avaliação humana também é tratado como automação, não
+    lead; (4) no máximo 1 alerta por IP por ciclo (o endpoint de maior
+    contagem), não um por endpoint batido."""
     time.sleep(600)
     avisados = {}
     limiar = int(os.environ.get("LEAD_ALERT_HITS", "5"))
+    teto = int(os.environ.get("LEAD_ALERT_MAX_HITS", "60"))  # acima disso é harness, não humano
+    max_endpoints_distintos = int(os.environ.get("LEAD_ALERT_MAX_SPREAD", "3"))
     while True:
         try:
             corte = int(time.time()) - 86400
             with LEDGER._conn() as c:
                 linhas = c.execute(
-                    "SELECT ip, endpoint, COUNT(*) n FROM requests "
+                    "SELECT ip, endpoint, COUNT(*) n, MAX(ua) ua FROM requests "
                     "WHERE ts>? AND kind IN ('challenge402','preview','preview_blocked') "
-                    "GROUP BY ip, endpoint HAVING n >= ? ORDER BY n DESC LIMIT 10",
+                    "GROUP BY ip, endpoint HAVING n >= ? ORDER BY n DESC LIMIT 50",
                     (corte, limiar)).fetchall()
                 pagantes = {r[0] for r in c.execute(
                     "SELECT DISTINCT ip FROM requests WHERE ts>? AND kind='paid'",
                     (corte,)).fetchall()}
+                dispersao = dict(c.execute(
+                    "SELECT ip, COUNT(DISTINCT endpoint) FROM requests "
+                    "WHERE ts>? AND kind IN ('challenge402','preview','preview_blocked') "
+                    "GROUP BY ip", (corte,)).fetchall())
             agora = time.time()
             avisados = {k: v for k, v in avisados.items() if agora - v < 86400}
-            for ip, ep, n in linhas:
-                if ip in pagantes or (ip, ep) in avisados or ep not in BASE_PRICES:
+            # v48.6.1: 1 alerta por IP por ciclo — pega só o endpoint de maior
+            # contagem para cada IP elegível, em vez de um ping por endpoint.
+            melhor_por_ip = {}
+            for ip, ep, n, ua in linhas:
+                if ip in pagantes or ep not in BASE_PRICES:
+                    continue
+                if n > teto:
+                    continue  # volume de harness/smoke-test, não avaliação humana
+                if dispersao.get(ip, 0) > max_endpoints_distintos:
+                    continue  # bateu em endpoints demais — é varredura de catálogo
+                ua_l = (ua or "")
+                if (_UA_NAMED_SCANNER.search(ua_l) or _UA_GENERIC_BOT.search(ua_l)):
+                    continue  # identidade de bot/scanner conhecida
+                atual = melhor_por_ip.get(ip)
+                if atual is None or n > atual[1]:
+                    melhor_por_ip[ip] = (ep, n)
+            for ip, (ep, n) in melhor_por_ip.items():
+                if (ip, ep) in avisados:
                     continue
                 avisados[(ip, ep)] = agora
                 _notify_telegram(
@@ -17273,7 +17340,16 @@ code{background:var(--bg2);padding:2px 6px;border-radius:3px;font-size:11px;colo
      <br>Status público: <a href="https://www.x402scan.com" target="_blank">x402scan.com</a>
   </p>
 </div>
-<div class="alert-ok" id="trust_ok">✓ trust bootstrap completo — node visível nos diretórios x402</div>
+<div class="alert-ok" id="trust_ok">✓ trust bootstrap completo — node visível nos diretórios x402 (genérico, tx_count≥3)</div>
+<div class="alert" id="base_bootstrap_alert">
+  <h4>⚠ CDP Bazaar (Base) pendente — requisito DIFERENTE do trust genérico acima</h4>
+  <p>Trust genérico e Bazaar da CDP checam coisas diferentes: o de cima olha o total de
+     pagamentos liquidados em qualquer chain; este olha especificamente se já houve
+     <strong>1 settle em Base</strong>. Zero até agora. Rode <code>POST /bootstrap-trust</code>
+     com um pagamento pequeno em Base, ou configure <code>BASE_OPERATOR_PRIVATE_KEY</code>
+     para o node tentar sozinho. Ver <a href="/bazaar-status" target="_blank">/bazaar-status</a>.</p>
+</div>
+<div class="alert-ok" id="base_bootstrap_ok">✓ CDP Bazaar (Base) também resolvido — pelo menos 1 settle em Base já registrado</div>
 
 <div class="section-label">Overview</div>
 <div class="grid" id="cards"></div>
@@ -17372,6 +17448,10 @@ async function reload(){
   const trustActive = (((j.stats||{}).paid_total!==undefined)?j.stats.paid_total:(j.stats||{}).paid_24h||0) >= 3;
   document.getElementById("trust_alert").classList.toggle("show", !trustActive);
   document.getElementById("trust_ok").classList.toggle("show", trustActive);
+  // v48.6.1: indicador separado — não depende do genérico acima.
+  const baseBootstrapActive = !!j.base_bootstrap_done;
+  document.getElementById("base_bootstrap_alert").classList.toggle("show", !baseBootstrapActive);
+  document.getElementById("base_bootstrap_ok").classList.toggle("show", baseBootstrapActive);
 
   const avgTicket = (j.stats.avg_ticket!==undefined) ? j.stats.avg_ticket : 0;
 
@@ -17542,6 +17622,13 @@ def dash_api():
         "prices":          {ep: get_dynamic_price(ep) for ep in BASE_PRICES},
         "featured_endpoints": FEATURED_ENDPOINTS,
         "dynamic_pricing": PREDICTIVE_PRICING,
+        # v48.6.1: separado do trust genérico de diretório (paid_total>=3)
+        # de propósito — são dois requisitos DIFERENTES que o dashboard
+        # vinha misturando sob o mesmo rótulo "trust bootstrap completo",
+        # escondendo que o requisito específico do CDP Bazaar (>=1 settle
+        # em Base, qualquer valor) podia estar pendente mesmo com o
+        # genérico satisfeito.
+        "base_bootstrap_done": _base_settles() > 0,
     })
 
 # ============================================================================
@@ -18150,6 +18237,13 @@ def autoregister_x402scan():
         log.info("   5. MCPay:         https://mcpay.tech — liste o MCP")
         log.info("   6. CDP Bazaar:    1 settle em Base via POST /bootstrap-trust")
         log.info("                     (o manifesto v39 já traz Base em accepts[0])")
+        log.info("   7. Circle Agent Marketplace (NOVO, lançado 09/set/2026):")
+        log.info("                     catálogo curado da própria emissora do USDC — "
+                 "600+ serviços, agents.circle.com/services + Discovery API "
+                 "(api.circle.com/v2/x402/discovery/resources). Requer form manual, "
+                 "revisão humana: campos prontos em GET /circle-listing")
+        log.info("   8. 402 Index:     https://402index.io — diretório protocol-agnostic")
+        log.info("   9. BlockRun:      https://blockrun.ai/marketplace — 600+ serviços indexados")
         log.info("=" * 62)
     except Exception as e:
         log.warning(f"autoregister erro: {e}")
@@ -19429,29 +19523,33 @@ def cdp_bazaar_bootstrap_loop():
         if not (ENABLE_BASE and BASE_PAYTO_EVM):
             log.info("[v27 bootstrap] Base desabilitado — skipping CDP seed")
             return
+        # v48.6.1 FIX — a ordem antiga checava BASE_OPERATOR_PRIVATE_KEY e
+        # desistia ANTES de perguntar se o bootstrap já não estava resolvido
+        # por tráfego real. Resultado visto ao vivo: todo boot avisava
+        # "chave não setada" mesmo com 3526 liquidações históricas em Base
+        # (mesma métrica que o _v46_boot usa para dizer "elegível ao CDP
+        # Bazaar" duas seções acima) — dois logs contraditórios na mesma
+        # inicialização, e o dashboard mostrando "trust bootstrap completo"
+        # por cima dos dois. Agora: verifica o histórico VITALÍCIO primeiro
+        # (mesma _base_settles() do resto do código, sem reimplementar com
+        # janela de 7d divergente); só menciona a chave que falta se o
+        # bootstrap realmente nunca aconteceu.
+        base_settles_total = _base_settles()
+        if base_settles_total > 0:
+            log.info(f"[v27 bootstrap] {base_settles_total} settle(s) Base "
+                     f"já registrados historicamente — bootstrap já resolvido, "
+                     f"nada a fazer (ver /bazaar-status)")
+            return
         op_key = _os.environ.get("BASE_OPERATOR_PRIVATE_KEY", "").strip()
         if not op_key:
-            log.info("[v27 bootstrap] BASE_OPERATOR_PRIVATE_KEY não setada — "
-                     "seed manual via POST /bootstrap-trust")
+            log.warning("[v27 bootstrap] ZERO settles Base na vida do node E "
+                        "BASE_OPERATOR_PRIVATE_KEY não setada — Agentic.Market/"
+                        "CDP Bazaar provavelmente não indexam este node. Rode "
+                        "1 self-payment manual de $0.01 via POST /bootstrap-trust "
+                        "ou configure a env var para o node se auto-resolver.")
             return
-        # Verifica se já tem settle Base recente
-        try:
-            with LEDGER._conn() as c:
-                row = c.execute(
-                    "SELECT COUNT(*) FROM revenue "
-                    "WHERE chain='base' AND ts > ?",
-                    (int(_time.time()) - 7 * 86400,)
-                ).fetchone()
-                base_settles = int(row[0]) if row else 0   # v27.1: tupla, não dict
-        except Exception:
-            base_settles = 0
-        if base_settles > 0:
-            log.info(f"[v27 bootstrap] {base_settles} Base settles nos últimos "
-                     f"7d — Bazaar indexação ativa")
-            return
-        log.warning("[v27 bootstrap] ZERO settles Base 7d — Agentic.Market "
-                    "provavelmente não está indexando este node. Considere "
-                    "fazer 1 self-payment manual de $0.01 via /bootstrap-trust.")
+        log.info("[v27 bootstrap] BASE_OPERATOR_PRIVATE_KEY setada e zero "
+                 "settles históricos — tentando self-seed automático")
     except Exception as e:
         log.warning(f"[v27 bootstrap] {e}")
 
@@ -22871,6 +22969,20 @@ def anvita_verification():
     return Response(tok + "\n", mimetype="text/plain")
 
 
+@app.route("/.well-known/402index-verify.txt")
+def x402index_verify_txt():
+    """v48.8: prova de propriedade do domínio para o claim na 402index
+    (fluxo documentado em 402index.io/verify): POST /api/v1/claim emite um
+    verification_hash → publicamos aqui via env INDEX402_VERIFY_HASH →
+    POST /api/v1/claim/verify confirma e libera a edição dos listings.
+    Sem env configurada responde 404 honesto (mesmo padrão do anvita)."""
+    tok = os.environ.get("INDEX402_VERIFY_HASH", "").strip()
+    if not tok:
+        return Response("402index verification not configured\n", status=404,
+                        mimetype="text/plain")
+    return Response(tok + "\n", mimetype="text/plain")
+
+
 @app.route("/.well-known/agent-directory.json")
 def agent_directory_wellknown():
     """O catálogo também no caminho well-known — mesma resposta, dois nomes."""
@@ -23310,6 +23422,207 @@ app.add_url_rule("/pay/<path:raw_endpoint>", "pay_bridge", _pay_bridge_handler,
 
 
 # ============================================================================
+# v48.7.0-CIRCLE (19/set/2026) — CANAL DE DISTRIBUIÇÃO NOVO, AUSENTE DO
+# CHECKLIST ATÉ AGORA: a Circle (emissora do USDC) lançou em 09/set/2026 o
+# Agent Marketplace — catálogo curado + sanctions-screened, com Discovery API
+# pública (api.circle.com/v2/x402/discovery/resources) e vitrine em
+# agents.circle.com/services (600+ serviços em 15+ chains no lançamento).
+# Nenhum dos diretórios já perseguidos pelo checklist v27 (x402scan,
+# awesome-x402, AgentCash, MCPay, Nevermined) é este — é um catálogo
+# DIFERENTE, mais novo, com a marca mais forte do ecossistema (é a emissora
+# da moeda que todo mundo aqui já usa) atrás dele.
+#
+# A inscrição é hoje um formulário revisado por humano (a própria Circle diz
+# que o self-serve automático "está chegando"), então esta rota não submete
+# nada sozinha — mas monta exatamente os campos que o formulário pede
+# (endpoint, wallet de recebimento já sanctions-screenable, OpenAPI spec,
+# descrição) para o preenchimento levar 2 minutos em vez de uma volta pela
+# documentação inteira.
+# ============================================================================
+# ============================================================================
+# v48.9.0-TOOLKIT (19/set/2026) — "BECOME THE DEFAULT": a pesquisa de
+# distribuição mostrou que quem vende não espera ser descoberto — já está
+# instalado onde o agente vive (a Apify levou 20.000+ Actors para dentro do
+# x402 de uma vez, 10x o catálogo do protocolo). Duas superfícies novas,
+# zero dado inventado (tudo derivado de BASE_PRICES/ENDPOINT_DESC em runtime):
+#   1) /.well-known/function-schemas.json — schemas de function-calling
+#      (formato OpenAI tools[] E formato Anthropic) prontos para colar, da
+#      MESMA lista curada que virou os módulos CrewAI/AutoGen do pacote
+#      losbeto-tools (PyPI) — os dois lados nunca dessincronizam.
+#   2) /.well-known/x402-bazaar (+ alias .json) — a ficha de identidade
+#      curta no formato observado no ecossistema (GoldBean serve este path;
+#      Conflux o usa para verificar agentes): nome, versão, chains/moedas
+#      aceitas e a faixa de preço REAL computada de BASE_PRICES em runtime.
+# ============================================================================
+_FUNCTION_SCHEMA_ENDPOINTS = [
+    ("/br-brief",              "losbeto_brazil_brief",         []),
+    ("/br-macro",              "losbeto_brazil_macro",         []),
+    ("/br-curve",              "losbeto_brazil_rate_curve",    []),
+    ("/br-equity",             "losbeto_brazil_equity",        ["symbol"]),
+    ("/oracle-consensus",      "losbeto_oracle_consensus",     ["symbol"]),
+    ("/sentiment-consensus",   "losbeto_sentiment_consensus",  []),
+    ("/correlation-matrix",    "losbeto_correlation_matrix",   []),
+    ("/global-morning-brief",  "losbeto_global_morning_brief", []),
+    ("/equity-dossier",        "losbeto_equity_dossier",       ["symbol"]),
+    ("/launch-risk",           "losbeto_launch_risk",          ["symbol"]),
+    ("/token-intel",           "losbeto_token_intel",          ["symbol"]),
+    ("/wallet-scan",           "losbeto_wallet_scan",          ["address"]),
+]
+
+# Prefixos de plano/pacote — NÃO são preço por chamada (para a faixa honesta
+# do x402-bazaar: per-call min/max exclui assinaturas e pacotes de crédito).
+_PLAN_PREFIXES = ("/buy-credits", "/subscribe", "/day-pass", "/week-pass",
+                  "/founding-agent", "/enterprise")
+
+
+@app.route("/.well-known/function-schemas.json")
+def function_schemas_wellknown():
+    base = _public_base()
+
+    def _desc(ep):
+        d = ENDPOINT_DESC.get(ep, f"Losbeto — {ep}")
+        d = d.split(". ")[0].strip().replace("\u2014", "-").replace("\u2013", "-")
+        d = d.encode("ascii", "ignore").decode()
+        return (f"{d}. Returns a real, delayed (~15min) free sample, no "
+                f"wallet needed. For real-time data, pay per call via x402 "
+                f"at the same path (no account, no API key).")
+
+    def _props(params):
+        return {p: {"type": "string", "description": f"Query parameter: {p}"}
+                for p in params}
+
+    openai_tools, anthropic_tools = [], []
+    for ep, name, params in _FUNCTION_SCHEMA_ENDPOINTS:
+        if ep not in BASE_PRICES:      # honestidade: nunca anunciar o que não existe
+            continue
+        d = _desc(ep)
+        openai_tools.append({
+            "type": "function",
+            "function": {"name": name, "description": d,
+                         "parameters": {"type": "object",
+                                        "properties": _props(params),
+                                        "required": []}},
+        })
+        anthropic_tools.append({
+            "name": name, "description": d,
+            "input_schema": {"type": "object", "properties": _props(params),
+                             "required": []},
+        })
+    return jsonify({
+        "_meta": {
+            "provider": SERVICE_NAME,
+            "base_url": base,
+            "protocol": "x402 (HTTP 402 Payment Required, USDC on Base/Solana/Algorand)",
+            "free_preview": "Add ?preview=1 to any endpoint for a free, "
+                            "~15min-delayed real sample — no wallet, no signup.",
+            "real_time_payment": "Drop preview=1 and settle the 402 challenge "
+                                 "via any x402 wallet/SDK.",
+            "manifest": f"{base}/.well-known/x402.json",
+            "mcp": f"{base}/mcp",
+            "python_package": "pip install losbeto-tools[crewai] / [autogen] / [langchain]",
+        },
+        "openai_tools": openai_tools,
+        "anthropic_tools": anthropic_tools,
+    })
+
+
+@app.route("/.well-known/x402-bazaar")
+@app.route("/.well-known/x402-bazaar.json")
+def x402_bazaar_wellknown():
+    """Ficha curta de descoberta no formato observado no ecossistema
+    (GoldBean: goldbean-api.xyz/.well-known/x402-bazaar; Conflux usa o alias
+    .json para verificar agentes). Todos os números são computados de
+    BASE_PRICES em runtime — nada hardcoded, nada inventado."""
+    base = _public_base()
+    currencies = [{
+        "id": "USDC", "network": "solana", "decimals": USDC_DECIMALS,
+        "contract": USDC_MINT,
+    }]
+    if ENABLE_BASE and BASE_PAYTO_EVM:
+        currencies.append({
+            "id": "USDC", "network": "base", "decimals": USDC_DECIMALS,
+            "contract": BASE_USDC,
+        })
+    if ENABLE_ALGO and ALGO_PAYTO:
+        currencies.append({
+            "id": "USDC", "network": "algorand", "decimals": USDC_DECIMALS,
+            "contract": ALGO_USDC_ASA,
+        })
+    per_call = {k: v for k, v in BASE_PRICES.items()
+                if not any(k.startswith(p) for p in _PLAN_PREFIXES)}
+    plans = {k: v for k, v in BASE_PRICES.items() if k not in per_call}
+    return jsonify({
+        "name": SERVICE_NAME,
+        "description": ("Cross-asset market data for AI agents: forex, "
+                        "equities, Brazil macro (BCB/B3), crypto."),
+        "version": VERSION,
+        "url": base,
+        "currencies": currencies,
+        "pricing": {
+            "unit_price": {
+                "per_call_usdc": {"min": min(per_call.values()),
+                                  "max": max(per_call.values())},
+                "plans_usdc": {"min": min(plans.values()),
+                               "max": max(plans.values())},
+            },
+        },
+        "free_tier": {
+            "preview": "Add ?preview=1 to any endpoint — real data, "
+                       "~15min delayed, no wallet.",
+            "first_call_free": f"{base}/welcome",
+        },
+        "resources_count": len(per_call),
+        "resources": f"{base}/x402-resources",
+        "manifest": f"{base}/.well-known/x402.json",
+        "function_schemas": f"{base}/.well-known/function-schemas.json",
+        "mcp": f"{base}/mcp",
+        "docs": f"{base}/llms.txt",
+    })
+
+
+@app.route("/circle-listing")
+def circle_listing_helper():
+    base = _public_base()
+    return jsonify({
+        "submit_at": "https://developers.circle.com/agent-stack/agent-marketplace/get-listed",
+        # v48.8: o intake REAL é este Google Form (extraído do HTML da página
+        # acima em 19/set/2026) — a doc page só explica os pré-requisitos.
+        "intake_form": "https://forms.gle/7YFzvdmMcn1JH5tF6",
+        "verify_listing_after_approval":
+            "https://api.circle.com/v2/x402/discovery/resources?query=losbeto",
+        "catalog_preview": "https://agents.circle.com/services",
+        "why": ("Catálogo curado da PRÓPRIA emissora do USDC, lançado 09/set/2026 — "
+                "não é o mesmo diretório que x402scan/AgentCash/MCPay/awesome-x402 "
+                "já cobertos pelo checklist de distribuição."),
+        "prerequisites_status": {
+            "returns_402_when_unpaid": True,
+            "openapi_spec_published": True,
+            "openapi_url": f"{base}/openapi.json",
+            "payout_wallet_configured": bool(BASE_PAYTO_EVM),
+            "payout_wallet": BASE_PAYTO_EVM or None,
+        },
+        "suggested_form_fields": {
+            "endpoint_url": f"{base}/",
+            "openapi_url": f"{base}/openapi.json",
+            "payout_wallet_address": BASE_PAYTO_EVM,
+            "network": "base",
+            # v48.8: categoria no ENUM real da Discovery API (não em prosa) —
+            # valores válidos: SOCIAL_INTELLIGENCE, FINANCIAL_ANALYSIS,
+            # WEB_SEARCH_RESEARCH, PREDICTION_MARKETS, CREATIVE, INFRASTRUCTURE.
+            "category": "FINANCIAL_ANALYSIS",
+            # v47.4.1: o mesmo limite de 100 chars que o MCP Registry oficial
+            # já exige — reaproveitado aqui, não é coincidência de tamanho.
+            "short_description": ("Cross-asset market data for AI agents: forex, "
+                                   "equities, Brazil macro (BCB/B3), crypto."),
+            "contact": "via /chat/send (Telegram do operador) ou GitHub do repositório",
+        },
+        "note": ("Revisão é manual hoje (Circle ainda não abriu self-serve). "
+                 "Depois de aprovado, o node aparece em agents.circle.com/services "
+                 "e na Discovery API sem nenhuma mudança de código adicional."),
+    })
+
+
+# ============================================================================
 # v48.1.0-REACTIVE (11/set/2026) — o nó que REAGE para não perder a venda:
 #   1) Escada de desconto em tempo real: 3º 402 sem pagar (mesmo IP+endpoint,
 #      24h) → 1 desafio a 50% (piso $0.001), 1x/dia, settle fecha no preço
@@ -23318,7 +23631,22 @@ app.add_url_rule("/pay/<path:raw_endpoint>", "pay_bridge", _pay_bridge_handler,
 #      200/dia global) — o padrão OpenRouter aplicado ao x402.
 #   3) Concierge de integração com IA: GET /integrate?q=... (cap 30/dia,
 #      fallback estático se a cadeia LLM estiver em quarentena).
-VERSION = "48.6.0-REGISTER"  # v48.6.0: /register·/signup·/auth/callback (demanda medida: 42 req/7d — playbook SaaS "registrar→receber key") · POST /register = /buy-credits $0.99 reempacotado como matrícula (MESMA tabela pública, mesma máquina de créditos idempotente — zero preço novo) · security.txt RFC 9116 (hermes-contact: 456 hits/24h) · lead_watch_loop: IP 5+× no MESMO endpoint pago em 24h sem liquidar → Telegram 1×/dia · dashboard: ZeroBot/heritrix/hermes saem de "humano" → crawler (funil honesto) · 402 upsell ganha ponte "registration" | base: v48.5.1-LOGO  # v48.5.1: /favicon.png|.ico = PNG 256px moeda-L #4ade80 embutido em base64 (6KB, zero arquivo externo) + /favicon.svg vetorial — aposenta placeholder SVG roxo "Ω10" | base: v48.5.0-FUNIL  # v48.5.0: /pay mobile-first (deep link + QR — fim do "No wallet found" que matava 55% do funil) · /blog/ + /login atendem demanda medida · docstring sincronizado | base: v48.4.0-WALLETPAY  # v48.4.0: /pay/<endpoint> checkout de carteira de navegador (MetaMask/Coinbase Wallet/Rabby) p/ o ~80% de avaliadores humanos que não tinham NENHUM caminho de compra sem CLI/agente + filtro de ruído de scanner de segredo (/env, /config/*.key) tirado do radar de demanda + banimento de modelo Gemini morto agora persiste entre restarts | base: v48.3.10-COMMERCE  # v48.3.10: /.well-known/acp.json (ACP discovery doc — demanda 8 reqs/4 IPs) | base: v48.3.9.4-PROXYFIX  # v48.3.9.4: /proxy registrado após o alvo /fetch (o loop ALIAS_ROUTES rodava antes e o pulava) | base: v48.3.9.3-KEYDIR  # v48.3.9.3: /.well-known/http-message-signatures-directory (JWKS Ed25519 assinado RFC9421) + /legal + /support + alias /proxy→/fetch | base: v48.3.9.2-ALIAS  # v48.3.9.2: alias /llm/freePublic → /llm/free (demanda medida: 7 IPs/7d) | base: v48.3.9.1-GLAMA  # v48.3.9.1: /.well-known/glama.json aceita override via env GLAMA_CLAIM_JSON (claim do Glama por HTTP challenge sem novo deploy de código) | base: v48.3.9-FETCH
+# ============================================================================
+# v48.8.0-ADCOPY (19/set/2026) — "EVERY 402 IS AN AD": achado da pesquisa de
+# conversão machine-to-machine (systemprompt.io + análise dos vendedores que
+# faturam: BlockRun, x402Vendor, os top-sellers do Bazaar): o agente comprador
+# lê UMA string antes de decidir pagar — o "error" do 402. Até aqui o nosso
+# corpo 402 era rico mas NÃO tinha esse campo: preço e CTA ficavam escondidos
+# em accepts/upsell que muitos clientes não renderizam. Agora cada um dos
+# ~15,4 mil probes/dia recebe o anúncio completo: preço exato, prova grátis
+# (?preview=1), 1 call real grátis (/welcome) e planos a partir de $0.99.
+# E o /circle-listing ganha o form de intake REAL + categoria no ENUM da
+# Discovery API — os dois bloqueadores práticos que restavam para o canal
+# Circle. Código pronto; o resto desta semana é SUBMISSÃO MANUAL, não feature.
+# ============================================================================
+VERSION = "48.9.0-TOOLKIT"  # v48.9.0: /.well-known/function-schemas.json + /.well-known/x402-bazaar(.json) — distribuição por padrão
+# (v48.8.0: 402 "error" vira anúncio de 1 linha · /circle-listing com form real + enum real
+# (v48.7.0: GET /circle-listing (campos prontos p/ o Agent Marketplace da Circle, lançado 09/set/2026 — canal de distribuição inteiro que faltava no checklist) + checklist de boot ganha Circle/402 Index/BlockRun | base: v48.6.1-LEADFIX  # v48.6.1: lead_watch_loop parava de confundir varredura de catálogo (mesmo IP, muitos endpoints diferentes) e harness de smoke-test (600+ hits num único endpoint) com lead quente — agora filtra por UA de scanner conhecido, teto de volume plausível p/ avaliação humana e 1 alerta por IP por ciclo · cdp_bazaar_bootstrap_loop checa liquidações VITALÍCIAS em Base antes de avisar que falta BASE_OPERATOR_PRIVATE_KEY (evita o log contradizer o próprio "3526 liquidações, elegível ao Bazaar"da v46) · dashboard separa "trust genérico" (tx_count≥3) de "CDP Bazaar/Base" (>=1 settle em Base) — eram rótulos diferentes escondidos atrás do mesmo badge "✓ completo" | base: v48.6.0-REGISTER  # v48.6.0: /register·/signup·/auth/callback (demanda medida: 42 req/7d — playbook SaaS "registrar→receber key") · POST /register = /buy-credits $0.99 reempacotado como matrícula (MESMA tabela pública, mesma máquina de créditos idempotente — zero preço novo) · security.txt RFC 9116 (hermes-contact: 456 hits/24h) · lead_watch_loop: IP 5+× no MESMO endpoint pago em 24h sem liquidar → Telegram 1×/dia · dashboard: ZeroBot/heritrix/hermes saem de "humano" → crawler (funil honesto) · 402 upsell ganha ponte "registration" | base: v48.5.1-LOGO  # v48.5.1: /favicon.png|.ico = PNG 256px moeda-L #4ade80 embutido em base64 (6KB, zero arquivo externo) + /favicon.svg vetorial — aposenta placeholder SVG roxo "Ω10" | base: v48.5.0-FUNIL  # v48.5.0: /pay mobile-first (deep link + QR — fim do "No wallet found" que matava 55% do funil) · /blog/ + /login atendem demanda medida · docstring sincronizado | base: v48.4.0-WALLETPAY  # v48.4.0: /pay/<endpoint> checkout de carteira de navegador (MetaMask/Coinbase Wallet/Rabby) p/ o ~80% de avaliadores humanos que não tinham NENHUM caminho de compra sem CLI/agente + filtro de ruído de scanner de segredo (/env, /config/*.key) tirado do radar de demanda + banimento de modelo Gemini morto agora persiste entre restarts | base: v48.3.10-COMMERCE  # v48.3.10: /.well-known/acp.json (ACP discovery doc — demanda 8 reqs/4 IPs) | base: v48.3.9.4-PROXYFIX  # v48.3.9.4: /proxy registrado após o alvo /fetch (o loop ALIAS_ROUTES rodava antes e o pulava) | base: v48.3.9.3-KEYDIR  # v48.3.9.3: /.well-known/http-message-signatures-directory (JWKS Ed25519 assinado RFC9421) + /legal + /support + alias /proxy→/fetch | base: v48.3.9.2-ALIAS  # v48.3.9.2: alias /llm/freePublic → /llm/free (demanda medida: 7 IPs/7d) | base: v48.3.9.1-GLAMA  # v48.3.9.1: /.well-known/glama.json aceita override via env GLAMA_CLAIM_JSON (claim do Glama por HTTP challenge sem novo deploy de código) | base: v48.3.9-FETCH
 log.warning("🧠 v48.2.0-SMART — preço de tabela fixo + First-Call Bonus pós-compra · "
             "/llm/free (freemium %s/dia) · /integrate (concierge IA)",
             LLM_FREE_PER_DAY)
@@ -23328,6 +23656,17 @@ log.warning("💳 v48.4.0-WALLETPAY — checkout de carteira de navegador ativo:
 log.warning("🤖 v48.6.0-REGISTER — /register·/signup·/auth/callback no ar: "
             "POST /register $0.99 → api_key lsk_ (máquina de créditos) · security.txt · "
             "radar de leads quentes · base LOGO+FUNIL intacta")
+log.warning("🌐 v48.7.0-CIRCLE — Circle Agent Marketplace (lançado 09/set, "
+            "ausente do checklist antigo) tem campos prontos em %s/circle-listing · "
+            "lead_watch_loop não confunde mais scanner com lead · cdp_bazaar_bootstrap_loop "
+            "não contradiz mais o próprio log de liquidações históricas em Base",
+            _public_base())
+log.warning("📣 v48.8.0-ADCOPY — todo 402 agora carrega o campo 'error' escrito "
+            "como anúncio de 1 linha (preço + prova grátis + /welcome + planos) · "
+            "/circle-listing com intake_form real e categoria FINANCIAL_ANALYSIS")
+log.warning("🧰 v48.9.0-TOOLKIT — /.well-known/function-schemas.json (OpenAI+Anthropic) "
+            "e /.well-known/x402-bazaar(.json) no ar · losbeto-tools PyPI ganha "
+            "CrewAI/AutoGen — o node vira ferramenta padrão, não resultado de busca")
 
 
 # --- v48.5.0-FUNIL: /blog/ e /login — gaps medidos pelo radar ---------------
