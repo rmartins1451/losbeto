@@ -1,9 +1,9 @@
 # -*- coding: utf-8 -*-
 """
 ================================================================================
- LOSBETO v48.5.0-FUNIL — "The Last Millimetre"
+ LOSBETO v48.5.1-LOGO — "The Last Millimetre"
 ================================================================================
- Upgrade: v48.4.0-WALLETPAY  →  v48.5.0-FUNIL  (2026-09)
+ Upgrade: v48.5.0-FUNIL  →  v48.5.1-LOGO  (2026-09) — favicon real da marca (moeda-L #4ade80) embutido; placeholder "Ω10" aposentado
 
  CAUSA RAIZ DO "0 VENDAS/24h" (lido do próprio ledger do node):
   Visibilidade RESOLVIDA (16K scanners/dia, trust bootstrap completo,
@@ -15581,18 +15581,139 @@ def llms_txt():
               f"- llms.txt:   {base}/llms.txt"]
     return app.response_class("\n".join(lines), mimetype="text/plain")
 
-@app.route("/favicon.ico")
-def favicon():
-    svg = ('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32">'
-           '<rect width="32" height="32" rx="6" fill="#7B61FF"/>'
-           '<text x="16" y="22" font-size="16" text-anchor="middle" '
-           'fill="white" font-family="sans-serif" font-weight="bold">Ω10</text></svg>')
-    return app.response_class(svg, mimetype="image/svg+xml")
+# --- v48.5.1-LOGO: identidade visual real --------------------------------------
+# Moeda-L #4ade80 (anel de moeda + no de rede + L). PNG 256px transparente
+# embutido em base64 (6 KB otimizado): zero arquivo externo, independente do
+# working directory do Railway. Aposenta o placeholder SVG roxo "Ω10".
+import base64 as _b64img
+_FAVICON_PNG = _b64img.b64decode(
+    "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"
+    "Ruj/AZbuB1l63kqYAAAAAElFTkSuQmCC")
+_FAVICON_SVG = (
+    '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256">'
+    '<circle cx="128" cy="128" r="92" fill="none" stroke="#4ade80" stroke-width="34"'
+    ' stroke-dasharray="523 55" stroke-dashoffset="-44"/>'
+    '<circle cx="193" cy="63" r="26" fill="#4ade80"/>'
+    '<rect x="100" y="74" width="32" height="96" fill="#4ade80"/>'
+    '<rect x="100" y="138" width="72" height="32" fill="#4ade80"/>'
+    '</svg>')
 
+@app.route("/favicon.ico")
 @app.route("/favicon.png")
+def favicon():
+    r = app.response_class(_FAVICON_PNG, mimetype="image/png")
+    r.headers["Cache-Control"] = "public, max-age=86400"
+    return r
+
 @app.route("/favicon.svg")
-def favicon_aliases():
-    return favicon()
+def favicon_svg():
+    r = app.response_class(_FAVICON_SVG, mimetype="image/svg+xml")
+    r.headers["Cache-Control"] = "public, max-age=86400"
+    return r
 
 @app.route("/launch-risk-preview")
 def launch_risk_preview():
@@ -23146,15 +23267,15 @@ app.add_url_rule("/pay/<path:raw_endpoint>", "pay_bridge", _pay_bridge_handler,
 #      200/dia global) — o padrão OpenRouter aplicado ao x402.
 #   3) Concierge de integração com IA: GET /integrate?q=... (cap 30/dia,
 #      fallback estático se a cadeia LLM estiver em quarentena).
-VERSION = "48.5.0-FUNIL"  # v48.5.0: /pay mobile-first (deep link + QR — fim do "No wallet found" que matava 55% do funil) · /blog/ + /login atendem demanda medida · docstring sincronizado | base: v48.4.0-WALLETPAY  # v48.4.0: /pay/<endpoint> checkout de carteira de navegador (MetaMask/Coinbase Wallet/Rabby) p/ o ~80% de avaliadores humanos que não tinham NENHUM caminho de compra sem CLI/agente + filtro de ruído de scanner de segredo (/env, /config/*.key) tirado do radar de demanda + banimento de modelo Gemini morto agora persiste entre restarts | base: v48.3.10-COMMERCE  # v48.3.10: /.well-known/acp.json (ACP discovery doc — demanda 8 reqs/4 IPs) | base: v48.3.9.4-PROXYFIX  # v48.3.9.4: /proxy registrado após o alvo /fetch (o loop ALIAS_ROUTES rodava antes e o pulava) | base: v48.3.9.3-KEYDIR  # v48.3.9.3: /.well-known/http-message-signatures-directory (JWKS Ed25519 assinado RFC9421) + /legal + /support + alias /proxy→/fetch | base: v48.3.9.2-ALIAS  # v48.3.9.2: alias /llm/freePublic → /llm/free (demanda medida: 7 IPs/7d) | base: v48.3.9.1-GLAMA  # v48.3.9.1: /.well-known/glama.json aceita override via env GLAMA_CLAIM_JSON (claim do Glama por HTTP challenge sem novo deploy de código) | base: v48.3.9-FETCH
+VERSION = "48.5.1-LOGO"  # v48.5.1: /favicon.png|.ico = PNG 256px moeda-L #4ade80 embutido em base64 (6KB, zero arquivo externo) + /favicon.svg vetorial — aposenta placeholder SVG roxo "Ω10" | base: v48.5.0-FUNIL  # v48.5.0: /pay mobile-first (deep link + QR — fim do "No wallet found" que matava 55% do funil) · /blog/ + /login atendem demanda medida · docstring sincronizado | base: v48.4.0-WALLETPAY  # v48.4.0: /pay/<endpoint> checkout de carteira de navegador (MetaMask/Coinbase Wallet/Rabby) p/ o ~80% de avaliadores humanos que não tinham NENHUM caminho de compra sem CLI/agente + filtro de ruído de scanner de segredo (/env, /config/*.key) tirado do radar de demanda + banimento de modelo Gemini morto agora persiste entre restarts | base: v48.3.10-COMMERCE  # v48.3.10: /.well-known/acp.json (ACP discovery doc — demanda 8 reqs/4 IPs) | base: v48.3.9.4-PROXYFIX  # v48.3.9.4: /proxy registrado após o alvo /fetch (o loop ALIAS_ROUTES rodava antes e o pulava) | base: v48.3.9.3-KEYDIR  # v48.3.9.3: /.well-known/http-message-signatures-directory (JWKS Ed25519 assinado RFC9421) + /legal + /support + alias /proxy→/fetch | base: v48.3.9.2-ALIAS  # v48.3.9.2: alias /llm/freePublic → /llm/free (demanda medida: 7 IPs/7d) | base: v48.3.9.1-GLAMA  # v48.3.9.1: /.well-known/glama.json aceita override via env GLAMA_CLAIM_JSON (claim do Glama por HTTP challenge sem novo deploy de código) | base: v48.3.9-FETCH
 log.warning("🧠 v48.2.0-SMART — preço de tabela fixo + First-Call Bonus pós-compra · "
             "/llm/free (freemium %s/dia) · /integrate (concierge IA)",
             LLM_FREE_PER_DAY)
 log.warning("💳 v48.4.0-WALLETPAY — checkout de carteira de navegador ativo: "
             "%s/pay/<endpoint> (assina EIP-3009 com MetaMask/Coinbase Wallet/Rabby, "
             "zero CLI, zero agente)", _public_base())
-log.warning("🎯 v48.5.0-FUNIL — checkout mobile-first (deep link + QR), "
-            "/blog/ + /login atendidos, docstring sincronizado")
+log.warning("🎨 v48.5.1-LOGO — favicon da marca (moeda-L #4ade80) embutido; "
+            "placeholder Ω10 aposentado · base FUNIL: checkout mobile, /blog/, /login")
 
 
 # --- v48.5.0-FUNIL: /blog/ e /login — gaps medidos pelo radar ---------------
