@@ -1,7 +1,13 @@
 # -*- coding: utf-8 -*-
 """
 ================================================================================
- LOSBETO v48.9.1-TOOLKIT — "Become The Default"
+ LOSBETO v48.9.2-BRAND — "Become The Default"
+
+ Hotfix de marca: v48.9.1 → v48.9.2 (2026-09) — logo v2 (mesma identidade
+ L+órbita, caps redondos, verde #4ade80 exato) embutida como favicon; a marca
+ agora aparece VISÍVEL nas páginas de pagamento (/pay e 402 HTML) e na home —
+ antes essas páginas não tinham nenhuma imagem, então qualquer ícone velho
+ vinha de cache de navegador. Links de ícone com ?v=2 estouram o cache.
 ================================================================================
  Hotfix: v48.9.0 → v48.9.1 (2026-09) — SyntaxError no boot no Railway
  (Python 3.11 não aceita backslash dentro de expressão f-string; o sandbox
@@ -9473,7 +9479,7 @@ footer a{color:var(--dim)}
 .hide{display:none}
 </style></head><body>
 <header><div class="wrap hrow">
-  <div class="logo">los<span>beto</span></div>
+  <div class="logo"><img src="/favicon.svg?v=2" width="22" height="22" alt="" style="vertical-align:-5px;margin-right:8px">los<span>beto</span></div>
   <nav>
     <a href="#top">Top</a><a href="#start">Start</a>
     <a href="/get-pricing">Pricing</a><a href="/openapi.json">API</a>
@@ -15716,119 +15722,117 @@ def llms_txt():
 # working directory do Railway. Aposenta o placeholder SVG roxo "Ω10".
 import base64 as _b64img
 _FAVICON_PNG = _b64img.b64decode(
-    "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"
-    "Ruj/AZbuB1l63kqYAAAAAElFTkSuQmCC")
+    "iVBORw0KGgoAAAANSUhEUgAAAQAAAAEACAMAAABrrFhUAAADAFBMVEUAAABI231L44JV/6pG1Xo9"
+    "u3cA/wB//38Af39CxnIA//9UqVVF03lDy3Q8uGlF0XhDzHVBxXFV/1U5qmVJ3oA1p1s+wW4zmFY4"
+    "q2Q+wm9Ft2tF0nj///8yilM+vWx/f38zmWRBvGwA/38//386fjpEznYtflVVqqpM13M6xG0AfwAz"
+    "ZjNF0XcANzckbUg3qV9AvW1I0np///8KWAoffz8celUqVSo3mzc3s11IxHBJ4H8APwAfXz8AVVVV"
+    "VVUAKioqKiokSCQzZmYniWJIkW1Ez3YAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+    "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+    "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+    "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+    "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+    "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+    "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+    "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+    "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+    "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+    "AAAAAAAAAAAAAAAcIC5CAAABAHRSTlMA/P4D0AoBAgJRAQOvbiqRizUDGP0SThAhLw5xAQ1OAgkp"
+    "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"
+    "gg==")
 _FAVICON_SVG = (
+    # v48.9.2-BRAND: réplica vetorial da marca v2 — caps redondos no arco,
+    # L com cantos arredondados, ponto orbital maior (match com o PNG v2).
     '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256">'
-    '<circle cx="128" cy="128" r="92" fill="none" stroke="#4ade80" stroke-width="34"'
-    ' stroke-dasharray="523 55" stroke-dashoffset="-44"/>'
-    '<circle cx="193" cy="63" r="26" fill="#4ade80"/>'
-    '<rect x="100" y="74" width="32" height="96" fill="#4ade80"/>'
-    '<rect x="100" y="138" width="72" height="32" fill="#4ade80"/>'
+    '<circle cx="128" cy="128" r="90" fill="none" stroke="#4ade80" stroke-width="30"'
+    ' stroke-linecap="round" stroke-dasharray="480 86" stroke-dashoffset="-46"/>'
+    '<circle cx="197" cy="61" r="25" fill="#4ade80"/>'
+    '<rect x="103" y="70" width="31" height="98" rx="7" fill="#4ade80"/>'
+    '<rect x="103" y="139" width="76" height="29" rx="7" fill="#4ade80"/>'
     '</svg>')
 
 @app.route("/favicon.ico")
@@ -21380,10 +21384,11 @@ def _render_402_html(endpoint: str) -> str:
         preco = 0.01
     desc = ENDPOINT_DESC.get(endpoint, f"Losbeto — {endpoint}")
     return f"""<html><head><title>{endpoint} — {BRAND_NAME}</title>
+<link rel="icon" type="image/png" href="/favicon.png?v=2">
 <meta name="viewport" content="width=device-width,initial-scale=1"></head>
 <body style="background:#0a0a0f;color:#ddd;font-family:-apple-system,Segoe UI,Roboto,sans-serif;max-width:760px;margin:0 auto;padding:32px 18px">
 <p style="color:#7af;letter-spacing:2px;font-size:12px">HTTP 402 · PAYMENT REQUIRED</p>
-<h1 style="margin:4px 0">{BRAND_EMOJI} {endpoint}</h1>
+<h1 style="margin:4px 0"><img src="/favicon.svg?v=2" width="30" height="30" alt="" style="vertical-align:-6px;margin-right:9px">{endpoint}</h1>
 <p style="color:#aaa;line-height:1.5">{desc}</p>
 <p style="font-size:28px;margin:18px 0"><b>${preco:.3f}</b> <span style="color:#888;font-size:14px">USDC · per call · Base / Solana / Algorand</span></p>
 <p style="line-height:1.6">This endpoint is sold <b>machine-to-machine</b> via the
@@ -23207,7 +23212,7 @@ def dashboard_alias():
 
 _PAY_BRIDGE_HTML = r"""<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Pay __ENDPOINT__ — Losbeto</title>
+<title>Pay __ENDPOINT__ — Losbeto</title><link rel="icon" type="image/png" href="/favicon.png?v=2"><link rel="apple-touch-icon" href="/favicon.png?v=2">
 <style>
 :root{--bg:#0a0b0d;--fg:#e8eaed;--dim:#8b9199;--line:#1e2126;--acc:#4ade80;
       --err:#f87171;--card:#101217;--mono:ui-monospace,SFMono-Regular,Menlo,monospace}
@@ -23247,7 +23252,7 @@ pre{background:#0d0f13;border:1px solid var(--line);border-radius:8px;
 .or{text-align:center;color:var(--dim);font-size:12px;margin:14px 0 4px;
     letter-spacing:.1em;text-transform:uppercase}
 </style></head><body><div class="w">
-<div class="top"><a href="/">← losbeto</a><span class="badge">one-tap USDC payment</span></div>
+<div class="top"><a href="/" style="display:flex;align-items:center;gap:8px"><img src="/favicon.svg?v=2" width="20" height="20" alt="" style="display:block">losbeto</a><span class="badge">one-tap USDC payment</span></div>
 <h1>__ENDPOINT__</h1>
 <p class="d">__DESC__</p>
 <div class="price">$__PRICE__ <span>USDC · Base · one call</span></div>
@@ -23656,7 +23661,7 @@ def circle_listing_helper():
 # Discovery API — os dois bloqueadores práticos que restavam para o canal
 # Circle. Código pronto; o resto desta semana é SUBMISSÃO MANUAL, não feature.
 # ============================================================================
-VERSION = "48.9.1-TOOLKIT"  # v48.9.0: /.well-known/function-schemas.json + /.well-known/x402-bazaar(.json) — distribuição por padrão
+VERSION = "48.9.2-BRAND"  # v48.9.0: /.well-known/function-schemas.json + /.well-known/x402-bazaar(.json) — distribuição por padrão
 # (v48.8.0: 402 "error" vira anúncio de 1 linha · /circle-listing com form real + enum real
 # (v48.7.0: GET /circle-listing (campos prontos p/ o Agent Marketplace da Circle, lançado 09/set/2026 — canal de distribuição inteiro que faltava no checklist) + checklist de boot ganha Circle/402 Index/BlockRun | base: v48.6.1-LEADFIX  # v48.6.1: lead_watch_loop parava de confundir varredura de catálogo (mesmo IP, muitos endpoints diferentes) e harness de smoke-test (600+ hits num único endpoint) com lead quente — agora filtra por UA de scanner conhecido, teto de volume plausível p/ avaliação humana e 1 alerta por IP por ciclo · cdp_bazaar_bootstrap_loop checa liquidações VITALÍCIAS em Base antes de avisar que falta BASE_OPERATOR_PRIVATE_KEY (evita o log contradizer o próprio "3526 liquidações, elegível ao Bazaar"da v46) · dashboard separa "trust genérico" (tx_count≥3) de "CDP Bazaar/Base" (>=1 settle em Base) — eram rótulos diferentes escondidos atrás do mesmo badge "✓ completo" | base: v48.6.0-REGISTER  # v48.6.0: /register·/signup·/auth/callback (demanda medida: 42 req/7d — playbook SaaS "registrar→receber key") · POST /register = /buy-credits $0.99 reempacotado como matrícula (MESMA tabela pública, mesma máquina de créditos idempotente — zero preço novo) · security.txt RFC 9116 (hermes-contact: 456 hits/24h) · lead_watch_loop: IP 5+× no MESMO endpoint pago em 24h sem liquidar → Telegram 1×/dia · dashboard: ZeroBot/heritrix/hermes saem de "humano" → crawler (funil honesto) · 402 upsell ganha ponte "registration" | base: v48.5.1-LOGO  # v48.5.1: /favicon.png|.ico = PNG 256px moeda-L #4ade80 embutido em base64 (6KB, zero arquivo externo) + /favicon.svg vetorial — aposenta placeholder SVG roxo "Ω10" | base: v48.5.0-FUNIL  # v48.5.0: /pay mobile-first (deep link + QR — fim do "No wallet found" que matava 55% do funil) · /blog/ + /login atendem demanda medida · docstring sincronizado | base: v48.4.0-WALLETPAY  # v48.4.0: /pay/<endpoint> checkout de carteira de navegador (MetaMask/Coinbase Wallet/Rabby) p/ o ~80% de avaliadores humanos que não tinham NENHUM caminho de compra sem CLI/agente + filtro de ruído de scanner de segredo (/env, /config/*.key) tirado do radar de demanda + banimento de modelo Gemini morto agora persiste entre restarts | base: v48.3.10-COMMERCE  # v48.3.10: /.well-known/acp.json (ACP discovery doc — demanda 8 reqs/4 IPs) | base: v48.3.9.4-PROXYFIX  # v48.3.9.4: /proxy registrado após o alvo /fetch (o loop ALIAS_ROUTES rodava antes e o pulava) | base: v48.3.9.3-KEYDIR  # v48.3.9.3: /.well-known/http-message-signatures-directory (JWKS Ed25519 assinado RFC9421) + /legal + /support + alias /proxy→/fetch | base: v48.3.9.2-ALIAS  # v48.3.9.2: alias /llm/freePublic → /llm/free (demanda medida: 7 IPs/7d) | base: v48.3.9.1-GLAMA  # v48.3.9.1: /.well-known/glama.json aceita override via env GLAMA_CLAIM_JSON (claim do Glama por HTTP challenge sem novo deploy de código) | base: v48.3.9-FETCH
 log.warning("🧠 v48.2.0-SMART — preço de tabela fixo + First-Call Bonus pós-compra · "
@@ -23679,6 +23684,8 @@ log.warning("📣 v48.8.0-ADCOPY — todo 402 agora carrega o campo 'error' escr
 log.warning("🧰 v48.9.0-TOOLKIT — /.well-known/function-schemas.json (OpenAI+Anthropic) "
             "e /.well-known/x402-bazaar(.json) no ar · losbeto-tools PyPI ganha "
             "CrewAI/AutoGen — o node vira ferramenta padrão, não resultado de busca")
+log.warning("🎨 v48.9.2-BRAND — logo v2 no favicon e VISÍVEL nas páginas de pagamento "
+            "(/pay + 402 HTML) e na home · links de ícone com cache-buster ?v=2")
 
 
 # --- v48.5.0-FUNIL: /blog/ e /login — gaps medidos pelo radar ---------------
