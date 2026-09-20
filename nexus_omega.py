@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 ================================================================================
- LOSBETO v48.9.3-TRUST — "Become The Default"
+ LOSBETO v48.9.4-SYNC — "Become The Default"
 
  Hotfix de marca: v48.9.1 → v48.9.2 (2026-09) — logo v2 (mesma identidade
  L+órbita, caps redondos, verde #4ade80 exato) embutida como favicon; a marca
@@ -22783,14 +22783,41 @@ _RADAR_MAX_ALIASES  = int(os.environ.get("RADAR_MAX_ALIASES", "60"))
 _RADAR_FREE_OK = ("/welcome", "/try", "/sample", "/health", "/ip",
                   "/receipts", "/agent-directory.json", "/losbeto-alpha")
 _AUTO_ALIASES: dict = {}
+_AUTO_ALIASES_MTIME: float = 0.0   # v48.9.4: sync entre workers (gunicorn roda 4)
 
 
-def _radar_alias_load():
+def _radar_alias_reload_if_changed():
+    """v48.9.4: o loop de auto-atendimento roda em UM worker (file-lock), mas o
+    gunicorn serve requests em 4. Sem isto, um alias criado às 22:34 só existia
+    na memória de 1 worker — 3/4 dos visitantes tomavam 404 por até 6h+
+    (observado ao vivo: /archive.zip 404 nas 6 tentativas). Recarga por mtime:
+    um os.stat por request com miss — custo de microssegundos, zero I/O de leitura
+    quando o arquivo não mudou."""
+    global _AUTO_ALIASES_MTIME
+    try:
+        st = os.stat(_RADAR_ALIASES_FILE)
+    except Exception:
+        return
+    if st.st_mtime <= _AUTO_ALIASES_MTIME:
+        return
     try:
         with open(_RADAR_ALIASES_FILE) as f:
             d = json.load(f)
         if isinstance(d, dict):
             _AUTO_ALIASES.update(d)
+            _AUTO_ALIASES_MTIME = st.st_mtime
+    except Exception:
+        pass
+
+
+def _radar_alias_load():
+    global _AUTO_ALIASES_MTIME
+    try:
+        with open(_RADAR_ALIASES_FILE) as f:
+            d = json.load(f)
+        if isinstance(d, dict):
+            _AUTO_ALIASES.update(d)
+            _AUTO_ALIASES_MTIME = os.stat(_RADAR_ALIASES_FILE).st_mtime
             if d:
                 log.info(f"🍒 radar: {len(d)} aliases auto-criados restaurados de /data")
     except Exception:
@@ -22802,6 +22829,8 @@ def _radar_alias_save():
         os.makedirs(os.path.dirname(_RADAR_ALIASES_FILE), exist_ok=True)
         with open(_RADAR_ALIASES_FILE, "w") as f:
             json.dump(_AUTO_ALIASES, f, ensure_ascii=False, indent=1)
+        global _AUTO_ALIASES_MTIME
+        _AUTO_ALIASES_MTIME = os.stat(_RADAR_ALIASES_FILE).st_mtime
     except Exception as e:
         log.debug(f"radar save: {e}")
 
@@ -22895,6 +22924,9 @@ def _radar_alias_dispatch():
     try:
         p = request.path
         a = _AUTO_ALIASES.get(p)
+        if a is None:
+            _radar_alias_reload_if_changed()   # v48.9.4: enxerga aliases dos outros workers
+            a = _AUTO_ALIASES.get(p)
         if not a and p != "/" and p.endswith("/"):
             a = _AUTO_ALIASES.get(p.rstrip("/"))
         if not a:
@@ -23710,7 +23742,7 @@ def circle_listing_helper():
 # Discovery API — os dois bloqueadores práticos que restavam para o canal
 # Circle. Código pronto; o resto desta semana é SUBMISSÃO MANUAL, não feature.
 # ============================================================================
-VERSION = "48.9.3-TRUST"  # v48.9.3: /api/health alias + /impressum honesto (sinais não atendidos do radar)  # v48.9.0: /.well-known/function-schemas.json + /.well-known/x402-bazaar(.json) — distribuição por padrão
+VERSION = "48.9.4-SYNC"  # v48.9.4: aliases do radar sincronizam entre os 4 workers (mtime /data) — antes só 1 worker conhecia o alias novo  # v48.9.3: /api/health alias + /impressum honesto (sinais não atendidos do radar)  # v48.9.0: /.well-known/function-schemas.json + /.well-known/x402-bazaar(.json) — distribuição por padrão
 # (v48.8.0: 402 "error" vira anúncio de 1 linha · /circle-listing com form real + enum real
 # (v48.7.0: GET /circle-listing (campos prontos p/ o Agent Marketplace da Circle, lançado 09/set/2026 — canal de distribuição inteiro que faltava no checklist) + checklist de boot ganha Circle/402 Index/BlockRun | base: v48.6.1-LEADFIX  # v48.6.1: lead_watch_loop parava de confundir varredura de catálogo (mesmo IP, muitos endpoints diferentes) e harness de smoke-test (600+ hits num único endpoint) com lead quente — agora filtra por UA de scanner conhecido, teto de volume plausível p/ avaliação humana e 1 alerta por IP por ciclo · cdp_bazaar_bootstrap_loop checa liquidações VITALÍCIAS em Base antes de avisar que falta BASE_OPERATOR_PRIVATE_KEY (evita o log contradizer o próprio "3526 liquidações, elegível ao Bazaar"da v46) · dashboard separa "trust genérico" (tx_count≥3) de "CDP Bazaar/Base" (>=1 settle em Base) — eram rótulos diferentes escondidos atrás do mesmo badge "✓ completo" | base: v48.6.0-REGISTER  # v48.6.0: /register·/signup·/auth/callback (demanda medida: 42 req/7d — playbook SaaS "registrar→receber key") · POST /register = /buy-credits $0.99 reempacotado como matrícula (MESMA tabela pública, mesma máquina de créditos idempotente — zero preço novo) · security.txt RFC 9116 (hermes-contact: 456 hits/24h) · lead_watch_loop: IP 5+× no MESMO endpoint pago em 24h sem liquidar → Telegram 1×/dia · dashboard: ZeroBot/heritrix/hermes saem de "humano" → crawler (funil honesto) · 402 upsell ganha ponte "registration" | base: v48.5.1-LOGO  # v48.5.1: /favicon.png|.ico = PNG 256px moeda-L #4ade80 embutido em base64 (6KB, zero arquivo externo) + /favicon.svg vetorial — aposenta placeholder SVG roxo "Ω10" | base: v48.5.0-FUNIL  # v48.5.0: /pay mobile-first (deep link + QR — fim do "No wallet found" que matava 55% do funil) · /blog/ + /login atendem demanda medida · docstring sincronizado | base: v48.4.0-WALLETPAY  # v48.4.0: /pay/<endpoint> checkout de carteira de navegador (MetaMask/Coinbase Wallet/Rabby) p/ o ~80% de avaliadores humanos que não tinham NENHUM caminho de compra sem CLI/agente + filtro de ruído de scanner de segredo (/env, /config/*.key) tirado do radar de demanda + banimento de modelo Gemini morto agora persiste entre restarts | base: v48.3.10-COMMERCE  # v48.3.10: /.well-known/acp.json (ACP discovery doc — demanda 8 reqs/4 IPs) | base: v48.3.9.4-PROXYFIX  # v48.3.9.4: /proxy registrado após o alvo /fetch (o loop ALIAS_ROUTES rodava antes e o pulava) | base: v48.3.9.3-KEYDIR  # v48.3.9.3: /.well-known/http-message-signatures-directory (JWKS Ed25519 assinado RFC9421) + /legal + /support + alias /proxy→/fetch | base: v48.3.9.2-ALIAS  # v48.3.9.2: alias /llm/freePublic → /llm/free (demanda medida: 7 IPs/7d) | base: v48.3.9.1-GLAMA  # v48.3.9.1: /.well-known/glama.json aceita override via env GLAMA_CLAIM_JSON (claim do Glama por HTTP challenge sem novo deploy de código) | base: v48.3.9-FETCH
 log.warning("🧠 v48.2.0-SMART — preço de tabela fixo + First-Call Bonus pós-compra · "
@@ -23733,7 +23765,7 @@ log.warning("📣 v48.8.0-ADCOPY — todo 402 agora carrega o campo 'error' escr
 log.warning("🧰 v48.9.0-TOOLKIT — /.well-known/function-schemas.json (OpenAI+Anthropic) "
             "e /.well-known/x402-bazaar(.json) no ar · losbeto-tools PyPI ganha "
             "CrewAI/AutoGen — o node vira ferramenta padrão, não resultado de busca")
-log.warning("🤝 v48.9.3-TRUST — /api/health + /impressum | v48.9.2: logo v2 visível "
+log.warning("🔄 v48.9.4-SYNC — aliases auto-criados visíveis em TODOS os workers (mtime reload) | v48.9.3: /api/health + /impressum | v48.9.2: logo v2 visível "
             "(/pay + 402 HTML) e na home · links de ícone com cache-buster ?v=2")
 
 
