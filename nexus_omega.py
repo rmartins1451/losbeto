@@ -23340,6 +23340,7 @@ pre{background:#0d0f13;border:1px solid var(--line);border-radius:8px;
 <div class="price">$__PRICE__ <span>USDC · Base · one call</span></div>
 
 <div class="card" id="cardInjected" style="display:none">
+  <div id="warnBox" class="status err" style="margin:0 0 12px"></div>
   <button id="btnConnect">Pay with browser wallet</button>
   <div id="status" class="status"></div>
 </div>
@@ -23359,6 +23360,8 @@ pre{background:#0d0f13;border:1px solid var(--line);border-radius:8px;
     Point your wallet app's scanner at this code</p>
   <div id="statusM" class="status"></div>
 </div>
+
+__PIX_CARD__
 
 <div id="result"></div>
 
@@ -23409,6 +23412,57 @@ function setStatus(msg, cls){ statusEl.textContent=msg; statusEl.className='stat
 function hex32(){ const b=new Uint8Array(32); crypto.getRandomValues(b);
   return '0x'+Array.from(b).map(x=>x.toString(16).padStart(2,'0')).join(''); }
 
+// v48.9.6-PAYFIX: pré-voo da carteira ANTES de assinar. Dois modos de falha
+// mudos matavam o checkout humano (provado on-chain 22/09/2026):
+//  (1) smart wallet (Coinbase Smart Wallet/passkey = contrato EIP-1167) —
+//      facilitadores x402 rejeitam a assinatura ERC-1271 (issue x402 #623,
+//      aberta desde nov/2025): erro "execution reverted /
+//      invalid_exact_evm_payload_signature" só aparecia DEPOIS de assinar;
+//  (2) saldo USDC na Base zerado — "tenho USDC" na exchange ≠ on-chain.
+// Ambos agora viram aviso claro ANTES da assinatura. Falha de RPC = pula
+// silenciosamente (nunca bloqueia um pagamento bom por checker ruim).
+const BASE_RPCS = ['https://mainnet.base.org','https://base-rpc.publicnode.com','https://base.llamarpc.com'];
+async function baseRpc(method, params){
+  for(const u of BASE_RPCS){
+    try{
+      const r = await fetch(u,{method:'POST',headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({jsonrpc:'2.0',id:1,method,params})});
+      const j = await r.json();
+      if(j && j.result !== undefined) return j.result;
+    }catch(e){}
+  }
+  return null;
+}
+async function preflightWallet(from){
+  const warns = [];
+  try{
+    const code = await baseRpc('eth_getCode',[from,'latest']);
+    if(code && code !== '0x'){
+      warns.push('This is a SMART CONTRACT wallet (e.g. Coinbase Smart Wallet / passkey). '+
+        'Many x402 facilitators still reject contract signatures (known ecosystem issue x402#623). '+
+        'If the payment fails, retry from a regular MetaMask/Rabby account (EOA) with USDC on Base.');
+    }
+  }catch(e){}
+  try{
+    const data = '0x70a08231' + '000000000000000000000000' + from.slice(2).toLowerCase();
+    const balHex = await baseRpc('eth_call',[{to:ACCEPT.asset, data},'latest']);
+    if(balHex && balHex !== '0x'){
+      const bal  = Number(BigInt(balHex))/1e6;
+      const need = Number(BigInt(ACCEPT.amount))/1e6;
+      if(bal < need){
+        warns.push('USDC balance on Base: '+bal.toFixed(4)+' — this payment needs '+need.toFixed(4)+'. '+
+          'Top up first: card via Coinbase Onramp (pay.coinbase.com), or buy on Binance with Pix and '+
+          'withdraw choosing the BASE network. A short balance reverts on-chain.');
+      }
+    }
+  }catch(e){}
+  if(warns.length){
+    const wb = document.getElementById('warnBox');
+    if(wb) wb.textContent = '⚠ '+warns.join('\n\n⚠ ');
+  }
+  return warns.length === 0;
+}
+
 async function ensureBaseChain(chainIdHex){
   try{ await window.ethereum.request({method:'wallet_switchEthereumChain',params:[{chainId:chainIdHex}]}); }
   catch(e){ if(e && e.code===4902){
@@ -23429,6 +23483,8 @@ async function payAndFetch(){
     const chainIdHex = '0x'+chainId.toString(16);
     setStatus('Switching to Base network…');
     await ensureBaseChain(chainIdHex);
+    setStatus('Checking wallet compatibility and USDC balance…');
+    await preflightWallet(from);
     const validBefore = String(Math.floor(Date.now()/1000)+(ACCEPT.maxTimeoutSeconds||300));
     const authorization = {from,to:ACCEPT.payTo,value:ACCEPT.amount,validAfter:"0",validBefore,nonce:hex32()};
     const domain = {name:(ACCEPT.extra&&ACCEPT.extra.name)||'USD Coin',
@@ -23471,6 +23527,37 @@ btn.addEventListener('click', payAndFetch);
 </script></body></html>"""
 
 
+# v48.9.6-PAYFIX — Pix Fase 0 no checkout humano (planos/bundles ≥ $0.99):
+# QR EMV gerado pelo PRÓPRIO motor /br-pix-code (_pix_build), valor em BRL
+# convertido do preço USDC pela PTAX oficial do BCB (mesmo preço, outro MÉTODO
+# — a regra do preço público único não é tocada). Ativação é manual (humano no
+# loop): cliente paga e envia o comprovante no /chat/send. Cliente Binance pode
+# pagar o QR com CRIPTO via Binance Pay→Pix (mai/2025) — recebemos BRL no banco.
+# Per-call de centavos NÃO ganha Pix (R$0,02 não cabe no rail); para esses o
+# caminho instantâneo continua sendo USDC/x402 acima.
+PIX_RECEIVER_KEY  = os.environ.get("PIX_RECEIVER_KEY",  "roberto.martins622@gmail.com")
+PIX_RECEIVER_NAME = os.environ.get("PIX_RECEIVER_NAME", "ROBERTO MARTINS")
+PIX_RECEIVER_CITY = os.environ.get("PIX_RECEIVER_CITY", "PORTO ALEGRE")
+PIX_MIN_USD       = float(os.environ.get("PIX_MIN_USD", "0.99"))
+
+_PAY_PIX_CARD = """
+<div class="card" id="cardPix">
+  <p style="margin:0 0 8px;font-size:14px;color:var(--dim)">
+    Brazil? Pay the same price with <b style="color:var(--fg)">Pix</b> —
+    <b style="color:var(--fg)">R$__PIX_BRL__</b> (converted at the official BCB PTAX rate):</p>
+  <img class="qr" src="__PIX_QR__" width="180" height="180" alt="Pix QR code"
+       onerror="this.style.display='none'">
+  <pre id="pixEmv" style="margin-top:8px">__PIX_EMV__</pre>
+  <span class="copy" onclick="navigator.clipboard.writeText(document.getElementById('pixEmv').innerText)">copy Pix code</span>
+  <p style="font-size:12.5px;color:var(--dim);margin:10px 0 0">
+    Manual activation, human in the loop: pay, then send the receipt at
+    <a href="/chat/send">/chat/send</a> and the plan is activated shortly after.
+    On Binance? Scan this QR with the Binance app to pay with crypto (Binance Pay → Pix).
+    For instant machine checkout, use USDC on Base above.</p>
+</div>
+"""
+
+
 def _pay_bridge_handler(raw_endpoint):
     """GET /pay/<endpoint> — checkout de navegador para humano com carteira
     de extensão (MetaMask/Coinbase Wallet/Rabby), sem CLI e sem agente.
@@ -23498,7 +23585,29 @@ def _pay_bridge_handler(raw_endpoint):
     price = get_dynamic_price(ep)
     desc = (ENDPOINT_DESC.get(ep, "") or "").replace('"', "&quot;")[:220]
     page_url = f"{_public_base()}/pay{ep}"  # v48.5.0: deep link + QR
+    # v48.9.6: cartão Pix (somente planos/bundles — ver PIX_MIN_USD). Se a
+    # PTAX falhar, o cartão simplesmente não aparece (checkout cripto intacto).
+    pix_card = ""
+    if price >= PIX_MIN_USD:
+        try:
+            ptax = (_bcb_last(1) or {}).get("value")
+            brl = round(price * float(ptax), 2) if ptax else None
+            if brl and brl >= 1.0:
+                emv = _pix_build(PIX_RECEIVER_KEY, PIX_RECEIVER_NAME,
+                                 PIX_RECEIVER_CITY, amount=brl,
+                                 txid="LSB" + secrets.token_hex(6).upper(),
+                                 description="Losbeto " + ep.strip("/")[:60])
+                qr = ("https://api.qrserver.com/v1/create-qr-code/"
+                      "?size=180x180&qzone=1&data=" + urllib.parse.quote(emv))
+                brl_txt = ("%.2f" % brl).replace(".", ",")
+                pix_card = (_PAY_PIX_CARD
+                            .replace("__PIX_BRL__", brl_txt)
+                            .replace("__PIX_QR__", qr)
+                            .replace("__PIX_EMV__", emv))
+        except Exception:
+            pix_card = ""
     html = (_PAY_BRIDGE_HTML
+            .replace("__PIX_CARD__", pix_card)
             .replace("__ENDPOINT__", ep)
             .replace("__ENDPOINT_URL__", f"{_public_base()}{ep}")
             .replace("__PAGE_URL__", page_url)
@@ -23808,7 +23917,7 @@ def circle_listing_helper():
 # Discovery API — os dois bloqueadores práticos que restavam para o canal
 # Circle. Código pronto; o resto desta semana é SUBMISSÃO MANUAL, não feature.
 # ============================================================================
-VERSION = "48.9.5-SKILLS"  # v48.9.5: /.well-known/agent-skills/index.json REAL (Cloudflare Discovery RFC 0.2.0) + classificador UA do dash reconhece Barkrowler/bots compatible  # v48.9.4: aliases do radar sincronizam entre os 4 workers (mtime /data) — antes só 1 worker conhecia o alias novo  # v48.9.3: /api/health alias + /impressum honesto (sinais não atendidos do radar)  # v48.9.0: /.well-known/function-schemas.json + /.well-known/x402-bazaar(.json) — distribuição por padrão
+VERSION = "48.9.6-PAYFIX"  # v48.9.6: /pay detecta smart wallet (eth_getCode) e saldo USDC-Base ANTES de assinar (fim do erro mudo da issue x402#623) + Pix Fase 0 para planos ≥$0.99 (QR EMV pelo próprio /br-pix-code, PTAX oficial, chave e-mail — ativação manual)  # v48.9.5: /.well-known/agent-skills/index.json REAL (Cloudflare Discovery RFC 0.2.0) + classificador UA do dash reconhece Barkrowler/bots compatible
 # (v48.8.0: 402 "error" vira anúncio de 1 linha · /circle-listing com form real + enum real
 # (v48.7.0: GET /circle-listing (campos prontos p/ o Agent Marketplace da Circle, lançado 09/set/2026 — canal de distribuição inteiro que faltava no checklist) + checklist de boot ganha Circle/402 Index/BlockRun | base: v48.6.1-LEADFIX  # v48.6.1: lead_watch_loop parava de confundir varredura de catálogo (mesmo IP, muitos endpoints diferentes) e harness de smoke-test (600+ hits num único endpoint) com lead quente — agora filtra por UA de scanner conhecido, teto de volume plausível p/ avaliação humana e 1 alerta por IP por ciclo · cdp_bazaar_bootstrap_loop checa liquidações VITALÍCIAS em Base antes de avisar que falta BASE_OPERATOR_PRIVATE_KEY (evita o log contradizer o próprio "3526 liquidações, elegível ao Bazaar"da v46) · dashboard separa "trust genérico" (tx_count≥3) de "CDP Bazaar/Base" (>=1 settle em Base) — eram rótulos diferentes escondidos atrás do mesmo badge "✓ completo" | base: v48.6.0-REGISTER  # v48.6.0: /register·/signup·/auth/callback (demanda medida: 42 req/7d — playbook SaaS "registrar→receber key") · POST /register = /buy-credits $0.99 reempacotado como matrícula (MESMA tabela pública, mesma máquina de créditos idempotente — zero preço novo) · security.txt RFC 9116 (hermes-contact: 456 hits/24h) · lead_watch_loop: IP 5+× no MESMO endpoint pago em 24h sem liquidar → Telegram 1×/dia · dashboard: ZeroBot/heritrix/hermes saem de "humano" → crawler (funil honesto) · 402 upsell ganha ponte "registration" | base: v48.5.1-LOGO  # v48.5.1: /favicon.png|.ico = PNG 256px moeda-L #4ade80 embutido em base64 (6KB, zero arquivo externo) + /favicon.svg vetorial — aposenta placeholder SVG roxo "Ω10" | base: v48.5.0-FUNIL  # v48.5.0: /pay mobile-first (deep link + QR — fim do "No wallet found" que matava 55% do funil) · /blog/ + /login atendem demanda medida · docstring sincronizado | base: v48.4.0-WALLETPAY  # v48.4.0: /pay/<endpoint> checkout de carteira de navegador (MetaMask/Coinbase Wallet/Rabby) p/ o ~80% de avaliadores humanos que não tinham NENHUM caminho de compra sem CLI/agente + filtro de ruído de scanner de segredo (/env, /config/*.key) tirado do radar de demanda + banimento de modelo Gemini morto agora persiste entre restarts | base: v48.3.10-COMMERCE  # v48.3.10: /.well-known/acp.json (ACP discovery doc — demanda 8 reqs/4 IPs) | base: v48.3.9.4-PROXYFIX  # v48.3.9.4: /proxy registrado após o alvo /fetch (o loop ALIAS_ROUTES rodava antes e o pulava) | base: v48.3.9.3-KEYDIR  # v48.3.9.3: /.well-known/http-message-signatures-directory (JWKS Ed25519 assinado RFC9421) + /legal + /support + alias /proxy→/fetch | base: v48.3.9.2-ALIAS  # v48.3.9.2: alias /llm/freePublic → /llm/free (demanda medida: 7 IPs/7d) | base: v48.3.9.1-GLAMA  # v48.3.9.1: /.well-known/glama.json aceita override via env GLAMA_CLAIM_JSON (claim do Glama por HTTP challenge sem novo deploy de código) | base: v48.3.9-FETCH
 log.warning("🧠 v48.2.0-SMART — preço de tabela fixo + First-Call Bonus pós-compra · "
