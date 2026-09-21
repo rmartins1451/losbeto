@@ -1,0 +1,24 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.rmartins1451/losbeto",
+  "title": "Losbeto — Market Data for AI Agents",
+  "description": "Cross-asset market data and LLM inference for AI agents. Pay-per-call in USDC via x402.",
+  "version": "48.9.7",
+  "repository": {
+    "source": "github",
+    "url": "https://github.com/rmartins1451/losbeto"
+  },
+  "websiteUrl": "https://api.losbeto.xyz",
+  "icons": [
+    {
+      "src": "https://api.losbeto.xyz/favicon.png",
+      "mimeType": "image/png"
+    }
+  ],
+  "remotes": [
+    {
+      "type": "streamable-http",
+      "url": "https://api.losbeto.xyz/mcp"
+    }
+  ]
+}
