@@ -360,6 +360,17 @@ REVENUE_TARGET_DAILY = float(os.environ.get("REVENUE_TARGET_DAILY", "50.0"))
 # balance_usd = -1 → ilimitado dentro da janela ttl_days.
 # v39: pitches em inglês — quem lê isto num 402 ou no Bazaar é um agente.
 CREDIT_PLANS = {
+    # v48.9.10-PLANS: MICRO-BUNDLE — a porta de entrada das máquinas.
+    # Diagnóstico (22/09): o client x402-fetch stock (legacy) nasce com teto
+    # de gasto default de 0.1 USDC; qualquer desafio acima disso é recusado
+    # ANTES do X-PAYMENT — invisível nos nossos logs. É o padrão que o MapMap
+    # documentou: "the $0.10 micro-bundle clears stock client spend caps".
+    # $0.10 → $0.11 de saldo: a 1ª compra autônoma custa o mínimo que a rede
+    # inteira aceita sem configuração.
+    "/buy-credits-micro": {"plan": "credits", "balance_usd": 0.11, "ttl_days": 14,
+                           "bonus": "+10%",
+                           "pitch": "Pay $0.10 once, get $0.11 of call credit — the machine starter bundle",
+                           "anchor_price": 0.10, "display_price": "$0.10"},
     "/buy-credits":      {"plan": "credits",  "balance_usd": 1.25,  "ttl_days": 30,
                           "bonus": "+25%",
                           "pitch": "Pay $0.99 once, get $1.25 of call credit",
@@ -479,6 +490,7 @@ BASE_PRICES = {
     "/thesis-engine":    0.690,
     "/starter-pack":     1.000,   # âncora de $1 — primeira compra humana
     # --- CREDIT PLANS (1 tx on-chain → N chamadas via X-API-Key) ---
+    "/buy-credits-micro": 0.100,   # v48.9.10: degrau $0.10 — teto default do x402-fetch stock
     "/buy-credits":      0.990,
     "/buy-credits-5":    4.990,
     "/buy-credits-25":   24.990,
@@ -624,6 +636,7 @@ ENDPOINT_DESC = {
     "/starter-pack":    "Entry bundle designed for a first purchase: several flagship products in one $1 call, Phantom-friendly, so an agent can evaluate the top of the catalog in a single transaction.",
 
     # ---- Planos de crédito ------------------------------------------------
+    "/buy-credits-micro": "CREDITS MICRO-BUNDLE: pay $0.10 once and receive $0.11 of call balance (+10% bonus), valid 14 days, spent via the X-API-Key header on every endpoint in this catalog. Sized to clear the default 0.1 USDC spend cap of unconfigured stock x402 clients — the recommended autonomous first purchase.",
     "/buy-credits":     "CREDITS: pay $0.99 once and receive $1.25 of call balance (+25% bonus), spent via the X-API-Key header. One on-chain transaction, then zero settlement latency per request.",
     "/buy-credits-5":   "CREDITS: pay $4.99 once and receive $6.00 of call balance (+20% bonus), valid 60 days, spent via the X-API-Key header. One on-chain transaction, then zero settlement latency per request.",
     "/buy-credits-25":  "CREDITS: pay $24.99 once and receive $33.00 of call balance (+32% bonus), valid 90 days, spent via the X-API-Key header. One on-chain transaction, then zero settlement latency per request.",
@@ -693,6 +706,7 @@ ENDPOINT_TAGS = {
     "/multi-chain-arbitrage": ["Trading", "Exclusive", "Featured"],
     "/win-rate-verified":     ["Trust", "Cryptographic", "Featured"],
     "/agent-composable":      ["AI", "Bundle", "Exclusive", "Featured"],
+    "/buy-credits-micro": ["Credits", "Starter", "Featured"],
     "/buy-credits":      ["Credits", "Featured"],
     "/buy-credits-5":    ["Credits", "Featured"],
     "/buy-credits-25":   ["Credits", "Featured"],
@@ -4890,7 +4904,9 @@ def _cors(resp):
     resp.headers["Access-Control-Allow-Origin"]   = "*"
     resp.headers["Access-Control-Allow-Headers"]  = (
         "X-PAYMENT,X-Payment,PAYMENT-SIGNATURE,Payment-Signature,"
-        "Authorization,Content-Type,X-Session-Token"
+        # v48.9.10: X-API-Key/X-Welcome-Token — sem eles, um agente EM BROWSER
+        # compra a key e o preflight bloqueia o uso (CORS).
+        "Authorization,Content-Type,X-Session-Token,X-API-Key,X-Welcome-Token"
     )
     resp.headers["Access-Control-Allow-Methods"]  = "GET,POST,OPTIONS,HEAD"
     # v48.3.7 FIX: este hook global SOBRESCREVIA o Access-Control-Expose-Headers
@@ -5591,7 +5607,7 @@ def _build_402(endpoint: str, price_override: float = None):
             f"{_pitch}. "
             f"Free delayed sample: GET {base}{endpoint}?preview=1 | "
             f"1 free real-time call: {base}/welcome | "
-            f"plans from $0.99: {base}/plans"
+            f"plans from $0.10: {base}/plans"
         ),
         "resource": {
             "url":         f"{base}{endpoint}",
@@ -5669,7 +5685,10 @@ def _build_402(endpoint: str, price_override: float = None):
                              "note": "One free call = live samples from 6 endpoints."},
             "cheapest_paid": _cheapest_paid(base),
             "credits": {"endpoint": f"{base}/buy-credits",
-                        "deal": "Pay $0.99 once, get $1.25 of credit (+25%), zero settlement latency"},
+                        "deal": "Pay $0.99 once, get $1.25 of credit (+25%), zero settlement latency",
+                        "micro_bundle": {"endpoint": f"{base}/buy-credits-micro",
+                                         "deal": "Pay $0.10 once, get $0.11 of credit (+10%)",
+                                         "note": "Starter bundle sized to clear the 0.1 USDC default spend cap of stock x402 clients — recommended first autonomous purchase"}},
             "plans_catalog": {"endpoint": f"{base}/plans",
                               "note": ("Machine-readable plan ladder: per-plan "
                                        "break-even math, value ratio and the "
@@ -5762,6 +5781,72 @@ def _build_402(endpoint: str, price_override: float = None):
             "additionalProperties": False,
         }
     payload["outputSchema"] = {"type": "object", "mimeType": "application/json"}
+
+    # v48.9.10-PLANS: o 402 de um PLANO passa a ser o manual de operação da
+    # máquina. Diagnóstico (22/09): os planos já estavam no manifesto e o
+    # fluxo de compra já funcionava — mas o corpo não dizia O QUE o pagamento
+    # entrega nem COMO operar depois, e o agente autônomo abortava na dúvida
+    # (os policy engines recusam em silêncio, sem X-PAYMENT nos logs).
+    # Padrão que converte (MapMap): o 402 do topup carrega extra.bundles +
+    # instrução de poll; e o bundle de $0.10 passa no teto default de
+    # 0.1 USDC dos clients x402 stock.
+    if endpoint in CREDIT_PLANS:
+        _cp = CREDIT_PLANS[endpoint]
+        _bundles = [
+            {"endpoint":   _p,
+             "price_usdc": BASE_PRICES.get(_p),
+             "credit_usd": _cfg.get("balance_usd"),
+             "ttl_days":   _cfg.get("ttl_days"),
+             "bonus":      _cfg.get("bonus")}
+            for _p, _cfg in CREDIT_PLANS.items()
+            if _cfg.get("plan") == "credits" and (_cfg.get("balance_usd") or 0) > 0
+        ]
+        if _cp.get("balance_usd", 0) == -1:
+            _what = (f"Unlimited calls on every endpoint in this catalog for "
+                     f"{_cp['ttl_days'] * 24}h — one payment, no per-call 402.")
+        else:
+            _what = (f"Prepaid call credit: pay {amount_usdc:.2f} USDC once, "
+                     f"receive {_cp['balance_usd']:.2f} USD of balance "
+                     f"({_cp['bonus']} bonus), valid {_cp['ttl_days']} days, "
+                     f"spent at public prices on EVERY paid endpoint in this catalog.")
+        payload["instructions"] = {
+            "what_you_buy":  _what,
+            "delivery":      ("Pay this 402 and the JSON response of THIS SAME "
+                              "request returns {api_key, balance_usd, expires_iso}. "
+                              "The key IS the credential — no signup, no account. "
+                              "Idempotent by transaction hash: re-submitting the "
+                              "same tx returns the same key, never a double charge."),
+            "how_to_use":    ("Send the key as the 'X-API-Key' header on any "
+                              "catalog endpoint. The 402 flow is skipped and the "
+                              "balance is debited in ~1ms — no per-call settlement "
+                              "latency."),
+            "balance_check": (f"GET {base}/credits-status?key=YOUR_KEY returns "
+                              "remaining balance and expiry. Poll BEFORE re-paying."),
+            "topup_loop":    ("Low-water pattern: when balance_usd falls below your "
+                              "per-call budget, buy any bundle again. Each purchase "
+                              "issues a NEW key — size the bundle to your spend horizon."),
+            "bundles":       _bundles,
+        }
+        payload["extra"] = {
+            "bundles": _bundles,
+            "spend_cap_note": ("The $0.10 micro-bundle (/buy-credits-micro) clears "
+                               "the default maxAmountToPay (0.1 USDC) of "
+                               "unconfigured stock x402 clients."),
+        }
+        payload["outputSchema"] = {
+            "type": "object", "mimeType": "application/json",
+            "properties": {
+                "api_key":     {"type": "string",
+                                "description": "Credential for the X-API-Key header. Shown once — store it."},
+                "balance_usd": {"type": "number",
+                                "description": "Prepaid call balance in USD."},
+                "expires_iso": {"type": "string",
+                                "description": "UTC expiry of the balance."},
+                "idempotent_replay": {"type": "boolean",
+                                      "description": "true when this transaction had already issued this key."},
+            },
+            "required": ["api_key", "balance_usd", "expires_iso"],
+        }
 
     payload_hdr = _slim(payload)
     b64 = base64.b64encode(
@@ -12699,7 +12784,7 @@ log.info("🔮 Oracle Consensus registrado ($0.03) — 5 fontes em paralelo")
 # sonda de WordPress de "produto novo" — 4 IPs em 7d poluindo a leitura.
 _SCAN_NOISE = re.compile(
     r"(\.env|\.git|\.aws|\.ssh|credentials|id_rsa|/wp(/|$)|wp-|wordpress|phpmyadmin|"
-    r"\.php|phpinfo|_profiler|admin|backup|dump|\.sql|\.bak|serviceaccount|firebase|"
+    r"\.php|phpinfo|_profiler|admin|backup|dump|\.sql|\.bak|service[-_]?account|_environment|firebase|"
     r"secrets?\.|config\.(json|yml|yaml)|actuator|/api/v1/(pods|namespaces)|"
     r"\.well-known/(acme|security)|favicon|robots|sitemap|apple-touch|"
     r"\.map$|\.asp|cgi-bin|xmlrpc|\.svn|docker|kube|"
@@ -14445,7 +14530,7 @@ Full catalog: {base}/llms.txt · Prices: {base}/get-pricing · OpenAPI: {base}/o
 
 ## Cheaper for repeated use
 
-- Header `X-API-Key: lsk_...` skips settlement latency (~1ms vs 2-5s). Buy at {base}/buy-credits ($0.99) or {base}/day-pass ($2.99 unlimited/24h).
+- Header `X-API-Key: lsk_...` skips settlement latency (~1ms vs 2-5s). Bundles: {base}/buy-credits-micro ($0.10 — sized to clear the 0.1 USDC default spend cap of stock x402 clients), {base}/buy-credits ($0.99 → $1.25), {base}/buy-credits-5 ($4.99 → $6.00), {base}/buy-credits-25 ($24.99 → $33.00) or {base}/day-pass ($2.99 unlimited/24h). Balance: GET {base}/credits-status?key=YOUR_KEY — poll before re-paying; top-ups are idempotent by tx hash.
 - MCP live server with a subscription: {base}/mcp (see `alternatives.mcp` in any 402).
 
 ## Trust
@@ -24195,7 +24280,7 @@ def circle_listing_helper():
 # Discovery API — os dois bloqueadores práticos que restavam para o canal
 # Circle. Código pronto; o resto desta semana é SUBMISSÃO MANUAL, não feature.
 # ============================================================================
-VERSION = "48.9.9-DISCO"  # v48.9.9: identidade+interop que o radar pediu — /.well-known/did.json (did:web), /.well-known/brick-blue.json, /api/mcp alias, /sse (ponte MCP legada) + seletor de carteira EIP-6963 no /pay (fim da loteria window.ethereum com várias extensões) | v48.9.8-SOLPAY  # v48.9.8: /pay ganha checkout SOLANA (Phantom — transferChecked USDC-SPL, feePayer do facilitador paga o gas; alternativa real à smart wallet da Coinbase que os facilitadores rejeitam) + manifesto ganha campos padrão-de-catálogo (siwx/supportsVanillax402/supportsCircleGateway/metadata.provider, estilo Vybe)  # v48.9.7: rodapé da home linka /pricing·/terms·/privacy·/impressum + sitemap  # v48.9.6: /pay detecta smart wallet e saldo USDC-Base ANTES de assinar + Pix Fase 0 para planos ≥$0.99  # v48.9.5: /.well-known/agent-skills/index.json REAL (Cloudflare Discovery RFC 0.2.0) + classificador UA do dash reconhece Barkrowler/bots compatible
+VERSION = "48.9.10-PLANS"  # v48.9.9: identidade+interop que o radar pediu — /.well-known/did.json (did:web), /.well-known/brick-blue.json, /api/mcp alias, /sse (ponte MCP legada) + seletor de carteira EIP-6963 no /pay (fim da loteria window.ethereum com várias extensões) | v48.9.8-SOLPAY  # v48.9.8: /pay ganha checkout SOLANA (Phantom — transferChecked USDC-SPL, feePayer do facilitador paga o gas; alternativa real à smart wallet da Coinbase que os facilitadores rejeitam) + manifesto ganha campos padrão-de-catálogo (siwx/supportsVanillax402/supportsCircleGateway/metadata.provider, estilo Vybe)  # v48.9.7: rodapé da home linka /pricing·/terms·/privacy·/impressum + sitemap  # v48.9.6: /pay detecta smart wallet e saldo USDC-Base ANTES de assinar + Pix Fase 0 para planos ≥$0.99  # v48.9.5: /.well-known/agent-skills/index.json REAL (Cloudflare Discovery RFC 0.2.0) + classificador UA do dash reconhece Barkrowler/bots compatible
 # (v48.8.0: 402 "error" vira anúncio de 1 linha · /circle-listing com form real + enum real
 # (v48.7.0: GET /circle-listing (campos prontos p/ o Agent Marketplace da Circle, lançado 09/set/2026 — canal de distribuição inteiro que faltava no checklist) + checklist de boot ganha Circle/402 Index/BlockRun | base: v48.6.1-LEADFIX  # v48.6.1: lead_watch_loop parava de confundir varredura de catálogo (mesmo IP, muitos endpoints diferentes) e harness de smoke-test (600+ hits num único endpoint) com lead quente — agora filtra por UA de scanner conhecido, teto de volume plausível p/ avaliação humana e 1 alerta por IP por ciclo · cdp_bazaar_bootstrap_loop checa liquidações VITALÍCIAS em Base antes de avisar que falta BASE_OPERATOR_PRIVATE_KEY (evita o log contradizer o próprio "3526 liquidações, elegível ao Bazaar"da v46) · dashboard separa "trust genérico" (tx_count≥3) de "CDP Bazaar/Base" (>=1 settle em Base) — eram rótulos diferentes escondidos atrás do mesmo badge "✓ completo" | base: v48.6.0-REGISTER  # v48.6.0: /register·/signup·/auth/callback (demanda medida: 42 req/7d — playbook SaaS "registrar→receber key") · POST /register = /buy-credits $0.99 reempacotado como matrícula (MESMA tabela pública, mesma máquina de créditos idempotente — zero preço novo) · security.txt RFC 9116 (hermes-contact: 456 hits/24h) · lead_watch_loop: IP 5+× no MESMO endpoint pago em 24h sem liquidar → Telegram 1×/dia · dashboard: ZeroBot/heritrix/hermes saem de "humano" → crawler (funil honesto) · 402 upsell ganha ponte "registration" | base: v48.5.1-LOGO  # v48.5.1: /favicon.png|.ico = PNG 256px moeda-L #4ade80 embutido em base64 (6KB, zero arquivo externo) + /favicon.svg vetorial — aposenta placeholder SVG roxo "Ω10" | base: v48.5.0-FUNIL  # v48.5.0: /pay mobile-first (deep link + QR — fim do "No wallet found" que matava 55% do funil) · /blog/ + /login atendem demanda medida · docstring sincronizado | base: v48.4.0-WALLETPAY  # v48.4.0: /pay/<endpoint> checkout de carteira de navegador (MetaMask/Coinbase Wallet/Rabby) p/ o ~80% de avaliadores humanos que não tinham NENHUM caminho de compra sem CLI/agente + filtro de ruído de scanner de segredo (/env, /config/*.key) tirado do radar de demanda + banimento de modelo Gemini morto agora persiste entre restarts | base: v48.3.10-COMMERCE  # v48.3.10: /.well-known/acp.json (ACP discovery doc — demanda 8 reqs/4 IPs) | base: v48.3.9.4-PROXYFIX  # v48.3.9.4: /proxy registrado após o alvo /fetch (o loop ALIAS_ROUTES rodava antes e o pulava) | base: v48.3.9.3-KEYDIR  # v48.3.9.3: /.well-known/http-message-signatures-directory (JWKS Ed25519 assinado RFC9421) + /legal + /support + alias /proxy→/fetch | base: v48.3.9.2-ALIAS  # v48.3.9.2: alias /llm/freePublic → /llm/free (demanda medida: 7 IPs/7d) | base: v48.3.9.1-GLAMA  # v48.3.9.1: /.well-known/glama.json aceita override via env GLAMA_CLAIM_JSON (claim do Glama por HTTP challenge sem novo deploy de código) | base: v48.3.9-FETCH
 log.warning("🧠 v48.2.0-SMART — preço de tabela fixo + First-Call Bonus pós-compra · "
