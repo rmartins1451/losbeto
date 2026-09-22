@@ -8993,6 +8993,82 @@ def owners_manifest():
     return resp
 
 
+# ============================================================================
+# v48.9.9-DISCO: identidade verificável + interoperabilidade. O radar de
+# demanda (7d) mostrou 4 artefatos que agentes PEDEM repetidamente e o nó
+# não servia — 11 IPs pedindo did.json, 10 brick-blue.json, 12 /api/mcp,
+# 12 /sse. Nenhum exige dado novo: são handshakes de confiança/descoberta.
+# Máquina não compra o que não consegue verificar nem conectar.
+# ============================================================================
+
+@app.route("/.well-known/did.json")
+def well_known_did():
+    """Identidade W3C did:web do nó. A chave pública é a MESMA que assina os
+    trust-hashes e snapshots (/archive) — um agente que verifica uma assinatura
+    nossa já tem a prova criptográfica de que o DID é nosso. did:web resolve
+    por HTTPS no próprio domínio: descentralizado, sem registry."""
+    base = _public_base()
+    host = base.split("://")[-1].split("/")[0]
+    did = "did:web:" + host
+    pub = WALLET.solana_address
+    resp = jsonify({
+        "@context": ["https://www.w3.org/ns/did/v1"],
+        "id": did,
+        "verificationMethod": [{
+            "id": did + "#key-1",
+            "type": "Ed25519VerificationKey2020",
+            "controller": did,
+            "publicKeyMultibase": "z" + pub,
+        }],
+        "authentication": [did + "#key-1"],
+        "assertionMethod": [did + "#key-1"],
+        "service": [
+            {"id": did + "#x402", "type": "X402PaymentGateway",
+             "serviceEndpoint": base + "/.well-known/x402.json"},
+            {"id": did + "#mcp", "type": "ModelContextProtocol",
+             "serviceEndpoint": base + "/mcp"},
+            {"id": did + "#openapi", "type": "OpenAPI",
+             "serviceEndpoint": base + "/openapi.json"},
+            {"id": did + "#llms", "type": "LLMsText",
+             "serviceEndpoint": base + "/llms.txt"},
+        ],
+    })
+    resp.headers["Access-Control-Allow-Origin"] = "*"
+    resp.headers["Cache-Control"] = "public, max-age=3600"
+    return resp
+
+
+@app.route("/.well-known/brick-blue.json")
+def brick_blue_proof():
+    """Prova de domínio para o hub brick.blue (registry de trabalho entre
+    agentes): quem controla o domínio nomeia a chave. Formato espelhado do
+    documento deles: {"key": <ed25519 base58>, "owner": "key:<id>"}.
+    A chave é a identidade pública do nó (a mesma dos trust-hashes)."""
+    pub = WALLET.solana_address
+    resp = jsonify({"key": pub, "owner": "key:" + pub})
+    resp.headers["Access-Control-Allow-Origin"] = "*"
+    resp.headers["Cache-Control"] = "public, max-age=300"
+    return resp
+
+
+@app.route("/sse")
+def mcp_sse_legacy_bridge():
+    """Ponte para clientes MCP legados (HTTP+SSE, spec 2024-11-05): o cliente
+    abre GET /sse e espera um evento `endpoint` dizendo onde POSTar JSON-RPC.
+    Entregamos o endpoint streamable /mcp e encerramos — sem segurar conexão
+    (4 workers gunicorn não podem virar reféns de streams longas). SDKs
+    modernos que SONDEAM /sse antes do fallback completam pelo POST normal."""
+    base = _public_base()
+    payload = ("event: endpoint\ndata: " + base + "/mcp\n\n"
+               ": losbeto — legacy SSE bridge; POST JSON-RPC 2.0 to the endpoint above "
+               "(streamable-http transport, spec 2025-03-26+)\n\n")
+    resp = Response(payload, mimetype="text/event-stream")
+    resp.headers["Cache-Control"] = "no-cache"
+    resp.headers["X-Accel-Buffering"] = "no"
+    resp.headers["Access-Control-Allow-Origin"] = "*"
+    return resp
+
+
 @app.route("/mcp.json")
 def mcp_json_root():
     """v47.6.1: descritor MCP na raiz — clientes que já conhecem o padrão
@@ -11120,6 +11196,8 @@ def _mcp_handle(msg: dict):
     return _jsonrpc_error(rid, -32601, f"Method not found: {method}")
 
 @app.route("/mcp", methods=["POST", "GET", "DELETE", "OPTIONS"])
+@app.route("/api/mcp", methods=["POST", "GET", "DELETE", "OPTIONS"])  # v48.9.9: alias — 12 IPs em 7d
+@app.route("/messages", methods=["POST", "OPTIONS"])                 # v48.9.9: alvo POST do SSE legado
 def mcp_streamable():
     if request.method == "OPTIONS":
         return ("", 204)
@@ -12621,7 +12699,7 @@ log.info("🔮 Oracle Consensus registrado ($0.03) — 5 fontes em paralelo")
 # sonda de WordPress de "produto novo" — 4 IPs em 7d poluindo a leitura.
 _SCAN_NOISE = re.compile(
     r"(\.env|\.git|\.aws|\.ssh|credentials|id_rsa|/wp(/|$)|wp-|wordpress|phpmyadmin|"
-    r"\.php|admin|backup|dump|\.sql|\.bak|serviceaccount|firebase|"
+    r"\.php|phpinfo|_profiler|admin|backup|dump|\.sql|\.bak|serviceaccount|firebase|"
     r"secrets?\.|config\.(json|yml|yaml)|actuator|/api/v1/(pods|namespaces)|"
     r"\.well-known/(acme|security)|favicon|robots|sitemap|apple-touch|"
     r"\.map$|\.asp|cgi-bin|xmlrpc|\.svn|docker|kube|"
@@ -23365,6 +23443,7 @@ pre{background:#0d0f13;border:1px solid var(--line);border-radius:8px;
 
 <div class="card" id="cardInjected" style="display:none">
   <div id="warnBox" class="status err" style="margin:0 0 12px"></div>
+  <div id="walletPick" style="display:none;margin:0 0 12px"></div>
   <button id="btnConnect">Pay with browser wallet</button>
   <div id="status" class="status"></div>
 </div>
@@ -23416,6 +23495,45 @@ const statusMEl = document.getElementById('statusM');
 const resultEl = document.getElementById('result');
 const btn = document.getElementById('btnConnect');
 
+// v48.9.9: EIP-6963 — com várias extensões instaladas (Phantom + Coinbase + MetaMask),
+// window.ethereum é LOTERIA: a última que injeta ganha, e o pagamento pode sair
+// pela carteira errada (o operador perdeu 2 tentativas assim — a Coinbase Smart
+// Wallet capturou o clique em vez do Phantom com saldo). Coletamos TODOS os
+// providers anunciados e, se houver mais de um, o usuário escolhe.
+const EIP6963 = [];
+window.addEventListener('eip6963:announceProvider', function(e){
+  const d = e && e.detail;
+  if (d && d.provider && d.info && !EIP6963.some(function(x){ return x.info.uuid === d.info.uuid; }))
+    EIP6963.push(d);
+});
+window.dispatchEvent(new Event('eip6963:requestProvider'));
+let EVMP = null;
+function evmProvider(){
+  if (EVMP) return EVMP;
+  if (EIP6963.length === 1) { EVMP = EIP6963[0].provider; return EVMP; }
+  if (EIP6963.length === 0 && window.ethereum) { EVMP = window.ethereum; return EVMP; }
+  return null; // vários providers e nenhum escolhido ainda
+}
+function renderWalletPicker(){
+  const box = document.getElementById('walletPick');
+  box.innerHTML = '';
+  EIP6963.forEach(function(d){
+    const b = document.createElement('button');
+    b.style.cssText = 'display:block;width:100%;margin:0 0 8px;padding:12px;border-radius:10px;' +
+      'border:1px solid #2a2f3a;background:#171b22;color:#e8ecf1;font-size:15px;cursor:pointer;text-align:left';
+    b.innerHTML = (d.info.icon ? '<img src="' + d.info.icon + '" style="width:20px;height:20px;vertical-align:-4px;margin-right:8px;border-radius:5px">' : '') +
+                  'Pay with ' + d.info.name;
+    b.addEventListener('click', function(){
+      EVMP = d.provider;
+      box.style.display = 'none';
+      setStatus(d.info.name + ' selected — tap the pay button to continue.', 'ok');
+    });
+    box.appendChild(b);
+  });
+  box.style.display = 'block';
+  setStatus('Several wallets found — choose which one pays (pick a regular EOA like Phantom/MetaMask, not a passkey smart wallet):', 'ok');
+}
+
 const enc = encodeURIComponent(PAGE_URL);
 const bare = PAGE_URL.replace(/^https?:\/\//, '');
 
@@ -23435,7 +23553,7 @@ else document.getElementById('dlPhantom').style.display = 'none';
 // v48.9.8: Phantom injeta window.ethereum E window.solana — mostrar os DOIS
 // cartões nesse caso (o usuário escolhe a rede onde tem saldo).
 let anyCard = false;
-if (window.ethereum) {
+if (window.ethereum || EIP6963.length) {
   document.getElementById('cardInjected').style.display = 'block';
   anyCard = true;
 }
@@ -23618,26 +23736,27 @@ async function paySolana(){
 }
 document.getElementById('btnSol').addEventListener('click', paySolana);
 
-async function ensureBaseChain(chainIdHex){
-  try{ await window.ethereum.request({method:'wallet_switchEthereumChain',params:[{chainId:chainIdHex}]}); }
+async function ensureBaseChain(chainIdHex, w){
+  try{ await w.request({method:'wallet_switchEthereumChain',params:[{chainId:chainIdHex}]}); }
   catch(e){ if(e && e.code===4902){
-    await window.ethereum.request({method:'wallet_addEthereumChain',params:[{chainId:chainIdHex,
+    await w.request({method:'wallet_addEthereumChain',params:[{chainId:chainIdHex,
       chainName:'Base',nativeCurrency:{name:'Ether',symbol:'ETH',decimals:18},
       rpcUrls:['https://mainnet.base.org'],blockExplorerUrls:['https://basescan.org']}]});}
   else { throw e; } }
 }
 
 async function payAndFetch(){
-  if(!window.ethereum) return;
+  const w = evmProvider();
+  if(!w){ renderWalletPicker(); return; }
   btn.disabled = true;
   try{
     setStatus('Requesting wallet connection…');
-    const accounts = await window.ethereum.request({method:'eth_requestAccounts'});
+    const accounts = await w.request({method:'eth_requestAccounts'});
     const from = accounts[0];
     const chainId = parseInt(String(ACCEPT.network).split(':')[1],10);
     const chainIdHex = '0x'+chainId.toString(16);
     setStatus('Switching to Base network…');
-    await ensureBaseChain(chainIdHex);
+    await ensureBaseChain(chainIdHex, w);
     setStatus('Checking wallet compatibility and USDC balance…');
     await preflightWallet(from);
     const validBefore = String(Math.floor(Date.now()/1000)+(ACCEPT.maxTimeoutSeconds||300));
@@ -23653,7 +23772,7 @@ async function payAndFetch(){
                     {name:'validBefore',type:'uint256'},{name:'nonce',type:'bytes32'}]},
       primaryType:'TransferWithAuthorization',domain,message:authorization};
     setStatus('Waiting for signature in your wallet…');
-    const signature = await window.ethereum.request({method:'eth_signTypedData_v4',
+    const signature = await w.request({method:'eth_signTypedData_v4',
       params:[from,JSON.stringify(typedData)]});
     const paymentPayload = {x402Version:2,scheme:'exact',network:ACCEPT.network,
       payload:{signature,authorization},accepted:ACCEPT};
@@ -24076,7 +24195,7 @@ def circle_listing_helper():
 # Discovery API — os dois bloqueadores práticos que restavam para o canal
 # Circle. Código pronto; o resto desta semana é SUBMISSÃO MANUAL, não feature.
 # ============================================================================
-VERSION = "48.9.8-SOLPAY"  # v48.9.8: /pay ganha checkout SOLANA (Phantom — transferChecked USDC-SPL, feePayer do facilitador paga o gas; alternativa real à smart wallet da Coinbase que os facilitadores rejeitam) + manifesto ganha campos padrão-de-catálogo (siwx/supportsVanillax402/supportsCircleGateway/metadata.provider, estilo Vybe)  # v48.9.7: rodapé da home linka /pricing·/terms·/privacy·/impressum + sitemap  # v48.9.6: /pay detecta smart wallet e saldo USDC-Base ANTES de assinar + Pix Fase 0 para planos ≥$0.99  # v48.9.5: /.well-known/agent-skills/index.json REAL (Cloudflare Discovery RFC 0.2.0) + classificador UA do dash reconhece Barkrowler/bots compatible
+VERSION = "48.9.9-DISCO"  # v48.9.9: identidade+interop que o radar pediu — /.well-known/did.json (did:web), /.well-known/brick-blue.json, /api/mcp alias, /sse (ponte MCP legada) + seletor de carteira EIP-6963 no /pay (fim da loteria window.ethereum com várias extensões) | v48.9.8-SOLPAY  # v48.9.8: /pay ganha checkout SOLANA (Phantom — transferChecked USDC-SPL, feePayer do facilitador paga o gas; alternativa real à smart wallet da Coinbase que os facilitadores rejeitam) + manifesto ganha campos padrão-de-catálogo (siwx/supportsVanillax402/supportsCircleGateway/metadata.provider, estilo Vybe)  # v48.9.7: rodapé da home linka /pricing·/terms·/privacy·/impressum + sitemap  # v48.9.6: /pay detecta smart wallet e saldo USDC-Base ANTES de assinar + Pix Fase 0 para planos ≥$0.99  # v48.9.5: /.well-known/agent-skills/index.json REAL (Cloudflare Discovery RFC 0.2.0) + classificador UA do dash reconhece Barkrowler/bots compatible
 # (v48.8.0: 402 "error" vira anúncio de 1 linha · /circle-listing com form real + enum real
 # (v48.7.0: GET /circle-listing (campos prontos p/ o Agent Marketplace da Circle, lançado 09/set/2026 — canal de distribuição inteiro que faltava no checklist) + checklist de boot ganha Circle/402 Index/BlockRun | base: v48.6.1-LEADFIX  # v48.6.1: lead_watch_loop parava de confundir varredura de catálogo (mesmo IP, muitos endpoints diferentes) e harness de smoke-test (600+ hits num único endpoint) com lead quente — agora filtra por UA de scanner conhecido, teto de volume plausível p/ avaliação humana e 1 alerta por IP por ciclo · cdp_bazaar_bootstrap_loop checa liquidações VITALÍCIAS em Base antes de avisar que falta BASE_OPERATOR_PRIVATE_KEY (evita o log contradizer o próprio "3526 liquidações, elegível ao Bazaar"da v46) · dashboard separa "trust genérico" (tx_count≥3) de "CDP Bazaar/Base" (>=1 settle em Base) — eram rótulos diferentes escondidos atrás do mesmo badge "✓ completo" | base: v48.6.0-REGISTER  # v48.6.0: /register·/signup·/auth/callback (demanda medida: 42 req/7d — playbook SaaS "registrar→receber key") · POST /register = /buy-credits $0.99 reempacotado como matrícula (MESMA tabela pública, mesma máquina de créditos idempotente — zero preço novo) · security.txt RFC 9116 (hermes-contact: 456 hits/24h) · lead_watch_loop: IP 5+× no MESMO endpoint pago em 24h sem liquidar → Telegram 1×/dia · dashboard: ZeroBot/heritrix/hermes saem de "humano" → crawler (funil honesto) · 402 upsell ganha ponte "registration" | base: v48.5.1-LOGO  # v48.5.1: /favicon.png|.ico = PNG 256px moeda-L #4ade80 embutido em base64 (6KB, zero arquivo externo) + /favicon.svg vetorial — aposenta placeholder SVG roxo "Ω10" | base: v48.5.0-FUNIL  # v48.5.0: /pay mobile-first (deep link + QR — fim do "No wallet found" que matava 55% do funil) · /blog/ + /login atendem demanda medida · docstring sincronizado | base: v48.4.0-WALLETPAY  # v48.4.0: /pay/<endpoint> checkout de carteira de navegador (MetaMask/Coinbase Wallet/Rabby) p/ o ~80% de avaliadores humanos que não tinham NENHUM caminho de compra sem CLI/agente + filtro de ruído de scanner de segredo (/env, /config/*.key) tirado do radar de demanda + banimento de modelo Gemini morto agora persiste entre restarts | base: v48.3.10-COMMERCE  # v48.3.10: /.well-known/acp.json (ACP discovery doc — demanda 8 reqs/4 IPs) | base: v48.3.9.4-PROXYFIX  # v48.3.9.4: /proxy registrado após o alvo /fetch (o loop ALIAS_ROUTES rodava antes e o pulava) | base: v48.3.9.3-KEYDIR  # v48.3.9.3: /.well-known/http-message-signatures-directory (JWKS Ed25519 assinado RFC9421) + /legal + /support + alias /proxy→/fetch | base: v48.3.9.2-ALIAS  # v48.3.9.2: alias /llm/freePublic → /llm/free (demanda medida: 7 IPs/7d) | base: v48.3.9.1-GLAMA  # v48.3.9.1: /.well-known/glama.json aceita override via env GLAMA_CLAIM_JSON (claim do Glama por HTTP challenge sem novo deploy de código) | base: v48.3.9-FETCH
 log.warning("🧠 v48.2.0-SMART — preço de tabela fixo + First-Call Bonus pós-compra · "
