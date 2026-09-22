@@ -10375,6 +10375,15 @@ def _resource_entry(ep: str) -> dict:
         # contra a spec marcavam as entradas como incompletas.
         "accepts": _accepts,
         "tags": _service_tags(ep),
+        # v48.9.8: campos padrão-de-catálogo (referência: manifesto Vybe) —
+        # x402scan/Agentic.Market leem siwx/supports*/metadata.provider.
+        "siwx": False,
+        "supportsVanillax402": True,
+        "supportsCircleGateway": False,
+        "metadata": {"provider": {"name": SERVICE_NAME, "website": base,
+                                  "openApiUrl": f"{base}/openapi.json",
+                                  "category": "FINANCIAL_ANALYSIS",
+                                  "tags": _service_tags(ep)}},
         "free_preview": f"{base}{ep}?preview=1",
         "lastUpdated": int(time.time()),
     }
@@ -10492,6 +10501,15 @@ def manifest_x402():
             "iconUrl":           f"{base}/favicon.png",
             "inputSchema":       ch.get("inputSchema"),
             "outputSchema":      ch.get("outputSchema"),
+            # v48.9.8: campos padrão-de-catálogo (referência: manifesto Vybe)
+            # — x402scan/Agentic.Market leem siwx/supports*/metadata.provider.
+            "siwx":                  False,
+            "supportsVanillax402":   True,
+            "supportsCircleGateway": False,
+            "metadata": {"provider": {"name": SERVICE_NAME, "website": base,
+                                      "openApiUrl": f"{base}/openapi.json",
+                                      "category": "FINANCIAL_ANALYSIS",
+                                      "tags": _service_tags(path)}},
         }
 
     for p in BASE_PRICES:
@@ -23358,6 +23376,7 @@ pre{background:#0d0f13;border:1px solid var(--line);border-radius:8px;
     <a id="dlMetamask" href="#">MetaMask</a>
     <a id="dlCoinbase" href="#">Coinbase Wallet</a>
     <a id="dlRainbow" href="#">Rainbow</a>
+    <a id="dlPhantom" href="#">Phantom</a>
   </div>
   <div class="or">— or scan with your phone —</div>
   <img class="qr" id="qrImg" width="180" height="180" alt="Scan to open this payment page"
@@ -23368,6 +23387,14 @@ pre{background:#0d0f13;border:1px solid var(--line);border-radius:8px;
 </div>
 
 __PIX_CARD__
+
+<div class="card" id="cardSol" style="display:none">
+  <p style="margin:0 0 10px;font-size:14px;color:var(--dim)">
+    Prefer Solana? Pay the same price in USDC-SPL with Phantom —
+    the facilitator pays the gas, you only sign:</p>
+  <button id="btnSol" style="background:#a78bfa;color:#14071f">Pay with Phantom · USDC on Solana</button>
+  <div id="statusSol" class="status"></div>
+</div>
 
 <div id="result"></div>
 
@@ -23380,6 +23407,7 @@ Prefer an AI agent? <a href="/pricing">See the agent flow</a>.</p>
 </div>
 <script>
 const ACCEPT = __ACCEPT_JSON__;
+const SOL_ACCEPT = __SOL_ACCEPT_JSON__;
 const ENDPOINT_URL = "__ENDPOINT_URL__";
 const PAGE_URL = "__PAGE_URL__";
 const IS_CREDIT = __IS_CREDIT__;
@@ -23401,10 +23429,21 @@ document.getElementById('qrImg').src =
 document.getElementById('dlMetamask').href  = 'https://metamask.app.link/dapp/' + bare;
 document.getElementById('dlCoinbase').href  = 'https://go.cb-w.com/dapp?cb_url=' + enc;
 document.getElementById('dlRainbow').href   = 'https://rnbwapp.com/dapp?url=' + enc;
+if (SOL_ACCEPT) document.getElementById('dlPhantom').href = 'https://phantom.app/ul/browse/' + enc;
+else document.getElementById('dlPhantom').style.display = 'none';
 
+// v48.9.8: Phantom injeta window.ethereum E window.solana — mostrar os DOIS
+// cartões nesse caso (o usuário escolhe a rede onde tem saldo).
+let anyCard = false;
 if (window.ethereum) {
   document.getElementById('cardInjected').style.display = 'block';
-} else {
+  anyCard = true;
+}
+if (SOL_ACCEPT && window.solana) {
+  document.getElementById('cardSol').style.display = 'block';
+  anyCard = true;
+}
+if (!anyCard) {
   document.getElementById('cardMobile').style.display = 'block';
   // v48.5.0 (correção de copy): o pagamento E o resultado acontecem DENTRO
   // do app da wallet — o browser original não é desbloqueado depois (não há
@@ -23468,6 +23507,116 @@ async function preflightWallet(from){
   }
   return warns.length === 0;
 }
+
+// ============================================================================
+// v48.9.8-SOLPAY — checkout Solana via Phantom. O facilitador (PayAI) paga o
+// gas (extra.feePayer): o cliente só ASSINA um transferChecked de USDC-SPL.
+// web3.js carregado sob demanda do CDN (unpkg, IIFE → window.solanaWeb3);
+// se o CDN falhar, o erro aparece no status e o checkout Base segue intacto.
+// ============================================================================
+const SOL_RPC    = 'https://api.mainnet-beta.solana.com';
+const TOKEN_PROG = 'TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA';
+const ATA_PROG   = 'ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL';
+
+function loadJs(src){ return new Promise((res, rej) => {
+  const s = document.createElement('script');
+  s.src = src; s.onload = res; s.onerror = () => rej(new Error('CDN indisponível: ' + src));
+  document.head.appendChild(s);
+}); }
+
+async function ataOf(w3, owner, mint){
+  const seeds = [owner.toBytes(), new w3.PublicKey(TOKEN_PROG).toBytes(), mint.toBytes()];
+  const r = await w3.PublicKey.findProgramAddress(seeds, new w3.PublicKey(ATA_PROG));
+  return r[0];
+}
+
+function ixTransferChecked(w3, src, mint, dst, owner, amount){
+  // SPL Token instruction 12 (TransferChecked): [12][amount u64 LE][decimals]
+  const data = new Uint8Array(10);
+  data[0] = 12;
+  let v = BigInt(amount);
+  for(let i = 0; i < 8; i++){ data[1 + i] = Number(v & 255n); v >>= 8n; }
+  data[9] = 6; // USDC decimals
+  return new w3.TransactionInstruction({
+    programId: new w3.PublicKey(TOKEN_PROG),
+    keys: [ {pubkey: src,   isSigner: false, isWritable: true},
+            {pubkey: mint,  isSigner: false, isWritable: false},
+            {pubkey: dst,   isSigner: false, isWritable: true},
+            {pubkey: owner, isSigner: true,  isWritable: false} ],
+    data });
+}
+
+function b64encode(buf){
+  const u = new Uint8Array(buf);
+  let s = '';
+  for(let i = 0; i < u.length; i += 8192) s += String.fromCharCode.apply(null, u.subarray(i, i + 8192));
+  return btoa(s);
+}
+
+async function paySolana(){
+  const btnS = document.getElementById('btnSol');
+  const st = document.getElementById('statusSol');
+  const setS = (m, c) => { st.textContent = m; st.className = 'status' + (c ? ' ' + c : ''); };
+  btnS.disabled = true;
+  try{
+    setS('Loading Solana runtime…');
+    await loadJs('https://unpkg.com/@solana/web3.js@1.95.3/lib/index.iife.min.js');
+    const w3 = window.solanaWeb3;
+    setS('Connecting Phantom…');
+    const conn = await window.solana.connect();
+    const owner = new w3.PublicKey(conn.publicKey.toString());
+    const mint  = new w3.PublicKey(SOL_ACCEPT.asset);
+    const rpc   = new w3.Connection(SOL_RPC, 'confirmed');
+    const srcAta = await ataOf(w3, owner, mint);
+    const dstAta = await ataOf(w3, new w3.PublicKey(SOL_ACCEPT.payTo), mint);
+    const need = Number(BigInt(SOL_ACCEPT.amount)) / 1e6;
+    try{
+      const bal = await rpc.getTokenAccountBalance(srcAta);
+      const have = Number(bal.value.amount) / 1e6;
+      if(have < need){
+        setS('⚠ USDC on Solana: ' + have.toFixed(4) + ' — this payment needs ' + need.toFixed(4) +
+             '. Top up USDC (Solana network) in Phantom first.', 'err');
+        btnS.disabled = false; return;
+      }
+    }catch(e){
+      setS('⚠ No USDC token account on Solana for this wallet. Add USDC on the Solana network ' +
+           'in Phantom first (or use the Base option above).', 'err');
+      btnS.disabled = false; return;
+    }
+    setS('Building transaction — the facilitator pays the gas…');
+    const bh = await rpc.getLatestBlockhash();
+    const tx = new w3.Transaction({ feePayer: new w3.PublicKey(SOL_ACCEPT.extra.feePayer),
+                                    recentBlockhash: bh.blockhash });
+    tx.add(ixTransferChecked(w3, srcAta, mint, dstAta, owner, SOL_ACCEPT.amount));
+    setS('Approve in Phantom…');
+    const signed = await window.solana.signTransaction(tx);
+    const b64tx = b64encode(signed.serialize({ requireAllSignatures: false, verifySignatures: false }));
+    const header = btoa(JSON.stringify({ x402Version: 2, scheme: 'exact',
+      network: SOL_ACCEPT.network, payload: { transaction: b64tx } }));
+    setS('Signature captured. Settling payment and fetching your data…');
+    const resp = await fetch(ENDPOINT_URL, { headers: { 'X-PAYMENT': header, 'Accept': 'application/json' } });
+    const body = await resp.json().catch(() => ({}));
+    if(!resp.ok){
+      setS('Payment not accepted: ' + (body.reason || body.error || resp.status) +
+           '\nNo funds moved if this failed before settlement — you can retry.', 'err');
+      btnS.disabled = false; return;
+    }
+    setS('Paid ✓ — settled on Solana.', 'ok');
+    if(IS_CREDIT && body.api_key){
+      resultEl.innerHTML = '<pre>X-API-Key: ' + body.api_key +
+        '<span class="copy" onclick="navigator.clipboard.writeText(\'' + body.api_key + '\')">copy</span>\n\n' +
+        '# use it on any endpoint:\ncurl -H "X-API-Key: ' + body.api_key + '" ' +
+        ENDPOINT_URL.replace('/buy-credits', '/<endpoint>') + '</pre>';
+    } else {
+      resultEl.innerHTML = '<pre>' + JSON.stringify(body, null, 2).slice(0, 4000) + '</pre>';
+    }
+    btnS.textContent = 'Pay again'; btnS.disabled = false;
+  }catch(e){
+    setS('Error: ' + (e && e.message ? e.message : e), 'err');
+    btnS.disabled = false;
+  }
+}
+document.getElementById('btnSol').addEventListener('click', paySolana);
 
 async function ensureBaseChain(chainIdHex){
   try{ await window.ethereum.request({method:'wallet_switchEthereumChain',params:[{chainId:chainIdHex}]}); }
@@ -23585,6 +23734,9 @@ def _pay_bridge_handler(raw_endpoint):
     accepts = chal.get("accepts") or []
     base_accept = next((a for a in accepts
                          if str(a.get("network", "")).startswith("eip155")), None)
+    sol_accept = next((a for a in accepts
+                        if str(a.get("network", "")).startswith("solana")
+                        and (a.get("extra") or {}).get("feePayer")), None)
     if not base_accept:
         return jsonify({"error": "no_base_accept",
                          "hint": "This node's Base chain is not configured."}), 503
@@ -23620,6 +23772,7 @@ def _pay_bridge_handler(raw_endpoint):
             .replace("__PRICE__", f"{price:.4f}")
             .replace("__DESC__", desc)
             .replace("__ACCEPT_JSON__", json.dumps(base_accept))
+            .replace("__SOL_ACCEPT_JSON__", json.dumps(sol_accept) if sol_accept else "null")
             .replace("__IS_CREDIT__", "true" if ep in CREDIT_PLANS else "false"))
     try:
         LEDGER.log_request(ep, True, 0,
@@ -23923,7 +24076,7 @@ def circle_listing_helper():
 # Discovery API — os dois bloqueadores práticos que restavam para o canal
 # Circle. Código pronto; o resto desta semana é SUBMISSÃO MANUAL, não feature.
 # ============================================================================
-VERSION = "48.9.7-LINKS"  # v48.9.7: rodapé da home linka /pricing·/terms·/privacy·/impressum + sitemap ganha /pricing·/impressum — alvo: 2 pilares ✗ do x402-list (pricing/terms)  # v48.9.6: /pay detecta smart wallet (eth_getCode) e saldo USDC-Base ANTES de assinar (fim do erro mudo da issue x402#623) + Pix Fase 0 para planos ≥$0.99  # v48.9.5: /.well-known/agent-skills/index.json REAL (Cloudflare Discovery RFC 0.2.0) + classificador UA do dash reconhece Barkrowler/bots compatible
+VERSION = "48.9.8-SOLPAY"  # v48.9.8: /pay ganha checkout SOLANA (Phantom — transferChecked USDC-SPL, feePayer do facilitador paga o gas; alternativa real à smart wallet da Coinbase que os facilitadores rejeitam) + manifesto ganha campos padrão-de-catálogo (siwx/supportsVanillax402/supportsCircleGateway/metadata.provider, estilo Vybe)  # v48.9.7: rodapé da home linka /pricing·/terms·/privacy·/impressum + sitemap  # v48.9.6: /pay detecta smart wallet e saldo USDC-Base ANTES de assinar + Pix Fase 0 para planos ≥$0.99  # v48.9.5: /.well-known/agent-skills/index.json REAL (Cloudflare Discovery RFC 0.2.0) + classificador UA do dash reconhece Barkrowler/bots compatible
 # (v48.8.0: 402 "error" vira anúncio de 1 linha · /circle-listing com form real + enum real
 # (v48.7.0: GET /circle-listing (campos prontos p/ o Agent Marketplace da Circle, lançado 09/set/2026 — canal de distribuição inteiro que faltava no checklist) + checklist de boot ganha Circle/402 Index/BlockRun | base: v48.6.1-LEADFIX  # v48.6.1: lead_watch_loop parava de confundir varredura de catálogo (mesmo IP, muitos endpoints diferentes) e harness de smoke-test (600+ hits num único endpoint) com lead quente — agora filtra por UA de scanner conhecido, teto de volume plausível p/ avaliação humana e 1 alerta por IP por ciclo · cdp_bazaar_bootstrap_loop checa liquidações VITALÍCIAS em Base antes de avisar que falta BASE_OPERATOR_PRIVATE_KEY (evita o log contradizer o próprio "3526 liquidações, elegível ao Bazaar"da v46) · dashboard separa "trust genérico" (tx_count≥3) de "CDP Bazaar/Base" (>=1 settle em Base) — eram rótulos diferentes escondidos atrás do mesmo badge "✓ completo" | base: v48.6.0-REGISTER  # v48.6.0: /register·/signup·/auth/callback (demanda medida: 42 req/7d — playbook SaaS "registrar→receber key") · POST /register = /buy-credits $0.99 reempacotado como matrícula (MESMA tabela pública, mesma máquina de créditos idempotente — zero preço novo) · security.txt RFC 9116 (hermes-contact: 456 hits/24h) · lead_watch_loop: IP 5+× no MESMO endpoint pago em 24h sem liquidar → Telegram 1×/dia · dashboard: ZeroBot/heritrix/hermes saem de "humano" → crawler (funil honesto) · 402 upsell ganha ponte "registration" | base: v48.5.1-LOGO  # v48.5.1: /favicon.png|.ico = PNG 256px moeda-L #4ade80 embutido em base64 (6KB, zero arquivo externo) + /favicon.svg vetorial — aposenta placeholder SVG roxo "Ω10" | base: v48.5.0-FUNIL  # v48.5.0: /pay mobile-first (deep link + QR — fim do "No wallet found" que matava 55% do funil) · /blog/ + /login atendem demanda medida · docstring sincronizado | base: v48.4.0-WALLETPAY  # v48.4.0: /pay/<endpoint> checkout de carteira de navegador (MetaMask/Coinbase Wallet/Rabby) p/ o ~80% de avaliadores humanos que não tinham NENHUM caminho de compra sem CLI/agente + filtro de ruído de scanner de segredo (/env, /config/*.key) tirado do radar de demanda + banimento de modelo Gemini morto agora persiste entre restarts | base: v48.3.10-COMMERCE  # v48.3.10: /.well-known/acp.json (ACP discovery doc — demanda 8 reqs/4 IPs) | base: v48.3.9.4-PROXYFIX  # v48.3.9.4: /proxy registrado após o alvo /fetch (o loop ALIAS_ROUTES rodava antes e o pulava) | base: v48.3.9.3-KEYDIR  # v48.3.9.3: /.well-known/http-message-signatures-directory (JWKS Ed25519 assinado RFC9421) + /legal + /support + alias /proxy→/fetch | base: v48.3.9.2-ALIAS  # v48.3.9.2: alias /llm/freePublic → /llm/free (demanda medida: 7 IPs/7d) | base: v48.3.9.1-GLAMA  # v48.3.9.1: /.well-known/glama.json aceita override via env GLAMA_CLAIM_JSON (claim do Glama por HTTP challenge sem novo deploy de código) | base: v48.3.9-FETCH
 log.warning("🧠 v48.2.0-SMART — preço de tabela fixo + First-Call Bonus pós-compra · "
