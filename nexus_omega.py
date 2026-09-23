@@ -5583,6 +5583,18 @@ def _build_402(endpoint: str, price_override: float = None):
             "extra":             {"feePayer": ALGO_FEEPAYER,
                                   "tag": "x402-global-challenge"},
         })
+    # v48.9.12-DUAL — O FIX DE COMPATIBILIDADE DECISIVO.
+    # Diagnóstico (23/09, teste com o client stock REAL, x402-fetch@1.2.0):
+    # o client v1 lê o CORPO do 402 e valida accepts[] contra o schema Zod v1
+    # (rede = nome curto "base"/"solana" + maxAmountRequired/resource/
+    # description/mimeType). Nosso corpo v2 (CAIP-2 "eip155:8453") lançava
+    # ZodError ANTES de qualquer lógica de pagamento — o desafio era
+    # ilegível para o client padrão da rede. O client v2 (@x402/fetch) lê o
+    # HEADER PAYMENT-REQUIRED primeiro e só aceita body com x402Version===1
+    # como fallback. Logo: header segue v2, corpo vira PaymentRequired v1
+    # puro, e acceptsV2 preserva o CAIP-2 para consumidores v2 de corpo.
+    accepts_v1 = [x for x in (_accept_to_v1(a, endpoint) for a in accepts) if x]
+
     # v21 FIX: payload compatível com x402scan — campos da spec v2 + challenges
     payment_req = accepts[0] if accepts else {}
     _challenge_remember(endpoint, accepts)   # v39: usado na liquidação
@@ -5600,7 +5612,9 @@ def _build_402(endpoint: str, price_override: float = None):
     _pitch = _pitch.replace("\u2014", "-").replace("\u2013", "-")
     _pitch = _pitch.encode("ascii", "ignore").decode()
     payload = {
-        "x402Version": 2,
+        # v48.9.12-DUAL: o CORPO é um PaymentRequired v1 (o client stock v1 só
+        # lê o corpo; o client v2 lê o header PAYMENT-REQUIRED, que segue v2).
+        "x402Version": 1,
         # v48.8-ADCOPY: "error" é a string que TODO cliente x402 expõe ao agente
         # comprador (x402-fetch loga, carteiras/aggregators exibem, a spec v1 a
         # define como mensagem human-readable opcional). Macete systemprompt.io:
@@ -5627,7 +5641,8 @@ def _build_402(endpoint: str, price_override: float = None):
             "tags":        _service_tags(endpoint),
             "iconUrl":     f"{base}/favicon.png",
         },
-        "accepts":    accepts,
+        "accepts":    accepts_v1,     # v1 (client stock lê o corpo)
+        "acceptsV2":  accepts,        # v2 CAIP-2 (header + consumidores v2)
         # v39.7: a alternativa mais barata, no momento exato da decisão.
         "alternatives": _subscription_offer(endpoint, amount_usdc),
         # v47.6.3 (parceria stipend.sh): agente SEM carteira recebe o caminho
@@ -5641,23 +5656,16 @@ def _build_402(endpoint: str, price_override: float = None):
                                 "works here.",
         },
         # v1 backward compat: alguns scanners (x402scan legacy) esperam paymentRequirements
-        "paymentRequirements": {
-            "scheme":            payment_req.get("scheme", "exact"),
-            "network":           payment_req.get("network", f"solana:{SOL_GENESIS}"),
-            "asset":             payment_req.get("asset", USDC_MINT),
-            "maxAmountRequired": payment_req.get("amount", "0"),
-            "payTo":             payment_req.get("payTo", RECEIVE_ADDRESS),
-            "maxTimeoutSeconds": payment_req.get("maxTimeoutSeconds", 300),
-        } if payment_req else None,
-        # challenges: formato alternativo que alguns scanners esperam
+        "paymentRequirements": accepts_v1[0] if accepts_v1 else None,
+        # challenges: formato alternativo que alguns scanners esperam (v1)
         "challenges": [{
             "scheme": acc.get("scheme", "exact"),
-            "network": acc.get("network", f"solana:{SOL_GENESIS}"),
+            "network": acc.get("network", "solana"),
             "asset": acc.get("asset", USDC_MINT),
-            "amount": acc.get("amount", "0"),
+            "maxAmountRequired": acc.get("maxAmountRequired", "0"),
             "payTo": acc.get("payTo", RECEIVE_ADDRESS),
             "maxTimeoutSeconds": acc.get("maxTimeoutSeconds", 300),
-        } for acc in accepts],
+        } for acc in accepts_v1],
         # v21.4 FIX: extensions DEVE ser objeto ({}), nunca null — o PayAI rejeita
         # com "extensions: Invalid input: expected record, received null" porque o
         # cliente (AgentCash) ecoa esse campo no PaymentPayload que envia de volta.
@@ -5753,11 +5761,11 @@ def _build_402(endpoint: str, price_override: float = None):
         if isinstance(_ext_desc, str) and len(_ext_desc) > 220:
             ext["description"] = _ext_desc[:217].rstrip() + "..."
         return {
-            "x402Version": p.get("x402Version", 2),
+            # v48.9.12-DUAL: o CABEÇALHO é sempre o payload v2 (o corpo virou
+            # v1). O client @x402/fetch lê este header primeiro.
+            "x402Version": 2,
             "resource":    _res,
-            "accepts":     p.get("accepts"),
-            # compat v1: alguns scanners antigos leem este campo
-            "paymentRequirements": p.get("paymentRequirements"),
+            "accepts":     p.get("acceptsV2") or p.get("accepts"),
             "extensions":  {"bazaar": ext},
             # "challenges" (cópia de accepts) e "upsell" (amostra, try_free,
             # créditos, docs) permanecem apenas no CORPO — não são necessários
@@ -6095,7 +6103,7 @@ def _verify_payment(endpoint: str, payment_header: str):
         # v39: prefere o desafio EMITIDO ao recalculado — ver _CHALLENGE_CACHE.
         accepts = _challenge_recall(endpoint)
         if accepts is None:
-            accepts = _build_402(endpoint).get_json()["accepts"]
+            accepts = _build_402(endpoint).get_json()["acceptsV2"]
         else:
             _issued = accepts[0].get("amount") if accepts else None
             _now_amt = str(int(get_dynamic_price(endpoint) * 10 ** USDC_DECIMALS))
@@ -6110,6 +6118,15 @@ def _verify_payment(endpoint: str, payment_header: str):
         pay_net = str(payload.get("network")
                       or (payload.get("accepted") or {}).get("network")
                       or network or "")
+        # v48.9.12-DUAL: o client v1 assina com nome curto ("base"/"solana").
+        # Sem normalizar para CAIP-2 aqui, o casamento com os accepts falhava
+        # e o loop abaixo pulava TODOS os candidatos (pagamento v1 morria
+        # sem nunca chegar ao facilitator).
+        _V1_TO_CAIP = {"base": BASE_CAIP2, "solana": f"solana:{SOL_GENESIS}",
+                       "base-sepolia": "eip155:84532"}
+        if pay_net in _V1_TO_CAIP:
+            pay_net = _V1_TO_CAIP[pay_net]
+            payload["network"] = pay_net   # o comparador do loop lê daqui
         matched = [a for a in accepts if str(a.get("network", "")) == pay_net]
         ordered = matched if matched else accepts
         # v21.6 DEFINITIVO (formato extraído do SDK oficial x402/PayAI):
@@ -6179,9 +6196,21 @@ def _verify_payment(endpoint: str, payment_header: str):
             # pagamento antes de desistir. Seguro: autorização EIP-3009 é de
             # uso único (nonce) — uma 2ª liquidação falharia on-chain.
             settled, sdata, fac = False, {}, None
+            # v48.9.12-DUAL: payload v1 (X-PAYMENT, x402Version:1) pede
+            # paymentRequirements no formato v1 — o facilitator casa
+            # requirements↔payload e rejeita formato cruzado. Mas há
+            # facilitator estrito que só fala CAIP-2: tenta v1 E v2.
+            _reqs = [req]
+            if int((payload or {}).get("x402Version", 2) or 2) == 1:
+                _v1r = _accept_to_v1(req, endpoint)
+                _reqs = ([_v1r] if _v1r else []) + [req]
             for _f in facs:
                 _tag = getattr(_f, 'tag', ('CDP' if getattr(_f, 'is_cdp', False) else 'PayAI'))
-                ok, reason, vdata = _f.verify(payload, req)
+                ok, reason, vdata = False, "", {}
+                for _rq in _reqs:
+                    ok, reason, vdata = _f.verify(payload, _rq)
+                    if ok:
+                        break
                 if not ok:
                     # v44.2.2: motivo carimbado vai pro log E pro 402 (retorno
                     # final) — o cliente vê na hora POR QUE recusou.
@@ -10636,7 +10665,7 @@ def manifest_x402():
         ch = _build_402(path).get_json(silent=True)
         if not ch:
             return None
-        accepts = ch.get("accepts") or []
+        accepts = ch.get("acceptsV2") or ch.get("accepts") or []   # v48.9.12
         if not accepts:
             return None
         primary = accepts[0]
@@ -11470,11 +11499,12 @@ def _x402_audit_handler():
     # ---- 4. estrutura do desafio -------------------------------------------
     accepts = ch.get("accepts") or []
     if p["status_code"] == 402:
-        if ch.get("x402Version") != 2:
-            add("warning", "x402_version",
-                f"x402Version is {ch.get('x402Version')!r}; v2 is current.")
+        if ch.get("x402Version") == 2 or (ch.get("x402Version") == 1 and ch.get("acceptsV2")):
+            add("pass", "x402_version",
+                "Dual-format (v48.9.12): v1 body for stock clients + v2 PAYMENT-REQUIRED header.")
         else:
-            add("pass", "x402_version", "Declares x402Version 2.")
+            add("warning", "x402_version",
+                f"x402Version is {ch.get('x402Version')!r}; expected dual (1 body + 2 header).")
         if not accepts:
             add("critical", "accepts",
                 "No accepts[] array — the agent has no payment instructions.")
@@ -21669,6 +21699,29 @@ so here are your options as a human:</p>
 _v46_build_402_orig = _build_402
 
 
+def _accept_to_v1(a: dict, endpoint: str) -> dict:
+    """v48.9.12-DUAL — converte um accept v2 (rede CAIP-2, campo amount) para o
+    formato do schema Zod v1 do client stock (x402-fetch@1.x): nomes curtos de
+    rede + maxAmountRequired/resource/description/mimeType OBRIGATÓRIOS.
+    Algorand não consta do enum v1 → None (rede v2-only, segue no header)."""
+    _V1_NET = {BASE_CAIP2: "base", f"solana:{SOL_GENESIS}": "solana"}
+    _n = _V1_NET.get(str(a.get("network", "")))
+    if not _n:
+        return None
+    return {
+        "scheme":            a.get("scheme", "exact"),
+        "network":           _n,
+        "maxAmountRequired": str(a.get("amount") or a.get("maxAmountRequired") or "0"),
+        "resource":          f"{_public_base()}{endpoint}",
+        "description":       ENDPOINT_DESC.get(endpoint, f"Losbeto — {endpoint}"),
+        "mimeType":          "application/json",
+        "payTo":             a.get("payTo", ""),
+        "maxTimeoutSeconds": int(a.get("maxTimeoutSeconds", 300)),
+        "asset":             a.get("asset", ""),
+        "extra":             a.get("extra") or {},
+    }
+
+
 def _build_402(endpoint: str, price_override: float = None):  # noqa: F811 — v48.1.1: encaminha override promocional
     """Desafio 402 servido de memória por CHALLENGE_CACHE_TTL segundos.
     O conteúdo só muda quando o preço muda; com 22 mil sondagens/dia, montar
@@ -23941,7 +23994,7 @@ def _pay_bridge_handler(raw_endpoint):
         chal = _build_402(ep).get_json() or {}
     except Exception as e:
         return jsonify({"error": "challenge_failed", "reason": str(e)[:160]}), 500
-    accepts = chal.get("accepts") or []
+    accepts = chal.get("acceptsV2") or chal.get("accepts") or []   # v48.9.12: corpo agora é v1
     base_accept = next((a for a in accepts
                          if str(a.get("network", "")).startswith("eip155")), None)
     sol_accept = next((a for a in accepts
@@ -24286,7 +24339,7 @@ def circle_listing_helper():
 # Discovery API — os dois bloqueadores práticos que restavam para o canal
 # Circle. Código pronto; o resto desta semana é SUBMISSÃO MANUAL, não feature.
 # ============================================================================
-VERSION = "48.9.11-PITCH"  # v48.9.9: identidade+interop que o radar pediu — /.well-known/did.json (did:web), /.well-known/brick-blue.json, /api/mcp alias, /sse (ponte MCP legada) + seletor de carteira EIP-6963 no /pay (fim da loteria window.ethereum com várias extensões) | v48.9.8-SOLPAY  # v48.9.8: /pay ganha checkout SOLANA (Phantom — transferChecked USDC-SPL, feePayer do facilitador paga o gas; alternativa real à smart wallet da Coinbase que os facilitadores rejeitam) + manifesto ganha campos padrão-de-catálogo (siwx/supportsVanillax402/supportsCircleGateway/metadata.provider, estilo Vybe)  # v48.9.7: rodapé da home linka /pricing·/terms·/privacy·/impressum + sitemap  # v48.9.6: /pay detecta smart wallet e saldo USDC-Base ANTES de assinar + Pix Fase 0 para planos ≥$0.99  # v48.9.5: /.well-known/agent-skills/index.json REAL (Cloudflare Discovery RFC 0.2.0) + classificador UA do dash reconhece Barkrowler/bots compatible
+VERSION = "48.9.12-DUAL"  # v48.9.9: identidade+interop que o radar pediu — /.well-known/did.json (did:web), /.well-known/brick-blue.json, /api/mcp alias, /sse (ponte MCP legada) + seletor de carteira EIP-6963 no /pay (fim da loteria window.ethereum com várias extensões) | v48.9.8-SOLPAY  # v48.9.8: /pay ganha checkout SOLANA (Phantom — transferChecked USDC-SPL, feePayer do facilitador paga o gas; alternativa real à smart wallet da Coinbase que os facilitadores rejeitam) + manifesto ganha campos padrão-de-catálogo (siwx/supportsVanillax402/supportsCircleGateway/metadata.provider, estilo Vybe)  # v48.9.7: rodapé da home linka /pricing·/terms·/privacy·/impressum + sitemap  # v48.9.6: /pay detecta smart wallet e saldo USDC-Base ANTES de assinar + Pix Fase 0 para planos ≥$0.99  # v48.9.5: /.well-known/agent-skills/index.json REAL (Cloudflare Discovery RFC 0.2.0) + classificador UA do dash reconhece Barkrowler/bots compatible
 # (v48.8.0: 402 "error" vira anúncio de 1 linha · /circle-listing com form real + enum real
 # (v48.7.0: GET /circle-listing (campos prontos p/ o Agent Marketplace da Circle, lançado 09/set/2026 — canal de distribuição inteiro que faltava no checklist) + checklist de boot ganha Circle/402 Index/BlockRun | base: v48.6.1-LEADFIX  # v48.6.1: lead_watch_loop parava de confundir varredura de catálogo (mesmo IP, muitos endpoints diferentes) e harness de smoke-test (600+ hits num único endpoint) com lead quente — agora filtra por UA de scanner conhecido, teto de volume plausível p/ avaliação humana e 1 alerta por IP por ciclo · cdp_bazaar_bootstrap_loop checa liquidações VITALÍCIAS em Base antes de avisar que falta BASE_OPERATOR_PRIVATE_KEY (evita o log contradizer o próprio "3526 liquidações, elegível ao Bazaar"da v46) · dashboard separa "trust genérico" (tx_count≥3) de "CDP Bazaar/Base" (>=1 settle em Base) — eram rótulos diferentes escondidos atrás do mesmo badge "✓ completo" | base: v48.6.0-REGISTER  # v48.6.0: /register·/signup·/auth/callback (demanda medida: 42 req/7d — playbook SaaS "registrar→receber key") · POST /register = /buy-credits $0.99 reempacotado como matrícula (MESMA tabela pública, mesma máquina de créditos idempotente — zero preço novo) · security.txt RFC 9116 (hermes-contact: 456 hits/24h) · lead_watch_loop: IP 5+× no MESMO endpoint pago em 24h sem liquidar → Telegram 1×/dia · dashboard: ZeroBot/heritrix/hermes saem de "humano" → crawler (funil honesto) · 402 upsell ganha ponte "registration" | base: v48.5.1-LOGO  # v48.5.1: /favicon.png|.ico = PNG 256px moeda-L #4ade80 embutido em base64 (6KB, zero arquivo externo) + /favicon.svg vetorial — aposenta placeholder SVG roxo "Ω10" | base: v48.5.0-FUNIL  # v48.5.0: /pay mobile-first (deep link + QR — fim do "No wallet found" que matava 55% do funil) · /blog/ + /login atendem demanda medida · docstring sincronizado | base: v48.4.0-WALLETPAY  # v48.4.0: /pay/<endpoint> checkout de carteira de navegador (MetaMask/Coinbase Wallet/Rabby) p/ o ~80% de avaliadores humanos que não tinham NENHUM caminho de compra sem CLI/agente + filtro de ruído de scanner de segredo (/env, /config/*.key) tirado do radar de demanda + banimento de modelo Gemini morto agora persiste entre restarts | base: v48.3.10-COMMERCE  # v48.3.10: /.well-known/acp.json (ACP discovery doc — demanda 8 reqs/4 IPs) | base: v48.3.9.4-PROXYFIX  # v48.3.9.4: /proxy registrado após o alvo /fetch (o loop ALIAS_ROUTES rodava antes e o pulava) | base: v48.3.9.3-KEYDIR  # v48.3.9.3: /.well-known/http-message-signatures-directory (JWKS Ed25519 assinado RFC9421) + /legal + /support + alias /proxy→/fetch | base: v48.3.9.2-ALIAS  # v48.3.9.2: alias /llm/freePublic → /llm/free (demanda medida: 7 IPs/7d) | base: v48.3.9.1-GLAMA  # v48.3.9.1: /.well-known/glama.json aceita override via env GLAMA_CLAIM_JSON (claim do Glama por HTTP challenge sem novo deploy de código) | base: v48.3.9-FETCH
 log.warning("🧠 v48.2.0-SMART — preço de tabela fixo + First-Call Bonus pós-compra · "
