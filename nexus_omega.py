@@ -1799,8 +1799,18 @@ class FacilitatorClient:
                 log.warning(f"⚠️ facilitator /verify body enviado: {json.dumps(body)[:600]}")
                 return False, f"facilitator-{r.status_code}:{r.text[:300]}", {}
             data = r.json() if r.text else {}
-            return bool(data.get("isValid") or data.get("valid")), \
-                   data.get("invalidReason", ""), data
+            _ok = bool(data.get("isValid") or data.get("valid"))
+            # v48.9.13-V1FIX: 200 com isValid=false também carrega o motivo
+            # real (ex.: insufficient_funds) — sem este log o attempt v1
+            # falhava invisível e só se via o erro do attempt de fallback.
+            if not _ok:
+                log.info(f"ℹ️ facilitator /verify 200 isValid=false: "
+                         f"reason={data.get('invalidReason') or data.get('reason')} "
+                         f"msg={str(data.get('invalidMessage') or data.get('message'))[:200]} "
+                         f"| req_net={requirements.get('network')} "
+                         f"pay_net={payment_payload.get('network')}")
+            data["_http"] = r.status_code   # v48.9.13: caller prefere 200-vs-400
+            return _ok, data.get("invalidReason", ""), data
         except Exception as e:
             return False, f"facilitator-error:{e}", {}
 
@@ -6119,14 +6129,19 @@ def _verify_payment(endpoint: str, payment_header: str):
                       or (payload.get("accepted") or {}).get("network")
                       or network or "")
         # v48.9.12-DUAL: o client v1 assina com nome curto ("base"/"solana").
-        # Sem normalizar para CAIP-2 aqui, o casamento com os accepts falhava
-        # e o loop abaixo pulava TODOS os candidatos (pagamento v1 morria
-        # sem nunca chegar ao facilitator).
+        # v48.9.13-V1FIX: a conversão para CAIP-2 vale SÓ para o MATCHING
+        # local — NUNCA grave o CAIP-2 dentro de um payload v1: o facilitator
+        # casa formato↔formato e REJEITA v1 com rede CAIP-2 ("x402Version 1
+        # requires V1 network format, got 'eip155:8453'" — erro real do PayAI
+        # em 24/09). Para payload v2 (rede já é CAIP-2) a gravação é no-op.
         _V1_TO_CAIP = {"base": BASE_CAIP2, "solana": f"solana:{SOL_GENESIS}",
                        "base-sepolia": "eip155:84532"}
-        if pay_net in _V1_TO_CAIP:
-            pay_net = _V1_TO_CAIP[pay_net]
-            payload["network"] = pay_net   # o comparador do loop lê daqui
+        _raw_net = pay_net
+        if _raw_net in _V1_TO_CAIP:
+            # v48.9.13-V1FIX: NUNCA gravar network no payload — v1 exige nome
+            # curto dentro do envelope; v2 já traz CAIP-2 em accepted.network.
+            # A conversão é só da CÓPIA local, p/ casar com accepts v2.
+            pay_net = _V1_TO_CAIP[_raw_net]
         matched = [a for a in accepts if str(a.get("network", "")) == pay_net]
         ordered = matched if matched else accepts
         # v21.6 DEFINITIVO (formato extraído do SDK oficial x402/PayAI):
@@ -6158,6 +6173,10 @@ def _verify_payment(endpoint: str, payment_header: str):
             _payload_net = str((payload or {}).get("network")
                                or ((payload or {}).get("accepted") or {}).get("network")
                                or (payload or {}).get("chain") or "")
+            # v48.9.13-V1FIX: nome curto v1 ("base") normalizado p/ comparar
+            # com accepts v2 (CAIP-2). Sem isso o guard abaixo descartava
+            # TODO candidato de um pagamento v1 (rede nunca casava).
+            _payload_net = _V1_TO_CAIP.get(_payload_net, _payload_net)
             _req_net = str(req.get("network", ""))
             if _payload_net and _req_net and _payload_net != _req_net:
                 log.debug(f"skip accept {_req_net} (cliente pagou em {_payload_net})")
@@ -6207,14 +6226,23 @@ def _verify_payment(endpoint: str, payment_header: str):
             for _f in facs:
                 _tag = getattr(_f, 'tag', ('CDP' if getattr(_f, 'is_cdp', False) else 'PayAI'))
                 ok, reason, vdata = False, "", {}
+                _rq_ok = req
+                _best = None
                 for _rq in _reqs:
                     ok, reason, vdata = _f.verify(payload, _rq)
                     if ok:
+                        _rq_ok = _rq     # v48.9.13-V1FIX: settle usa QUEM VERIFICOU
                         break
+                    # v48.9.13: 200 com isValid=false = formato ACEITO, pagamento
+                    # recusado no mérito (ex.: insufficient_balance). Esse motivo
+                    # é o que o cliente precisa ver — não o ruído 400 do fallback
+                    # de formato (ex.: unsupported_x402_version do attempt v2).
+                    if (vdata or {}).get("_http") == 200 and _best is None:
+                        _best = reason
                 if not ok:
                     # v44.2.2: motivo carimbado vai pro log E pro 402 (retorno
                     # final) — o cliente vê na hora POR QUE recusou.
-                    fac_reasons[_tag] = str(reason or 'facilitator-rejected')[:140]
+                    fac_reasons[_tag] = str(_best or reason or 'facilitator-rejected')[:140]
                     log.warning(f"⚠️ {_tag}.verify falhou p/ {endpoint}: {reason} | vdata={vdata}")
                     if _tag == 'CDP':
                         _cdp_note_failure(reason)   # v44.3.3: alimenta o disjuntor
@@ -6226,7 +6254,7 @@ def _verify_payment(endpoint: str, payment_header: str):
                          "description": ENDPOINT_DESC.get(endpoint, endpoint),
                          "mimeType": "application/json"}
                         if getattr(_f, 'is_cdp', False) else None)
-                _ok_settle, _sdata = _f.settle(payload, req, bazaar=bz, resource=_res)
+                _ok_settle, _sdata = _f.settle(payload, _rq_ok, bazaar=bz, resource=_res)
                 if _ok_settle:
                     settled, sdata, fac = True, _sdata, _f
                     if _tag == 'CDP':
@@ -24339,7 +24367,7 @@ def circle_listing_helper():
 # Discovery API — os dois bloqueadores práticos que restavam para o canal
 # Circle. Código pronto; o resto desta semana é SUBMISSÃO MANUAL, não feature.
 # ============================================================================
-VERSION = "48.9.12-DUAL"  # v48.9.9: identidade+interop que o radar pediu — /.well-known/did.json (did:web), /.well-known/brick-blue.json, /api/mcp alias, /sse (ponte MCP legada) + seletor de carteira EIP-6963 no /pay (fim da loteria window.ethereum com várias extensões) | v48.9.8-SOLPAY  # v48.9.8: /pay ganha checkout SOLANA (Phantom — transferChecked USDC-SPL, feePayer do facilitador paga o gas; alternativa real à smart wallet da Coinbase que os facilitadores rejeitam) + manifesto ganha campos padrão-de-catálogo (siwx/supportsVanillax402/supportsCircleGateway/metadata.provider, estilo Vybe)  # v48.9.7: rodapé da home linka /pricing·/terms·/privacy·/impressum + sitemap  # v48.9.6: /pay detecta smart wallet e saldo USDC-Base ANTES de assinar + Pix Fase 0 para planos ≥$0.99  # v48.9.5: /.well-known/agent-skills/index.json REAL (Cloudflare Discovery RFC 0.2.0) + classificador UA do dash reconhece Barkrowler/bots compatible
+VERSION = "48.9.13-V1FIX"  # v48.9.13: verify v1 NÃO converte network p/ CAIP-2 (PayAI/CDP rejeitam v1 com CAIP-2 — "x402Version 1 requires V1 network format") + settle usa o requirement que VERIFICOU + match de rede normalizado no guard | v48.9.12-DUAL: corpo v1 + cabeçalho v2  # v48.9.9: identidade+interop que o radar pediu — /.well-known/did.json (did:web), /.well-known/brick-blue.json, /api/mcp alias, /sse (ponte MCP legada) + seletor de carteira EIP-6963 no /pay (fim da loteria window.ethereum com várias extensões) | v48.9.8-SOLPAY  # v48.9.8: /pay ganha checkout SOLANA (Phantom — transferChecked USDC-SPL, feePayer do facilitador paga o gas; alternativa real à smart wallet da Coinbase que os facilitadores rejeitam) + manifesto ganha campos padrão-de-catálogo (siwx/supportsVanillax402/supportsCircleGateway/metadata.provider, estilo Vybe)  # v48.9.7: rodapé da home linka /pricing·/terms·/privacy·/impressum + sitemap  # v48.9.6: /pay detecta smart wallet e saldo USDC-Base ANTES de assinar + Pix Fase 0 para planos ≥$0.99  # v48.9.5: /.well-known/agent-skills/index.json REAL (Cloudflare Discovery RFC 0.2.0) + classificador UA do dash reconhece Barkrowler/bots compatible
 # (v48.8.0: 402 "error" vira anúncio de 1 linha · /circle-listing com form real + enum real
 # (v48.7.0: GET /circle-listing (campos prontos p/ o Agent Marketplace da Circle, lançado 09/set/2026 — canal de distribuição inteiro que faltava no checklist) + checklist de boot ganha Circle/402 Index/BlockRun | base: v48.6.1-LEADFIX  # v48.6.1: lead_watch_loop parava de confundir varredura de catálogo (mesmo IP, muitos endpoints diferentes) e harness de smoke-test (600+ hits num único endpoint) com lead quente — agora filtra por UA de scanner conhecido, teto de volume plausível p/ avaliação humana e 1 alerta por IP por ciclo · cdp_bazaar_bootstrap_loop checa liquidações VITALÍCIAS em Base antes de avisar que falta BASE_OPERATOR_PRIVATE_KEY (evita o log contradizer o próprio "3526 liquidações, elegível ao Bazaar"da v46) · dashboard separa "trust genérico" (tx_count≥3) de "CDP Bazaar/Base" (>=1 settle em Base) — eram rótulos diferentes escondidos atrás do mesmo badge "✓ completo" | base: v48.6.0-REGISTER  # v48.6.0: /register·/signup·/auth/callback (demanda medida: 42 req/7d — playbook SaaS "registrar→receber key") · POST /register = /buy-credits $0.99 reempacotado como matrícula (MESMA tabela pública, mesma máquina de créditos idempotente — zero preço novo) · security.txt RFC 9116 (hermes-contact: 456 hits/24h) · lead_watch_loop: IP 5+× no MESMO endpoint pago em 24h sem liquidar → Telegram 1×/dia · dashboard: ZeroBot/heritrix/hermes saem de "humano" → crawler (funil honesto) · 402 upsell ganha ponte "registration" | base: v48.5.1-LOGO  # v48.5.1: /favicon.png|.ico = PNG 256px moeda-L #4ade80 embutido em base64 (6KB, zero arquivo externo) + /favicon.svg vetorial — aposenta placeholder SVG roxo "Ω10" | base: v48.5.0-FUNIL  # v48.5.0: /pay mobile-first (deep link + QR — fim do "No wallet found" que matava 55% do funil) · /blog/ + /login atendem demanda medida · docstring sincronizado | base: v48.4.0-WALLETPAY  # v48.4.0: /pay/<endpoint> checkout de carteira de navegador (MetaMask/Coinbase Wallet/Rabby) p/ o ~80% de avaliadores humanos que não tinham NENHUM caminho de compra sem CLI/agente + filtro de ruído de scanner de segredo (/env, /config/*.key) tirado do radar de demanda + banimento de modelo Gemini morto agora persiste entre restarts | base: v48.3.10-COMMERCE  # v48.3.10: /.well-known/acp.json (ACP discovery doc — demanda 8 reqs/4 IPs) | base: v48.3.9.4-PROXYFIX  # v48.3.9.4: /proxy registrado após o alvo /fetch (o loop ALIAS_ROUTES rodava antes e o pulava) | base: v48.3.9.3-KEYDIR  # v48.3.9.3: /.well-known/http-message-signatures-directory (JWKS Ed25519 assinado RFC9421) + /legal + /support + alias /proxy→/fetch | base: v48.3.9.2-ALIAS  # v48.3.9.2: alias /llm/freePublic → /llm/free (demanda medida: 7 IPs/7d) | base: v48.3.9.1-GLAMA  # v48.3.9.1: /.well-known/glama.json aceita override via env GLAMA_CLAIM_JSON (claim do Glama por HTTP challenge sem novo deploy de código) | base: v48.3.9-FETCH
 log.warning("🧠 v48.2.0-SMART — preço de tabela fixo + First-Call Bonus pós-compra · "
