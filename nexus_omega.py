@@ -6190,10 +6190,20 @@ def _verify_payment(endpoint: str, payment_header: str):
             # então blob/resource da CDP só vão quando a CDP liquidou.
             # v44.3.3: disjuntor aberto = CDP fora da cadeia (venda vai direto
             # ao PayAI, sem o ~1s perdido nem o WARNING por request).
-            if CDP_FAC and _req_net.startswith("eip155") and _cdp_available():
+            # v48.9.15-ROUTE: envelope v1 (x402-fetch@1.x, X-PAYMENT) NÃO vai à
+            # CDP — a hosted Facilitator da Coinbase rejeita v1 com
+            # "invalid_amount" vazio (reprovado em produção 24/09 com
+            # maxAmountRequired E amount presentes; código fechado). PayAI
+            # verifica v1 comprovadamente (chega a insufficient_balance).
+            # v2 mantém CDP-first: clientes v2 (stipend/indexar/@x402) alimentam
+            # o Bazaar, que é o índice de descoberta de compradores.
+            _is_v1_pay = int((payload or {}).get("x402Version", 2) or 2) == 1
+            if CDP_FAC and _req_net.startswith("eip155") and _cdp_available() and not _is_v1_pay:
                 facs = [CDP_FAC]
                 if FACILITATOR and CDP_FALLBACK_PAYAI:
                     facs.append(FACILITATOR)
+            elif _is_v1_pay and FACILITATOR:
+                facs = [FACILITATOR]
             elif GO_FAC and _req_net.startswith("algorand"):
                 # v44.7.0: pagamento AVM vai SÓ ao GoPlausible — regra do
                 # challenge (settle fora dele não conta no leaderboard) e
@@ -6237,8 +6247,14 @@ def _verify_payment(endpoint: str, payment_header: str):
                     # recusado no mérito (ex.: insufficient_balance). Esse motivo
                     # é o que o cliente precisa ver — não o ruído 400 do fallback
                     # de formato (ex.: unsupported_x402_version do attempt v2).
-                    if (vdata or {}).get("_http") == 200 and _best is None:
-                        _best = reason
+                    if (vdata or {}).get("_http") == 200:
+                        if _best is None:
+                            _best = reason
+                        # v48.9.15: 200 isValid=false = formato ACEITO pelo
+                        # facilitator, pagamento recusado no mérito. Tentar o
+                        # fallback de formato (v2 p/ payload v1) é perda de
+                        # ~1s e ruído 400 garantido — para no primeiro mérito.
+                        break
                 if not ok:
                     # v44.2.2: motivo carimbado vai pro log E pro 402 (retorno
                     # final) — o cliente vê na hora POR QUE recusou.
@@ -24372,7 +24388,7 @@ def circle_listing_helper():
 # Discovery API — os dois bloqueadores práticos que restavam para o canal
 # Circle. Código pronto; o resto desta semana é SUBMISSÃO MANUAL, não feature.
 # ============================================================================
-VERSION = "48.9.14-V1FIX2"  # v48.9.14: _accept_to_v1 passa a incluir o campo `amount` (além de maxAmountRequired) — a CDP Facilitator no modo v1 lê `amount` e devolvia "invalid amount: " vazio, bloqueando settle CDP/Bazaar para clientes v1 | v48.9.13: verify v1 NÃO converte network p/ CAIP-2 + settle usa o requirement que VERIFICOU + match normalizado  # v48.9.9: identidade+interop que o radar pediu — /.well-known/did.json (did:web), /.well-known/brick-blue.json, /api/mcp alias, /sse (ponte MCP legada) + seletor de carteira EIP-6963 no /pay (fim da loteria window.ethereum com várias extensões) | v48.9.8-SOLPAY  # v48.9.8: /pay ganha checkout SOLANA (Phantom — transferChecked USDC-SPL, feePayer do facilitador paga o gas; alternativa real à smart wallet da Coinbase que os facilitadores rejeitam) + manifesto ganha campos padrão-de-catálogo (siwx/supportsVanillax402/supportsCircleGateway/metadata.provider, estilo Vybe)  # v48.9.7: rodapé da home linka /pricing·/terms·/privacy·/impressum + sitemap  # v48.9.6: /pay detecta smart wallet e saldo USDC-Base ANTES de assinar + Pix Fase 0 para planos ≥$0.99  # v48.9.5: /.well-known/agent-skills/index.json REAL (Cloudflare Discovery RFC 0.2.0) + classificador UA do dash reconhece Barkrowler/bots compatible
+VERSION = "48.9.15-ROUTE"  # v48.9.15: pagamento v1 vai DIRETO ao PayAI — a CDP hosted REJEITA envelopes v1 ("invalid_amount" vazio, reprovado com maxAmountRequired E amount em 24/09; código fechado, não fixável às cegas sem gastar deploys do operador). PayAI verifica v1 comprovadamente. v2 segue CDP-first (Bazaar via clientes v2: stipend/indexar). Efeitos: -1~2s de latência por tentativa v1, 402 limpo (só insufficient_balance), zero risco de venda | v48.9.14: _accept_to_v1 inclui `amount` p/ CDP  # v48.9.13: verify v1 NÃO converte network p/ CAIP-2 + settle usa o requirement que VERIFICOU + match normalizado  # v48.9.9: identidade+interop que o radar pediu — /.well-known/did.json (did:web), /.well-known/brick-blue.json, /api/mcp alias, /sse (ponte MCP legada) + seletor de carteira EIP-6963 no /pay (fim da loteria window.ethereum com várias extensões) | v48.9.8-SOLPAY  # v48.9.8: /pay ganha checkout SOLANA (Phantom — transferChecked USDC-SPL, feePayer do facilitador paga o gas; alternativa real à smart wallet da Coinbase que os facilitadores rejeitam) + manifesto ganha campos padrão-de-catálogo (siwx/supportsVanillax402/supportsCircleGateway/metadata.provider, estilo Vybe)  # v48.9.7: rodapé da home linka /pricing·/terms·/privacy·/impressum + sitemap  # v48.9.6: /pay detecta smart wallet e saldo USDC-Base ANTES de assinar + Pix Fase 0 para planos ≥$0.99  # v48.9.5: /.well-known/agent-skills/index.json REAL (Cloudflare Discovery RFC 0.2.0) + classificador UA do dash reconhece Barkrowler/bots compatible
 # (v48.8.0: 402 "error" vira anúncio de 1 linha · /circle-listing com form real + enum real
 # (v48.7.0: GET /circle-listing (campos prontos p/ o Agent Marketplace da Circle, lançado 09/set/2026 — canal de distribuição inteiro que faltava no checklist) + checklist de boot ganha Circle/402 Index/BlockRun | base: v48.6.1-LEADFIX  # v48.6.1: lead_watch_loop parava de confundir varredura de catálogo (mesmo IP, muitos endpoints diferentes) e harness de smoke-test (600+ hits num único endpoint) com lead quente — agora filtra por UA de scanner conhecido, teto de volume plausível p/ avaliação humana e 1 alerta por IP por ciclo · cdp_bazaar_bootstrap_loop checa liquidações VITALÍCIAS em Base antes de avisar que falta BASE_OPERATOR_PRIVATE_KEY (evita o log contradizer o próprio "3526 liquidações, elegível ao Bazaar"da v46) · dashboard separa "trust genérico" (tx_count≥3) de "CDP Bazaar/Base" (>=1 settle em Base) — eram rótulos diferentes escondidos atrás do mesmo badge "✓ completo" | base: v48.6.0-REGISTER  # v48.6.0: /register·/signup·/auth/callback (demanda medida: 42 req/7d — playbook SaaS "registrar→receber key") · POST /register = /buy-credits $0.99 reempacotado como matrícula (MESMA tabela pública, mesma máquina de créditos idempotente — zero preço novo) · security.txt RFC 9116 (hermes-contact: 456 hits/24h) · lead_watch_loop: IP 5+× no MESMO endpoint pago em 24h sem liquidar → Telegram 1×/dia · dashboard: ZeroBot/heritrix/hermes saem de "humano" → crawler (funil honesto) · 402 upsell ganha ponte "registration" | base: v48.5.1-LOGO  # v48.5.1: /favicon.png|.ico = PNG 256px moeda-L #4ade80 embutido em base64 (6KB, zero arquivo externo) + /favicon.svg vetorial — aposenta placeholder SVG roxo "Ω10" | base: v48.5.0-FUNIL  # v48.5.0: /pay mobile-first (deep link + QR — fim do "No wallet found" que matava 55% do funil) · /blog/ + /login atendem demanda medida · docstring sincronizado | base: v48.4.0-WALLETPAY  # v48.4.0: /pay/<endpoint> checkout de carteira de navegador (MetaMask/Coinbase Wallet/Rabby) p/ o ~80% de avaliadores humanos que não tinham NENHUM caminho de compra sem CLI/agente + filtro de ruído de scanner de segredo (/env, /config/*.key) tirado do radar de demanda + banimento de modelo Gemini morto agora persiste entre restarts | base: v48.3.10-COMMERCE  # v48.3.10: /.well-known/acp.json (ACP discovery doc — demanda 8 reqs/4 IPs) | base: v48.3.9.4-PROXYFIX  # v48.3.9.4: /proxy registrado após o alvo /fetch (o loop ALIAS_ROUTES rodava antes e o pulava) | base: v48.3.9.3-KEYDIR  # v48.3.9.3: /.well-known/http-message-signatures-directory (JWKS Ed25519 assinado RFC9421) + /legal + /support + alias /proxy→/fetch | base: v48.3.9.2-ALIAS  # v48.3.9.2: alias /llm/freePublic → /llm/free (demanda medida: 7 IPs/7d) | base: v48.3.9.1-GLAMA  # v48.3.9.1: /.well-known/glama.json aceita override via env GLAMA_CLAIM_JSON (claim do Glama por HTTP challenge sem novo deploy de código) | base: v48.3.9-FETCH
 log.warning("🧠 v48.2.0-SMART — preço de tabela fixo + First-Call Bonus pós-compra · "
