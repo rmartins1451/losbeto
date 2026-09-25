@@ -1830,28 +1830,22 @@ class FacilitatorClient:
             # ---------------------------------------------------------------
             # v41.1 — `resource` VIROU OPT-IN. Leia antes de ligar.
             #
-            # O patch v41 passou a injetar pp["resource"] em todo settle CDP,
-            # com a justificativa de que o Bazaar precisa dele para indexar.
-            # Fui verificar na extensão oficial do Bazaar (coinbase/x402,
-            # go/extensions/bazaar) e o que está documentado é outra coisa:
+            # ATUALIZAÇÃO v48.9.19-CATALOG (25/set/2026): a dúvida original
+            # está RESOLVIDA. A documentação oficial da CDP ("Get discovered",
+            # 24/set/2026) passou a declarar explicitamente:
+            #   "The payment payload sent to the facilitator must include
+            #    paymentPayload.resource so CDP knows which resource to
+            #    catalog."
+            #   "the settle request must contain paymentPayload.resource.
+            #    Without this, the Bazaar has no way to associate the
+            #    discovery metadata with a resource."
+            # Ou seja: sem CDP_SEND_RESOURCE=1, nenhum settle vira catálogo.
+            # O flag continua existindo por segurança operacional (testar com
+            # $0.01 e conferir /bazaar-status → discovery_feedback), mas o
+            # comportamento documentado como necessário é LIGADO.
             #
-            #   "V2: Extensions are in PaymentPayload.Extensions
-            #    (client copied from PaymentRequired)"
-            #   "V1: Discovery info is in PaymentRequirements.OutputSchema"
-            #
-            # Ou seja: o canal documentado é `extensions`, que este código já
-            # usava. Não achei `paymentPayload.resource` em lugar nenhum — nem
-            # no quickstart-for-sellers, nem na extensão Go.
-            #
-            # O risco é assimétrico. Se o facilitador ignorar o campo, não
-            # ganhamos nada. Se validar o schema estritamente, um campo
-            # desconhecido em paymentPayload pode fazer o settle ser REJEITADO
-            # — e Base é a maioria das vendas. Perder receita para testar uma
-            # hipótese não verificada é troca ruim.
-            #
-            # Então: desligado por padrão, ligável por env para testar.
-            #   CDP_SEND_RESOURCE=1  → volta ao comportamento do v41
-            # Teste com $0.01 em Base e confira /receipts antes de deixar ligado.
+            # Registro histórico da v41.1: o canal extensions já existia; o
+            # resource era a peça que faltava e hoje está confirmada.
             # ---------------------------------------------------------------
             if self.is_cdp and (bazaar or (resource and CDP_SEND_RESOURCE)):
                 pp = dict(payment_payload)
@@ -1875,6 +1869,9 @@ class FacilitatorClient:
             if self.is_cdp:
                 _ext = r.headers.get("EXTENSION-RESPONSES") or r.headers.get("extension-responses")
                 log.info(f"🏪 settle CDP ok | EXTENSION-RESPONSES: {_ext or 'AUSENTE'}")
+                # v48.9.19-CATALOG: persistir o veredito — sem isto, conferir a
+                # indexação exigia garimpar logs do Railway. /bazaar-status lê.
+                _bazaar_ext_note(_ext, bool(pp.get("resource")))
             return True, r.json()
         except Exception as e:
             return False, {"error": str(e)}
@@ -1906,6 +1903,35 @@ class FacilitatorClient:
         return cached
 
 FACILITATOR = FacilitatorClient(FACILITATOR_URL) if USE_FACILITATOR else None
+
+# ---------------------------------------------------------------------------
+# v48.9.19-CATALOG — veredito do Bazaar, persistido.
+# A CDP devolve o header EXTENSION-RESPONSES em verify/settle dizendo se o
+# metadata de discovery foi "processing" ou "rejected" (docs oficiais
+# x402/bazaar, 24/set/2026). Guardamos o último em disco para o operador ver
+# em /bazaar-status em vez de garimpar logs. Falha de escrita nunca derruba
+# um settle — por isso o try/except total.
+# ---------------------------------------------------------------------------
+_BAZAAR_EXT_PATH = HOME_DIR / "bazaar_ext_last.json"
+
+def _bazaar_ext_note(header_value: Optional[str], sent_resource: bool) -> None:
+    try:
+        _BAZAAR_EXT_PATH.write_text(json.dumps({
+            "ts": int(time.time()),
+            "extension_responses": header_value or None,
+            "paymentpayload_resource_sent": bool(sent_resource),
+        }))
+    except Exception:
+        pass
+
+def _bazaar_ext_last() -> dict:
+    try:
+        d = json.loads(_BAZAAR_EXT_PATH.read_text())
+        d["age_s"] = int(time.time()) - int(d.get("ts") or 0)
+        return d
+    except Exception:
+        return {"extension_responses": None, "note": "nenhum settle CDP desde o boot desta versão"}
+
 # v21.13: facilitator CDP dedicado para a rail Base — settles via CDP indexam
 # o endpoint automaticamente no x402 Bazaar da Coinbase (descoberta de agentes).
 CDP_FACILITATOR_URL = os.environ.get(
@@ -5294,20 +5320,31 @@ def _bazaar_blob(endpoint: str) -> dict:
         }
     props = {k: {"type": "string", "description": _PARAM_DESC.get(k, f"{k} parameter")}
              for k in params}
+    # v48.9.19-CATALOG: parâmetros FUNCIONAIS (tudo menos "format") são
+    # OBRIGATÓRIOS no schema. Docs CDP Bazaar (24/set/2026): "sem schemas
+    # explícitos, agentes descobrem o endpoint mas não conseguem montar uma
+    # chamada válida" — e o requisito de curadoria "agent-ready metadata"
+    # pede input schema completo. Com required=[], um agente chamava
+    # /research-brief sem ?q= e recebia 400 — chamada inválida construída a
+    # partir do NOSSO schema. O agente que segue o schema agora sempre monta
+    # uma chamada válida (pior caso: envia o exemplo — aceito e cobrado).
+    _req_params = sorted(k for k in params if k != "format")
     return {
         "info": {
             "input": {"type": "http", "method": "GET", "queryParams": params},
             "output": ({"type": "json", "example": example_out} if example_out
                        else {"type": "json"}),
         },
-        "inputSchema": {"type": "object", "properties": props, "required": []},
+        "inputSchema": {"type": "object", "properties": props,
+                        "required": _req_params},
         # Shape legado exigido pelo validador @agentcash/discovery (extractSchemas2)
         "schema": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "type": "object",
             "properties": {
                 "input": {"type": "object", "properties": {
-                    "queryParams": {"type": "object", "properties": props}}},
+                    "queryParams": {"type": "object", "properties": props,
+                                    "required": _req_params}}},
                 "output": {"type": "object", "properties": {
                     "example": {"type": "object", "description": desc}}},
             },
@@ -5801,7 +5838,9 @@ def _build_402(endpoint: str, price_override: float = None):
         payload["inputSchema"] = {
             "type": "object",
             "properties": _props,
-            "required": [],
+            # v48.9.19-CATALOG: _props já exclui "format"; o que sobra é
+            # parâmetro funcional = obrigatório (mesma regra do bazaar blob).
+            "required": sorted(_props.keys()),
             "additionalProperties": False,
         }
     payload["outputSchema"] = {"type": "object", "mimeType": "application/json"}
@@ -21901,6 +21940,19 @@ def bazaar_status():
                      f"-H 'X-PAYMENT: <base64 payload, network eip155:8453>'"),
             "then": "Declare that wallet in BUYER_WALLETS so it is labelled honestly.",
         },
+        # v48.9.19-CATALOG: o loop da indexação fica visível aqui. Docs CDP
+        # (24/set/2026) confirmam: settle precisa de paymentPayload.resource
+        # p/ catalogar, e o header EXTENSION-RESPONSES diz se o metadata foi
+        # aceito ("processing") ou rejeitado. CDP_SEND_RESOURCE=1 liga o envio.
+        "discovery_feedback": {
+            "cdp_send_resource_env": bool(CDP_SEND_RESOURCE),
+            "last_cdp_settle": _bazaar_ext_last(),
+            "how_to_read": ("extension_responses=processing → metadata aceito, "
+                            "indexação assíncrona em andamento; rejected → o "
+                            "schema declarado falhou na validação; null → "
+                            "nenhum settle CDP desde o boot. Janela de 30d: "
+                            "recurso sem settle recente some do catálogo."),
+        },
         "ts": int(time.time()), "version": VERSION,
     })
 
@@ -24415,7 +24467,7 @@ def circle_listing_helper():
 # Discovery API — os dois bloqueadores práticos que restavam para o canal
 # Circle. Código pronto; o resto desta semana é SUBMISSÃO MANUAL, não feature.
 # ============================================================================
-VERSION = "48.9.18-DEMAND"  # v48.9.18-DEMAND: /ask vira apelido pago de /llm (12 reqs no radar — convencao de pergunta p/ gateway LLM) + /api/session/properties entra no filtro de ruido (sonda de SDK de analytics, 11 IPs, nao e demanda de produto) | v48.9.17-HYGIENE: /mcp/v1 vira rota MCP real (13 reqs/10 IPs no radar tomavam 308 p/ chat/completions — probe MCP nao e comprador de LLM) + radar ignora sonda de vulnerabilidade (.log//storage//laravel) para nao poluir demanda | v48.9.16-SELLER: /.well-known/agenteconomy-verify.txt (claim por domínio, tokens via env AGENT_ECONOMY_TOKEN_API/_RAILWAY) + /config.js machine-readable (13 IPs sondaram, radar) + MCP tools/list com preços na description E _meta (convenção de discovery) | v48.9.15: pagamento v1 vai DIRETO ao PayAI — a CDP hosted REJEITA envelopes v1 ("invalid_amount" vazio, reprovado com maxAmountRequired E amount em 24/09; código fechado, não fixável às cegas sem gastar deploys do operador). PayAI verifica v1 comprovadamente. v2 segue CDP-first (Bazaar via clientes v2: stipend/indexar). Efeitos: -1~2s de latência por tentativa v1, 402 limpo (só insufficient_balance), zero risco de venda | v48.9.14: _accept_to_v1 inclui `amount` p/ CDP  # v48.9.13: verify v1 NÃO converte network p/ CAIP-2 + settle usa o requirement que VERIFICOU + match normalizado  # v48.9.9: identidade+interop que o radar pediu — /.well-known/did.json (did:web), /.well-known/brick-blue.json, /api/mcp alias, /sse (ponte MCP legada) + seletor de carteira EIP-6963 no /pay (fim da loteria window.ethereum com várias extensões) | v48.9.8-SOLPAY  # v48.9.8: /pay ganha checkout SOLANA (Phantom — transferChecked USDC-SPL, feePayer do facilitador paga o gas; alternativa real à smart wallet da Coinbase que os facilitadores rejeitam) + manifesto ganha campos padrão-de-catálogo (siwx/supportsVanillax402/supportsCircleGateway/metadata.provider, estilo Vybe)  # v48.9.7: rodapé da home linka /pricing·/terms·/privacy·/impressum + sitemap  # v48.9.6: /pay detecta smart wallet e saldo USDC-Base ANTES de assinar + Pix Fase 0 para planos ≥$0.99  # v48.9.5: /.well-known/agent-skills/index.json REAL (Cloudflare Discovery RFC 0.2.0) + classificador UA do dash reconhece Barkrowler/bots compatible
+VERSION = "48.9.19-CATALOG"  # v48.9.19-CATALOG: inputSchema do 402/Bazaar agora marca os parâmetros funcionais como OBRIGATÓRIOS (required=["q"], ["address"], ...) — docs CDP Bazaar (24/set/2026): "sem schemas completos, agentes descobrem o endpoint mas não conseguem montar uma chamada válida"; requisito de curadoria "agent-ready metadata". Antes ia required=[] em tudo. + EXTENSION-RESPONSES do settle CDP persistido em /data e exposto em /bazaar-status (fecha o loop da Ação 2: ligar CDP_SEND_RESOURCE=1 deixa de ser às cegas) | v48.9.18-DEMAND: /ask vira apelido pago de /llm (12 reqs no radar — convencao de pergunta p/ gateway LLM) + /api/session/properties entra no filtro de ruido (sonda de SDK de analytics, 11 IPs, nao e demanda de produto) | v48.9.17-HYGIENE: /mcp/v1 vira rota MCP real (13 reqs/10 IPs no radar tomavam 308 p/ chat/completions — probe MCP nao e comprador de LLM) + radar ignora sonda de vulnerabilidade (.log//storage//laravel) para nao poluir demanda | v48.9.16-SELLER: /.well-known/agenteconomy-verify.txt (claim por domínio, tokens via env AGENT_ECONOMY_TOKEN_API/_RAILWAY) + /config.js machine-readable (13 IPs sondaram, radar) + MCP tools/list com preços na description E _meta (convenção de discovery) | v48.9.15: pagamento v1 vai DIRETO ao PayAI — a CDP hosted REJEITA envelopes v1 ("invalid_amount" vazio, reprovado com maxAmountRequired E amount em 24/09; código fechado, não fixável às cegas sem gastar deploys do operador). PayAI verifica v1 comprovadamente. v2 segue CDP-first (Bazaar via clientes v2: stipend/indexar). Efeitos: -1~2s de latência por tentativa v1, 402 limpo (só insufficient_balance), zero risco de venda | v48.9.14: _accept_to_v1 inclui `amount` p/ CDP  # v48.9.13: verify v1 NÃO converte network p/ CAIP-2 + settle usa o requirement que VERIFICOU + match normalizado  # v48.9.9: identidade+interop que o radar pediu — /.well-known/did.json (did:web), /.well-known/brick-blue.json, /api/mcp alias, /sse (ponte MCP legada) + seletor de carteira EIP-6963 no /pay (fim da loteria window.ethereum com várias extensões) | v48.9.8-SOLPAY  # v48.9.8: /pay ganha checkout SOLANA (Phantom — transferChecked USDC-SPL, feePayer do facilitador paga o gas; alternativa real à smart wallet da Coinbase que os facilitadores rejeitam) + manifesto ganha campos padrão-de-catálogo (siwx/supportsVanillax402/supportsCircleGateway/metadata.provider, estilo Vybe)  # v48.9.7: rodapé da home linka /pricing·/terms·/privacy·/impressum + sitemap  # v48.9.6: /pay detecta smart wallet e saldo USDC-Base ANTES de assinar + Pix Fase 0 para planos ≥$0.99  # v48.9.5: /.well-known/agent-skills/index.json REAL (Cloudflare Discovery RFC 0.2.0) + classificador UA do dash reconhece Barkrowler/bots compatible
 # (v48.8.0: 402 "error" vira anúncio de 1 linha · /circle-listing com form real + enum real
 # (v48.7.0: GET /circle-listing (campos prontos p/ o Agent Marketplace da Circle, lançado 09/set/2026 — canal de distribuição inteiro que faltava no checklist) + checklist de boot ganha Circle/402 Index/BlockRun | base: v48.6.1-LEADFIX  # v48.6.1: lead_watch_loop parava de confundir varredura de catálogo (mesmo IP, muitos endpoints diferentes) e harness de smoke-test (600+ hits num único endpoint) com lead quente — agora filtra por UA de scanner conhecido, teto de volume plausível p/ avaliação humana e 1 alerta por IP por ciclo · cdp_bazaar_bootstrap_loop checa liquidações VITALÍCIAS em Base antes de avisar que falta BASE_OPERATOR_PRIVATE_KEY (evita o log contradizer o próprio "3526 liquidações, elegível ao Bazaar"da v46) · dashboard separa "trust genérico" (tx_count≥3) de "CDP Bazaar/Base" (>=1 settle em Base) — eram rótulos diferentes escondidos atrás do mesmo badge "✓ completo" | base: v48.6.0-REGISTER  # v48.6.0: /register·/signup·/auth/callback (demanda medida: 42 req/7d — playbook SaaS "registrar→receber key") · POST /register = /buy-credits $0.99 reempacotado como matrícula (MESMA tabela pública, mesma máquina de créditos idempotente — zero preço novo) · security.txt RFC 9116 (hermes-contact: 456 hits/24h) · lead_watch_loop: IP 5+× no MESMO endpoint pago em 24h sem liquidar → Telegram 1×/dia · dashboard: ZeroBot/heritrix/hermes saem de "humano" → crawler (funil honesto) · 402 upsell ganha ponte "registration" | base: v48.5.1-LOGO  # v48.5.1: /favicon.png|.ico = PNG 256px moeda-L #4ade80 embutido em base64 (6KB, zero arquivo externo) + /favicon.svg vetorial — aposenta placeholder SVG roxo "Ω10" | base: v48.5.0-FUNIL  # v48.5.0: /pay mobile-first (deep link + QR — fim do "No wallet found" que matava 55% do funil) · /blog/ + /login atendem demanda medida · docstring sincronizado | base: v48.4.0-WALLETPAY  # v48.4.0: /pay/<endpoint> checkout de carteira de navegador (MetaMask/Coinbase Wallet/Rabby) p/ o ~80% de avaliadores humanos que não tinham NENHUM caminho de compra sem CLI/agente + filtro de ruído de scanner de segredo (/env, /config/*.key) tirado do radar de demanda + banimento de modelo Gemini morto agora persiste entre restarts | base: v48.3.10-COMMERCE  # v48.3.10: /.well-known/acp.json (ACP discovery doc — demanda 8 reqs/4 IPs) | base: v48.3.9.4-PROXYFIX  # v48.3.9.4: /proxy registrado após o alvo /fetch (o loop ALIAS_ROUTES rodava antes e o pulava) | base: v48.3.9.3-KEYDIR  # v48.3.9.3: /.well-known/http-message-signatures-directory (JWKS Ed25519 assinado RFC9421) + /legal + /support + alias /proxy→/fetch | base: v48.3.9.2-ALIAS  # v48.3.9.2: alias /llm/freePublic → /llm/free (demanda medida: 7 IPs/7d) | base: v48.3.9.1-GLAMA  # v48.3.9.1: /.well-known/glama.json aceita override via env GLAMA_CLAIM_JSON (claim do Glama por HTTP challenge sem novo deploy de código) | base: v48.3.9-FETCH
 log.warning("🧠 v48.2.0-SMART — preço de tabela fixo + First-Call Bonus pós-compra · "
