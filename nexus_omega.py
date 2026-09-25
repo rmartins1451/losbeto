@@ -11006,7 +11006,10 @@ def _mcp_search(query: str, limit: int = 8) -> list:
 
 
 def _mcp_tools_list() -> list:
-    """Cinco tools em vez de setenta e três."""
+    """Cinco tools em vez de setenta e três.
+    v48.9.16: preço explícito em description E _meta (convenção de descoberta
+    MCP — marketplaces ranqueiam e exibem o custo ANTES da chamada; tool sem
+    preço declarado é pulada por agentes com orçamento)."""
     if MCP_LEGACY_TOOLS:
         return _mcp_legacy_tools_list()
     base = _public_base()
@@ -11014,13 +11017,15 @@ def _mcp_tools_list() -> list:
         {
             "name": "search_market_data",
             "description": (
-                "FIRST STEP for any market-data question. Describe what you need in "
-                "plain language and get back the endpoints that cover it, with their "
-                "price and parameters. Covers Brazil (central bank, B3), US equities, "
-                "forex, commodities, macro, crypto and AI research. "
+                "FREE. FIRST STEP for any market-data question. Describe what you "
+                "need in plain language and get back the endpoints that cover it, "
+                "with their price and parameters. Covers Brazil (central bank, B3), "
+                "US equities, forex, commodities, macro, crypto and AI research. "
                 "Examples: 'Brazilian interest rate and inflation', 'gold price', "
                 "'is this Solana token a rug pull', 'correlation between bitcoin and "
                 "the S&P', 'what is the Ibovespa doing'."),
+            "_meta": {"pricing": {"cost": "free",
+                                   "live_data": "per-endpoint x402 price, $0.005-$0.50/call"}},
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -11035,11 +11040,16 @@ def _mcp_tools_list() -> list:
         {
             "name": "get_market_data",
             "description": (
-                "Fetch data from an endpoint returned by search_market_data. "
-                "Without a subscription this returns a REAL but delayed sample at no "
-                "cost — enough to see the exact response shape and judge the data. "
-                "With an active subscription key it returns live data. "
-                f"Live data is also purchasable per call in USDC over x402 at {base}."),
+                "FREE for the delayed sample; the endpoint's x402 price applies for "
+                "live data (from $0.005/call). Fetch data from an endpoint returned "
+                "by search_market_data. Without a subscription this returns a REAL "
+                "but delayed sample at no cost — enough to see the exact response "
+                "shape and judge the data. With an active subscription key it "
+                "returns live data. Live data is also purchasable per call in USDC "
+                f"over x402 at {base}."),
+            "_meta": {"pricing": {"delayed_sample": "free",
+                                   "live": "endpoint's x402 price, from $0.005 USDC/call",
+                                   "subscription": f"plans from $0.99 at {base}/plans"}},
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -11055,11 +11065,15 @@ def _mcp_tools_list() -> list:
         {
             "name": "market_snapshot",
             "description": (
-                "One call for a whole area instead of several. 'brazil' returns central-bank "
-                "macro, the real interest rate, Ibovespa and B3 blue chips together; "
-                "'global' returns forex, commodities, equities and macro regime; "
-                "'crypto' returns oracle consensus, sentiment and market regime. "
-                "Use this when the question is broad rather than about one number."),
+                "FREE for delayed samples; live components billed at each endpoint's "
+                "x402 price. One call for a whole area instead of several. 'brazil' "
+                "returns central-bank macro, the real interest rate, Ibovespa and B3 "
+                "blue chips together; 'global' returns forex, commodities, equities "
+                "and macro regime; 'crypto' returns oracle consensus, sentiment and "
+                "market regime. Use this when the question is broad rather than "
+                "about one number."),
+            "_meta": {"pricing": {"delayed_sample": "free",
+                                   "live": "sum of component endpoints' x402 prices"}},
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -11072,17 +11086,21 @@ def _mcp_tools_list() -> list:
         {
             "name": "list_categories",
             "description": (
-                "The catalog at a glance: every category, how many endpoints it holds "
-                "and the cheapest price in it. Use when you want to know what this "
-                "service covers before searching."),
+                "FREE. The catalog at a glance: every category, how many endpoints "
+                "it holds and the cheapest price in it. Use when you want to know "
+                "what this service covers before searching."),
+            "_meta": {"pricing": {"cost": "free"}},
             "inputSchema": {"type": "object", "properties": {}},
         },
         {
             "name": "account_status",
             "description": (
-                "Check whether this connection has an active subscription, how much "
-                "credit is left and when it expires. Also returns how to subscribe. "
-                "Call this if a request returned delayed data and you need live."),
+                "FREE. Check whether this connection has an active subscription, how "
+                "much credit is left and when it expires. Also returns how to "
+                "subscribe (plans from $0.99). Call this if a request returned "
+                "delayed data and you need live."),
+            "_meta": {"pricing": {"cost": "free",
+                                   "subscription_plans": f"from $0.99 at {base}/plans"}},
             "inputSchema": {"type": "object", "properties": {}},
         },
     ]
@@ -24388,7 +24406,7 @@ def circle_listing_helper():
 # Discovery API — os dois bloqueadores práticos que restavam para o canal
 # Circle. Código pronto; o resto desta semana é SUBMISSÃO MANUAL, não feature.
 # ============================================================================
-VERSION = "48.9.15-ROUTE"  # v48.9.15: pagamento v1 vai DIRETO ao PayAI — a CDP hosted REJEITA envelopes v1 ("invalid_amount" vazio, reprovado com maxAmountRequired E amount em 24/09; código fechado, não fixável às cegas sem gastar deploys do operador). PayAI verifica v1 comprovadamente. v2 segue CDP-first (Bazaar via clientes v2: stipend/indexar). Efeitos: -1~2s de latência por tentativa v1, 402 limpo (só insufficient_balance), zero risco de venda | v48.9.14: _accept_to_v1 inclui `amount` p/ CDP  # v48.9.13: verify v1 NÃO converte network p/ CAIP-2 + settle usa o requirement que VERIFICOU + match normalizado  # v48.9.9: identidade+interop que o radar pediu — /.well-known/did.json (did:web), /.well-known/brick-blue.json, /api/mcp alias, /sse (ponte MCP legada) + seletor de carteira EIP-6963 no /pay (fim da loteria window.ethereum com várias extensões) | v48.9.8-SOLPAY  # v48.9.8: /pay ganha checkout SOLANA (Phantom — transferChecked USDC-SPL, feePayer do facilitador paga o gas; alternativa real à smart wallet da Coinbase que os facilitadores rejeitam) + manifesto ganha campos padrão-de-catálogo (siwx/supportsVanillax402/supportsCircleGateway/metadata.provider, estilo Vybe)  # v48.9.7: rodapé da home linka /pricing·/terms·/privacy·/impressum + sitemap  # v48.9.6: /pay detecta smart wallet e saldo USDC-Base ANTES de assinar + Pix Fase 0 para planos ≥$0.99  # v48.9.5: /.well-known/agent-skills/index.json REAL (Cloudflare Discovery RFC 0.2.0) + classificador UA do dash reconhece Barkrowler/bots compatible
+VERSION = "48.9.16-SELLER"  # v48.9.16-SELLER: /.well-known/agenteconomy-verify.txt (claim por domínio, tokens via env AGENT_ECONOMY_TOKEN_API/_RAILWAY) + /config.js machine-readable (13 IPs sondaram, radar) + MCP tools/list com preços na description E _meta (convenção de discovery) | v48.9.15: pagamento v1 vai DIRETO ao PayAI — a CDP hosted REJEITA envelopes v1 ("invalid_amount" vazio, reprovado com maxAmountRequired E amount em 24/09; código fechado, não fixável às cegas sem gastar deploys do operador). PayAI verifica v1 comprovadamente. v2 segue CDP-first (Bazaar via clientes v2: stipend/indexar). Efeitos: -1~2s de latência por tentativa v1, 402 limpo (só insufficient_balance), zero risco de venda | v48.9.14: _accept_to_v1 inclui `amount` p/ CDP  # v48.9.13: verify v1 NÃO converte network p/ CAIP-2 + settle usa o requirement que VERIFICOU + match normalizado  # v48.9.9: identidade+interop que o radar pediu — /.well-known/did.json (did:web), /.well-known/brick-blue.json, /api/mcp alias, /sse (ponte MCP legada) + seletor de carteira EIP-6963 no /pay (fim da loteria window.ethereum com várias extensões) | v48.9.8-SOLPAY  # v48.9.8: /pay ganha checkout SOLANA (Phantom — transferChecked USDC-SPL, feePayer do facilitador paga o gas; alternativa real à smart wallet da Coinbase que os facilitadores rejeitam) + manifesto ganha campos padrão-de-catálogo (siwx/supportsVanillax402/supportsCircleGateway/metadata.provider, estilo Vybe)  # v48.9.7: rodapé da home linka /pricing·/terms·/privacy·/impressum + sitemap  # v48.9.6: /pay detecta smart wallet e saldo USDC-Base ANTES de assinar + Pix Fase 0 para planos ≥$0.99  # v48.9.5: /.well-known/agent-skills/index.json REAL (Cloudflare Discovery RFC 0.2.0) + classificador UA do dash reconhece Barkrowler/bots compatible
 # (v48.8.0: 402 "error" vira anúncio de 1 linha · /circle-listing com form real + enum real
 # (v48.7.0: GET /circle-listing (campos prontos p/ o Agent Marketplace da Circle, lançado 09/set/2026 — canal de distribuição inteiro que faltava no checklist) + checklist de boot ganha Circle/402 Index/BlockRun | base: v48.6.1-LEADFIX  # v48.6.1: lead_watch_loop parava de confundir varredura de catálogo (mesmo IP, muitos endpoints diferentes) e harness de smoke-test (600+ hits num único endpoint) com lead quente — agora filtra por UA de scanner conhecido, teto de volume plausível p/ avaliação humana e 1 alerta por IP por ciclo · cdp_bazaar_bootstrap_loop checa liquidações VITALÍCIAS em Base antes de avisar que falta BASE_OPERATOR_PRIVATE_KEY (evita o log contradizer o próprio "3526 liquidações, elegível ao Bazaar"da v46) · dashboard separa "trust genérico" (tx_count≥3) de "CDP Bazaar/Base" (>=1 settle em Base) — eram rótulos diferentes escondidos atrás do mesmo badge "✓ completo" | base: v48.6.0-REGISTER  # v48.6.0: /register·/signup·/auth/callback (demanda medida: 42 req/7d — playbook SaaS "registrar→receber key") · POST /register = /buy-credits $0.99 reempacotado como matrícula (MESMA tabela pública, mesma máquina de créditos idempotente — zero preço novo) · security.txt RFC 9116 (hermes-contact: 456 hits/24h) · lead_watch_loop: IP 5+× no MESMO endpoint pago em 24h sem liquidar → Telegram 1×/dia · dashboard: ZeroBot/heritrix/hermes saem de "humano" → crawler (funil honesto) · 402 upsell ganha ponte "registration" | base: v48.5.1-LOGO  # v48.5.1: /favicon.png|.ico = PNG 256px moeda-L #4ade80 embutido em base64 (6KB, zero arquivo externo) + /favicon.svg vetorial — aposenta placeholder SVG roxo "Ω10" | base: v48.5.0-FUNIL  # v48.5.0: /pay mobile-first (deep link + QR — fim do "No wallet found" que matava 55% do funil) · /blog/ + /login atendem demanda medida · docstring sincronizado | base: v48.4.0-WALLETPAY  # v48.4.0: /pay/<endpoint> checkout de carteira de navegador (MetaMask/Coinbase Wallet/Rabby) p/ o ~80% de avaliadores humanos que não tinham NENHUM caminho de compra sem CLI/agente + filtro de ruído de scanner de segredo (/env, /config/*.key) tirado do radar de demanda + banimento de modelo Gemini morto agora persiste entre restarts | base: v48.3.10-COMMERCE  # v48.3.10: /.well-known/acp.json (ACP discovery doc — demanda 8 reqs/4 IPs) | base: v48.3.9.4-PROXYFIX  # v48.3.9.4: /proxy registrado após o alvo /fetch (o loop ALIAS_ROUTES rodava antes e o pulava) | base: v48.3.9.3-KEYDIR  # v48.3.9.3: /.well-known/http-message-signatures-directory (JWKS Ed25519 assinado RFC9421) + /legal + /support + alias /proxy→/fetch | base: v48.3.9.2-ALIAS  # v48.3.9.2: alias /llm/freePublic → /llm/free (demanda medida: 7 IPs/7d) | base: v48.3.9.1-GLAMA  # v48.3.9.1: /.well-known/glama.json aceita override via env GLAMA_CLAIM_JSON (claim do Glama por HTTP challenge sem novo deploy de código) | base: v48.3.9-FETCH
 log.warning("🧠 v48.2.0-SMART — preço de tabela fixo + First-Call Bonus pós-compra · "
@@ -24542,6 +24560,105 @@ def security_txt():
            f"Canonical: {_public_base()}/.well-known/security.txt\n")
     r = app.response_class(txt, mimetype="text/plain")
     r.headers["Cache-Control"] = "public, max-age=86400"
+    return r
+
+
+# ---------------------------------------------------------------------------
+# v48.9.16-SELLER — AGENT ECONOMY REPORT: claim por controle de domínio.
+# O serviço envia UM token por host e o verifica DIARIAMENTE nesta rota, nos
+# DOIS hosts (api.losbeto.xyz e o host railway). Tokens NUNCA no repo: chegam
+# por Railway Variables (AGENT_ECONOMY_TOKEN_API / AGENT_ECONOMY_TOKEN_RAILWAY).
+# Sem token configurado a rota responde 404 seco — nunca um token inventado.
+# ---------------------------------------------------------------------------
+_AGENT_ECONOMY_HOST_ENV = {
+    "api.losbeto.xyz": "AGENT_ECONOMY_TOKEN_API",
+    "losbeto-production-dd7c.up.railway.app": "AGENT_ECONOMY_TOKEN_RAILWAY",
+}
+
+@app.route("/.well-known/agenteconomy-verify.txt")
+def agenteconomy_verify():
+    host = (request.host or "").split(":")[0].lower().strip()
+    env_name = _AGENT_ECONOMY_HOST_ENV.get(host)
+    token = (os.environ.get(env_name, "") if env_name else "").strip()
+    if not token and host:
+        # host customizado futuro: tenta o token do domínio principal como
+        # fallback SOMENTE se for alias conhecido do mesmo serviço.
+        token = ""
+    if not token:
+        return ("not configured\n", 404, {"Content-Type": "text/plain; charset=utf-8"})
+    r = app.response_class(token + "\n", mimetype="text/plain")
+    # o verificador relê todo dia; cache curto p/ não atrasar uma rotação.
+    r.headers["Cache-Control"] = "public, max-age=60"
+    return r
+
+
+# ---------------------------------------------------------------------------
+# v48.9.16-SELLER — /config.js (radar: 13 IPs sondaram, "not built").
+# Agentes e SDKs procuram um descriptor machine-readable de bootstrap na raiz.
+# Servimos JS válido que TAMBÉM é JSON embutido (window.LOSBETO_CONFIG = {...})
+# e o espelho /config.json puro. Aponta para TODAS as portas de descoberta e
+# para o pagamento — é o índice dos índices. Cache 5 min (muda com deploy).
+# ---------------------------------------------------------------------------
+def _losbeto_config_dict() -> dict:
+    base = _public_base()
+    return {
+        "service": "Losbeto",
+        "version": VERSION,
+        "base_url": base,
+        "description": ("Pay-per-call machine API for AI agents: LLM inference "
+                         "(OpenAI-compatible) plus cross-asset market data. "
+                         "No accounts, no API keys: the x402 payment is the auth."),
+        "payment": {
+            "protocol": "x402",
+            "scheme": "exact",
+            "asset": "USDC",
+            "networks": [f"{BASE_CAIP2}", f"solana:{SOL_GENESIS}"],
+            "price_range_usd": {"min": 0.005, "max": 99.99,
+                                 "typical_call": "0.01-0.50"},
+        },
+        "endpoints": {
+            "catalog": f"{base}/x402.json",
+            "plans": f"{base}/plans",
+            "llm_gateway": f"{base}/v1/chat/completions",
+            "llm_get": f"{base}/llm?q=your+prompt",
+            "llm_free": f"{base}/llm/free?q=your+prompt",
+            "models": f"{base}/v1/models",
+            "status": f"{base}/health",
+        },
+        "discovery": {
+            "llms_txt": f"{base}/llms.txt",
+            "openapi": f"{base}/openapi.json",
+            "agents": f"{base}/agents.json",
+            "mcp_server": f"{base}/server.json",
+            "mcp_transport": f"{base}/mcp",
+            "a2a": f"{base}/.well-known/agent.json",
+            "acp": f"{base}/.well-known/acp.json",
+            "ucp": f"{base}/.well-known/ucp",
+        },
+        "free_evaluation": {
+            "one_real_call": f"{base}/welcome",
+            "samples": f"{base}/try",
+            "preview_param": "?preview=1 on any paid path",
+        },
+        "contact": "roberto.martins622@gmail.com",
+        "ts": int(time.time()),
+    }
+
+@app.route("/config.js")
+def config_js():
+    body = ("// Losbeto machine-readable bootstrap descriptor\n"
+            "// JSON mirror: " + _public_base() + "/config.json\n"
+            "window.LOSBETO_CONFIG = "
+            + json.dumps(_losbeto_config_dict(), ensure_ascii=False, indent=2)
+            + ";\n")
+    r = app.response_class(body, mimetype="application/javascript")
+    r.headers["Cache-Control"] = "public, max-age=300"
+    return r
+
+@app.route("/config.json")
+def config_json():
+    r = jsonify(_losbeto_config_dict())
+    r.headers["Cache-Control"] = "public, max-age=300"
     return r
 
 
