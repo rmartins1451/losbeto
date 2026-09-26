@@ -5262,7 +5262,7 @@ def _bazaar_blob(endpoint: str) -> dict:
       3. inputSchema             -> era 'Input schema present: no'
     O schema legado (schema.properties.*) fica preservado para o validador
     @agentcash/discovery, que usa outro shape."""
-    desc = ENDPOINT_DESC.get(endpoint, endpoint)
+    desc = _cap500(ENDPOINT_DESC.get(endpoint, endpoint))
     params = dict(ENDPOINT_PARAM_HINTS.get(endpoint, {"format": "json"}))
 
 
@@ -5561,7 +5561,7 @@ def _build_402(endpoint: str, price_override: float = None):
     amount_atomic_sol = str(int(amount_usdc * 10 ** USDC_DECIMALS))
     amount_atomic_base = str(int(amount_usdc * 10 ** 6))
     base = _public_base()
-    desc = ENDPOINT_DESC.get(endpoint, f"Losbeto — {endpoint}")
+    desc = _cap500(ENDPOINT_DESC.get(endpoint, f"Losbeto — {endpoint}"))
 
     # extra.feePayer é OBRIGATÓRIO no scheme "exact" da SVM (Solana) — sem isso,
     # clientes x402 corretos (AgentCash, x402-fetch, etc.) rejeitam a payment requirement
@@ -6306,7 +6306,7 @@ def _verify_payment(endpoint: str, payment_header: str):
                 # dinheiro on-chain é settle(). bazaar blob/resource só na CDP.
                 bz = _bazaar_blob(endpoint) if getattr(_f, 'is_cdp', False) else None
                 _res = ({"url": f"{_public_base()}{endpoint}",
-                         "description": ENDPOINT_DESC.get(endpoint, endpoint),
+                         "description": _cap500(ENDPOINT_DESC.get(endpoint, endpoint)),
                          "mimeType": "application/json"}
                         if getattr(_f, 'is_cdp', False) else None)
                 _ok_settle, _sdata = _f.settle(payload, _rq_ok, bazaar=bz, resource=_res)
@@ -10752,7 +10752,7 @@ def manifest_x402():
         if not accepts:
             return None
         primary = accepts[0]
-        desc = ENDPOINT_DESC.get(path)
+        desc = _cap500(ENDPOINT_DESC.get(path))
         if not desc:
             # v39: o fallback da v38 era `ENDPOINT_DESC.get(p, p)`, que fazia
             # /week-pass e /enterprise aparecerem no Bazaar com a descrição
@@ -10821,6 +10821,19 @@ def manifest_x402():
         "version":         2,
         "ownershipProofs": [WALLET.solana_address],
         "resources":       resources,
+        # v48.9.20-LINT (S6): /.well-known/x402(.json) precisa de uma lista
+        # "endpoints[]" PARSEAVEL no topo — x402lint e afins nao leem
+        # "resources". Compacta: url+method+desc+accepts primarios, sem
+        # duplicar o payload pesado.
+        "endpoints":       [{"url": r["url"], "method": r["method"],
+                             "description": r["description"],
+                             "accepts": [{"scheme": a.get("scheme"),
+                                          "network": a.get("network"),
+                                          "asset": a.get("asset"),
+                                          "amount": a.get("amount"),
+                                          "payTo": a.get("payTo")}
+                                         for a in r["accepts"]]}
+                            for r in resources],
         "node": {
             "name":        SERVICE_NAME,
             "version":     VERSION,
@@ -10891,9 +10904,9 @@ def _mcp_legacy_tools_list() -> list:
         price = get_dynamic_price(p)
         tools.append({
             "name": p.strip("/").replace("-", "_"),
-            "description": (f"{ENDPOINT_DESC.get(p, p)} "
+            "description": (_cap500(f"{ENDPOINT_DESC.get(p, p)} "
                             f"[Free delayed sample via MCP; real-time costs "
-                            f"${price:.4f} USDC via x402 at {_public_base()}{p}]"),
+                            f"${price:.4f} USDC via x402 at {_public_base()}{p}]")),
             "inputSchema": {"type": "object", "properties": props, "required": []},
         })
     return tools
@@ -13249,7 +13262,7 @@ def manifest_mcp():
         }
         tools.append({
             "name": p.strip("/").replace("-", "_"),
-            "description": f"{ENDPOINT_DESC.get(p, p)} (${dyn_price:.4f} USDC via x402 — Solana/Base)",
+            "description": _cap500(f"{ENDPOINT_DESC.get(p, p)} (${dyn_price:.4f} USDC via x402 — Solana/Base)"),
             "inputSchema": {"type": "object", "properties": {}, "required": []},
             "x402": x402_opts,
         })
@@ -14659,7 +14672,7 @@ Use this skill when the user or agent wants to:
 
 - `GET {base}/try` — live samples from 6 endpoints in ONE free call
 - `GET {base}/welcome` — first-call-free coupon
-- `GET {base}/<any-endpoint>?preview=1` — real delayed data, free
+- `GET {base}/pyth-price?preview=1` — real delayed data, free (works on any paid endpoint)
 - `GET {base}/live` — public node telemetry (uptime, receipts)
 
 ## Top endpoints
@@ -15466,6 +15479,17 @@ def api_x402_alias():
     convenção de manifesto x402. 308 para o manifesto canônico."""
     return redirect("/.well-known/x402.json", code=308)
 
+def _cap500(s, limit=480):
+    """v48.9.20-LINT: teto duro de 480 chars nas descriptions PUBLICADAS
+    (openapi/manifesto/bazaar). Docs CDP + x402lint P8: description >500 eh
+    truncada ou REJEITADA pelo facilitador — tinhamos 4 fora (ex.: openapi
+    /br-bizdays = 554). Corte em fronteira de palavra, sufixo ASCII."""
+    s = (s or "").strip()
+    if len(s) <= limit:
+        return s
+    return s[:limit - 3].rsplit(" ", 1)[0].rstrip(" ,;:.") + "..."
+
+
 def _build_openapi():
     base = _public_base()
     contact_email = os.environ.get("CONTACT_EMAIL", "").strip()
@@ -15798,8 +15822,8 @@ def _build_openapi():
         ])
         paths[p] = {
             "get": {
-                "summary":     ENDPOINT_DESC.get(p, p),
-                "description": f"{ENDPOINT_DESC.get(p, p)}. Preco: ${price:.4f} USDC via x402.",
+                "summary":     _cap500(ENDPOINT_DESC.get(p, p), 200),
+                "description": _cap500(f"{ENDPOINT_DESC.get(p, p)}. Preco: ${price:.4f} USDC via x402."),
                 "operationId": p.strip("/").replace("-", "_"),
                 "tags":        ENDPOINT_TAGS.get(p, ["Trading"]),
                 "parameters":  params,
@@ -15839,8 +15863,8 @@ def _build_openapi():
         if _obs:
             paths[p] = {
                 "post": {
-                    "summary":     ENDPOINT_DESC.get(p, p),
-                    "description": f"{ENDPOINT_DESC.get(p, p)}. Preco: ${price:.4f} USDC via x402.",
+                    "summary":     _cap500(ENDPOINT_DESC.get(p, p), 200),
+                    "description": _cap500(f"{ENDPOINT_DESC.get(p, p)}. Preco: ${price:.4f} USDC via x402."),
                     "operationId": p.strip("/").replace("/", "_").replace("-", "_") + "_post",
                     "tags":        ENDPOINT_TAGS.get(p, ["AI"]),
                     "requestBody": {
@@ -15967,7 +15991,7 @@ def llms_txt():
         f"GET {_public_base()}/try  -> live samples from 6 endpoints in ONE free call",
         f"GET {_public_base()}/live -> public real-time node telemetry (no auth)",
         f"GET {_public_base()}/about -> who operates this and how to audit it",
-        f"GET {_public_base()}/<any-endpoint>?preview=1  -> real delayed data, free",
+        f"GET {_public_base()}/pyth-price?preview=1  -> real delayed data, free (any paid endpoint)",
         "Every 402 response also carries an inline `upsell.sample` with real output.",
         "",
         "## FLAGSHIP — LLM GATEWAY (OpenAI-compatible, pay-per-call)",
@@ -20027,7 +20051,7 @@ def _bazaar_blob_v27(endpoint):
     qualidade: `naturalLanguageDescription`, `useCases`, `sampleQueries`,
     `pricingRationale`, `dataFreshness`."""
     blob = _ORIG_BAZAAR_BLOB(endpoint)
-    desc = ENDPOINT_DESC.get(endpoint, endpoint)
+    desc = _cap500(ENDPOINT_DESC.get(endpoint, endpoint))
     price = get_dynamic_price(endpoint)
     tier = ("discovery" if price <= 0.03 else
             "core"      if price <= 0.12 else
@@ -21828,7 +21852,7 @@ def _accept_to_v1(a: dict, endpoint: str) -> dict:
         # insufficient_balance, não em erro de formato).
         "amount":            str(a.get("amount") or a.get("maxAmountRequired") or "0"),
         "resource":          f"{_public_base()}{endpoint}",
-        "description":       ENDPOINT_DESC.get(endpoint, f"Losbeto — {endpoint}"),
+        "description":       _cap500(ENDPOINT_DESC.get(endpoint, f"Losbeto — {endpoint}")),
         "mimeType":          "application/json",
         "payTo":             a.get("payTo", ""),
         "maxTimeoutSeconds": int(a.get("maxTimeoutSeconds", 300)),
@@ -21938,7 +21962,7 @@ def bazaar_status():
                     f"letting the CDP facilitator settle it."),
             "curl": (f"curl -X POST {base}/bootstrap-trust "
                      f"-H 'X-PAYMENT: <base64 payload, network eip155:8453>'"),
-            "then": "Declare that wallet in BUYER_WALLETS so it is labelled honestly.",
+            "then": "Declare that wallet in OPERATOR_WALLETS so it is labelled honestly.",
         },
         # v48.9.19-CATALOG: o loop da indexação fica visível aqui. Docs CDP
         # (24/set/2026) confirmam: settle precisa de paymentPayload.resource
@@ -24467,7 +24491,7 @@ def circle_listing_helper():
 # Discovery API — os dois bloqueadores práticos que restavam para o canal
 # Circle. Código pronto; o resto desta semana é SUBMISSÃO MANUAL, não feature.
 # ============================================================================
-VERSION = "48.9.19-CATALOG"  # v48.9.19-CATALOG: inputSchema do 402/Bazaar agora marca os parâmetros funcionais como OBRIGATÓRIOS (required=["q"], ["address"], ...) — docs CDP Bazaar (24/set/2026): "sem schemas completos, agentes descobrem o endpoint mas não conseguem montar uma chamada válida"; requisito de curadoria "agent-ready metadata". Antes ia required=[] em tudo. + EXTENSION-RESPONSES do settle CDP persistido em /data e exposto em /bazaar-status (fecha o loop da Ação 2: ligar CDP_SEND_RESOURCE=1 deixa de ser às cegas) | v48.9.18-DEMAND: /ask vira apelido pago de /llm (12 reqs no radar — convencao de pergunta p/ gateway LLM) + /api/session/properties entra no filtro de ruido (sonda de SDK de analytics, 11 IPs, nao e demanda de produto) | v48.9.17-HYGIENE: /mcp/v1 vira rota MCP real (13 reqs/10 IPs no radar tomavam 308 p/ chat/completions — probe MCP nao e comprador de LLM) + radar ignora sonda de vulnerabilidade (.log//storage//laravel) para nao poluir demanda | v48.9.16-SELLER: /.well-known/agenteconomy-verify.txt (claim por domínio, tokens via env AGENT_ECONOMY_TOKEN_API/_RAILWAY) + /config.js machine-readable (13 IPs sondaram, radar) + MCP tools/list com preços na description E _meta (convenção de discovery) | v48.9.15: pagamento v1 vai DIRETO ao PayAI — a CDP hosted REJEITA envelopes v1 ("invalid_amount" vazio, reprovado com maxAmountRequired E amount em 24/09; código fechado, não fixável às cegas sem gastar deploys do operador). PayAI verifica v1 comprovadamente. v2 segue CDP-first (Bazaar via clientes v2: stipend/indexar). Efeitos: -1~2s de latência por tentativa v1, 402 limpo (só insufficient_balance), zero risco de venda | v48.9.14: _accept_to_v1 inclui `amount` p/ CDP  # v48.9.13: verify v1 NÃO converte network p/ CAIP-2 + settle usa o requirement que VERIFICOU + match normalizado  # v48.9.9: identidade+interop que o radar pediu — /.well-known/did.json (did:web), /.well-known/brick-blue.json, /api/mcp alias, /sse (ponte MCP legada) + seletor de carteira EIP-6963 no /pay (fim da loteria window.ethereum com várias extensões) | v48.9.8-SOLPAY  # v48.9.8: /pay ganha checkout SOLANA (Phantom — transferChecked USDC-SPL, feePayer do facilitador paga o gas; alternativa real à smart wallet da Coinbase que os facilitadores rejeitam) + manifesto ganha campos padrão-de-catálogo (siwx/supportsVanillax402/supportsCircleGateway/metadata.provider, estilo Vybe)  # v48.9.7: rodapé da home linka /pricing·/terms·/privacy·/impressum + sitemap  # v48.9.6: /pay detecta smart wallet e saldo USDC-Base ANTES de assinar + Pix Fase 0 para planos ≥$0.99  # v48.9.5: /.well-known/agent-skills/index.json REAL (Cloudflare Discovery RFC 0.2.0) + classificador UA do dash reconhece Barkrowler/bots compatible
+VERSION = "48.9.20-LINT"  # v48.9.20-LINT: teto 480 chars em TODA description publicada (402 accepts, openapi, manifesto x402, blob Bazaar, resource do settle CDP) — x402lint P8 FAIL: 4 descriptions >500 (ex.: /br-bizdays 523 no 402 ao vivo) eram REJEITADAS/truncadas pelo facilitador CDP, bloqueando settle E catalogacao desses endpoints | manifesto ganha "endpoints[]" parseavel no topo (S6) | llms.txt sem URL placeholder dangling (S11) | P7 (2 payTos Base+Solana) eh multi-chain intencional, nao bug | base: v48.9.19-CATALOG
 # (v48.8.0: 402 "error" vira anúncio de 1 linha · /circle-listing com form real + enum real
 # (v48.7.0: GET /circle-listing (campos prontos p/ o Agent Marketplace da Circle, lançado 09/set/2026 — canal de distribuição inteiro que faltava no checklist) + checklist de boot ganha Circle/402 Index/BlockRun | base: v48.6.1-LEADFIX  # v48.6.1: lead_watch_loop parava de confundir varredura de catálogo (mesmo IP, muitos endpoints diferentes) e harness de smoke-test (600+ hits num único endpoint) com lead quente — agora filtra por UA de scanner conhecido, teto de volume plausível p/ avaliação humana e 1 alerta por IP por ciclo · cdp_bazaar_bootstrap_loop checa liquidações VITALÍCIAS em Base antes de avisar que falta BASE_OPERATOR_PRIVATE_KEY (evita o log contradizer o próprio "3526 liquidações, elegível ao Bazaar"da v46) · dashboard separa "trust genérico" (tx_count≥3) de "CDP Bazaar/Base" (>=1 settle em Base) — eram rótulos diferentes escondidos atrás do mesmo badge "✓ completo" | base: v48.6.0-REGISTER  # v48.6.0: /register·/signup·/auth/callback (demanda medida: 42 req/7d — playbook SaaS "registrar→receber key") · POST /register = /buy-credits $0.99 reempacotado como matrícula (MESMA tabela pública, mesma máquina de créditos idempotente — zero preço novo) · security.txt RFC 9116 (hermes-contact: 456 hits/24h) · lead_watch_loop: IP 5+× no MESMO endpoint pago em 24h sem liquidar → Telegram 1×/dia · dashboard: ZeroBot/heritrix/hermes saem de "humano" → crawler (funil honesto) · 402 upsell ganha ponte "registration" | base: v48.5.1-LOGO  # v48.5.1: /favicon.png|.ico = PNG 256px moeda-L #4ade80 embutido em base64 (6KB, zero arquivo externo) + /favicon.svg vetorial — aposenta placeholder SVG roxo "Ω10" | base: v48.5.0-FUNIL  # v48.5.0: /pay mobile-first (deep link + QR — fim do "No wallet found" que matava 55% do funil) · /blog/ + /login atendem demanda medida · docstring sincronizado | base: v48.4.0-WALLETPAY  # v48.4.0: /pay/<endpoint> checkout de carteira de navegador (MetaMask/Coinbase Wallet/Rabby) p/ o ~80% de avaliadores humanos que não tinham NENHUM caminho de compra sem CLI/agente + filtro de ruído de scanner de segredo (/env, /config/*.key) tirado do radar de demanda + banimento de modelo Gemini morto agora persiste entre restarts | base: v48.3.10-COMMERCE  # v48.3.10: /.well-known/acp.json (ACP discovery doc — demanda 8 reqs/4 IPs) | base: v48.3.9.4-PROXYFIX  # v48.3.9.4: /proxy registrado após o alvo /fetch (o loop ALIAS_ROUTES rodava antes e o pulava) | base: v48.3.9.3-KEYDIR  # v48.3.9.3: /.well-known/http-message-signatures-directory (JWKS Ed25519 assinado RFC9421) + /legal + /support + alias /proxy→/fetch | base: v48.3.9.2-ALIAS  # v48.3.9.2: alias /llm/freePublic → /llm/free (demanda medida: 7 IPs/7d) | base: v48.3.9.1-GLAMA  # v48.3.9.1: /.well-known/glama.json aceita override via env GLAMA_CLAIM_JSON (claim do Glama por HTTP challenge sem novo deploy de código) | base: v48.3.9-FETCH
 log.warning("🧠 v48.2.0-SMART — preço de tabela fixo + First-Call Bonus pós-compra · "
