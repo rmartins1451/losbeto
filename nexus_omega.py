@@ -2741,12 +2741,23 @@ class LLM:
                     "temperature": temperature}
             if "flash" in _gm:
                 _cfg["thinkingConfig"] = {"thinkingBudget": 0}
-            r = requests.post(
-                f"https://generativelanguage.googleapis.com/v1beta/models/"
-                f"{_gm}:generateContent?key={GEMINI_KEY}",
-                json={"contents": [{"parts": [{"text": prompt}]}],
-                      "generationConfig": _cfg},
-                timeout=25)
+            def _gem_post():
+                return requests.post(
+                    f"https://generativelanguage.googleapis.com/v1beta/models/"
+                    f"{_gm}:generateContent?key={GEMINI_KEY}",
+                    json={"contents": [{"parts": [{"text": prompt}]}],
+                          "generationConfig": _cfg},
+                    timeout=25)
+            r = _gem_post()
+            # v48.10.1: 503 "high demand" aparece a cada ~8 min nos logs e é
+            # transitório — 1 retry com jitter recupera a maioria sem descer a
+            # cadeia nem marcar o provedor. 500 idem. 429 NÃO entra: no free
+            # tier é quota diária/TPD ou billing — irrecuperável em <1.5s, o
+            # retry só queimaria latência e bateria numa quota morta; quem
+            # trata 429 é a quarentena do _llm_mark.
+            if r.status_code in (500, 503):
+                time.sleep(0.7 + random.random() * 0.8)
+                r = _gem_post()
             if r.ok:
                 j = r.json()
                 cands = j.get("candidates") or []
@@ -6393,7 +6404,23 @@ def _verify_payment(endpoint: str, payment_header: str):
             # "payer" — o comprador real vem no SettleResponse do facilitator.
             # Sem isso, "Compradores únicos" ficava sempre 0 no dashboard.
             real_payer = (sdata.get("payer") or sdata.get("from")
-                          or sdata.get("sender") or payer or "")
+                          or sdata.get("sender") or sdata.get("account")
+                          or ((sdata.get("settlement") or {}).get("payer")
+                              if isinstance(sdata.get("settlement"), dict) else "")
+                          or payer or "")
+            # v48.10.1: fallback universal — o pagador está ASSINADO dentro do
+            # próprio payload em todos os rails que usam authorization (EVM
+            # EIP-3009: payload.payload.authorization.from; Algorand: remetente
+            # do grupo de pagamento). Sem isto o ledger gravava payer vazio e
+            # a receita saía sem atribuição.
+            if not real_payer and isinstance(payload, dict):
+                _pl = payload.get("payload")
+                _pl = _pl if isinstance(_pl, dict) else {}
+                _au = _pl.get("authorization")
+                _au = _au if isinstance(_au, dict) else {}
+                real_payer = (_pl.get("payer") or _pl.get("from")
+                              or _pl.get("sender") or _au.get("from") or "")
+            real_payer = str(real_payer or "")
             if str(real_payer).startswith("0x"):
                 real_payer = real_payer.lower()
             LEDGER.replay_mark(h)
@@ -12311,6 +12338,235 @@ app.add_url_rule("/v1/chat/completions", "llm_chat_completions",
                  methods=["POST"])
 app.add_url_rule("/v1/chat/completions", "llm_chat_docs",
                  llm_chat_docs, methods=["GET"])
+
+
+# ============================================================================
+# v48.10.1-TRANSFORM — o que agentes de fato PAGAM: texto sujo -> estrutura
+#
+# Evidência verificável (set/2026): Visa/Artemis mediram ticket médio de
+# US$0,14 em 109,6M tx x402 — micro-utilidade, não dado exótico; os tutoriais
+# canônicos do protocolo (simplescraper.io, docs x402) usam "POST /extract a
+# $0.01" como produto-exemplo; TRM Labs mostra que o volume real de agentes é
+# pequeno mas concentrado em serviços de utilidade. O gateway LLM já existe
+# aqui — estes dois SKUs são a MESMA cadeia de failover com contrato estrito
+# e validação de saída, o que justifica o prêmio sobre o /llm cru ($0.005).
+# Mesmo motor, mesmo gate de caps, sem chave nova. Pré-gate AI_REQUIRED:
+# se a cadeia LLM estiver fora, nem 402 é emitido (não vendemos o que não
+# entregamos); falha pós-settle → o wrapper devolve o valor como crédito.
+# ============================================================================
+
+EXTRACT_PRICE   = float(os.environ.get("PRICE_EXTRACT", "0.01"))
+TRANSLATE_PRICE = float(os.environ.get("PRICE_TRANSLATE", "0.008"))
+_XF_MAX_CHARS   = int(os.environ.get("XF_MAX_CHARS", "6000"))
+_XF_SAMPLE_TEXT = ("Invoice 2041 from Acme Ltda, issued 2026-09-12, total R$ 1.250,00, "
+                   "due 2026-10-12. Contact: financeiro@acme.com.br")
+
+
+def _xf_body() -> dict:
+    b = request.get_json(silent=True)
+    return b if isinstance(b, dict) else {}
+
+
+def _xf_arg(name: str, body: dict, default: str = "") -> str:
+    v = body.get(name)
+    if v is None:
+        v = request.args.get(name)
+    return default if v is None else str(v)
+
+
+def _xf_parse_fields(body: dict) -> dict:
+    """Aceita: schema={campo: descrição} (JSON), schema=JSON-Schema com
+    properties, ou fields=a,b,c. Devolve {campo: descrição}."""
+    raw = body.get("schema") if "schema" in body else request.args.get("schema")
+    if isinstance(raw, str) and raw.strip():
+        try:
+            raw = json.loads(raw)
+        except Exception:
+            raw = None
+    fields = {}
+    if isinstance(raw, dict):
+        props = raw.get("properties") if isinstance(raw.get("properties"), dict) else raw
+        for k, v in list(props.items())[:40]:
+            if isinstance(v, dict):
+                fields[str(k)[:64]] = str(v.get("description") or v.get("type") or "")[:160]
+            else:
+                fields[str(k)[:64]] = str(v)[:160]
+    if not fields:
+        fl = body.get("fields") if "fields" in body else request.args.get("fields", "")
+        if isinstance(fl, list):
+            names = [str(x) for x in fl]
+        else:
+            names = [x.strip() for x in str(fl or "").split(",")]
+        for n in [x for x in names if x][:40]:
+            fields[n[:64]] = ""
+    return fields
+
+
+def _xf_json_from(txt: str):
+    t = (txt or "").strip()
+    t = re.sub(r"^```(?:json)?\s*|\s*```$", "", t, flags=re.I).strip()
+    a, z = t.find("{"), t.rfind("}")
+    if a == -1 or z <= a:
+        return None
+    try:
+        out = json.loads(t[a:z + 1])
+        return out if isinstance(out, dict) else None
+    except Exception:
+        return None
+
+
+def xf_extract():
+    """/extract — texto -> JSON com EXATAMENTE os campos pedidos (null quando
+    ausente, nunca inventado). Uma tentativa de reparo antes de desistir; se
+    não sair JSON válido, 503 (o wrapper devolve o valor como crédito)."""
+    body = _xf_body()
+    text = _xf_arg("text", body)
+    preview = request.args.get("preview") == "1"
+    if not text.strip() and preview:
+        text = _XF_SAMPLE_TEXT
+        body = dict(body)
+        body.setdefault("fields", "invoice_number,issuer,issue_date,total,currency,due_date,email")
+    text = text[:_XF_MAX_CHARS]
+    fields = _xf_parse_fields(body)
+    if not text.strip() or not fields:
+        return ({"error": "invalid-request",
+                 "message": ('Send text plus the fields you want: POST {"text": "...", '
+                             '"schema": {"total": "invoice total as number", "due_date": '
+                             '"ISO date"}} or GET ?text=...&fields=total,due_date'),
+                 "paid_retry": ("If you already paid, resend with the X-Session-Token "
+                                "you received — it retries this call at no extra cost."),
+                 "max_chars": _XF_MAX_CHARS, "ts": int(time.time())}, 400)
+    if not llm_healthy():
+        return _llm_proxy_down()
+    _g = _llm_gate()
+    if _g:
+        return _g
+    spec = "\n".join(f'- "{k}"' + (f": {d}" if d else "") for k, d in fields.items())
+    prompt = (
+        "Extract data from the TEXT below into one JSON object.\n"
+        "Rules: output ONLY the JSON object, no prose, no code fences. Use EXACTLY "
+        "these keys and no others. If a value is not stated in the text, use null — "
+        "never guess or invent. Numbers as JSON numbers, dates as ISO-8601 when "
+        "the text allows it.\nKEYS:\n" + spec + "\n\nTEXT:\n" + text)
+    ans = LLM.ask(prompt, max_tokens=800, temperature=0.0, cache=False)
+    data = _xf_json_from(ans)
+    if data is None and ans:
+        ans2 = LLM.ask("Fix this into ONE valid JSON object with exactly these keys ("
+                       + ", ".join(fields) + "); output only JSON:\n" + ans[:3000],
+                       max_tokens=800, temperature=0.0, cache=False)
+        data = _xf_json_from(ans2)
+    if data is None:
+        return _llm_proxy_down()
+    _llm_count()
+    clean = {k: data.get(k) for k in fields}
+    missing = [k for k, v in clean.items() if v is None]
+    return {"data": clean, "missing": missing,
+            "schema_valid": True, "fields_requested": len(fields),
+            "chars_in": len(text),
+            "guarantee": ("keys are exactly the ones requested; absent values are null, "
+                          "never inferred. If valid JSON could not be produced the call "
+                          "returns 503 and any payment is refunded as credit."),
+            "sample_input": text == _XF_SAMPLE_TEXT,
+            "limits": _llm_limits_block(),
+            "ts": int(time.time()), "provider": "Losbeto/Transform", "version": VERSION}
+
+
+def xf_translate():
+    """/translate — tradução pura: devolve só o texto traduzido, preservando
+    números, URLs, nomes próprios e quebras de linha."""
+    body = _xf_body()
+    text = _xf_arg("text", body)
+    preview = request.args.get("preview") == "1"
+    if not text.strip() and preview:
+        text = "Selic mantida em 15% ao ano; inflação em 12 meses desacelera."
+    text = text[:min(_XF_MAX_CHARS, 4000)]
+    to = (_xf_arg("to", body) or _xf_arg("target", body) or "en").strip()[:40]
+    frm = (_xf_arg("from", body) or "").strip()[:40]
+    if not text.strip():
+        return ({"error": "invalid-request",
+                 "message": 'Send {"text": "...", "to": "pt-BR"} or GET ?text=...&to=es',
+                 "paid_retry": ("If you already paid, resend with the X-Session-Token "
+                                "you received — it retries this call at no extra cost."),
+                 "ts": int(time.time())}, 400)
+    if not llm_healthy():
+        return _llm_proxy_down()
+    _g = _llm_gate()
+    if _g:
+        return _g
+    prompt = (f"Translate the TEXT into {to}" + (f" from {frm}" if frm else "") +
+              ". Output ONLY the translation — no notes, no quotes, no explanation. "
+              "Keep numbers, currency amounts, URLs, code, hashtags and proper "
+              "names unchanged; preserve line breaks.\n\nTEXT:\n" + text)
+    ans = LLM.ask(prompt, max_tokens=min(2048, max(256, len(text))), temperature=0.1, cache=False)
+    if not ans or not ans.strip():
+        return _llm_proxy_down()
+    _llm_count()
+    return {"translation": ans.strip(), "target": to, "source": frm or "auto",
+            "chars_in": len(text),
+            "limits": _llm_limits_block(),
+            "ts": int(time.time()), "provider": "Losbeto/Transform", "version": VERSION}
+
+
+_XF_OUT_EXTRACT = {"type": "object", "properties": {
+    "data": {"type": "object", "description": "Exactly the requested keys; null when absent."},
+    "missing": {"type": "array", "items": {"type": "string"}},
+    "schema_valid": {"type": "boolean"}}, "required": ["data", "schema_valid"]}
+_XF_OUT_TRANSLATE = {"type": "object", "properties": {
+    "translation": {"type": "string"}, "target": {"type": "string"},
+    "source": {"type": "string"}}, "required": ["translation", "target"]}
+
+ENDPOINT_BODY_SCHEMAS["/extract"] = {
+    "method": "POST", "contentType": "application/json",
+    "schema": {"type": "object", "properties": {
+        "text": {"type": "string", "description": "Messy source text (max 6000 chars)."},
+        "schema": {"type": "object", "description": "{field: description} — the keys you want back."},
+        "fields": {"type": "string", "description": "Alternative to schema: comma-separated field names."}},
+        "required": ["text"]},
+    "example": {"text": _XF_SAMPLE_TEXT,
+                "schema": {"invoice_number": "string", "total": "number", "due_date": "ISO date"}},
+    "outputSchema": _XF_OUT_EXTRACT}
+ENDPOINT_BODY_SCHEMAS["/translate"] = {
+    "method": "POST", "contentType": "application/json",
+    "schema": {"type": "object", "properties": {
+        "text": {"type": "string", "description": "Text to translate (max 4000 chars)."},
+        "to": {"type": "string", "description": "Target language, e.g. en, pt-BR, es, ja."},
+        "from": {"type": "string", "description": "Optional source language (auto-detected)."}},
+        "required": ["text", "to"]},
+    "example": {"text": "Selic mantida em 15% ao ano.", "to": "en"},
+    "outputSchema": _XF_OUT_TRANSLATE}
+
+_XF_PRODUCTS = {
+    "/extract": (xf_extract, EXTRACT_PRICE,
+        "Turn messy text into strict JSON: send text plus the fields you want and get "
+        "back exactly those keys, null for anything the text does not state — never "
+        "invented. Invoices, emails, contracts, scraped pages, chat logs. One retry "
+        "repairs malformed model output; if valid JSON still cannot be produced the "
+        "payment is returned as call credit. Replaces your own parse-and-retry "
+        "error branch. Do NOT use for free-form chat — that is /llm.",
+        ["AI", "Extraction", "StructuredOutput", "Transform"],
+        {"text": "Invoice 2041 from Acme, total 1250.00, due 2026-10-12",
+         "fields": "invoice_number,issuer,total,due_date"}),
+    "/translate": (xf_translate, TRANSLATE_PRICE,
+        "Translate text between any language pair and get back only the translation — "
+        "numbers, currency, URLs, code and proper names untouched, line breaks kept. "
+        "Portuguese-English-Spanish tuned for financial and legal text. Flat price per "
+        "call, no key, no account. Do NOT use for summarising or rewriting — that is /llm.",
+        ["AI", "Translation", "Transform", "Portuguese"],
+        {"text": "Selic mantida em 15% ao ano", "to": "en"}),
+}
+
+for _path, (_fn, _price, _desc, _tags, _hint) in _XF_PRODUCTS.items():
+    BASE_PRICES[_path] = float(os.environ.get(
+        "PRICE_" + _path.strip("/").replace("-", "_").upper(), str(_price)))
+    ENDPOINT_DESC[_path] = _desc
+    ENDPOINT_TAGS[_path] = _tags
+    ENDPOINT_PARAM_HINTS[_path] = _hint
+    ENDPOINT_HANDLERS[_path] = _fn
+    AI_REQUIRED_ENDPOINTS.add(_path)
+    app.add_url_rule(_path, "xf" + _path.replace("/", "_"),
+                     paid_endpoint(_path)(_fn), methods=["GET", "POST"])
+
+log.info("🔁 v48.10.1-TRANSFORM: /extract e /translate registrados (mesmo gateway LLM, contrato estrito)")
 
 # ---------------------------------------------------------------------------
 # v48.0.0 — DESCOBERTA GRATUITA DO GATEWAY (padrão OpenAI + telemetria honesta)
@@ -20869,6 +21125,48 @@ def _sweep_payers(limit_rows: int = 4000) -> dict:
 
 
 _SWEEP_CACHE = {"ts": 0.0, "data": {}}
+_SWEEP_TX_CACHE = {"ts": 0.0, "data": set()}
+
+
+def _sweep_unattributed_txs(limit_rows: int = 4000) -> set:
+    """v48.10.1 — rajadas SEM pagador registrado. O detector original agrupa
+    por pagador e ignora payer vazio; em rails onde o pagador não chegava ao
+    ledger (caso real: 50 endpoints liquidados em ~210s via Algorand), a
+    varredura de catálogo saía como 'organic' no /receipts. Aqui a rajada é
+    detectada por chain+tempo: >= SWEEP_MIN_ENDPOINTS endpoints distintos em
+    SWEEP_WINDOW_S segundos, sem pagador atribuído. Devolve o conjunto de
+    tx_sig marcados como varredura."""
+    flagged = set()
+    try:
+        with LEDGER._conn() as c:
+            rows = c.execute(
+                "SELECT ts, endpoint, tx_sig, chain FROM revenue "
+                "WHERE (payer IS NULL OR payer = '') "
+                "AND tx_sig IS NOT NULL AND tx_sig != '' "
+                "ORDER BY ts DESC LIMIT ?", (limit_rows,)).fetchall()
+    except Exception as e:
+        log.debug(f"sweep-unattributed scan: {e}")
+        return flagged
+    by_chain = defaultdict(list)
+    for ts_, ep_, tx_, ch_ in rows:
+        by_chain[(ch_ or "").lower()].append((int(ts_ or 0), ep_ or "", tx_))
+    for _ch, evs in by_chain.items():
+        evs.sort()
+        i = 0
+        for j in range(len(evs)):
+            while evs[j][0] - evs[i][0] > SWEEP_WINDOW_S:
+                i += 1
+            win = evs[i:j + 1]
+            if len({e for _, e, _ in win}) >= SWEEP_MIN_ENDPOINTS:
+                flagged.update(t for _, _, t in win)
+    return flagged
+
+
+def _sweep_unattributed_cached(ttl: int = 300) -> set:
+    now = time.time()
+    if now - _SWEEP_TX_CACHE["ts"] > ttl:
+        _SWEEP_TX_CACHE.update({"ts": now, "data": _sweep_unattributed_txs()})
+    return _SWEEP_TX_CACHE["data"]
 
 
 def _sweep_payers_cached(ttl: int = 300) -> dict:
@@ -20878,12 +21176,19 @@ def _sweep_payers_cached(ttl: int = 300) -> dict:
     return _SWEEP_CACHE["data"]
 
 
-def classify_payer(payer: str, source: str = "") -> str:
-    """operator-test | self-sweep | organic. Uma só definição, usada em
-    TODO lugar que fala de receita — dashboard, recibos, manifests."""
+def classify_payer(payer: str, source: str = "", tx: str = "") -> str:
+    """operator-test | self-sweep | unattributed | organic. Uma só definição,
+    usada em TODO lugar que fala de receita — dashboard, recibos, manifests.
+    v48.10.1: pagamento sem pagador NÃO é 'organic' — só é cliente quem foi
+    identificado como carteira externa. Sem pagador: rajada => self-sweep,
+    senão => unattributed (não conta como venda orgânica)."""
     p = (payer or "").lower()
     if source == "bootstrap":
         return "operator-test"
+    if not p:
+        if tx and tx in _sweep_unattributed_cached():
+            return "self-sweep"
+        return "unattributed"
     if p and p in _self_pay_wallets():
         return "operator-test"
     if p and p in _sweep_payers_cached():
@@ -20897,19 +21202,20 @@ def revenue_split(window_s: int = 0) -> dict:
     out = {"organic_usdc": 0.0, "organic_tx": 0, "organic_buyers": 0,
            "operator_usdc": 0.0, "operator_tx": 0,
            "self_sweep_usdc": 0.0, "self_sweep_tx": 0,
+           "unattributed_usdc": 0.0, "unattributed_tx": 0,
            "window_seconds": window_s or None}
     try:
         cutoff = int(time.time()) - window_s if window_s else 0
         with LEDGER._conn() as c:  # v48.3.2: leitura sem o lock do app (WAL)
             rows = c.execute(
-                "SELECT amount, payer, source FROM revenue WHERE ts > ?",
+                "SELECT amount, payer, source, tx_sig FROM revenue WHERE ts > ?",
                 (cutoff,)).fetchall()
     except Exception as e:
         out["error"] = str(e)[:80]
         return out
     buyers = set()
-    for amt, payer, src in rows:
-        k = classify_payer(payer or "", src or "")
+    for amt, payer, src, _tx in rows:
+        k = classify_payer(payer or "", src or "", _tx or "")
         a = float(amt or 0)
         if k == "organic":
             out["organic_usdc"] += a
@@ -20919,11 +21225,15 @@ def revenue_split(window_s: int = 0) -> dict:
         elif k == "self-sweep":
             out["self_sweep_usdc"] += a
             out["self_sweep_tx"] += 1
+        elif k == "unattributed":
+            out["unattributed_usdc"] += a
+            out["unattributed_tx"] += 1
         else:
             out["operator_usdc"] += a
             out["operator_tx"] += 1
     out["organic_buyers"] = len(buyers)
-    for k in ("organic_usdc", "operator_usdc", "self_sweep_usdc"):
+    for k in ("organic_usdc", "operator_usdc", "self_sweep_usdc",
+              "unattributed_usdc"):
         out[k] = round(out[k], 6)
     return out
 
@@ -20967,7 +21277,7 @@ def _receipts_json_v45():
                 "SELECT COUNT(*) FROM revenue "
                 "WHERE tx_sig IS NOT NULL AND tx_sig != ''").fetchone()[0]
         for ts_, ep_, amt_, sig_, ch_, payer_, src_ in rows:
-            origin = classify_payer(payer_ or "", src_ or "")
+            origin = classify_payer(payer_ or "", src_ or "", sig_ or "")
             out.append({
                 "ts": ts_, "endpoint": ep_,
                 "amount_usdc": f"{float(amt_ or 0):.4f}",
@@ -21001,6 +21311,8 @@ def _receipts_json_v45():
             "self-sweep": ("same wallet settled >= "
                            f"{SWEEP_MIN_ENDPOINTS} distinct endpoints within "
                            f"{SWEEP_WINDOW_S}s — catalog sweep, not demand"),
+            "unattributed": ("settled but the facilitator did not disclose the "
+                             "payer; NOT counted as an organic customer"),
         },
         "note": ("Every line is verifiable on-chain. Operator-funded traffic "
                  "is labelled as such: only 'organic' is a real customer."),
@@ -21709,6 +22021,19 @@ try:
 except Exception as _e:
     log.warning(f"v45 featured: {_e}")
 
+# v48.10.1: os SKUs de transformação (produtos-porta, ticket mais baixo da
+# loja de IA) entram logo APÓS os heróis PIT — posição garantida aqui, no
+# fim da cadeia de suites; o insert(2) original da proposta rodava cedo
+# demais e era enterrado pelos insert(0) das suites seguintes.
+try:
+    for _p in reversed(("/extract", "/translate")):
+        if _p in FEATURED_ENDPOINTS:
+            FEATURED_ENDPOINTS.remove(_p)
+        FEATURED_ENDPOINTS.insert(len(V45_HERO), _p)
+    log.info("🚪 Transform SKUs na vitrine: logo após os heróis PIT")
+except Exception as _e:
+    log.warning(f"v48.10.1 featured: {_e}")
+
 V45_POSITIONING = (
     "Machine market intelligence for AI agents and quants, global in scope: "
     "real-time crypto, equities, forex, commodities and macro — anchored by a "
@@ -21799,6 +22124,10 @@ def _v45_start_loops():
             log.warning(f"   ⚠️  {_sp['self_sweep_tx']} tx classificadas como "
                         f"VARREDURA DE CATÁLOGO (${_sp['self_sweep_usdc']:.4f}) — "
                         "não conte isso como venda e não submeta como prova.")
+        if _sp.get("unattributed_tx"):
+            log.info(f"   Sem atribuição: {_sp['unattributed_tx']} tx "
+                     f"(${_sp['unattributed_usdc']:.4f}) — facilitator não "
+                     "revelou o pagador; NÃO contadas como orgânicas.")
     except Exception as _e:
         log.debug(f"v45 split: {_e}")
     log.info("=" * 62)
@@ -22674,6 +23003,8 @@ def challenge_entry_json():
             "organic_distinct_buyers": rev_all.get("organic_buyers"),
             "operator_funded_usdc_excluded": rev_all.get("operator_usdc"),
             "catalog_sweeps_excluded_usdc": rev_all.get("self_sweep_usdc"),
+            "unattributed_usdc_excluded": rev_all.get("unattributed_usdc"),
+            "unattributed_transactions_excluded": rev_all.get("unattributed_tx"),
             "statement": ("Operator-funded settlements are excluded from every "
                           "figure above and labelled on-chain at /receipts. The "
                           "organic number is small and is reported as-is."),
@@ -25285,6 +25616,7 @@ def config_json():
     return r
 
 
+VERSION = "48.10.1-TRANSFORM"  # v48.10.1-TRANSFORM: revisao K3 da proposta Claude v48.10 (aceita com correcoes) — (1) /receipts: pagamento SEM pagador deixa de ser organic (novo rotulo unattributed, excluido da receita organica) e rajada sem pagador (>=8 endpoints/600s por chain) vira self-sweep — caso real: 50 tx Algorand em 210s saiam como organicas | (2) extracao de pagador universal: sdata.account/settlement.payer + fallback no payload assinado (EVM authorization.from, grupo Algorand) | (3) Gemini: 1 retry com jitter SOMENTE em 500/503 (transitorio); 429 NAO — quota/billing irrecuperavel em <1.5s, quem trata e a quarentena do _llm_mark (correcao K3: a Claude tentava retry em 429 tambem) | (4) NOVOS /extract ($0.01, texto->JSON estrito, null nunca inventado, 1 reparo, 503->credito) e /translate ($0.008, traducao pura) — categoria transformacao, 2x/1.6x o /llm, pre-gate AI_REQUIRED, body schemas no openapi, featured #2 | (5) K3: paid_retry (X-Session-Token) nos 400s pos-pagamento + unattributed exposto no boot log e no scorecard | base: v48.9.28-TRANSPARENCY
 if __name__ == "__main__":
     cli()
 else:
