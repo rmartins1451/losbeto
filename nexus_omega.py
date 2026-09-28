@@ -10756,7 +10756,71 @@ def manifest_x402_alias():
     # v48.9.24-LINTFIX: era um redirect 308 → /.well-known/x402.json. O
     # x402lint (S6) NÃO segue redirect e marcava FAIL "not found or not
     # valid JSON" — o único FAIL do scan 92/100 de 27/09. Serve direto.
-    return manifest_x402()
+    #
+    # v48.9.26-WKSLIM: mesmo com 200 JSON + x402Version/kind (v48.9.25) o S6
+    # SEGUIU FAIL no scan fresco de 27/09 23:50 UTC. Referencia do formato
+    # que o proprio x402lint serve em api.x402lint.dev/.well-known/x402:
+    # 2.4KB, {x402Version, endpoints:[{resource,method,scheme,networks[],
+    # price:"$0.05",description}], asset, networks[], payTo, terms,
+    # instructions}. O nosso tinha 291KB e endpoints[] com url/accepts —
+    # fora do shape deles (e acima de qualquer cap de tamanho de scanner).
+    # O alias passa a servir o documento COMPACTO nesse formato; o catalogo
+    # completo (resources[] pesado, Bazaar) segue em /.well-known/x402.json
+    # e /x402.json — nada se perde.
+    try:
+        full = manifest_x402().get_json(silent=True) or {}
+    except Exception as e:
+        log.warning(f"manifest slim: fallback vazio ({e})")
+        full = {}
+    base = _public_base()
+    chains = []
+    if ENABLE_BASE and BASE_PAYTO_EVM:
+        chains.append(BASE_CAIP2)
+    chains.append(f"solana:{SOL_GENESIS}")
+    if not PREFER_BASE:
+        chains.reverse()
+    endpoints = []
+    for e in (full.get("endpoints") or []):
+        acc = e.get("accepts") or []
+        nets = []
+        for a in acc:
+            n = a.get("network")
+            if n and n not in nets:
+                nets.append(n)
+        ep = {"resource":    e.get("url"),
+              "method":      e.get("method", "GET"),
+              "scheme":      "exact",
+              "networks":    nets,
+              "description": e.get("description")}
+        try:
+            amt = int(str((acc[0] or {}).get("amount")))
+            ep["price"] = "$" + f"{amt/1e6:.6f}".rstrip("0").rstrip(".")
+        except Exception:
+            pass
+        endpoints.append(ep)
+    slim = {
+        "x402Version": 2,
+        "endpoints":   endpoints,
+        "asset":       "USDC",
+        "networks":    chains,
+        "payTo":       (BASE_PAYTO_EVM if (ENABLE_BASE and BASE_PAYTO_EVM)
+                        else WALLET.solana_address),
+        "terms":       f"{base}/terms",
+        "instructions": ("Market data, Brazil point-in-time macro archive and "
+                         "LLM inference for agents — USDC per call via x402 "
+                         f"(Base + Solana). Docs: {base}/llms.txt"),
+        # draft-hawkins-x402-dns-discovery: RECOMMENDED/OPTIONAL no topo
+        "kind":         "resource-server",
+        "name":         SERVICE_NAME,
+        "description":  full.get("description"),
+        "updated":      full.get("updated"),
+        "openapi":      f"{base}/openapi.json",
+        "docs":         f"{base}/llms-full.txt",
+        "contact":      "roberto.martins622@gmail.com",
+        "ownershipProofs": full.get("ownershipProofs"),
+        "node":         full.get("node"),
+    }
+    return jsonify(slim)
 
 @app.route("/x402.json")
 def manifest_x402_root():
@@ -24823,7 +24887,7 @@ VERSION = "48.9.20-LINT"  # v48.9.20-LINT: teto 480 chars em TODA description pu
 VERSION = "48.9.21-CONCIERGE"  # v48.9.21-CONCIERGE: IA atendente no /chat — responde em segundos com fatos AO VIVO (BASE_PRICES, links reais; nunca inventa), PT/EN automatico, cadeia Groq→Gemini existente | escalacao dura: reembolso/parceria/"humano"/IA insegura => [HUMANO] e operador assume | operador recebe TUDO no Telegram com tag 🤖 IA respondeu / 🙋 precisa de voce (pergunta+resposta) | IA se retira da thread se o operador respondeu nas ultimas 12h | widget renderiza who='ai' (🤖) e avisa que a IA esta digitando | chat_poll marca ai como entregue | agentes/SDKs no /chat ganham resposta instantanea = conversao | base: v48.9.20-LINT
 VERSION = "48.9.22-GREET"  # v48.9.22-GREET: saudacao PROATIVA — 2s apos carregar a pagina o widget abre sozinho (1x/sessao) com mensagem personalizada por 3 sinais: GEO do IP (BR => Pix em destaque, PT-BR; demais => USDC/cartao via /pay, EN), HISTORICO do IP no ledger (welcome-back com o endpoint avaliado + preco real) e TIPO de cliente (bot/SDK => pitch machine-readable com manifesto, sem UI) | chips de resposta rapida que alimentam a IA concierge | geo via ipapi.co com cache 30d em sqlite, nunca quebra a pagina se falhar | base: v48.9.21-CONCIERGE
 VERSION = "48.9.23-BAZAARFIX"  # v48.9.23-BAZAARFIX: outputSchema V1 ({input:{type:http,method,discoverable},output:exemplo direto}) em CADA accepts[] do corpo 402 + no paymentRequirements legacy — extrator V1 do Bazaar (x402-foundation/x402#2844) le accepts[0].outputSchema, NAO extensions.bazaar; sem ele o no liquidava mas ficava invisivel no indice ("processing" eterno) | header PAYMENT-REQUIRED (v2) passa a MANTER o campo schema da extensao bazaar (ValidateAndExtract v2 exige info+schema juntos; so removemos) e so corta o exemplo de saida se >480B | base: v48.9.22-GREET
-VERSION = "48.9.25-WKFIX"  # v48.9.25-WKFIX: rescan pos-deploy (21:31 UTC) seguiu FAIL S6 — o 200 JSON existia mas faltavam os campos OBRIGATORIOS do draft-hawkins-x402-dns-discovery no topo do manifesto: x402Version e kind ("resource-server"); adicionados name/description/updated/openapi/docs/contact — puramente aditivo, endpoints/resources/node/ownershipProofs intactos | base: v48.9.24-LINTFIX /.well-known/x402 servia 308 → x402.json; o x402lint NAO segue redirect e marcava FAIL S6 "not found or not valid JSON" (unico FAIL do scan fresco A 92/100 de 27/09, pago via rescan-x402lint.mjs) — agora serve o manifesto direto (200) | scan confirmou S5 PASS: extensions.bazaar.schema presente no header = fix BAZAARFIX funcionando em producao | base: v48.9.23-BAZAARFIX
+VERSION = "48.9.26-WKSLIM"  # v48.9.26-WKSLIM: scan FRESCO pago (27/09 23:50 UTC, cache miss) seguiu FAIL S6 mesmo com 200+x402Version+kind — referencia real do S6 e o manifesto que o PROPRIO x402lint serve (2.4KB: x402Version, endpoints[{resource,method,scheme,networks,price:"$0.05",description}], asset, networks, payTo, terms, instructions); nosso alias tinha 291KB e shape url/accepts — provavel cap de tamanho e/ou validacao de schema | alias /.well-known/x402 agora serve documento COMPACTO nesse formato exato (+kind/name/draft-hawkins extras); catalogo completo segue intacto em /.well-known/x402.json e /x402.json (Bazaar/catalogos leem la) | base: v48.9.25-WKFIX /.well-known/x402 servia 308 → x402.json; o x402lint NAO segue redirect e marcava FAIL S6 "not found or not valid JSON" (unico FAIL do scan fresco A 92/100 de 27/09, pago via rescan-x402lint.mjs) — agora serve o manifesto direto (200) | scan confirmou S5 PASS: extensions.bazaar.schema presente no header = fix BAZAARFIX funcionando em producao | base: v48.9.23-BAZAARFIX
 # (v48.8.0: 402 "error" vira anúncio de 1 linha · /circle-listing com form real + enum real
 # (v48.7.0: GET /circle-listing (campos prontos p/ o Agent Marketplace da Circle, lançado 09/set/2026 — canal de distribuição inteiro que faltava no checklist) + checklist de boot ganha Circle/402 Index/BlockRun | base: v48.6.1-LEADFIX  # v48.6.1: lead_watch_loop parava de confundir varredura de catálogo (mesmo IP, muitos endpoints diferentes) e harness de smoke-test (600+ hits num único endpoint) com lead quente — agora filtra por UA de scanner conhecido, teto de volume plausível p/ avaliação humana e 1 alerta por IP por ciclo · cdp_bazaar_bootstrap_loop checa liquidações VITALÍCIAS em Base antes de avisar que falta BASE_OPERATOR_PRIVATE_KEY (evita o log contradizer o próprio "3526 liquidações, elegível ao Bazaar"da v46) · dashboard separa "trust genérico" (tx_count≥3) de "CDP Bazaar/Base" (>=1 settle em Base) — eram rótulos diferentes escondidos atrás do mesmo badge "✓ completo" | base: v48.6.0-REGISTER  # v48.6.0: /register·/signup·/auth/callback (demanda medida: 42 req/7d — playbook SaaS "registrar→receber key") · POST /register = /buy-credits $0.99 reempacotado como matrícula (MESMA tabela pública, mesma máquina de créditos idempotente — zero preço novo) · security.txt RFC 9116 (hermes-contact: 456 hits/24h) · lead_watch_loop: IP 5+× no MESMO endpoint pago em 24h sem liquidar → Telegram 1×/dia · dashboard: ZeroBot/heritrix/hermes saem de "humano" → crawler (funil honesto) · 402 upsell ganha ponte "registration" | base: v48.5.1-LOGO  # v48.5.1: /favicon.png|.ico = PNG 256px moeda-L #4ade80 embutido em base64 (6KB, zero arquivo externo) + /favicon.svg vetorial — aposenta placeholder SVG roxo "Ω10" | base: v48.5.0-FUNIL  # v48.5.0: /pay mobile-first (deep link + QR — fim do "No wallet found" que matava 55% do funil) · /blog/ + /login atendem demanda medida · docstring sincronizado | base: v48.4.0-WALLETPAY  # v48.4.0: /pay/<endpoint> checkout de carteira de navegador (MetaMask/Coinbase Wallet/Rabby) p/ o ~80% de avaliadores humanos que não tinham NENHUM caminho de compra sem CLI/agente + filtro de ruído de scanner de segredo (/env, /config/*.key) tirado do radar de demanda + banimento de modelo Gemini morto agora persiste entre restarts | base: v48.3.10-COMMERCE  # v48.3.10: /.well-known/acp.json (ACP discovery doc — demanda 8 reqs/4 IPs) | base: v48.3.9.4-PROXYFIX  # v48.3.9.4: /proxy registrado após o alvo /fetch (o loop ALIAS_ROUTES rodava antes e o pulava) | base: v48.3.9.3-KEYDIR  # v48.3.9.3: /.well-known/http-message-signatures-directory (JWKS Ed25519 assinado RFC9421) + /legal + /support + alias /proxy→/fetch | base: v48.3.9.2-ALIAS  # v48.3.9.2: alias /llm/freePublic → /llm/free (demanda medida: 7 IPs/7d) | base: v48.3.9.1-GLAMA  # v48.3.9.1: /.well-known/glama.json aceita override via env GLAMA_CLAIM_JSON (claim do Glama por HTTP challenge sem novo deploy de código) | base: v48.3.9-FETCH
 log.warning("🧠 v48.2.0-SMART — preço de tabela fixo + First-Call Bonus pós-compra · "
