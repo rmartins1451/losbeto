@@ -1796,7 +1796,20 @@ class FacilitatorClient:
                 hdrs = self._headers("POST", "/verify")
                 r = requests.post(f"{self.url}/verify", json=body, headers=hdrs, timeout=FAC_VERIFY_TIMEOUT)
             if not r.ok:
-                log.warning(f"⚠️ facilitator /verify body enviado: {json.dumps(body)[:600]}")
+                # v48.9.28-HYGIENE: o log levava o paymentPayload INTEIRO
+                # (600 chars) — inclui a assinatura EIP-3009 do comprador.
+                # Assinatura em log público de plataforma é material de
+                # replay se o settle ainda não aconteceu. Agora: só o hash
+                # do payload (rastreável) + metadados não sensíveis.
+                try:
+                    _ph = hashlib.sha256(json.dumps(body, sort_keys=True,
+                                         default=str).encode()).hexdigest()[:16]
+                except Exception:
+                    _ph = "?"
+                log.warning(f"⚠️ facilitator /verify recusou "
+                            f"(payload#{_ph} net={requirements.get('network')} "
+                            f"scheme={requirements.get('scheme')}): "
+                            f"{r.status_code} {r.text[:200]}")
                 return False, f"facilitator-{r.status_code}:{r.text[:300]}", {}
             data = r.json() if r.text else {}
             _ok = bool(data.get("isValid") or data.get("valid"))
@@ -22078,6 +22091,126 @@ def scorecard_json():
 
 
 # ============================================================================
+# v48.9.28-TRANSPARENCY — /transparency: o radar de demanda registrou 2 IPs
+# distintos pedindo /transparency em 7d (28/set) e o nó devolvia 404. Quem
+# pede isso é avaliador institucional (due diligence de gateway/aggregator)
+# procurando UM documento que junte: receita verificável, disponibilidade,
+# provas criptográficas e identidade. Tudo isso já existia espalhado em
+# /receipts, /.well-known/honest-revenue.json, /scorecard.json e
+# /br-pit-proof — faltava a composição. Grátis e assinado: documento de
+# confiança NUNCA se vende, ele é o que faz vender.
+# ============================================================================
+
+_TRANSPARENCY_CACHE = {"ts": 0.0, "data": None}
+TRANSPARENCY_TTL = int(os.environ.get("TRANSPARENCY_TTL", "300"))
+
+
+def build_transparency() -> dict:
+    now = time.time()
+    if (_TRANSPARENCY_CACHE["data"]
+            and now - _TRANSPARENCY_CACHE["ts"] < TRANSPARENCY_TTL):
+        return _TRANSPARENCY_CACHE["data"]
+    base = _public_base()
+    rev_all = revenue_split()
+    rev_7d = revenue_split(7 * 86400)
+    rev_1d = revenue_split(86400)
+    lat = _latency_stats()
+    try:
+        with LEDGER.lock, LEDGER._conn() as _c:
+            n_receipts = _c.execute(
+                "SELECT COUNT(*) FROM revenue "
+                "WHERE tx_sig IS NOT NULL AND tx_sig != ''").fetchone()[0]
+    except Exception:
+        n_receipts = None
+    try:
+        conn = _pit_conn()
+        pit = {"days_covered": conn.execute(
+            "SELECT COUNT(DISTINCT observed_day) FROM prints").fetchone()[0],
+            "observations": conn.execute(
+                "SELECT COUNT(*) FROM prints").fetchone()[0],
+            "revisions_caught": conn.execute(
+                "SELECT COUNT(*) FROM prints WHERE seq>0").fetchone()[0],
+            "coverage_starts": conn.execute(
+                "SELECT MIN(observed_day) FROM prints").fetchone()[0]}
+        conn.close()
+    except Exception:
+        pit = None
+    doc = {
+        "node": BRAND_NAME,
+        "url": base,
+        "version": VERSION,
+        "generated_at": datetime.now(timezone.utc).isoformat(
+            timespec="seconds").replace("+00:00", "Z"),
+        "what_this_is": (
+            "Single signed transparency document for evaluators and buyers: "
+            "real revenue (operator-funded labelled and excluded), measured "
+            "availability, and the cryptographic proofs this node publishes. "
+            "Every figure is read from this node's own ledger; every "
+            "settlement tx is verifiable on-chain."),
+        "revenue": {
+            "organic_all_time": rev_all,
+            "organic_last_7d": rev_7d,
+            "organic_last_24h": rev_1d,
+            "operator_funded_excluded": True,
+            "methodology": ("payer wallet not controlled/declared by the "
+                            "operator; catalog sweeps and bootstrap settlements "
+                            "excluded. Full breakdown + bad numbers included: "
+                            f"{base}/.well-known/honest-revenue.json"),
+        },
+        "availability_24h": (lat.get("overall") or {}),
+        "receipts": {"count": n_receipts,
+                     "url": f"{base}/receipts",
+                     "note": "paginated, each with on-chain explorer link"},
+        "proofs": {
+            "point_in_time_brazil": ({**pit,
+                "free_proof": f"{base}/br-pit-proof"} if pit else None),
+            "scorecard": f"{base}/scorecard.json",
+            "honest_revenue": f"{base}/.well-known/honest-revenue.json",
+            "signed_catalog": f"{base}/.well-known/x402.sig",
+        },
+        "identity": {
+            "signer_solana": getattr(WALLET, "solana_address", ""),
+            "payto_base": BASE_PAYTO_EVM if ENABLE_BASE else None,
+            "payto_solana": RECEIVE_ADDRESS,
+            "self_declared_operator_wallets": sorted(_self_pay_wallets()),
+            "ownership_proofs": f"{base}/.well-known/x402.json",
+        },
+        "conduct": [
+            "Premium endpoints return 503 and DO NOT charge when a data "
+            "source or the AI layer is down.",
+            "Public 402 price never varies per wallet; incentives only "
+            "post-payment.",
+            "Free previews (?preview=1) serve real delayed data, labelled "
+            "with its age.",
+            "Operator test purchases are labelled 'operator-test' in /receipts.",
+        ],
+        "contact": "roberto.martins622@gmail.com",
+    }
+    blob = json.dumps(doc, sort_keys=True, separators=(",", ":"), default=str)
+    doc["sha256"] = hashlib.sha256(blob.encode()).hexdigest()
+    try:
+        doc["signature"] = base64.b64encode(
+            WALLET.sign(f"losbeto-transparency|{doc['sha256']}".encode())).decode()
+        doc["signer"] = WALLET.solana_address
+        doc["verify"] = ("Ed25519 signature over sha256 of the canonical JSON "
+                         "(sorted keys, no whitespace), message "
+                         "'losbeto-transparency|<sha256>'. Verify offline "
+                         "against signer_solana.")
+    except Exception as e:
+        doc["signature_error"] = str(e)[:60]
+    _TRANSPARENCY_CACHE.update({"ts": now, "data": doc})
+    return doc
+
+
+@app.route("/transparency")
+@app.route("/.well-known/transparency.json")
+def transparency_doc():
+    resp = jsonify(build_transparency())
+    resp.headers["Cache-Control"] = "public, max-age=240"
+    return resp
+
+
+# ============================================================================
 # BLOCO H — FIDELITY: a receita determinística para quem testa a resposta
 # ============================================================================
 #
@@ -24895,7 +25028,8 @@ VERSION = "48.9.21-CONCIERGE"  # v48.9.21-CONCIERGE: IA atendente no /chat — r
 VERSION = "48.9.22-GREET"  # v48.9.22-GREET: saudacao PROATIVA — 2s apos carregar a pagina o widget abre sozinho (1x/sessao) com mensagem personalizada por 3 sinais: GEO do IP (BR => Pix em destaque, PT-BR; demais => USDC/cartao via /pay, EN), HISTORICO do IP no ledger (welcome-back com o endpoint avaliado + preco real) e TIPO de cliente (bot/SDK => pitch machine-readable com manifesto, sem UI) | chips de resposta rapida que alimentam a IA concierge | geo via ipapi.co com cache 30d em sqlite, nunca quebra a pagina se falhar | base: v48.9.21-CONCIERGE
 VERSION = "48.9.23-BAZAARFIX"  # v48.9.23-BAZAARFIX: outputSchema V1 ({input:{type:http,method,discoverable},output:exemplo direto}) em CADA accepts[] do corpo 402 + no paymentRequirements legacy — extrator V1 do Bazaar (x402-foundation/x402#2844) le accepts[0].outputSchema, NAO extensions.bazaar; sem ele o no liquidava mas ficava invisivel no indice ("processing" eterno) | header PAYMENT-REQUIRED (v2) passa a MANTER o campo schema da extensao bazaar (ValidateAndExtract v2 exige info+schema juntos; so removemos) e so corta o exemplo de saida se >480B | base: v48.9.22-GREET
 VERSION = "48.9.26-WKSLIM"  # v48.9.26-WKSLIM: scan FRESCO pago (27/09 23:50 UTC, cache miss) seguiu FAIL S6 mesmo com 200+x402Version+kind — referencia real do S6 e o manifesto que o PROPRIO x402lint serve (2.4KB: x402Version, endpoints[{resource,method,scheme,networks,price:"$0.05",description}], asset, networks, payTo, terms, instructions); nosso alias tinha 291KB e shape url/accepts — provavel cap de tamanho e/ou validacao de schema | alias /.well-known/x402 agora serve documento COMPACTO nesse formato exato (+kind/name/draft-hawkins extras); catalogo completo segue intacto em /.well-known/x402.json e /x402.json (Bazaar/catalogos leem la) | base: v48.9.25-WKFIX
-VERSION = "48.9.27-PRICESYNC"  # v48.9.27-PRICESYNC: S6 virou WARN no scan A 94/100 (28/09 06:49 UTC) — o manifesto slim PASSOU a parsear, mas o x402lint cruzou precos: openapi dizia /fear-greed=0.003, /regime=0.008, /anomalias=0.010 enquanto o 402 cobra 0.010/0.020/0.030 via PRICE_OVERRIDES de env (Railway PRICE_*); _build_openapi usava BASE_PRICES[p] cru — agora get_dynamic_price(p) (fonte unica, honra override, identico quando DYNAMIC_PRICING=false) | warns restantes: P7 multi-payTo (intencional), P8 descriptions 400-500 (polish opcional), D5 lista x402-org (PR #356 em revisao) | base: v48.9.26-WKSLIM /.well-known/x402 servia 308 → x402.json; o x402lint NAO segue redirect e marcava FAIL S6 "not found or not valid JSON" (unico FAIL do scan fresco A 92/100 de 27/09, pago via rescan-x402lint.mjs) — agora serve o manifesto direto (200) | scan confirmou S5 PASS: extensions.bazaar.schema presente no header = fix BAZAARFIX funcionando em producao | base: v48.9.23-BAZAARFIX
+VERSION = "48.9.27-PRICESYNC"  # v48.9.27-PRICESYNC: S6 virou WARN no scan A 94/100 (28/09 06:49 UTC) — o manifesto slim PASSOU a parsear, mas o x402lint cruzou precos: openapi dizia /fear-greed=0.003, /regime=0.008, /anomalias=0.010 enquanto o 402 cobra 0.010/0.020/0.030 via PRICE_OVERRIDES de env (Railway PRICE_*); _build_openapi usava BASE_PRICES[p] cru — agora get_dynamic_price(p) (fonte unica, honra override, identico quando DYNAMIC_PRICING=false) | warns restantes: P7 multi-payTo (intencional), P8 descriptions 400-500 (polish opcional), D5 lista x402-org (PR #356 em revisao) | base: v48.9.26-WKSLIM
+VERSION = "48.9.28-TRANSPARENCY"  # v48.9.28-TRANSPARENCY: (1) NOVO PRODUTO/PORTA /transparency (+ /.well-known/transparency.json) — radar marcou 2 IPs/7d pedindo e tomando 404; documento UNICO assinado Ed25519 compondo receita organica (split honesto), disponibilidade 24h, recibos on-chain, provas PIT/scorecard/x402.sig, identidade e regras de conduta — gratis de proposito: documento de confianca nao se vende, ele vende | (2) HIGIENE DE LOG: /verify do facilitator nao loga mais o paymentPayload inteiro (vazava assinatura EIP-3009 do comprador em WARNING) — agora hash16 + metadados | revisao estatica: pyflakes 36 achados benignos, AST sem rotas/chaves duplicadas, 0 bare excepts, redefinicoes sao wrappers documentados | base: v48.9.27-PRICESYNC /.well-known/x402 servia 308 → x402.json; o x402lint NAO segue redirect e marcava FAIL S6 "not found or not valid JSON" (unico FAIL do scan fresco A 92/100 de 27/09, pago via rescan-x402lint.mjs) — agora serve o manifesto direto (200) | scan confirmou S5 PASS: extensions.bazaar.schema presente no header = fix BAZAARFIX funcionando em producao | base: v48.9.23-BAZAARFIX
 # (v48.8.0: 402 "error" vira anúncio de 1 linha · /circle-listing com form real + enum real
 # (v48.7.0: GET /circle-listing (campos prontos p/ o Agent Marketplace da Circle, lançado 09/set/2026 — canal de distribuição inteiro que faltava no checklist) + checklist de boot ganha Circle/402 Index/BlockRun | base: v48.6.1-LEADFIX  # v48.6.1: lead_watch_loop parava de confundir varredura de catálogo (mesmo IP, muitos endpoints diferentes) e harness de smoke-test (600+ hits num único endpoint) com lead quente — agora filtra por UA de scanner conhecido, teto de volume plausível p/ avaliação humana e 1 alerta por IP por ciclo · cdp_bazaar_bootstrap_loop checa liquidações VITALÍCIAS em Base antes de avisar que falta BASE_OPERATOR_PRIVATE_KEY (evita o log contradizer o próprio "3526 liquidações, elegível ao Bazaar"da v46) · dashboard separa "trust genérico" (tx_count≥3) de "CDP Bazaar/Base" (>=1 settle em Base) — eram rótulos diferentes escondidos atrás do mesmo badge "✓ completo" | base: v48.6.0-REGISTER  # v48.6.0: /register·/signup·/auth/callback (demanda medida: 42 req/7d — playbook SaaS "registrar→receber key") · POST /register = /buy-credits $0.99 reempacotado como matrícula (MESMA tabela pública, mesma máquina de créditos idempotente — zero preço novo) · security.txt RFC 9116 (hermes-contact: 456 hits/24h) · lead_watch_loop: IP 5+× no MESMO endpoint pago em 24h sem liquidar → Telegram 1×/dia · dashboard: ZeroBot/heritrix/hermes saem de "humano" → crawler (funil honesto) · 402 upsell ganha ponte "registration" | base: v48.5.1-LOGO  # v48.5.1: /favicon.png|.ico = PNG 256px moeda-L #4ade80 embutido em base64 (6KB, zero arquivo externo) + /favicon.svg vetorial — aposenta placeholder SVG roxo "Ω10" | base: v48.5.0-FUNIL  # v48.5.0: /pay mobile-first (deep link + QR — fim do "No wallet found" que matava 55% do funil) · /blog/ + /login atendem demanda medida · docstring sincronizado | base: v48.4.0-WALLETPAY  # v48.4.0: /pay/<endpoint> checkout de carteira de navegador (MetaMask/Coinbase Wallet/Rabby) p/ o ~80% de avaliadores humanos que não tinham NENHUM caminho de compra sem CLI/agente + filtro de ruído de scanner de segredo (/env, /config/*.key) tirado do radar de demanda + banimento de modelo Gemini morto agora persiste entre restarts | base: v48.3.10-COMMERCE  # v48.3.10: /.well-known/acp.json (ACP discovery doc — demanda 8 reqs/4 IPs) | base: v48.3.9.4-PROXYFIX  # v48.3.9.4: /proxy registrado após o alvo /fetch (o loop ALIAS_ROUTES rodava antes e o pulava) | base: v48.3.9.3-KEYDIR  # v48.3.9.3: /.well-known/http-message-signatures-directory (JWKS Ed25519 assinado RFC9421) + /legal + /support + alias /proxy→/fetch | base: v48.3.9.2-ALIAS  # v48.3.9.2: alias /llm/freePublic → /llm/free (demanda medida: 7 IPs/7d) | base: v48.3.9.1-GLAMA  # v48.3.9.1: /.well-known/glama.json aceita override via env GLAMA_CLAIM_JSON (claim do Glama por HTTP challenge sem novo deploy de código) | base: v48.3.9-FETCH
 log.warning("🧠 v48.2.0-SMART — preço de tabela fixo + First-Call Bonus pós-compra · "
