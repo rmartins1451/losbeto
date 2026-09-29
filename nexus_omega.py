@@ -205,6 +205,12 @@ BASE_RPC          = os.environ.get("BASE_RPC", "https://mainnet.base.org")
 BASE_USDC         = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"
 BASE_PAYTO_EVM    = os.environ.get("BASE_PAYTO_EVM", "").strip()
 BASE_CAIP2        = "eip155:8453"
+# v48.11.0-GLOBAL: Polygon (eip155:137) e Arbitrum (eip155:42161) settle pelo
+# MESMO facilitador CDP (docs oficiais: exact/upto nas duas) — so entram nos
+# accepts quando o operador confirmar na Binance que deposito USDC-Polygon e
+# USDC-Arbitrum credita no mesmo endereco EVM. Default OFF = risco zero.
+X402_POLYGON      = os.environ.get("X402_POLYGON", "") == "1"
+X402_ARBITRUM     = os.environ.get("X402_ARBITRUM", "") == "1"
 ENABLE_BASE       = bool(BASE_PAYTO_EVM)
 # v25.1: Base como 1ª opção de pagamento -> settles vão pela CDP -> indexação
 # automática no Bazaar (a camada de descoberta que os agentes consultam).
@@ -262,6 +268,12 @@ CLAUDE_KEY   = (os.environ.get("CLAUDE_API_KEY", "").strip() or
                 # v44.0.5: aceita também o nome oficial da Anthropic — o
                 # Railway já tinha ANTHROPIC_API_KEY e a chave não era lida.
                 os.environ.get("ANTHROPIC_API_KEY", "").strip())
+
+# v48.11.0-GLOBAL: provedores premium dormem ate o operador ativar.
+# Sem chave = zero custo, zero chamada, codigo inerte. Ativar = setar a env
+# no Railway (MOONSHOT_API_KEY / OPENROUTER_API_KEY) — nada no codigo/repo.
+MOONSHOT_KEY   = os.environ.get("MOONSHOT_API_KEY", "").strip()
+OPENROUTER_KEY = os.environ.get("OPENROUTER_API_KEY", "").strip()
 OLLAMA_URL   = os.environ.get("OLLAMA_URL", "http://127.0.0.1:11434")
 # v39: o default acima é conveniente para rodar local, mas fazia o Ollama
 # contar como "provedor configurado" mesmo sem nada escutando na porta —
@@ -2266,6 +2278,8 @@ def is_geo_blocked(ip: str) -> bool:
 # env = troca sem redeploy quando um provedor descontinua algo.
 DEEPSEEK_MODEL = os.environ.get("DEEPSEEK_MODEL", "deepseek-chat")
 CLAUDE_MODEL   = os.environ.get("CLAUDE_MODEL",   "claude-sonnet-4-5")
+MOONSHOT_MODEL   = os.environ.get("MOONSHOT_MODEL",   "kimi-k2.5")
+OPENROUTER_MODEL = os.environ.get("OPENROUTER_MODEL", "deepseek/deepseek-chat")
 GROQ_MODEL     = os.environ.get("GROQ_MODEL",     "").strip()
 # v47.1.0: sem default fixo. Vazio = descoberta automatica via /models.
 # Registro: llama-3.3-70b-versatile foi DESCOMISSIONADO pela Groq em
@@ -2398,6 +2412,8 @@ def llm_providers_configured() -> List[str]:
     if CLAUDE_KEY:   out.append("claude")
     if GROQ_KEY:     out.append("groq")
     if GEMINI_KEY:   out.append("gemini")
+    if MOONSHOT_KEY:   out.append("moonshot")
+    if OPENROUTER_KEY: out.append("openrouter")
     if OLLAMA_ENABLED and OLLAMA_URL: out.append("ollama")
     return out
 
@@ -2423,7 +2439,8 @@ def llm_health_report() -> dict:
                             for p in cfg if time.time() < _LLM_DOWN_UNTIL.get(p, 0)},
             "models": {"deepseek": DEEPSEEK_MODEL, "claude": CLAUDE_MODEL,
                        "groq": (groq_model() if GROQ_KEY else "(sem chave)"),
-                       "gemini": GEMINI_MODEL or gemini_model()},
+                       "gemini": GEMINI_MODEL or gemini_model(),
+                       "moonshot": MOONSHOT_MODEL, "openrouter": OPENROUTER_MODEL},
         }
 
 
@@ -2651,11 +2668,23 @@ _LLM_ORDER_ENV = [x.strip().lower() for x in
                   os.environ.get("LLM_ORDER", "").split(",") if x.strip()]
 
 
+# v48.11.0-GLOBAL: perfis de roteamento estilo ClawRouter. O comprador escolhe
+# o perfil por querystring (?profile=) ou pelo nome do modelo no body OpenAI —
+# a mesma feature que o BlockRun vende como produto, aqui embutida no /llm.
+_LLM_PROFILES = {
+    "eco":     ["groq", "gemini", "ollama"],
+    "fast":    ["groq", "gemini", "ollama"],
+    "premium": ["moonshot", "openrouter", "claude", "deepseek", "gemini", "groq"],
+    "auto":    [],
+}
+
+
 def _llm_chain(max_tokens: int) -> List[str]:
     """Ordem de tentativa para este pedido específico."""
     if _LLM_ORDER_ENV:
         return _LLM_ORDER_ENV
-    pagos = [p for p in ("deepseek", "claude") if p in llm_providers_configured()]
+    pagos = [p for p in ("deepseek", "claude", "moonshot", "openrouter")
+             if p in llm_providers_configured()]
     if max_tokens <= LLM_SMALL_TOKENS:
         gratis = ["groq", "gemini"]      # curto: Groq é mais rápido
     else:
@@ -2682,7 +2711,7 @@ class LLM:
                     _LLM_CACHE.pop(k, None)
 
     @staticmethod
-    def ask(prompt: str, max_tokens=512, temperature=0.4, cache=True) -> str:
+    def ask(prompt: str, max_tokens=512, temperature=0.4, cache=True, order=None) -> str:
         """Devolve texto do primeiro provedor que responder.
         String vazia significa 'nenhum provedor disponível' — nunca um
         placeholder que possa vazar para dentro de uma resposta paga."""
@@ -2727,6 +2756,35 @@ class LLM:
                 timeout=25)
             if r.ok:
                 return r.json()["content"][0]["text"], None
+            return None, f"HTTP {r.status_code}: {r.text[:160]}"
+
+        def _try_moonshot():
+            # v48.11.0-GLOBAL: Moonshot/Kimi (api.moonshot.ai, OpenAI-compatible).
+            r = requests.post("https://api.moonshot.ai/v1/chat/completions",
+                headers={"Authorization": f"Bearer {MOONSHOT_KEY}",
+                         "Content-Type": "application/json"},
+                json={"model": MOONSHOT_MODEL,
+                      "messages": [{"role": "user", "content": prompt}],
+                      "max_tokens": max_tokens, "temperature": temperature},
+                timeout=30)
+            if r.ok:
+                return r.json()["choices"][0]["message"]["content"], None
+            return None, f"HTTP {r.status_code}: {r.text[:160]}"
+
+        def _try_openrouter():
+            # v48.11.0-GLOBAL: OpenRouter — porta para 300+ modelos (DeepSeek,
+            # Qwen, GLM...) com UMA chave. Attribution headers sao exigidos.
+            r = requests.post("https://openrouter.ai/api/v1/chat/completions",
+                headers={"Authorization": f"Bearer {OPENROUTER_KEY}",
+                         "HTTP-Referer": _public_base(),
+                         "X-Title": "Losbeto x402 Node",
+                         "Content-Type": "application/json"},
+                json={"model": OPENROUTER_MODEL,
+                      "messages": [{"role": "user", "content": prompt}],
+                      "max_tokens": max_tokens, "temperature": temperature},
+                timeout=30)
+            if r.ok:
+                return r.json()["choices"][0]["message"]["content"], None
             return None, f"HTTP {r.status_code}: {r.text[:160]}"
 
         def _try_groq():
@@ -2830,9 +2888,11 @@ class LLM:
                      "claude":   (_try_claude,   CLAUDE_KEY),
                      "groq":     (_try_groq,     GROQ_KEY),
                      "gemini":   (_try_gemini,   GEMINI_KEY),
+                     "moonshot":   (_try_moonshot,   MOONSHOT_KEY),
+                     "openrouter": (_try_openrouter, OPENROUTER_KEY),
                      "ollama":   (_try_ollama,   OLLAMA_URL if OLLAMA_ENABLED else "")}
 
-        for _prov in _llm_chain(max_tokens):
+        for _prov in (order or _llm_chain(max_tokens)):
             _fn, _cred = _CHAMADAS.get(_prov, (None, None))
             if not _fn or not _cred or _llm_is_down(_prov):
                 continue
@@ -5687,6 +5747,30 @@ def _build_402(endpoint: str, price_override: float = None):
             "maxTimeoutSeconds": 300,
             "extra":             {"feePayer": ALGO_FEEPAYER,
                                   "tag": "x402-global-challenge"},
+        })
+    # v48.11.0-GLOBAL: 4a e 5a rails — USDC nativo na Polygon e na Arbitrum,
+    # EIP-3009 com o mesmo dominio do USDC de Base. amount reutiliza
+    # amount_atomic_base (USDC 6 decimais nas tres EVM). _accept_to_v1 devolve
+    # None para redes desconhecidas -> ficam v2-only no header, sem quebrar v1.
+    if X402_POLYGON and BASE_PAYTO_EVM:
+        accepts.append({
+            "scheme":            "exact",
+            "network":           "eip155:137",
+            "asset":             "0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359",
+            "amount":            amount_atomic_base,
+            "payTo":             BASE_PAYTO_EVM,
+            "maxTimeoutSeconds": 300,
+            "extra":             {"name": "USD Coin", "version": "2"},
+        })
+    if X402_ARBITRUM and BASE_PAYTO_EVM:
+        accepts.append({
+            "scheme":            "exact",
+            "network":           "eip155:42161",
+            "asset":             "0xaf88d065e77c8cC2239327C5EDb3A432268e5831",
+            "amount":            amount_atomic_base,
+            "payTo":             BASE_PAYTO_EVM,
+            "maxTimeoutSeconds": 300,
+            "extra":             {"name": "USD Coin", "version": "2"},
         })
     # v48.9.12-DUAL — O FIX DE COMPATIBILIDADE DECISIVO.
     # Diagnóstico (23/09, teste com o client stock REAL, x402-fetch@1.2.0):
@@ -9007,7 +9091,8 @@ def health_providers():
     out["ai"] = {"live": ai_live,
                  "providers_configured": [n for n, k in
                      (("deepseek", DEEPSEEK_KEY), ("claude", CLAUDE_KEY),
-                      ("groq", GROQ_KEY), ("gemini", GEMINI_KEY)) if k],
+                      ("groq", GROQ_KEY), ("gemini", GEMINI_KEY),
+                      ("moonshot", MOONSHOT_KEY), ("openrouter", OPENROUTER_KEY)) if k],
                  "probe": (probe or "")[:60],
                  "probe_cache_ttl_s": AI_PROBE_TTL}
     # 2) mercados tradicionais: o que a auditoria reprovou
@@ -12361,11 +12446,14 @@ def llm_quick():
     _g = _llm_gate()
     if _g:
         return _g
-    ans = LLM.ask(q, max_tokens=mt, temperature=0.3, cache=False)
+    _prof = (request.args.get("profile") or "").strip().lower()
+    _order = _LLM_PROFILES.get(_prof) if _prof else None
+    ans = LLM.ask(q, max_tokens=mt, temperature=0.3, cache=False, order=_order)
     if not ans:
         return _llm_proxy_down()
     _llm_count()
     return {"answer": ans,
+            "profile": _prof or "auto",
             "sample_prompt": q == _LLM_PROXY_SAMPLE_Q,
             "max_tokens": mt,
             "how_it_works": ("One flat price per call, any subject. The node runs a "
@@ -12413,7 +12501,19 @@ def llm_chat_completions():
     _g = _llm_gate()
     if _g:
         return _g
-    ans = LLM.ask(prompt, max_tokens=mt, temperature=temp, cache=False)
+    # v48.11.0-GLOBAL: o campo "model" do body OpenAI vira seletor de rota.
+    # "kimi"/"moonshot" -> Moonshot primeiro; "deepseek" -> OpenRouter/DeepSeek;
+    # "eco"/"fast"/"premium" -> perfil ClawRouter; qualquer outro -> cadeia auto.
+    _req_model = str(body.get("model") or "").strip().lower()
+    if any(k in _req_model for k in ("kimi", "moonshot")):
+        _order = ["moonshot", "openrouter", "gemini", "groq"]
+    elif "deepseek" in _req_model:
+        _order = ["openrouter", "deepseek", "gemini", "groq"]
+    elif _req_model in _LLM_PROFILES:
+        _order = _LLM_PROFILES[_req_model]
+    else:
+        _order = None
+    ans = LLM.ask(prompt, max_tokens=mt, temperature=temp, cache=False, order=_order)
     if not ans:
         return _llm_proxy_down()
     _llm_count()
@@ -13502,7 +13602,14 @@ _SCAN_NOISE = re.compile(
     # analytics (Statsig/PostHog-style) atrás de config vazada. Também não.
     r"(^|/)\.?env$|/config/[^/]*\.key$|appsettings(\..*)?\.json$|"
     r"master\.key$|\.pem$|\.pfx$|\.p12$|\.htpasswd|\.htaccess|"
-    r"\.log$|/storage/logs?/|laravel|/api/session/properties$)", re.I)
+    r"\.log$|/storage/logs?/|laravel|/api/session/properties$|"
+    # v48.11.0-GLOBAL: fugiam do filtro e viravam "produto novo" no radar —
+    # /env.txt /env.js (a regra exigia .env com ponto ou env no fim),
+    # /settings.json (sem o prefixo appsettings) e /config/aws.yml (a regra
+    # pedia config. com ponto, nao config/ com barra). Mesma familia: caca a
+    # credencial vazada, nao demanda.
+    r"(^|/)\.?env\.(txt|js|json|ya?ml|local|prod(uction)?)$|"
+    r"(^|/)settings\.json$|(^|/)config/[^/]+\.(ya?ml|xml|ini|conf)$)", re.I)
 
 def _is_scan_noise(path: str) -> bool:
     return bool(_SCAN_NOISE.search(path or ""))
@@ -16263,7 +16370,9 @@ def api_x402_alias():
     convenção de manifesto x402. 308 para o manifesto canônico."""
     return redirect("/.well-known/x402.json", code=308)
 
-def _cap500(s, limit=480):
+# v48.11.0-GLOBAL: default 480 -> 390. x402lint P8 apontou 24 descriptions na
+# zona de risco 400-500 (CDP trunca em 500; margem p/ sufixo "..." e encoding).
+def _cap500(s, limit=390):
     """v48.9.20-LINT: teto duro de 480 chars nas descriptions PUBLICADAS
     (openapi/manifesto/bazaar). Docs CDP + x402lint P8: description >500 eh
     truncada ou REJEITADA pelo facilitador — tinhamos 4 fora (ex.: openapi
@@ -23814,6 +23923,119 @@ def _h_doc():
             "ts": ts_now, "version": VERSION}
 
 
+def _h_global_rates():
+    """GET /global-rates — taxas de juros dos 6 maiores bancos centrais.
+    Serie oficial diaria do BIS (WS_CBPOL) + cross-check ao vivo nas fontes
+    primarias (FRED, ECB SDW, BCB SGS). Nenhum concorrente x402 tem."""
+    import csv as _csv
+    import io as _io
+    from concurrent.futures import ThreadPoolExecutor as _TPE
+    t0 = time.perf_counter()
+    ts_now = int(time.time())
+    _BANKS = {"US": "Federal Reserve",
+              "XM": "European Central Bank",
+              "CN": "People's Bank of China (LPR 1y)",
+              "JP": "Bank of Japan",
+              "RU": "Central Bank of Russia",
+              "BR": "Banco Central do Brasil (Selic)"}
+
+    def _bis():
+        r = requests.get(
+            "https://stats.bis.org/api/v2/data/dataflow/BIS/WS_CBPOL/1.0/"
+            "D.US+XM+CN+JP+RU+BR?format=csvfile&lastNObservations=1", timeout=10)
+        rows = {}
+        if r.ok:
+            for row in _csv.DictReader(_io.StringIO(r.text)):
+                a, v, per = row.get("REF_AREA"), row.get("OBS_VALUE"), row.get("TIME_PERIOD")
+                if a and v:
+                    try:
+                        rows[a] = {"rate_pct": float(v), "as_of": per}
+                    except (TypeError, ValueError):
+                        continue
+        return rows, (None if r.ok else f"HTTP {r.status_code}")
+
+    def _fed():
+        r = requests.get("https://fred.stlouisfed.org/graph/fredgraph.csv?id=DFEDTARU",
+                         timeout=8)
+        if not r.ok:
+            return None, f"HTTP {r.status_code}"
+        linhas = [l for l in r.text.strip().splitlines()
+                  if l and not l.startswith("DATE")]
+        if not linhas:
+            return None, "sem linhas"
+        d, v = linhas[-1].split(",")[:2]
+        return {"rate_pct": float(v), "as_of": d,
+                "series": "FRED DFEDTARU (target upper bound)"}, None
+
+    def _ecb():
+        r = requests.get("https://data-api.ecb.europa.eu/service/data/FM/"
+                         "B.U2.EUR.4F.KR.MRR_FR.LEV?lastNObservations=1&format=csvdata",
+                         timeout=8)
+        if not r.ok:
+            return None, f"HTTP {r.status_code}"
+        for row in _csv.DictReader(_io.StringIO(r.text)):
+            if row.get("OBS_VALUE"):
+                return {"rate_pct": float(row["OBS_VALUE"]),
+                        "as_of": row.get("TIME_PERIOD"),
+                        "series": "ECB SDW MRR (main refi)"}, None
+        return None, "sem observacoes"
+
+    def _bcb():
+        r = requests.get("https://api.bcb.gov.br/dados/serie/bcdata.sgs.11/"
+                         "dados/ultimos/1?formato=json", timeout=8)
+        if not r.ok:
+            return None, f"HTTP {r.status_code}"
+        arr = r.json()
+        if arr:
+            return {"rate_pct_per_day": float(arr[0]["valor"]),
+                    "as_of": arr[0]["data"],
+                    "series": "BCB SGS 11 (Selic diaria %/dia)"}, None
+        return None, "sem observacoes"
+
+    rows, errs, checks = {}, {}, {}
+    with _TPE(max_workers=4) as ex:
+        futs = {"bis": ex.submit(_bis), "US": ex.submit(_fed),
+                "XM": ex.submit(_ecb), "BR": ex.submit(_bcb)}
+        bis_rows, bis_err = futs["bis"].result()
+        rows.update(bis_rows)
+        if bis_err:
+            errs["bis"] = bis_err
+        for area in ("US", "XM", "BR"):
+            val, err = futs[area].result()
+            if val:
+                checks[area] = val
+            if err:
+                errs[area.lower()] = err
+    if not rows:
+        return ({"status": "unavailable", "charged": False,
+                 "error": "all rate sources failed", "detail": errs,
+                 "ts": ts_now, "version": VERSION}, 502)
+    us = rows.get("US", {}).get("rate_pct")
+    out = {}
+    for area, bank in _BANKS.items():
+        r = rows.get(area)
+        if not r:
+            continue
+        item = {"bank": bank, "policy_rate_pct": r["rate_pct"],
+                "as_of": r["as_of"], "source": "BIS WS_CBPOL daily (official)"}
+        if area in checks:
+            item["live_check"] = checks[area]
+        if us is not None:
+            item["differential_vs_us_pp"] = round(r["rate_pct"] - us, 3)
+        out[area] = item
+    missing = [a for a in _BANKS if a not in out]
+    return {"product": "Global central bank policy rates — Fed, ECB, PBoC, BOJ, CBR, BCB",
+            "rates": out,
+            "missing": missing or None,
+            "source_errors": errs or None,
+            "note": ("Headline rates are the BIS daily policy-rate series (official). "
+                     "Fed/ECB/BCB carry an additional live cross-check from the "
+                     "primary source (FRED, ECB SDW, BCB SGS). BIS publishes with a "
+                     "short lag; as_of dates are per-series."),
+            "compute_ms": round((time.perf_counter() - t0) * 1000, 1),
+            "ts": ts_now, "version": VERSION}
+
+
 # ---- registro --------------------------------------------------------------
 
 _V47_PRODUCTS = {
@@ -23855,6 +24077,17 @@ _V47_PRODUCTS = {
         "status an official Receita Federal query is required.",
         ["Brazil", "Validation", "KYB", "ZeroUpstream"],
         {"doc": "33.000.167/0001-01"}),
+    "/global-rates": (_h_global_rates, 0.030,
+        "The six policy rates that price the world's money in one call: "
+        "Federal Reserve, ECB, PBoC (LPR), Bank of Japan, Central Bank of "
+        "Russia and Brazil's Selic — headline series from the BIS daily "
+        "policy-rate feed (official), with a live cross-check against each "
+        "primary source (FRED, ECB SDW, BCB SGS) and the carry differential "
+        "vs the Fed in percentage points. Built for agents pricing global "
+        "carry, macro regime and cross-country allocation. No key, no "
+        "account — USDC via x402.",
+        ["GlobalMacro", "Rates", "CentralBanks", "China", "Russia", "Europe", "US"],
+        {}),
 }
 
 for _path, (_fn, _price, _desc, _tags, _hint) in _V47_PRODUCTS.items():
@@ -25739,7 +25972,7 @@ def config_json():
     return r
 
 
-VERSION = "48.10.3-REFINE"  # v48.10.3-REFINE: reprice consolidado no codigo (fonte unica, sem depender de env) — piso $0.01 em 12 endpoints de $0.003-0.008 (fear-greed, pyth-price, trust-hash, agent-market, bootstrap-trust, regime, mempool, web-search, ai-news + os 4 primitivos BR pix/bizdays/doc) e /br-archive $0.05->$0.09: a Coinbase cobra $0.001/settle apos 1k/mes (fazemos ~8k) — a $0.003 a taxa efetiva era 33%, a $0.01 cai a 10%; clientes x402 tem cap default 0.1 USDC, abaixo disso preco nao influencia decisao de maquina; referencia CoinGecko flat $0.01 | LLM_PROXY_PRICE agora le PRICE_LLM_PROXY (default $0.005 — a isca fica) | NOVO /.well-known/agent-registration.json (ERC-8004 registration-v1: A2A+MCP+x402+OAS, x402Support, supportedTrust) — registrar no Identity Registry 0x8004A169...a432 na Base | FIX telemetria: pos-refund nao loga mais "paid" (double-log inflava calls; Agent402 e /receipts leem isso) | refund agora carrega recommended_next (cross-sell na falha — falha vira retencao) | billing LLM com backoff persistente em /data (strikes 6h->12h->18h->24h; o 429 diario do Gemini parava de gritar a cada boot; provider saudavel zera) | base: v48.10.2-REFUND
+VERSION = "48.11.0-GLOBAL"  # v48.11.0-GLOBAL: Moonshot/Kimi + OpenRouter como provedores premium DORMENTES (env-gated: sem chave = zero custo; ativar = MOONSHOT_API_KEY/OPENROUTER_API_KEY no Railway) | perfis de roteamento estilo ClawRouter: /llm?profile=eco|fast|premium e model=kimi|deepseek|eco|premium no /v1/chat/completions | NOVO /global-rates ($0.03): taxas de Fed/ECB/PBoC/BOJ/CBR/BCB numa chamada — BIS WS_CBPOL + cross-check ao vivo FRED/ECB-SDW/BCB-SGS, diferencial de carry vs Fed; nenhum concorrente x402 tem | rails Polygon (eip155:137) + Arbitrum (eip155:42161) PRONTAS, settle pelo mesmo facilitador CDP, env-gated OFF (X402_POLYGON=1/X402_ARBITRUM=1 so apos confirmar credito na Binance) | _SCAN_NOISE cobre /env.txt /env.js /settings.json /config/*.yml (scanner de credencial nao vira mais produto novo no radar) | _cap500 default 480->390 (x402lint P8: 24 descriptions na zona de risco; caminho p/ 100/100) | base: v48.10.3-REFINE: reprice consolidado no codigo (fonte unica, sem depender de env) — piso $0.01 em 12 endpoints de $0.003-0.008 (fear-greed, pyth-price, trust-hash, agent-market, bootstrap-trust, regime, mempool, web-search, ai-news + os 4 primitivos BR pix/bizdays/doc) e /br-archive $0.05->$0.09: a Coinbase cobra $0.001/settle apos 1k/mes (fazemos ~8k) — a $0.003 a taxa efetiva era 33%, a $0.01 cai a 10%; clientes x402 tem cap default 0.1 USDC, abaixo disso preco nao influencia decisao de maquina; referencia CoinGecko flat $0.01 | LLM_PROXY_PRICE agora le PRICE_LLM_PROXY (default $0.005 — a isca fica) | NOVO /.well-known/agent-registration.json (ERC-8004 registration-v1: A2A+MCP+x402+OAS, x402Support, supportedTrust) — registrar no Identity Registry 0x8004A169...a432 na Base | FIX telemetria: pos-refund nao loga mais "paid" (double-log inflava calls; Agent402 e /receipts leem isso) | refund agora carrega recommended_next (cross-sell na falha — falha vira retencao) | billing LLM com backoff persistente em /data (strikes 6h->12h->18h->24h; o 429 diario do Gemini parava de gritar a cada boot; provider saudavel zera) | base: v48.10.2-REFUND
 if __name__ == "__main__":
     cli()
 else:
