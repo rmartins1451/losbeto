@@ -1236,7 +1236,7 @@ class LedgerV10:
             # v29: O QUE AS MÁQUINAS PEDEM ------------------------------------
             try:  # caminhos inexistentes = pedidos de produto
                 demand_404 = [{"path": r[0], "hits": r[1], "ips": r[2], "ua": (r[3] or "")[:40],
-                               **_demand_classify(r[0])}
+                               **_demand_classify_ml(r[0])}
                     for r in c.execute(
                     "SELECT endpoint, COUNT(*) n, COUNT(DISTINCT ip), "
                     "COALESCE(NULLIF(ua,''),'?') FROM requests "
@@ -9095,6 +9095,10 @@ def health_providers():
                       ("moonshot", MOONSHOT_KEY), ("openrouter", OPENROUTER_KEY)) if k],
                  "probe": (probe or "")[:60],
                  "probe_cache_ttl_s": AI_PROBE_TTL}
+    out["ml"] = {"sklearn": bool(_ML_SK),
+                 "demand_classifier": _ML_CLF["n"] or ("file" if _ML_CLF_FILE.exists() else 0),
+                 "anomaly_detector": _ML_IF["n"] or ("file" if _ML_IF_FILE.exists() else 0),
+                 "discover": "semantic" if _ML_EMB_OK else "keyword"}
     # 2) mercados tradicionais: o que a auditoria reprovou
     checks = {}
     for path, fn in (("/stock-quote", Brain.stock_quote),
@@ -13669,6 +13673,360 @@ def _demand_classify(path: str) -> dict:
             "action": "Nada equivalente no catálogo — exige fonte de dados nova",
             "closest": []}
 
+# ============================================================================
+# v48.12.0-ML — CAMADA DE MACHINE LEARNING EMBARCADA
+# Tres modelos treinados nos dados do PROPRIO node (60k+ probes + ledger de
+# receita): nenhum concorrente pode copiar — eles nao tem o nosso trafego.
+# Tudo import-guarded: sem scikit-learn/fastembed instalado, o node roda
+# exatamente como antes (as features dormem, nada quebra). ML_DISABLED=1
+# desliga tudo. Deps novas no requirements: scikit-learn, fastembed.
+# ============================================================================
+ML_DISABLED = os.environ.get("ML_DISABLED", "") == "1"
+_ML_SK = None
+try:
+    if not ML_DISABLED:
+        import joblib as _joblib
+        from sklearn.ensemble import GradientBoostingClassifier, IsolationForest
+        _ML_SK = True
+except Exception as _mle:
+    _ML_SK = None
+    log.info(f"🧠 ML: scikit-learn ausente ({_mle.__class__.__name__}) — classificador/anomalias dormem")
+
+_ML_DIR = Path(HOME_DIR)
+_ML_CLF_FILE = _ML_DIR / "ml_demand_clf.joblib"
+_ML_IF_FILE  = _ML_DIR / "ml_ops_iforest.joblib"
+_ML_ANOM_FILE = _ML_DIR / "ml_anomalies.json"
+_ML_CLF = {"model": None, "trained_at": 0, "n": 0}
+_ML_IF  = {"model": None, "trained_at": 0, "n": 0}
+_ML_LABELS = ["scanner_noise", "resolved", "alias_candidate", "new_product"]
+
+
+def _ml_path_features(path: str) -> list:
+    """Vetor de features de um caminho pedido — o 'DNA' que o modelo aprende."""
+    p = (path or "").lower()
+    segs = [s for s in p.split("/") if s]
+    tail = p.rsplit("/", 1)[-1]
+    ext = tail.rsplit(".", 1)[-1] if "." in tail else ""
+    kws = ("wp", "admin", "config", "env", "backup", "dump", "api", "token",
+           "price", "data", "login", "auth", "debug", "test", "php", "sql")
+    return [
+        len(p), len(segs), len(ext),
+        sum(c.isdigit() for c in p), sum(c.isupper() for c in (path or "")),
+        len(set(p)) / max(1, len(p)),
+        float(p.count(".")), float(p.count("%")),
+        float(any(k in p for k in ("wp-", "wordpress", "phpmyadmin", "xmlrpc"))),
+        float(ext in ("php", "asp", "aspx", "jsp", "cgi")),
+        float(ext in ("env", "pem", "key", "p12", "pfx", "sql", "bak", "log")),
+        float(ext in ("json", "yml", "yaml", "xml", "ini", "conf", "txt", "js")),
+        float(any(k in p for k in ("config", "credential", "secret", "settings"))),
+        float(any(k in p for k in ("api", "v1", "v2", "graphql"))),
+        float(any(k in p for k in ("price", "rates", "macro", "llm", "br-", "x402"))),
+        float(p.endswith("/")),
+    ] + [float(k in p) for k in kws]
+
+
+def _ml_train_demand() -> dict:
+    """Auto-rotulagem: as regras atuais (_is_scan_noise/_route_now_live/
+    _suggest_paths) rotulam o historico de 404s; o GradientBoosting generaliza
+    para variacoes que o regex nunca viu. Sem dados suficientes, dorme."""
+    if not _ML_SK:
+        return {"trained": False, "reason": "sklearn ausente"}
+    try:
+        with LEDGER._conn() as c:
+            rows = c.execute(
+                "SELECT endpoint, COUNT(*) FROM requests "
+                "WHERE kind='notfound' GROUP BY endpoint").fetchall()
+        if len(rows) < 60:
+            return {"trained": False, "reason": f"amostras insuficientes ({len(rows)})"}
+        X, y = [], []
+        for path, _n in rows:
+            if _is_scan_noise(path):
+                lbl = "scanner_noise"
+            elif _route_now_live(path):
+                lbl = "resolved"
+            elif _suggest_paths(path, n=1):
+                lbl = "alias_candidate"
+            else:
+                lbl = "new_product"
+            X.append(_ml_path_features(path))
+            y.append(_ML_LABELS.index(lbl))
+        if len(set(y)) < 2:
+            return {"trained": False, "reason": "uma so classe no historico"}
+        clf = GradientBoostingClassifier(n_estimators=120, max_depth=3,
+                                         learning_rate=0.08, random_state=42)
+        clf.fit(X, y)
+        _joblib.dump(clf, _ML_CLF_FILE)
+        _ML_CLF.update({"model": clf, "trained_at": int(time.time()), "n": len(X)})
+        dist = {_ML_LABELS[i]: y.count(i) for i in sorted(set(y))}
+        log.info(f"🧠 ML demanda: treinado com {len(X)} caminhos {dist}")
+        return {"trained": True, "n": len(X), "dist": dist}
+    except Exception as e:
+        log.warning(f"🧠 ML demanda treino: {e}")
+        return {"trained": False, "reason": str(e)[:120]}
+
+
+def _ml_clf_load():
+    if _ML_CLF["model"] is None and _ML_SK and _ML_CLF_FILE.exists():
+        try:
+            _ML_CLF["model"] = _joblib.load(_ML_CLF_FILE)
+            _ML_CLF["trained_at"] = int(_ML_CLF_FILE.stat().st_mtime)
+        except Exception as e:
+            log.warning(f"🧠 ML demanda load: {e}")
+
+
+def _ml_predict_path(path: str):
+    """Devolve (label, confianca) ou None se o modelo nao esta ativo."""
+    if not _ML_SK:
+        return None
+    _ml_clf_load()
+    clf = _ML_CLF["model"]
+    if clf is None:
+        return None
+    try:
+        proba = clf.predict_proba([_ml_path_features(path)])[0]
+        j = int(proba.argmax())
+        # classes_ guarda os indices de _ML_LABELS vistos no treino — se uma
+        # classe estava ausente, argmax NAO bate com o indice do rótulo.
+        i = int(clf.classes_[j])
+        return (_ML_LABELS[i], round(float(proba[j]), 3))
+    except Exception:
+        return None
+
+
+def _demand_classify_ml(path: str) -> dict:
+    """_demand_classify com a segunda opiniao do ML anexada. As REGRAS
+    continuam soberanas; o ML enriquece painel/alerta e — com confianca alta —
+    rebaixa para scanner_noise o 'produto novo' que o regex nao cobriu."""
+    out = _demand_classify(path)
+    pred = _ml_predict_path(path)
+    if pred:
+        out["ml"] = {"label": pred[0], "confidence": pred[1],
+                     "agrees": pred[0] == out["kind"]}
+        if pred[0] == "scanner_noise" and out["kind"] == "new_product" and pred[1] >= 0.85:
+            out["kind"] = "scanner_noise"
+            out["action"] = "Sonda de exploracao (detectada por ML; regex nao cobria)"
+    return out
+
+
+def _ml_hourly_aggregates(days=30) -> list:
+    """Agrega requests+revenue em amostras horarias p/ o IsolationForest."""
+    try:
+        corte = int(time.time()) - days * 86400
+        with LEDGER._conn() as c:
+            req = dict(c.execute(
+                "SELECT ts/3600 h, COUNT(*) FROM requests WHERE ts>? GROUP BY h",
+                (corte,)).fetchall())
+            ips = dict(c.execute(
+                "SELECT ts/3600 h, COUNT(DISTINCT ip) FROM requests WHERE ts>? GROUP BY h",
+                (corte,)).fetchall())
+            paid = dict(c.execute(
+                "SELECT ts/3600 h, COUNT(*) FROM requests WHERE ts>? AND kind='paid' GROUP BY h",
+                (corte,)).fetchall())
+            rev = dict(c.execute(
+                "SELECT ts/3600 h, COALESCE(SUM(amount),0) FROM revenue WHERE ts>? GROUP BY h",
+                (corte,)).fetchall())
+            payers = dict(c.execute(
+                "SELECT ts/3600 h, COUNT(DISTINCT payer) FROM revenue WHERE ts>? GROUP BY h",
+                (corte,)).fetchall())
+        return [[req.get(h, 0), ips.get(h, 0), paid.get(h, 0),
+                 round(rev.get(h, 0.0), 4), payers.get(h, 0)] for h in sorted(req)]
+    except Exception as e:
+        log.debug(f"🧠 ML hourly: {e}")
+        return []
+
+
+def _ml_train_anomaly() -> dict:
+    if not _ML_SK:
+        return {"trained": False, "reason": "sklearn ausente"}
+    try:
+        X = _ml_hourly_aggregates(30)
+        if len(X) < 72:
+            return {"trained": False, "reason": f"horas insuficientes ({len(X)})"}
+        iforest = IsolationForest(n_estimators=150, contamination=0.05, random_state=42)
+        iforest.fit(X)
+        _joblib.dump(iforest, _ML_IF_FILE)
+        _ML_IF.update({"model": iforest, "trained_at": int(time.time()), "n": len(X)})
+        log.info(f"🧠 ML anomalias: treinado com {len(X)} amostras horarias")
+        return {"trained": True, "n": len(X)}
+    except Exception as e:
+        log.warning(f"🧠 ML anomalias treino: {e}")
+        return {"trained": False, "reason": str(e)[:120]}
+
+
+def _ml_if_load():
+    if _ML_IF["model"] is None and _ML_SK and _ML_IF_FILE.exists():
+        try:
+            _ML_IF["model"] = _joblib.load(_ML_IF_FILE)
+        except Exception as e:
+            log.warning(f"🧠 ML anomalias load: {e}")
+
+
+def _ml_score_current_hour() -> dict:
+    """Pontua a ultima hora COMPLETA; anomalia -> log + arquivo + Telegram (1/6h)."""
+    if not _ML_SK:
+        return {}
+    _ml_if_load()
+    iforest = _ML_IF["model"]
+    if iforest is None:
+        return {}
+    try:
+        X = _ml_hourly_aggregates(2)
+        if len(X) < 2:
+            return {}
+        cur = X[-2]  # hora fechada — a corrente e parcial e pareceria anomala
+        pred = int(iforest.predict([cur])[0])
+        score = round(float(iforest.score_samples([cur])[0]), 4)
+        out = {"anomaly": pred == -1, "score": score,
+               "features": {"requests": cur[0], "ips": cur[1], "paid": cur[2],
+                            "revenue": cur[3], "payers": cur[4]}}
+        if out["anomaly"]:
+            hist = []
+            if _ML_ANOM_FILE.exists():
+                try:
+                    hist = json.loads(_ML_ANOM_FILE.read_text())
+                except Exception:
+                    hist = []
+            hist.append({"ts": int(time.time()), **out})
+            _ML_ANOM_FILE.write_text(json.dumps(hist[-50:]))
+            last = getattr(_ml_score_current_hour, "_last_alert", 0)
+            if time.time() - last > 6 * 3600:
+                _ml_score_current_hour._last_alert = time.time()
+                _notify_telegram(
+                    f"🧠 *ANOMALIA OPERACIONAL*\n\n"
+                    f"Ultima hora fora do padrao (score {score}):\n"
+                    f"• requests: {cur[0]} · IPs: {cur[1]}\n"
+                    f"• vendas: {cur[2]} · receita: ${cur[3]:.4f} · pagadores: {cur[4]}\n\n"
+                    f"IsolationForest treinado em {_ML_IF['n']}h do proprio node.")
+            log.warning(f"🧠 ANOMALIA: {out}")
+        return out
+    except Exception as e:
+        log.debug(f"🧠 ML anomalia score: {e}")
+        return {}
+
+
+def ml_ops_loop():
+    """Ciclo ML: primeiro treino 10 min apos o boot; re-treina 1x/dia (o node
+    aprende com o trafego novo) e pontua a ultima hora fechada a cada hora."""
+    time.sleep(600)
+    if not _ML_SK:
+        return
+    _ml_train_demand()
+    _ml_train_anomaly()
+    ultimo_treino = time.time()
+    while True:
+        try:
+            _ml_score_current_hour()
+            if time.time() - ultimo_treino > 86400:
+                _ml_train_demand()
+                _ml_train_anomaly()
+                ultimo_treino = time.time()
+        except Exception as e:
+            log.debug(f"ml_ops: {e}")
+        time.sleep(3600)
+
+
+# ---- /discover — descoberta semantica do catalogo (FastEmbed/ONNX) ----------
+_ML_EMB = {"model": None, "vectors": None, "paths": [], "hash": ""}
+try:
+    if not ML_DISABLED:
+        from fastembed import TextEmbedding as _TextEmbedding
+        _ML_EMB_OK = True
+    else:
+        _ML_EMB_OK = False
+        _TextEmbedding = None
+except Exception as _mle:
+    _ML_EMB_OK = False
+    _TextEmbedding = None
+    log.info(f"🧠 /discover: fastembed ausente ({_mle.__class__.__name__}) — modo palavra-chave")
+
+
+def _discover_keyword(q: str, n: int) -> list:
+    """Fallback sem embeddings: overlap de tokens entre query e descricoes."""
+    toks = {t for t in re.findall(r"[a-z0-9]+", (q or "").lower()) if len(t) > 2}
+    scored = []
+    for path, desc in ENDPOINT_DESC.items():
+        dtoks = set(re.findall(r"[a-z0-9]+", (path + " " + (desc or "")).lower()))
+        inter = len(toks & dtoks)
+        if inter:
+            scored.append((inter / max(1, len(toks)), path))
+    scored.sort(key=lambda t: (-t[0], t[1]))
+    return [p for _s, p in scored[:n]]
+
+
+def _discover_embed(q: str, n: int) -> list:
+    """Busca vetorial: MiniLM ONNX 100% local (nada sai do node), embeddings
+    do catalogo cacheados em /data e invalidados quando o catalogo muda."""
+    if not _ML_EMB_OK:
+        return []
+    if time.time() < _ML_EMB.get("backoff_until", 0):
+        return []  # download do modelo falhou ha pouco — nao trava toda chamada
+    try:
+        import hashlib as _hl
+        import numpy as _np
+        cat_hash = _hl.sha256("|".join(sorted(ENDPOINT_DESC)).encode()).hexdigest()[:16]
+        if _ML_EMB["model"] is None:
+            _ML_EMB["model"] = _TextEmbedding(
+                model_name="sentence-transformers/all-MiniLM-L6-v2",
+                cache_dir=str(_ML_DIR / "fastembed_cache"))
+        if _ML_EMB["hash"] != cat_hash:
+            paths = sorted(ENDPOINT_DESC)
+            docs = [f"{p}: {ENDPOINT_DESC[p]}" for p in paths]
+            _ML_EMB["vectors"] = list(_ML_EMB["model"].embed(docs))
+            _ML_EMB["paths"] = paths
+            _ML_EMB["hash"] = cat_hash
+        qv = _np.array(list(_ML_EMB["model"].embed([q]))[0])
+        V = _np.array(_ML_EMB["vectors"])
+        sims = (V @ qv) / (_np.linalg.norm(V, axis=1) * _np.linalg.norm(qv) + 1e-9)
+        idx = sims.argsort()[::-1][:n]
+        return [(_ML_EMB["paths"][int(i)], round(float(sims[int(i)]), 3)) for i in idx]
+    except Exception as e:
+        log.warning(f"🧠 /discover embed: {e}")
+        _ML_EMB["backoff_until"] = time.time() + 6 * 3600
+        return []
+
+
+@app.route("/discover")
+def discover():
+    """GET /discover?q=... — descoberta SEMANTICA do catalogo, gratis.
+    O agente descreve a tarefa em linguagem natural; o node rankeia os
+    proprios endpoints por similaridade vetorial (MiniLM ONNX local) — ou
+    por palavra-chave se o fastembed nao estiver instalado. Funil: quem
+    acha o endpoint certo, compra."""
+    q = (request.args.get("q") or "").strip()[:300]
+    try:
+        n = max(1, min(int(request.args.get("n", 5)), 10))
+    except (TypeError, ValueError):
+        n = 5
+    if not q:
+        return ({"error": "missing q",
+                 "example": "/discover?q=validate brazilian tax id",
+                 "endpoints": len(ENDPOINT_DESC), "version": VERSION}, 400)
+    t0 = time.perf_counter()
+    hits = _discover_embed(q, n)
+    mode = "semantic-minilm-onnx"
+    if not hits:
+        mode = "keyword-fallback"
+        hits = [(p, None) for p in _discover_keyword(q, n)]
+    out = []
+    for path, sim in hits:
+        item = {"endpoint": path,
+                "price_usd": round(BASE_PRICES.get(path, 0.0), 4),
+                "description": _cap500(ENDPOINT_DESC.get(path, ""), 220),
+                "tags": ENDPOINT_TAGS.get(path, []),
+                "pay_with": f"{_public_base()}{path}"}
+        if sim is not None:
+            item["similarity"] = sim
+        out.append(item)
+    return {"query": q, "mode": mode, "results": out,
+            "how_it_works": ("Describe the task in plain language; the node ranks its "
+                             "own catalog by vector similarity (local MiniLM ONNX — "
+                             "no data leaves this node). Free discovery; pay per call "
+                             "with USDC via x402."),
+            "compute_ms": round((time.perf_counter() - t0) * 1000, 1),
+            "endpoints_indexed": len(ENDPOINT_DESC),
+            "ts": int(time.time()), "version": VERSION}
+
+
 def demand_watch_loop():
     """v29.1: vigia os pedidos fora do catálogo. Quando um mesmo caminho é
     pedido por N IPs distintos, avisa o operador no Telegram. É o ciclo
@@ -13690,7 +14048,7 @@ def demand_watch_loop():
                 if path in avisados:
                     continue
                 avisados.add(path)
-                cls = _demand_classify(path)
+                cls = _demand_classify_ml(path)
                 if cls["kind"] in ("resolved", "scanner_noise"):
                     # v44.1.0: a rota já existe — demanda atendida, não alerta.
                     # v44.3.0: sonda de exploração — ruído, não alerta.
@@ -20145,6 +20503,7 @@ def _start_background_once():
     threading.Thread(target=archive_loop, daemon=True).start()
     threading.Thread(target=demand_watch_loop, daemon=True).start()
     threading.Thread(target=lead_watch_loop, daemon=True).start()  # v48.6.0-REGISTER
+    threading.Thread(target=ml_ops_loop, daemon=True).start()      # v48.12.0-ML
     threading.Thread(target=autopilot_report_loop, daemon=True).start()
     threading.Thread(target=llm_watchdog_loop, daemon=True).start()
     threading.Thread(target=acp_railway_seller_loop, daemon=True).start()
@@ -25972,7 +26331,7 @@ def config_json():
     return r
 
 
-VERSION = "48.11.0-GLOBAL"  # v48.11.0-GLOBAL: Moonshot/Kimi + OpenRouter como provedores premium DORMENTES (env-gated: sem chave = zero custo; ativar = MOONSHOT_API_KEY/OPENROUTER_API_KEY no Railway) | perfis de roteamento estilo ClawRouter: /llm?profile=eco|fast|premium e model=kimi|deepseek|eco|premium no /v1/chat/completions | NOVO /global-rates ($0.03): taxas de Fed/ECB/PBoC/BOJ/CBR/BCB numa chamada — BIS WS_CBPOL + cross-check ao vivo FRED/ECB-SDW/BCB-SGS, diferencial de carry vs Fed; nenhum concorrente x402 tem | rails Polygon (eip155:137) + Arbitrum (eip155:42161) PRONTAS, settle pelo mesmo facilitador CDP, env-gated OFF (X402_POLYGON=1/X402_ARBITRUM=1 so apos confirmar credito na Binance) | _SCAN_NOISE cobre /env.txt /env.js /settings.json /config/*.yml (scanner de credencial nao vira mais produto novo no radar) | _cap500 default 480->390 (x402lint P8: 24 descriptions na zona de risco; caminho p/ 100/100) | base: v48.10.3-REFINE: reprice consolidado no codigo (fonte unica, sem depender de env) — piso $0.01 em 12 endpoints de $0.003-0.008 (fear-greed, pyth-price, trust-hash, agent-market, bootstrap-trust, regime, mempool, web-search, ai-news + os 4 primitivos BR pix/bizdays/doc) e /br-archive $0.05->$0.09: a Coinbase cobra $0.001/settle apos 1k/mes (fazemos ~8k) — a $0.003 a taxa efetiva era 33%, a $0.01 cai a 10%; clientes x402 tem cap default 0.1 USDC, abaixo disso preco nao influencia decisao de maquina; referencia CoinGecko flat $0.01 | LLM_PROXY_PRICE agora le PRICE_LLM_PROXY (default $0.005 — a isca fica) | NOVO /.well-known/agent-registration.json (ERC-8004 registration-v1: A2A+MCP+x402+OAS, x402Support, supportedTrust) — registrar no Identity Registry 0x8004A169...a432 na Base | FIX telemetria: pos-refund nao loga mais "paid" (double-log inflava calls; Agent402 e /receipts leem isso) | refund agora carrega recommended_next (cross-sell na falha — falha vira retencao) | billing LLM com backoff persistente em /data (strikes 6h->12h->18h->24h; o 429 diario do Gemini parava de gritar a cada boot; provider saudavel zera) | base: v48.10.2-REFUND
+VERSION = "48.12.0-ML"  # v48.12.0-ML: camada de machine learning embarcada treinada nos dados do PROPRIO node (60k+ probes + ledger) — (1) classificador de demanda GradientBoosting com auto-rotulagem pelas regras atuais e retreino diario: pega scanner que o regex nunca viu (conf>=0.85 rebaixa new_product->scanner_noise) e anexa label+confianca ao painel/alertas; (2) detector de anomalias IsolationForest sobre agregados horarios de requests/revenue (min 72h): surto de comprador ou ataque vira log + Telegram (1/6h) + /data/ml_anomalies.json; (3) NOVO /discover gratis: busca semantica do catalogo por similaridade vetorial (MiniLM ONNX via fastembed, cache em /data) com fallback palavra-chave — funil de descoberta p/ agentes | tudo import-guarded (sem sklearn/fastembed o node roda como antes) + ML_DISABLED=1 | deps novas p/ requirements: scikit-learn fastembed | base: v48.11.0-GLOBAL: Moonshot/Kimi + OpenRouter como provedores premium DORMENTES (env-gated: sem chave = zero custo; ativar = MOONSHOT_API_KEY/OPENROUTER_API_KEY no Railway) | perfis de roteamento estilo ClawRouter: /llm?profile=eco|fast|premium e model=kimi|deepseek|eco|premium no /v1/chat/completions | NOVO /global-rates ($0.03): taxas de Fed/ECB/PBoC/BOJ/CBR/BCB numa chamada — BIS WS_CBPOL + cross-check ao vivo FRED/ECB-SDW/BCB-SGS, diferencial de carry vs Fed; nenhum concorrente x402 tem | rails Polygon (eip155:137) + Arbitrum (eip155:42161) PRONTAS, settle pelo mesmo facilitador CDP, env-gated OFF (X402_POLYGON=1/X402_ARBITRUM=1 so apos confirmar credito na Binance) | _SCAN_NOISE cobre /env.txt /env.js /settings.json /config/*.yml (scanner de credencial nao vira mais produto novo no radar) | _cap500 default 480->390 (x402lint P8: 24 descriptions na zona de risco; caminho p/ 100/100) | base: v48.10.3-REFINE: reprice consolidado no codigo (fonte unica, sem depender de env) — piso $0.01 em 12 endpoints de $0.003-0.008 (fear-greed, pyth-price, trust-hash, agent-market, bootstrap-trust, regime, mempool, web-search, ai-news + os 4 primitivos BR pix/bizdays/doc) e /br-archive $0.05->$0.09: a Coinbase cobra $0.001/settle apos 1k/mes (fazemos ~8k) — a $0.003 a taxa efetiva era 33%, a $0.01 cai a 10%; clientes x402 tem cap default 0.1 USDC, abaixo disso preco nao influencia decisao de maquina; referencia CoinGecko flat $0.01 | LLM_PROXY_PRICE agora le PRICE_LLM_PROXY (default $0.005 — a isca fica) | NOVO /.well-known/agent-registration.json (ERC-8004 registration-v1: A2A+MCP+x402+OAS, x402Support, supportedTrust) — registrar no Identity Registry 0x8004A169...a432 na Base | FIX telemetria: pos-refund nao loga mais "paid" (double-log inflava calls; Agent402 e /receipts leem isso) | refund agora carrega recommended_next (cross-sell na falha — falha vira retencao) | billing LLM com backoff persistente em /data (strikes 6h->12h->18h->24h; o 429 diario do Gemini parava de gritar a cada boot; provider saudavel zera) | base: v48.10.2-REFUND
 if __name__ == "__main__":
     cli()
 else:
