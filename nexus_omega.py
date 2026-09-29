@@ -426,15 +426,15 @@ CREDIT_PLANS = {
 # Preços base (USDC) – 42 endpoints
 BASE_PRICES = {
     # --- DISCOVERY ($0.01–0.03): commodities — preço de mercado, volume e trust ---
-    "/fear-greed":       0.003,
-    "/pyth-price":       0.003,
-    "/trust-hash":       0.003,
-    "/agent-market":     0.005,
-    "/bootstrap-trust":  0.005,
-    "/regime":           0.008,
-    "/mempool":          0.008,
-    "/web-search":       0.008,
-    "/ai-news":          0.008,
+    "/fear-greed":       0.010,   # v48.10.3: piso $0.01 — taxa facilitator 33%→10%
+    "/pyth-price":       0.010,   # v48.10.3: idem (CoinGecko cobra flat $0.01 — referência)
+    "/trust-hash":       0.010,
+    "/agent-market":     0.010,
+    "/bootstrap-trust":  0.010,
+    "/regime":           0.010,
+    "/mempool":          0.010,
+    "/web-search":       0.010,
+    "/ai-news":          0.010,
     "/geo-alpha":        0.010,
     "/sentiment":        0.010,
     "/anomalias":        0.010,
@@ -2333,10 +2333,30 @@ def _llm_mark(provider: str, ok: bool, detail: str = "") -> None:
             _LLM_DOWN_UNTIL.pop(provider, None)
             _LLM_LAST_ERROR.pop(provider, None)
             _BILLING_ALERTED.pop(provider, None)
+            try:  # v48.10.3: provider saudável zera o backoff de billing
+                _bf = os.path.join(os.path.dirname(DB_PATH), "llm_billing_backoff.json")
+                if os.path.exists(_bf):
+                    _st = json.load(open(_bf))
+                    if _st.pop(provider, None) is not None:
+                        json.dump(_st, open(_bf, "w"))
+            except Exception:
+                pass
         else:
             espera = (_BILLING_COOLDOWN if cobranca
                       else _DAILY_COOLDOWN if diaria
                       else _LLM_COOLDOWN)
+            if cobranca:
+                # v48.10.3: backoff persistente de billing — strikes em /data
+                # sobrevivem a redeploy; 6h→12h→18h→24h (cap 4 strikes).
+                # O 429 diário do free tier parava de gritar a cada boot.
+                try:
+                    _bf = os.path.join(os.path.dirname(DB_PATH), "llm_billing_backoff.json")
+                    _st = json.load(open(_bf)) if os.path.exists(_bf) else {}
+                    _st[provider] = int(_st.get(provider, 0)) + 1
+                    json.dump(_st, open(_bf, "w"))
+                    espera = _BILLING_COOLDOWN * min(_st[provider], 4)
+                except Exception:
+                    pass
             _LLM_DOWN_UNTIL[provider] = time.time() + espera
             _LLM_LAST_ERROR[provider] = detail[:180]
 
@@ -7396,6 +7416,7 @@ def paid_endpoint(path):
                 _g.losbeto_payer = info.get("payer", "") if isinstance(info, dict) else ""
                 _track_spend(payer, get_dynamic_price(path))   # v39.7
                 _g.losbeto_payment = info if isinstance(info, dict) else {}
+                _refunded_here = False
                 try:
                     result = handler()
                     # v48.10.2-REFUND: DELIVERY-OR-REFUND universal. Antes só
@@ -7422,6 +7443,15 @@ def paid_endpoint(path):
                         result[0]["note"] = ("Payment settled but the endpoint did not "
                             "deliver. A credit equal to the amount paid has been issued — "
                             "send it as the X-API-Key header on any endpoint, valid 30 days.")
+                        _refunded_here = True
+                        # v48.10.3: cross-sell também na falha — o crédito volta
+                        # com um destino sugerido; falha vira retenção.
+                        try:
+                            _recs = _recommended_next(path, payer)
+                            if _recs and "recommended_next" not in result[0]:
+                                result[0]["recommended_next"] = _recs
+                        except Exception:
+                            pass
                 except LLMUnavailable:
                     # Corrida: o gate passou, mas o provedor caiu entre o
                     # settle e a geração. O pagamento já é on-chain e não pode
@@ -7466,8 +7496,12 @@ def paid_endpoint(path):
                             _PREVIEW_CACHE[path] = {"ts": time.time(), "data": prev_data}
                             _preview_db_put(path, prev_data)
                 except Exception: pass
-                LEDGER.log_request(path, True, int((time.time() - t0) * 1000), ip,
-                                    kind="paid", ua=request.headers.get("User-Agent",""), params=_clean_params())
+                # v48.10.3: após refund NÃO loga "paid" — o request já entrou
+                # como kind="refunded"; o double-log inflava calls pagas e
+                # distorcia a telemetria que /receipts e o Agent402 leem.
+                if not _refunded_here:
+                    LEDGER.log_request(path, True, int((time.time() - t0) * 1000), ip,
+                                        kind="paid", ua=request.headers.get("User-Agent",""), params=_clean_params())
                 # v21.12 FIX: handlers que retornam flask.Response (jsonify
                 # interno) quebravam aqui com "Response is not JSON serializable"
                 # — 500 pago em /win-rate-verified. Response passa direto;
@@ -9492,6 +9526,38 @@ def x402list_proof_trailing(rest):
     """v47.6.0: clientes malformados concatenam a URL inteira ao path
     (/.well-known/x402list.txthttps://...). Serve o mesmo token."""
     return x402list_proof()
+
+
+@app.route("/.well-known/agent-registration.json")
+def agent_registration_8004():
+    """v48.10.3: ERC-8004 (Trustless Agents) registration file — aponte este
+    URL como agentURI ao chamar register() no Identity Registry
+    0x8004A169FB4a3325136EB29fA0ceB6D2e539a432 (Base). Routers e compradores
+    consultam o registry antes de pagar; o strict-test da TRM só conta como
+    agente legítimo quem está registrado."""
+    base = _public_base()
+    return jsonify({
+        "type": "https://eips.ethereum.org/EIPS/eip-8004#registration-v1",
+        "name": "Losbeto Market Intelligence",
+        "description": ("99 paid endpoints for AI agents: the only Brazilian data suite "
+                        "on x402 (PIX BR Code tools, du/252 business-day rates math, BCB "
+                        "series, B3 equities, point-in-time macro archive), market data, "
+                        "an OpenAI-compatible LLM inference gateway, and transform APIs "
+                        "(/extract, /translate). USDC via x402 on Base, Solana and "
+                        "Algorand. Free delayed preview on every endpoint; "
+                        "delivery-or-refund on every paid call."),
+        "image": f"{base}/favicon.png",
+        "services": [
+            {"name": "web",  "endpoint": f"{base}/"},
+            {"name": "A2A",  "endpoint": f"{base}/.well-known/agent-card.json"},
+            {"name": "MCP",  "endpoint": f"{base}/mcp"},
+            {"name": "x402", "endpoint": f"{base}/.well-known/x402.json"},
+            {"name": "OAS",  "endpoint": f"{base}/openapi.json"},
+        ],
+        "x402Support": True,
+        "active": True,
+        "supportedTrust": ["reputation", "crypto-economic"],
+    })
 
 
 @app.route("/bazaar.json")
@@ -12088,7 +12154,7 @@ log.info("🌍 world-quote registrado ($0.02) — 16 praças globais, um schema"
 # pré-gate nem emite 402 (AI_REQUIRED_ENDPOINTS); falha pós-settle → tupla
 # (status:unavailable, 503) → estorno automático em crédito pelo paid_endpoint.
 # ===========================================================================
-LLM_PROXY_PRICE = 0.005
+LLM_PROXY_PRICE = float(os.environ.get("PRICE_LLM_PROXY", "0.005"))  # v48.10.3: repricing do gateway sem deploy (default mantém a isca $0.005)
 _LLM_PROXY_MAX_PROMPT_CHARS = 16000
 _LLM_PROXY_SAMPLE_Q = ("Give a one-paragraph briefing on current crypto market "
                        "sentiment, naming one bullish and one bearish signal.")
@@ -12413,7 +12479,7 @@ app.add_url_rule("/v1/chat/completions", "llm_chat_docs",
 # ============================================================================
 
 EXTRACT_PRICE   = float(os.environ.get("PRICE_EXTRACT", "0.01"))
-TRANSLATE_PRICE = float(os.environ.get("PRICE_TRANSLATE", "0.008"))
+TRANSLATE_PRICE = float(os.environ.get("PRICE_TRANSLATE", "0.01"))  # v48.10.3: piso $0.01
 _XF_MAX_CHARS   = int(os.environ.get("XF_MAX_CHARS", "6000"))
 _XF_SAMPLE_TEXT = ("Invoice 2041 from Acme Ltda, issued 2026-09-12, total R$ 1.250,00, "
                    "due 2026-10-12. Contact: financeiro@acme.com.br")
@@ -15087,7 +15153,7 @@ def _br_archive_handler():
             "archive_depth_days": depth,
             "provider": "Losbeto/Brasil-Archive", "version": VERSION}
 
-_BASE_PRICES_BR_ARCHIVE = 0.05
+_BASE_PRICES_BR_ARCHIVE = 0.09  # v48.10.3: arquivo assinado irreproduzível — alinha com /br-asof e /br-agro
 BASE_PRICES["/br-archive"] = _BASE_PRICES_BR_ARCHIVE
 ENDPOINT_DESC["/br-archive"] = (
     "What did Brazilian markets actually look like on a specific past day — "
@@ -23751,7 +23817,7 @@ def _h_doc():
 # ---- registro --------------------------------------------------------------
 
 _V47_PRODUCTS = {
-    "/br-pix-parse": (_h_pix_parse, 0.004,
+    "/br-pix-parse": (_h_pix_parse, 0.010,  # v48.10.3: piso $0.01
         "Decode and CRC-verify a PIX BR Code (EMV-MPM) payload. Input: the "
         "full ?code= string from a QR. Returns the pix key, amount, merchant, "
         "txid and — the part that matters — whether the CRC16-CCITT checksum "
@@ -23761,7 +23827,7 @@ _V47_PRODUCTS = {
         "use it to look up a payment's status — it only reads the QR.",
         ["Brazil", "PIX", "Payments", "Validation", "ZeroUpstream"],
         {"code": "00020101021226370014br.gov.bcb.pix0115pix@losbeto.xyz52040000530398654040.105802BR5907LOSBETO6012PORTO ALEGRE62110507EXAMPLE6304A156"}),
-    "/br-pix-code": (_h_pix_code, 0.004,
+    "/br-pix-code": (_h_pix_code, 0.010,  # v48.10.3: piso $0.01
         "Generate a valid static or amount-fixed PIX BR Code from ?key= plus "
         "optional name, city, amount, txid. Returns the EMV payload with a "
         "correct CRC16, plus a self-check that re-parses what it just built. "
@@ -23769,7 +23835,7 @@ _V47_PRODUCTS = {
         "existing QR — that is /br-pix-parse.",
         ["Brazil", "PIX", "Payments", "ZeroUpstream"],
         {"key": "pay@example.com", "amount": "10.00"}),
-    "/br-bizdays": (_h_bizdays, 0.004,
+    "/br-bizdays": (_h_bizdays, 0.010,  # v48.10.3: piso $0.01
         "Count Brazilian bank business days between two dates on the ANBIMA "
         "252 convention, or list a full year's bank holidays with ?year=. "
         "Carnaval, Good Friday and Corpus Christi move with Easter and "
@@ -23780,7 +23846,7 @@ _V47_PRODUCTS = {
         "instrument. Do NOT use for the rate itself — that is /br-curve.",
         ["Brazil", "Calendar", "RatesMath", "ZeroUpstream"],
         {"from": "2026-01-02", "to": "2026-07-01"}),
-    "/br-doc": (_h_doc, 0.004,
+    "/br-doc": (_h_doc, 0.010,  # v48.10.3: piso $0.01
         "Validate a Brazilian CNPJ or CPF by its modulo-11 check digits and "
         "return it formatted, plus whether a CNPJ is a headquarters (branch "
         "0001). Catches typos and fabricated identifiers before they enter a "
@@ -25673,7 +25739,7 @@ def config_json():
     return r
 
 
-VERSION = "48.10.2-REFUND"  # v48.10.2-REFUND: hotfix do relato do scout nohumans.directory (jalcodev) — (1) DELIVERY-OR-REFUND universal: novo _is_error_result() centraliza a convencao de falha do proprio codebase (corpo-dict com chave "error" = falha); no caminho settle, QUALQUER falha pos-settle vira credito (charged+refunded+refund_api_key) — antes so "unavailable"+5xx; /pyth-price, /ai-news e /dex-screen retornavam dict {"error": ...} com HTTP 200 quando a fonte caia e o comprador pagava pelo erro; /br-pix-parse retornava 400 invalid_payload dizendo "rejected free of charge" com o pagamento JA settled (tx 0xeb91e4b82027...) | (2) mesmo recredito no caminho X-API-Key: novo LedgerV10.api_key_credit() devolve o debito ao saldo | (3) exemplo declarado do /br-pix-parse era o placeholder "00020101021226...6304ABCD" — falhava no proprio parser ("non-numeric length for tag 26") e ia no 402/bazaar; substituido por BR Code REAL gerado por _pix_build e auto-verificado por _pix_parse (crc_valid, key pix@losbeto.xyz, amount 0.10, txid EXAMPLE) | base: v48.10.1-TRANSFORM
+VERSION = "48.10.3-REFINE"  # v48.10.3-REFINE: reprice consolidado no codigo (fonte unica, sem depender de env) — piso $0.01 em 12 endpoints de $0.003-0.008 (fear-greed, pyth-price, trust-hash, agent-market, bootstrap-trust, regime, mempool, web-search, ai-news + os 4 primitivos BR pix/bizdays/doc) e /br-archive $0.05->$0.09: a Coinbase cobra $0.001/settle apos 1k/mes (fazemos ~8k) — a $0.003 a taxa efetiva era 33%, a $0.01 cai a 10%; clientes x402 tem cap default 0.1 USDC, abaixo disso preco nao influencia decisao de maquina; referencia CoinGecko flat $0.01 | LLM_PROXY_PRICE agora le PRICE_LLM_PROXY (default $0.005 — a isca fica) | NOVO /.well-known/agent-registration.json (ERC-8004 registration-v1: A2A+MCP+x402+OAS, x402Support, supportedTrust) — registrar no Identity Registry 0x8004A169...a432 na Base | FIX telemetria: pos-refund nao loga mais "paid" (double-log inflava calls; Agent402 e /receipts leem isso) | refund agora carrega recommended_next (cross-sell na falha — falha vira retencao) | billing LLM com backoff persistente em /data (strikes 6h->12h->18h->24h; o 429 diario do Gemini parava de gritar a cada boot; provider saudavel zera) | base: v48.10.2-REFUND
 if __name__ == "__main__":
     cli()
 else:
