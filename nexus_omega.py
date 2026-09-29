@@ -1548,6 +1548,20 @@ class LedgerV10:
                       (new_bal, key))
             return {"remaining": new_bal, "unlimited": False, "expires": exp}
 
+    def api_key_credit(self, key: str, amount: float):
+        """v48.10.2-REFUND: recrédito atômico — delivery-or-refund no caminho
+        de créditos (handler falhou depois do débito, o saldo volta)."""
+        with self.lock, self._conn() as c:
+            r = c.execute("SELECT balance_usd FROM api_keys WHERE key=?", (key,)).fetchone()
+            if not r:
+                return None
+            bal = r[0]
+            if bal is None or bal < 0:  # ilimitado — nada a recreditar
+                return {"remaining": -1, "unlimited": True}
+            new_bal = round(bal + amount, 6)
+            c.execute("UPDATE api_keys SET balance_usd=? WHERE key=?", (new_bal, key))
+            return {"remaining": new_bal, "unlimited": False}
+
     def api_key_stats(self):
         with self._conn() as c:
             total = c.execute("SELECT COUNT(*) FROM api_keys").fetchone()[0]
@@ -6754,6 +6768,27 @@ def _unavailable_body(reason: str, retry_after: int = 300):
              "ts": int(time.time())}, 503)
 
 
+def _is_error_result(result) -> bool:
+    """v48.10.2-REFUND: True quando o handler sinalizou FALHA.
+
+    Convenção do próprio codebase (freshness check do preview:
+    'isinstance(fresh, dict) and "error" not in fresh'): corpo-dict com a
+    chave "error" é falha, não produto. Cobre os dois formatos históricos:
+      (a) tuple (body, status>=400) cujo corpo tem "error" ou status de falha
+          ("unavailable", "invalid_payload", "error") — ex.: /br-pix-parse 400;
+      (b) dict simples (HTTP 200 implícito) contendo "error" — ex.: /pyth-price,
+          /ai-news, /dex-screen quando a fonte cai.
+    """
+    if isinstance(result, tuple) and len(result) >= 2 and isinstance(result[0], dict):
+        _b, _s = result[0], result[1]
+        if isinstance(_s, int) and _s >= 400:
+            return ("error" in _b) or (_b.get("status") in ("unavailable", "invalid_payload", "error"))
+        return False
+    if isinstance(result, dict):
+        return "error" in result
+    return False
+
+
 # v39.1: endpoints que dependem de um provedor externo pago. Sem chave, o
 # produto não existe — e a v39 vendia números inventados no lugar.
 PROVIDER_REQUIRED_ENDPOINTS = {
@@ -7167,6 +7202,26 @@ def paid_endpoint(path):
                         _g.losbeto_payer = "apikey:" + api_key[:12]
                         _g.losbeto_payment = {"payer": "credits", "tx": "", "via": "credits"}
                         result = handler()
+                        # v48.10.2-REFUND: handler falhou no caminho de
+                        # créditos — o débito volta ao saldo da chave.
+                        if _is_error_result(result):
+                            _rc = LEDGER.api_key_credit(api_key, cost)
+                            LEDGER.log_request(path, False, int((time.time() - t0) * 1000), ip,
+                                                kind="refunded", ua=request.headers.get("User-Agent",""), params=_clean_params())
+                            if not isinstance(result, tuple):
+                                result = (result, 502)
+                            result[0]["charged"] = False
+                            result[0]["refunded"] = True
+                            result[0]["refund_credit_usd"] = round(cost, 6)
+                            result[0]["note"] = ("The endpoint did not deliver; the credit "
+                                                 "was returned to your API key balance.")
+                            _er = jsonify(result[0])
+                            _er.status_code = result[1] if isinstance(result[1], int) else 502
+                            if _rc:
+                                _er.headers["X-Credits-Remaining"] = (
+                                    "unlimited" if _rc.get("unlimited") else f"{_rc['remaining']:.6f}")
+                            _er.headers["X-Credits-Cost"] = "0.000000"
+                            return _er
                         LEDGER.log_request(path, True, int((time.time() - t0) * 1000), ip,
                                             kind="paid", ua=request.headers.get("User-Agent",""), params=_clean_params())
                         if isinstance(result, Response):
@@ -7343,15 +7398,17 @@ def paid_endpoint(path):
                 _g.losbeto_payment = info if isinstance(info, dict) else {}
                 try:
                     result = handler()
-                    # v44.0.9: handler respondeu "unavailable" — a fonte morreu
-                    # entre o settle e a geração (ex.: timeout de RPC). O
-                    # pagamento é on-chain e não volta; devolvemos crédito
-                    # equivalente — a regra do LLMUnavailable, agora para TODA
-                    # indisponibilidade pós-settle. Nunca mais 503 pago.
-                    if (isinstance(result, tuple) and len(result) >= 2
-                            and isinstance(result[0], dict)
-                            and result[0].get("status") == "unavailable"
-                            and isinstance(result[1], int) and result[1] >= 500):
+                    # v48.10.2-REFUND: DELIVERY-OR-REFUND universal. Antes só
+                    # "unavailable"+5xx virava crédito; o scout da
+                    # nohumans.directory pagou /pyth-price, /ai-news e
+                    # /br-pix-parse e recebeu corpo de ERRO sem reembolso
+                    # (dict {"error": ...} com 200 e tuple 400 passavam
+                    # direto). Agora QUALQUER falha sinalizada pelo handler
+                    # após o settle vira crédito — a regra do LLMUnavailable,
+                    # estendida a todo resultado de falha. Nunca mais erro pago.
+                    if _is_error_result(result):
+                        if not isinstance(result, tuple):
+                            result = (result, 502)
                         _amt = get_dynamic_price(path)
                         _key = _refund_as_credit(payer, _amt, path, info.get("tx", ""))
                         LEDGER.log_request(path, False, int((time.time() - t0) * 1000),
@@ -7362,9 +7419,9 @@ def paid_endpoint(path):
                         result[0]["refunded"] = True
                         result[0]["refund_credit_usd"] = round(_amt, 6)
                         result[0]["refund_api_key"] = _key
-                        result[0]["note"] = ("The data source failed after settlement. "
-                            "A credit equal to the amount paid has been issued — send "
-                            "it as the X-API-Key header on any endpoint, valid 30 days.")
+                        result[0]["note"] = ("Payment settled but the endpoint did not "
+                            "deliver. A credit equal to the amount paid has been issued — "
+                            "send it as the X-API-Key header on any endpoint, valid 30 days.")
                 except LLMUnavailable:
                     # Corrida: o gate passou, mas o provedor caiu entre o
                     # settle e a geração. O pagamento já é on-chain e não pode
@@ -23703,7 +23760,7 @@ _V47_PRODUCTS = {
         "rate-limit. Use this before initiating any Brazilian payment. Do NOT "
         "use it to look up a payment's status — it only reads the QR.",
         ["Brazil", "PIX", "Payments", "Validation", "ZeroUpstream"],
-        {"code": "00020101021226...6304ABCD"}),
+        {"code": "00020101021226370014br.gov.bcb.pix0115pix@losbeto.xyz52040000530398654040.105802BR5907LOSBETO6012PORTO ALEGRE62110507EXAMPLE6304A156"}),
     "/br-pix-code": (_h_pix_code, 0.004,
         "Generate a valid static or amount-fixed PIX BR Code from ?key= plus "
         "optional name, city, amount, txid. Returns the EMV payload with a "
@@ -25616,7 +25673,7 @@ def config_json():
     return r
 
 
-VERSION = "48.10.1-TRANSFORM"  # v48.10.1-TRANSFORM: revisao K3 da proposta Claude v48.10 (aceita com correcoes) — (1) /receipts: pagamento SEM pagador deixa de ser organic (novo rotulo unattributed, excluido da receita organica) e rajada sem pagador (>=8 endpoints/600s por chain) vira self-sweep — caso real: 50 tx Algorand em 210s saiam como organicas | (2) extracao de pagador universal: sdata.account/settlement.payer + fallback no payload assinado (EVM authorization.from, grupo Algorand) | (3) Gemini: 1 retry com jitter SOMENTE em 500/503 (transitorio); 429 NAO — quota/billing irrecuperavel em <1.5s, quem trata e a quarentena do _llm_mark (correcao K3: a Claude tentava retry em 429 tambem) | (4) NOVOS /extract ($0.01, texto->JSON estrito, null nunca inventado, 1 reparo, 503->credito) e /translate ($0.008, traducao pura) — categoria transformacao, 2x/1.6x o /llm, pre-gate AI_REQUIRED, body schemas no openapi, featured #2 | (5) K3: paid_retry (X-Session-Token) nos 400s pos-pagamento + unattributed exposto no boot log e no scorecard | base: v48.9.28-TRANSPARENCY
+VERSION = "48.10.2-REFUND"  # v48.10.2-REFUND: hotfix do relato do scout nohumans.directory (jalcodev) — (1) DELIVERY-OR-REFUND universal: novo _is_error_result() centraliza a convencao de falha do proprio codebase (corpo-dict com chave "error" = falha); no caminho settle, QUALQUER falha pos-settle vira credito (charged+refunded+refund_api_key) — antes so "unavailable"+5xx; /pyth-price, /ai-news e /dex-screen retornavam dict {"error": ...} com HTTP 200 quando a fonte caia e o comprador pagava pelo erro; /br-pix-parse retornava 400 invalid_payload dizendo "rejected free of charge" com o pagamento JA settled (tx 0xeb91e4b82027...) | (2) mesmo recredito no caminho X-API-Key: novo LedgerV10.api_key_credit() devolve o debito ao saldo | (3) exemplo declarado do /br-pix-parse era o placeholder "00020101021226...6304ABCD" — falhava no proprio parser ("non-numeric length for tag 26") e ia no 402/bazaar; substituido por BR Code REAL gerado por _pix_build e auto-verificado por _pix_parse (crc_valid, key pix@losbeto.xyz, amount 0.10, txid EXAMPLE) | base: v48.10.1-TRANSFORM
 if __name__ == "__main__":
     cli()
 else:
