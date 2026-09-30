@@ -6162,6 +6162,15 @@ def _build_402(endpoint: str, price_override: float = None):
     # direto o fluxo "exact" do x402 — é o que a spec chama de backward-compat).
     if MPP_CHALLENGE:
         resp.headers.add("WWW-Authenticate", _mpp_challenge(endpoint, primary))
+    # v48.14.0-MONETIZE: challenges MPP REAIS (method="tempo") — um por
+    # moeda aceita; o agente escolhe a que tem saldo. Settlement push mode.
+    if MPP_TEMPO:
+        for _cur in MPP_TEMPO_CURRENCIES:
+            try:
+                resp.headers.add("WWW-Authenticate",
+                                 _mpp_tempo_challenge(endpoint, amount_usdc, _cur))
+            except Exception:
+                pass
     resp.headers["PAYMENT-REQUIRED"]   = b64
     # v28.1: era uma cópia byte a byte de PAYMENT-REQUIRED (+6 KB à toa).
     # Mantido só se couber no orçamento total de cabeçalhos.
@@ -6248,6 +6257,437 @@ def _mpp_challenge(endpoint: str, primary: dict) -> str:
                                  ).strftime("%Y-%m-%dT%H:%M:%SZ")
     return (f'Payment id="{cid}", realm="losbeto", method="x402", intent="charge", '
             f'request="{blob}", expires="{exp}", description="{desc}"')
+
+# ============================================================================
+# v48.14.0-MONETIZE — TRILHO MPP/TEMPO REAL + INTELIGENCIA DE RECEITA
+#
+# 1) MPP tempo/charge (IETF draft-httpauth-payment + draft-tempo-charge-00),
+#    modo PUSH: o cliente liquida TIP-20 na Tempo (chainId 4217) e volta com
+#    Authorization: Payment <credential> carregando o hash da tx. O node
+#    verifica o receipt on-chain (evento Transfer do token = valor, destino,
+#    moeda), faz anti-replay atomico e devolve Payment-Receipt. Dois desafios
+#    sao emitidos por 402 (USDC.e + pathUSD) — o agente escolhe a moeda que
+#    tem. SEM Stripe, SEM chave privada no servidor (push mode nao co-assina:
+#    quem transmite a tx e o cliente). Captura a onda de saldos AgentCash que
+#    nascem na rede Tempo — o node passa a falar o protocolo deles DE VERDADE.
+# 2) /ecosystem-pulse ($0.05): o node VENDE a inteligencia que os 64k probes
+#    geram — demanda por endpoint, IPs-agente unicos, tendencias 7d vs 7d
+#    (z-score) e clusters de demanda emergente. O trafego de scanner vira
+#    produto em vez de custo puro.
+# 3) Price-elasticity advisor: funil probes→previews→vendas por endpoint,
+#    sugestao de preco GLOBAL (nunca por carteira) via Telegram; PRICE_AUTO=1
+#    aplica com trava de +-30%/semana e persiste em /data. Padrao: so avisa.
+# 4) Radar auto-atendimento ganha fallback SEMANTICO: quando a similaridade
+#    lexical falha, embeddings (multilingue se preciso) casam o 404 pelo
+#    SIGNIFICADO — /cotacao-bitcoin encontra /pyth-price. Mesmas travas de
+#    seguranca (so aliasa para rota real, limiar conservador, cap semanal).
+# ============================================================================
+MPP_TEMPO = os.environ.get("MPP_TEMPO", "1") != "0"
+MPP_TEMPO_RECIPIENT = (os.environ.get("MPP_TEMPO_RECIPIENT")
+                       or "0xcC83159a6513E56778dA45A2981f55F44eF8e9E2").strip()
+TEMPO_RPC = os.environ.get("TEMPO_RPC_URL", "https://rpc.tempo.xyz").strip()
+TEMPO_CHAIN_ID = int(os.environ.get("TEMPO_CHAIN_ID", "4217"))
+MPP_MIN_CONF = int(os.environ.get("MPP_MIN_CONF", "2"))
+_TIP20_TRANSFER_TOPIC0 = ("0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef")
+MPP_TEMPO_CURRENCIES = [c.strip().lower() for c in os.environ.get(
+    "MPP_TEMPO_CURRENCIES",
+    "0x20c000000000000000000000b9537d11c60e8b50,"   # USDC.e na Tempo mainnet
+    "0x20c0000000000000000000000000000000000000"    # pathUSD (Bridge) na Tempo
+).split(",") if c.strip()]
+_MPP_CHAL_TTL = int(os.environ.get("MPP_CHALLENGE_TTL", "600"))
+
+
+def _b64url_pad(s: str) -> str:
+    return s + "=" * (-len(s) % 4)
+
+
+def _mpp_tempo_challenge(endpoint: str, amount_usd: float, currency: str) -> str:
+    """Challenge MPP real (method=tempo, intent=charge). O id e um HMAC de
+    (endpoint, request) — stateless, sem tabela: qualquer worker verifica.
+    request carrega amount/currency/recipient/expires — mexer em qualquer
+    campo invalida o id. TTL 600s >> cache de desafio (45s)."""
+    amt = str(int(round(float(amount_usd) * 1_000_000)))
+    exp = datetime.fromtimestamp(time.time() + _MPP_CHAL_TTL, timezone.utc
+                                 ).strftime("%Y-%m-%dT%H:%M:%SZ")
+    req = {"amount": amt, "currency": currency, "recipient": MPP_TEMPO_RECIPIENT,
+           "expires": exp,
+           "methodDetails": {"chainId": TEMPO_CHAIN_ID, "supportedModes": ["push"]}}
+    blob = _b64url(json.dumps(req, separators=(",", ":"), sort_keys=True).encode())
+    cid = hmac.new(JWT_SECRET.encode(), f"mpp|{endpoint}|{blob}".encode(),
+                   hashlib.sha256).hexdigest()[:24]
+    desc = _ascii_header(ENDPOINT_DESC.get(endpoint, endpoint) or "")[:90].replace('"', "'")
+    return (f'Payment id="{cid}", realm="losbeto", method="tempo", intent="charge", '
+            f'request="{blob}", expires="{exp}", description="{desc}"')
+
+
+def _tempo_rpc(method: str, params: list):
+    """JSON-RPC contra a Tempo mainnet. Levanta excecao em erro de transporte."""
+    r = requests.post(TEMPO_RPC, timeout=12,
+                      json={"jsonrpc": "2.0", "id": 1, "method": method,
+                            "params": params})
+    j = r.json()
+    if j.get("error"):
+        raise RuntimeError(str(j["error"])[:160])
+    return j.get("result")
+
+
+def _mpp_verify_credential(endpoint: str, cred_b64: str):
+    """Verifica um credential MPP tempo/charge push-mode.
+    Retorna (ok, reason, info) no mesmo contrato de _verify_payment.
+    Ordem de custo: parse local -> HMAC -> termos -> anti-replay atomico ->
+    RPC. Lixo morre de graca; falha transitoria devolve a reserva de replay
+    (o cliente pode tentar de novo); falha definitiva do cliente QUEIMA o
+    hash (nao vira cupom reutilizavel)."""
+    try:
+        cred = json.loads(base64.urlsafe_b64decode(_b64url_pad(cred_b64)).decode())
+        ch = cred.get("challenge") or {}
+        payload = cred.get("payload") or {}
+        req_b64 = str(ch.get("request") or "")
+        req = json.loads(base64.urlsafe_b64decode(_b64url_pad(req_b64)).decode())
+    except Exception:
+        return False, "malformed-credential", {}
+    if ch.get("method") != "tempo" or ch.get("intent") != "charge":
+        return False, "unsupported-method", {}
+    expect = hmac.new(JWT_SECRET.encode(), f"mpp|{endpoint}|{req_b64}".encode(),
+                      hashlib.sha256).hexdigest()[:24]
+    if not hmac.compare_digest(str(ch.get("id", "")), expect):
+        return False, "challenge-mismatch", {}
+    try:
+        _exp = datetime.strptime(str(req.get("expires", "")),
+                                 "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+        if time.time() > _exp.timestamp():
+            return False, "challenge-expired", {}
+    except Exception:
+        return False, "challenge-expired", {}
+    try:
+        want_amt = int(req["amount"])
+    except Exception:
+        return False, "bad-amount", {}
+    currency = str(req.get("currency", "")).lower()
+    recipient = str(req.get("recipient", "")).lower()
+    if recipient != MPP_TEMPO_RECIPIENT.lower():
+        return False, "wrong-recipient", {}
+    if currency not in MPP_TEMPO_CURRENCIES:
+        return False, "wrong-currency", {}
+    try:
+        if int((req.get("methodDetails") or {}).get("chainId", 0)) != TEMPO_CHAIN_ID:
+            return False, "wrong-chain", {}
+    except Exception:
+        return False, "wrong-chain", {}
+    # Preco dinamico pode ter andado entre desafio e pagamento — honra a
+    # cotacao com 3% de tolerancia (mesma filosofia do challenge-recall x402).
+    cur_atomic = int(round(get_dynamic_price(endpoint) * 1_000_000))
+    if want_amt < int(cur_atomic * 0.97):
+        return False, "insufficient-amount", {}
+    if str(payload.get("type")) != "hash":
+        return False, "unsupported-mode", {}
+    txh = str(payload.get("hash", "")).lower()
+    if not re.fullmatch(r"0x[0-9a-f]{64}", txh):
+        return False, "bad-tx-hash", {}
+    if not LEDGER.replay_claim("mpp:" + txh):
+        return False, "replay", {}
+    try:
+        rcpt = _tempo_rpc("eth_getTransactionReceipt", [txh])
+        if not rcpt:
+            LEDGER.replay_unmark("mpp:" + txh)
+            return False, "tx-not-found", {}
+        if str(rcpt.get("status")) != "0x1":
+            return False, "tx-failed", {}
+        payer, got = "", 0
+        for lg in (rcpt.get("logs") or []):
+            if str(lg.get("address", "")).lower() != currency:
+                continue
+            tpcs = lg.get("topics") or []
+            if len(tpcs) < 3 or str(tpcs[0]).lower() != _TIP20_TRANSFER_TOPIC0:
+                continue
+            if not str(tpcs[2]).lower().endswith(recipient[2:]):
+                continue
+            try:
+                v = int(str(lg.get("data", "0x0")), 16)
+            except Exception:
+                continue
+            if v > got:
+                got = v
+                payer = "0x" + str(tpcs[1])[-40:]
+        if got < want_amt:
+            return False, "insufficient-amount", {}
+        tip = _tempo_rpc("eth_blockNumber", [])
+        bn = int(str(rcpt.get("blockNumber", "0x0")), 16)
+        if tip is not None and int(str(tip), 16) - bn < MPP_MIN_CONF:
+            LEDGER.replay_unmark("mpp:" + txh)
+            return False, "insufficient-confirmations", {}
+    except Exception as e:
+        LEDGER.replay_unmark("mpp:" + txh)
+        log.warning(f"mpp tempo rpc: {e}")
+        return False, "rpc-error", {}
+    usd = round(want_amt / 1_000_000, 6)
+    LEDGER.add_revenue(endpoint, usd, txh, payer, source="mpp", chain="tempo")
+    receipt = {"method": "tempo", "reference": txh, "status": "success",
+               "timestamp": datetime.fromtimestamp(time.time(), timezone.utc
+                                                   ).strftime("%Y-%m-%dT%H:%M:%SZ")}
+    log.info(f"💰 MPP/tempo ${usd:.4f} em {endpoint} de {payer[:14]}… tx {txh[:18]}…")
+    return True, "mpp", {"payer": payer, "tx": txh,
+                         "settlement": {"success": True, "transaction": txh,
+                                        "payer": payer, "network": "tempo"},
+                         "mpp_receipt": receipt}
+
+
+# ---- /ecosystem-pulse — a inteligencia dos 64k probes/dia, como produto ----
+_PULSE_CACHE = {"ts": 0, "data": None}
+_PULSE_MONITORS = ("carbonmonitor", "x402-list-monitor", "lumiere",
+                   "x402-observer", "forum-labs", "402explorer",
+                   "bazaardiscovery", "x402scan", "uptime", "pingdom",
+                   "statuscake", "betterstack", "hetrixtools")
+
+
+def _h_ecosystem_pulse():
+    """Vende o que o trafego ENSINA: quem sonda o que, quantos agentes reais,
+    o que esta subindo. Dado exclusivo — nenhum concorrente tem o NOSSO funil.
+    Cache 10min: a assinatura do dado e horaria, nao por-request."""
+    now = int(time.time())
+    if _PULSE_CACHE["data"] is not None and now - _PULSE_CACHE["ts"] < 600:
+        return _PULSE_CACHE["data"]
+    d1, d7, d14 = now - 86400, now - 7 * 86400, now - 14 * 86400
+    with LEDGER._conn() as c:
+        top = c.execute(
+            "SELECT endpoint, COUNT(*) n, COUNT(DISTINCT ip) ips FROM requests "
+            "WHERE ts>? GROUP BY endpoint ORDER BY n DESC LIMIT 25", (d1,)).fetchall()
+        uas = c.execute(
+            "SELECT ua, COUNT(*) n FROM requests WHERE ts>? AND ua!='' "
+            "GROUP BY ua ORDER BY n DESC LIMIT 80", (d1,)).fetchall()
+        cur7 = dict(c.execute("SELECT endpoint, COUNT(*) FROM requests WHERE ts>? "
+                              "GROUP BY endpoint", (d7,)).fetchall())
+        prev7 = dict(c.execute("SELECT endpoint, COUNT(*) FROM requests "
+                               "WHERE ts>? AND ts<=? GROUP BY endpoint",
+                               (d14, d7)).fetchall())
+        tot24 = c.execute("SELECT COUNT(*) FROM requests WHERE ts>?", (d1,)).fetchone()[0]
+        agent_ips = c.execute(
+            "SELECT COUNT(DISTINCT ip) FROM requests WHERE ts>? AND "
+            "(LOWER(ua) GLOB 'node*' OR LOWER(ua) GLOB 'python-requests*' "
+            "OR LOWER(ua) GLOB 'axios*' OR LOWER(ua) GLOB 'undici*')", (d1,)).fetchone()[0]
+        paid24 = c.execute("SELECT COUNT(*), COALESCE(SUM(amount),0) FROM revenue "
+                           "WHERE ts>?", (d1,)).fetchone()
+    mon = sum(n for ua, n in uas if any(m in (ua or "").lower() for m in _PULSE_MONITORS))
+    agent_hits = sum(n for ua, n in uas
+                     if (ua or "").lower().startswith(("node", "python-requests",
+                                                       "axios", "undici", "got")))
+    rising = []
+    for ep, n7 in cur7.items():
+        p7 = prev7.get(ep, 0)
+        if n7 >= 20:
+            z = (n7 - p7) / math.sqrt(p7 + 1.0)
+            if z > 2.0:
+                rising.append({"path": ep, "hits_7d": int(n7), "hits_prev_7d": int(p7),
+                               "z_score": round(z, 2)})
+    rising.sort(key=lambda r: -r["z_score"])
+    heat = []
+    for ep, n, ips in top:
+        z = (cur7.get(ep, 0) - prev7.get(ep, 0)) / math.sqrt(prev7.get(ep, 0) + 1.0)
+        heat.append({"path": ep, "probes_24h": int(n), "unique_ips_24h": int(ips),
+                     "heat": round(0.6 * max(-1.0, min(z / 5.0, 1.0))
+                                   + 0.4 * min(ips / 50.0, 1.0), 3),
+                     "served_live": bool(_route_now_live(ep))})
+    clusters = []
+    try:
+        if _CLUSTER_FILE.exists():
+            cj = json.loads(_CLUSTER_FILE.read_text())
+            clusters = [{"example": c2.get("example"), "size": c2.get("size"),
+                         "unique_ips": c2.get("unique_ips")}
+                        for c2 in (cj.get("clusters") or [])[:5]]
+    except Exception:
+        pass
+    data = {
+        "generated_at": datetime.fromtimestamp(now, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "node": "losbeto",
+        "window_hours": 24,
+        "totals": {"requests_24h": int(tot24),
+                   "agent_class_requests_24h": int(agent_hits),
+                   "qos_monitor_requests_24h": int(mon),
+                   "monitor_share_24h": round(mon / max(1, tot24), 3),
+                   "agent_unique_ips_24h": int(agent_ips),
+                   "paid_settlements_24h": int(paid24[0] or 0),
+                   "revenue_24h_usd": round(float(paid24[1] or 0.0), 4)},
+        "top_probed": heat[:15],
+        "rising_7d": rising[:10],
+        "emerging_demand_clusters": clusters,
+        "methodology": {
+            "agent_class": "UA families used by agent SDKs (node, python-requests, axios, undici, got)",
+            "qos_monitors": "known uptime/directory scanners — counted separately, never blended into demand",
+            "heat": "0.6*clip(7d-vs-prev-7d z-score / 5) + 0.4*clip(unique_ips_24h / 50)",
+            "rising": "7d hits >= 20 and Poisson z-score > 2 vs the previous 7d window",
+            "clusters": "weekly Agglomerative (cosine) clustering of 404 demand, on-node embeddings"},
+        "notes": [
+            "This is the node's own first-party traffic — data no third party can replicate.",
+            "Counts are request-level probes (incl. unpaid 402 challenges); paid settlements are reported separately.",
+            "Not financial advice."],
+    }
+    _PULSE_CACHE.update({"ts": now, "data": data})
+    return data
+
+
+# ---- price-elasticity advisor — ML de preco com governanca -----------------
+PRICE_AUTO = os.environ.get("PRICE_AUTO", "") == "1"
+_ML_PRICE_FILE = "/data/ml_price_overrides.json"
+_PRICE_ADV_STATE = {"last_run": 0}
+
+
+def _ml_price_overrides_load():
+    """Carrega sugestoes auto-aplicadas (so com PRICE_AUTO=1). Override de ENV
+    ( Railway Variables ) sempre vence o ML — operador > modelo."""
+    try:
+        if not os.path.exists(_ML_PRICE_FILE):
+            return
+        saved = json.loads(open(_ML_PRICE_FILE).read())
+        n = 0
+        for ep, rec in (saved or {}).items():
+            # sem exigir ep in BASE_PRICES: o bloco roda ANTES do registro
+            # dos produtos v47 — o get_dynamic_price consulta por endpoint.
+            if _price_env_key(ep) not in os.environ:
+                PRICE_OVERRIDES[ep] = float(rec["price"])
+                n += 1
+        if n:
+            log.info(f"🧠💲 price-advisor: {n} precos ML restaurados de /data")
+    except Exception as e:
+        log.warning(f"price overrides load: {e}")
+
+
+def _ml_price_advisor():
+    """Funil por endpoint (probes 7d -> previews 7d -> vendas 7d) vira
+    recomendacao de PRECO DE TABELA — global, igual para todo mundo (preco
+    publico nunca varia por carteira; incentivo so pos-pagamento).
+    PRICE_AUTO=1 aplica com trava: 1 movimento por endpoint por semana,
+    limitado a +-30%, piso $0.01 e teto $0.50. Sem a flag: so Telegram."""
+    now = int(time.time())
+    d7 = now - 7 * 86400
+    with LEDGER._conn() as c:
+        probes = dict(c.execute(
+            "SELECT endpoint, COUNT(*) FROM requests WHERE ts>? "
+            "AND kind IN ('probe','challenge402') GROUP BY endpoint", (d7,)).fetchall())
+        previews = dict(c.execute(
+            "SELECT endpoint, COUNT(*) FROM requests WHERE ts>? AND kind='preview' "
+            "GROUP BY endpoint", (d7,)).fetchall())
+        sales = dict(c.execute(
+            "SELECT endpoint, COUNT(*) FROM revenue WHERE ts>? GROUP BY endpoint",
+            (d7,)).fetchall())
+        rev = dict(c.execute(
+            "SELECT endpoint, ROUND(SUM(amount),4) FROM revenue WHERE ts>? "
+            "GROUP BY endpoint", (d7,)).fetchall())
+    sugg = []
+    for ep in sorted(BASE_PRICES, key=lambda e: -(probes.get(e, 0) + sales.get(e, 0))):
+        p, pv, s = probes.get(ep, 0), previews.get(ep, 0), sales.get(ep, 0)
+        if p < 20 and s == 0:
+            continue
+        cur = get_dynamic_price(ep)
+        action = why = None
+        newp = None
+        if p >= 200 and pv >= 5 and s == 0:
+            action, why = "lower", "high probe interest, previews happening, zero conversion"
+            newp = max(0.01, round(cur * 0.75, 4))
+        elif s >= 5 and pv >= 3 and s / max(1, pv) >= 0.25:
+            action, why = "raise", "conversion >= 25% — demand is price-insensitive"
+            newp = round(cur * 1.15, 4)
+        elif p >= 50 and pv == 0 and s == 0:
+            action, why = "review", "probes but no previews — description/teaser may be unclear"
+        if action:
+            sugg.append({"endpoint": ep, "current_usd": cur,
+                         "suggested_usd": newp, "action": action, "why": why,
+                         "probes_7d": p, "previews_7d": pv, "sales_7d": s,
+                         "revenue_7d_usd": rev.get(ep, 0.0)})
+    if not sugg:
+        return {"suggestions": 0}
+    applied = []
+    if PRICE_AUTO:
+        try:
+            saved = {}
+            if os.path.exists(_ML_PRICE_FILE):
+                saved = json.loads(open(_ML_PRICE_FILE).read())
+            for sg in sugg:
+                ep, np_ = sg["endpoint"], sg["suggested_usd"]
+                if np_ is None or sg["action"] == "review":
+                    continue
+                rec = (saved or {}).get(ep) or {}
+                last_ts = int(rec.get("ts", 0))
+                last_p = float(rec.get("price", sg["current_usd"]))
+                if now - last_ts < 7 * 86400:
+                    continue
+                np_ = min(max(np_, last_p * 0.7), last_p * 1.3)   # trava +-30%/semana
+                np_ = min(max(np_, 0.01), 0.50)
+                if abs(np_ - sg["current_usd"]) < 0.0005:
+                    continue
+                if _price_env_key(ep) in os.environ:
+                    continue   # operador fixou por env — ML nao pisa
+                PRICE_OVERRIDES[ep] = round(np_, 4)
+                saved[ep] = {"price": round(np_, 4), "ts": now}
+                applied.append((ep, sg["current_usd"], round(np_, 4)))
+            with open(_ML_PRICE_FILE, "w") as f:
+                json.dump(saved, f, indent=1)
+        except Exception as e:
+            log.warning(f"price advisor apply: {e}")
+    lines = []
+    for sg in sugg[:6]:
+        if sg["action"] == "review":
+            lines.append(f"• `{sg['endpoint']}`: {sg['probes_7d']} probes, 0 previews — revisar descricao/teaser")
+        else:
+            lines.append(f"• `{sg['endpoint']}` ${sg['current_usd']:.3f} → ${sg['suggested_usd']:.3f} "
+                         f"({sg['why']}; {sg['probes_7d']}p/{sg['previews_7d']}pv/{sg['sales_7d']}s)")
+    _notify_telegram(
+        f"🧠💲 *PRICE ADVISOR (semanal)*\n\n" + "\n".join(lines) +
+        (f"\n\n✅ Auto-aplicados: {len(applied)} (trava +-30%/semana)"
+         if PRICE_AUTO else "\n\nℹ️ Modo consultivo — PRICE_AUTO=1 para aplicar com trava.") +
+        "\n_Preco de tabela global — nunca por carteira._")
+    if applied:
+        log.warning(f"🧠💲 price-advisor aplicou: {applied}")
+    return {"suggestions": len(sugg), "applied": len(applied)}
+
+
+# ---- radar semantico — o 404 encontra o catalogo pelo SIGNIFICADO ----------
+_RADAR_SEM_MIN = float(os.environ.get("RADAR_SEM_MIN", "0.72"))
+
+
+def _radar_semantic_target(path: str) -> str:
+    """Fallback do radar: _suggest_paths e lexical (tokens do nome); aqui o
+    embedding casa pela SEMANTICA (multilingue se o caminho nao for ingles).
+    Retorna path do catalogo ou ''. Limiar conservador (0.72) — alias errado
+    e pior que 404 honesto."""
+    if not _ML_EMB_OK or _NP is None:
+        return ""
+    try:
+        q = re.sub(r"[^a-z0-9à-ÿ]+", " ", (path or "").lower()).strip()
+        if len(q) < 3:
+            return ""
+        key = "multi" if _needs_multi(q) else "base"
+        paths, vecs = _emb_catalog(key)
+        if not paths or vecs is None:
+            return ""
+        qv = _emb_encode([q], key)
+        if qv is None:
+            return ""
+        V = _NP.array(vecs)
+        V = V / (_NP.linalg.norm(V, axis=1, keepdims=True) + 1e-9)
+        qn = _NP.array(qv[0])
+        qn = qn / (_NP.linalg.norm(qn) + 1e-9)
+        sims = V @ qn
+        j = int(sims.argmax())
+        if float(sims[j]) < _RADAR_SEM_MIN:
+            return ""
+        tgt = paths[j]
+        return tgt if _radar_safe_target(tgt) else ""
+    except Exception:
+        return ""
+
+
+def _fc_seed_needed() -> list:
+    """Simbolos do /forecast ainda sem backfill (flag fc_seeded_ ausente)."""
+    try:
+        with LEDGER._conn() as c:
+            return [s for s in _FC_FEEDS if not c.execute(
+                "SELECT 1 FROM meta WHERE k=?", (f"fc_seeded_{s}",)).fetchone()]
+    except Exception:
+        return []
+
+
+_ml_price_overrides_load()
+
 
 def _payload_shape_ok(pdata: dict) -> bool:
     """v48.3.2 — sanity check LOCAL do paymentPayload decodificado, antes de
@@ -7436,6 +7876,28 @@ def paid_endpoint(path):
                    or request.headers.get("X-Payment")
                    or request.headers.get("PAYMENT-SIGNATURE")
                    or request.headers.get("Payment-Signature"))
+
+            # v48.14.0-MONETIZE: credential MPP chega em Authorization: Payment.
+            # Verifica ANTES do fluxo x402; em sucesso, sig vira marcador e o
+            # verify abaixo e substituido pelo resultado MPP (mesmo pipeline:
+            # JWT, entrega, refund-on-failure, FCB — nada muda para o cliente).
+            _mpp_info = None
+            _auth_pay = auth[8:].strip() if auth.startswith("Payment ") else ""
+            if _auth_pay and MPP_TEMPO and not sig:
+                if not _rl_check(ip):
+                    return jsonify({"error": "rate-limit", "limit_rpm": RL_RPM_IP}), 429
+                _okm, _whym, _mpp_info = _mpp_verify_credential(path, _auth_pay)
+                if not _okm:
+                    LEDGER.log_request(path, False, int((time.time() - t0) * 1000), ip,
+                                       kind="probe", ua=request.headers.get("User-Agent", ""),
+                                       params=_clean_params())
+                    _rm = _build_402(path)
+                    _bm = _rm.get_json()
+                    _bm["error"] = f"MPP payment invalid: {_whym}"
+                    _rm.set_data(json.dumps(_bm))
+                    return _rm
+                sig = "mpp-tempo"
+                log.info(f"MPP credential aceito p/ {path} — verificado on-chain (tempo)")
             if sig and not _rl_check(ip):
                 return jsonify({"error": "rate-limit", "limit_rpm": RL_RPM_IP}), 429
 
@@ -7509,7 +7971,10 @@ def paid_endpoint(path):
                 return _reactive_402(path, ip)   # v48.2: preço fixo + bônus pós-compra
 
             # ====== CORREÇÃO APLICADA (HEADERS PRESERVADOS) ======
-            ok, reason, info = _verify_payment(path, sig)
+            if _mpp_info is not None:
+                ok, reason, info = True, "mpp", _mpp_info
+            else:
+                ok, reason, info = _verify_payment(path, sig)
             if not ok:
                 LEDGER.log_request(path, False, int((time.time() - t0) * 1000), ip,
                                     kind="probe", ua=request.headers.get("User-Agent",""), params=_clean_params())
@@ -7649,6 +8114,10 @@ def paid_endpoint(path):
                 ).decode()
                 resp.headers["PAYMENT-RESPONSE"]   = settle_b64
                 resp.headers["X-PAYMENT-RESPONSE"] = settle_b64
+                # v48.14.0: receipt MPP no header canonico da spec (b64url).
+                if isinstance(info, dict) and info.get("mpp_receipt"):
+                    resp.headers["Payment-Receipt"] = _b64url(json.dumps(
+                        info["mpp_receipt"], separators=(",", ":")).encode())
                 # v48.2-SMART FCB (emissão): 1ª compra deste pagador → o
                 # session token passa a carregar 1 chamada grátis (7 dias).
                 # Preço de tabela intacto; o bônus é valor agregado.
@@ -7689,7 +8158,7 @@ def paid_endpoint(path):
                 except Exception:
                     pass
                 resp.headers["Access-Control-Expose-Headers"] = (
-                    "PAYMENT-RESPONSE,X-PAYMENT-RESPONSE,X-Session-Token,X-Session-TTL,X-First-Call-Bonus,X-Savings-Tip,X-Next-Step")
+                    "Payment-Receipt,PAYMENT-RESPONSE,X-PAYMENT-RESPONSE,X-Session-Token,X-Session-TTL,X-First-Call-Bonus,X-Savings-Tip,X-Next-Step")
                 resp.headers["X-Session-Token"] = token
                 resp.headers["X-Session-TTL"]   = str(JWT_TTL)
                 return resp
@@ -9135,7 +9604,9 @@ def health_providers():
                  "forecast_symbols": len([s for s in _FC_FEEDS if s in _FC_MODELS]),
                  "recommender_endpoints": len(_ALSO["map"]),
                  "local_llm": "on" if _LOCAL_LLM_ON else "off",
-                 "public_status": "/ml"}
+                 "public_status": "/ml",
+                 "mpp_tempo": ("on" if MPP_TEMPO else "off"),
+                 "price_advisor": ("auto" if PRICE_AUTO else "advisory")}
     # 2) mercados tradicionais: o que a auditoria reprovou
     checks = {}
     for path, fn in (("/stock-quote", Brain.stock_quote),
@@ -13973,6 +14444,7 @@ def ml_ops_loop():
             if time.time() - ultimo_cluster > 7 * 86400:
                 if _ml_cluster_demand():
                     _ml_cluster_digest()
+                _ml_price_advisor()          # v48.14.0: elasticidade semanal
                 ultimo_cluster = time.time()
         except Exception as e:
             log.debug(f"ml_ops: {e}")
@@ -14471,8 +14943,19 @@ def _fc_loop():
     except Exception as e:
         log.info(f"🧠 /forecast seed: {e}")
     _last_train = 0.0
+    _last_seed = time.time()
     while True:
         try:
+            # v48.14.0: seed auto-recupera — simbolo sem backfill refaz a
+            # tentativa a cada 30min (429 de IP compartilhado se resolve
+            # sozinho; nao exige redeploy).
+            if time.time() - _last_seed > 1800:
+                _last_seed = time.time()
+                try:
+                    if _fc_seed_needed():
+                        _fc_seed()
+                except Exception as _se:
+                    log.debug(f"fc self-heal: {_se}")
             _fc_collect()
             if time.time() - _last_train > 6 * 3600:
                 ok = sum(1 for s in _FC_FEEDS if _fc_train(s))
@@ -25304,6 +25787,20 @@ _V47_PRODUCTS = {
         "Not financial advice.",
         ["Forecast", "ML", "Crypto", "LocalModel", "QuantileBands"],
         {"symbol": "BTC", "horizon": "24h"}),
+    # v48.14.0-MONETIZE — o trafego de scanner vira produto
+    "/ecosystem-pulse": (_h_ecosystem_pulse, 0.050,
+        "First-party agent-traffic intelligence from this node's own request "
+        "stream (~64k probes/day): most-probed endpoints with a heat score, "
+        "7d-vs-previous-7d demand trends (Poisson z-score), unique agent-IP "
+        "counts, QoS-monitor share, and emerging-demand clusters found by "
+        "weekly on-node embedding clustering. Use this when sizing demand for "
+        "x402 services, choosing which endpoints to build or mirror, or "
+        "tracking where agent traffic is actually going. This data exists "
+        "nowhere else — it is the node's own funnel, not a third-party panel. "
+        "Counts are request-level probes; paid settlements are reported "
+        "separately. Refreshed hourly, cached 10 minutes.",
+        ["Analytics", "AgentTraffic", "DemandIntel", "FirstPartyData", "ML"],
+        {}),
 }
 
 for _path, (_fn, _price, _desc, _tags, _hint) in _V47_PRODUCTS.items():
@@ -25707,7 +26204,13 @@ def _radar_autofulfill_cycle() -> list:
                 continue          # já existe rota de verdade — não sombrear
             cls = _demand_classify(path)
             if cls["kind"] != "alias_candidate" or not cls["closest"]:
-                continue          # produto novo continua decidido pelo humano
+                # v48.14.0: fallback SEMANTICO — o lexical nao achou nome
+                # parecido; o embedding casa pelo significado (multilingue
+                # se preciso). So aliasa rota real, limiar conservador.
+                _sem = _radar_semantic_target(path)
+                if not _sem:
+                    continue      # nem significado parecido — decisao humana
+                cls = {"kind": "alias_candidate_ml", "closest": [_sem]}
             target = cls["closest"][0]
             # _suggest_paths devolve URL absoluta — normaliza para path
             _b = _public_base()
@@ -27188,7 +27691,7 @@ def config_json():
     return r
 
 
-VERSION = "48.13.0-INTEL"  # v48.13.0-INTEL: SEGUNDA CAMADA DE IA LOCAL — (1) NOVO /forecast $0.05: previsao p10/p50/p90 com HistGradientBoosting quantilico treinado NO HISTORICO QUE O PROPRIO NODE COLETA (Pyth a cada 10min + backfill CoinGecko 90d, 8 simbolos, 4 horizontes), MAPE de walk-forward publicado em toda resposta; sem historico = 503 e NAO cobra; (2) recomendador agents_also_bought por co-ocorrencia real de pagadores — cross-sell dentro do proprio 402 + /recommend gratis; (3) lead scoring SEMANTICO dos previews (embedding da intencao x catalogo premium) -> alerta de lead quente no Telegram; (4) clustering semanal dos 404s por significado (Agglomerative cosine sobre embeddings) -> oportunidades de produto em /ml + digest; (5) NOVO /ml publico: transparencia da camada de IA local; (6) /discover com reranker cross-encoder (ms-marco-MiniLM-L-6, 80MB ONNX) + modo MULTILINGUE sob demanda (paraphrase-MiniLM-L12: PT/ES/ZH acham o catalogo em ingles); (7) LLM LOCAL de ultimo recurso (LOCAL_LLM=1, llama-cpp-python + Qwen3-0.6B GGUF ~480MB em /data): se TODOS os provedores externos cairem, /llm responde com o modelo da casa em vez de 503 — OFF por padrao = custo zero; (8) detector de anomalias ganha severidade (volume puro -> log; comprador/receita -> Telegram) — fim do apito de hora em hora; (9) /live rotula scanner_noise como 'filtered noise' | requirements INALTERADOS (tudo roda sobre sklearn/fastembed ja instalados; llama-cpp-python e OPCIONAL e so e necessario com LOCAL_LLM=1) | base: v48.12.0-ML: camada de machine learning embarcada treinada nos dados do PROPRIO node (60k+ probes + ledger) — (1) classificador de demanda GradientBoosting com auto-rotulagem pelas regras atuais e retreino diario: pega scanner que o regex nunca viu (conf>=0.85 rebaixa new_product->scanner_noise) e anexa label+confianca ao painel/alertas; (2) detector de anomalias IsolationForest sobre agregados horarios de requests/revenue (min 72h): surto de comprador ou ataque vira log + Telegram (1/6h) + /data/ml_anomalies.json; (3) NOVO /discover gratis: busca semantica do catalogo por similaridade vetorial (MiniLM ONNX via fastembed, cache em /data) com fallback palavra-chave — funil de descoberta p/ agentes | tudo import-guarded (sem sklearn/fastembed o node roda como antes) + ML_DISABLED=1 | deps novas p/ requirements: scikit-learn fastembed | base: v48.11.0-GLOBAL: Moonshot/Kimi + OpenRouter como provedores premium DORMENTES (env-gated: sem chave = zero custo; ativar = MOONSHOT_API_KEY/OPENROUTER_API_KEY no Railway) | perfis de roteamento estilo ClawRouter: /llm?profile=eco|fast|premium e model=kimi|deepseek|eco|premium no /v1/chat/completions | NOVO /global-rates ($0.03): taxas de Fed/ECB/PBoC/BOJ/CBR/BCB numa chamada — BIS WS_CBPOL + cross-check ao vivo FRED/ECB-SDW/BCB-SGS, diferencial de carry vs Fed; nenhum concorrente x402 tem | rails Polygon (eip155:137) + Arbitrum (eip155:42161) PRONTAS, settle pelo mesmo facilitador CDP, env-gated OFF (X402_POLYGON=1/X402_ARBITRUM=1 so apos confirmar credito na Binance) | _SCAN_NOISE cobre /env.txt /env.js /settings.json /config/*.yml (scanner de credencial nao vira mais produto novo no radar) | _cap500 default 480->390 (x402lint P8: 24 descriptions na zona de risco; caminho p/ 100/100) | base: v48.10.3-REFINE: reprice consolidado no codigo (fonte unica, sem depender de env) — piso $0.01 em 12 endpoints de $0.003-0.008 (fear-greed, pyth-price, trust-hash, agent-market, bootstrap-trust, regime, mempool, web-search, ai-news + os 4 primitivos BR pix/bizdays/doc) e /br-archive $0.05->$0.09: a Coinbase cobra $0.001/settle apos 1k/mes (fazemos ~8k) — a $0.003 a taxa efetiva era 33%, a $0.01 cai a 10%; clientes x402 tem cap default 0.1 USDC, abaixo disso preco nao influencia decisao de maquina; referencia CoinGecko flat $0.01 | LLM_PROXY_PRICE agora le PRICE_LLM_PROXY (default $0.005 — a isca fica) | NOVO /.well-known/agent-registration.json (ERC-8004 registration-v1: A2A+MCP+x402+OAS, x402Support, supportedTrust) — registrar no Identity Registry 0x8004A169...a432 na Base | FIX telemetria: pos-refund nao loga mais "paid" (double-log inflava calls; Agent402 e /receipts leem isso) | refund agora carrega recommended_next (cross-sell na falha — falha vira retencao) | billing LLM com backoff persistente em /data (strikes 6h->12h->18h->24h; o 429 diario do Gemini parava de gritar a cada boot; provider saudavel zera) | base: v48.10.2-REFUND
+VERSION = "48.14.0-MONETIZE"  # v48.14.0-MONETIZE: (1) MPP tempo/charge REAL push-mode — challenges method="tempo" (USDC.e + pathUSD, chainId 4217) em TODO 402 e verificacao on-chain do credential Authorization: Payment (receipt TIP-20 Transfer: valor/destino/moeda + anti-replay atomico + Payment-Receipt) — captura os saldos AgentCash que nascem na Tempo; sem Stripe, sem chave privada no servidor; (2) NOVO /ecosystem-pulse $0.05 — a inteligencia dos 64k probes/dia como produto: top sondados com heat score, tendencias 7d-vs-7d (z-score Poisson), IPs-agente unicos, share de monitores QoS, clusters de demanda emergente; (3) price-elasticity advisor semanal — funil probes->previews->vendas por endpoint vira sugestao de PRECO DE TABELA global (nunca por carteira) no Telegram; PRICE_AUTO=1 aplica com trava +-30%/semana persistida em /data (env do operador sempre vence); (4) radar auto-atendimento com fallback SEMANTICO — embeddings (multilingue se preciso) casam 404 pelo significado quando o lexical falha, limiar 0.72, mesmas travas de seguranca; (5) /forecast seed auto-recupera a cada 30min ate todos os 8 simbolos terem backfill (429 de IP compartilhado nao exige mais redeploy); (6) /health expoe mpp_tempo + modo do advisor | base: v48.13.0-INTEL  # v48.13.0-INTEL: SEGUNDA CAMADA DE IA LOCAL — (1) NOVO /forecast $0.05: previsao p10/p50/p90 com HistGradientBoosting quantilico treinado NO HISTORICO QUE O PROPRIO NODE COLETA (Pyth a cada 10min + backfill CoinGecko 90d, 8 simbolos, 4 horizontes), MAPE de walk-forward publicado em toda resposta; sem historico = 503 e NAO cobra; (2) recomendador agents_also_bought por co-ocorrencia real de pagadores — cross-sell dentro do proprio 402 + /recommend gratis; (3) lead scoring SEMANTICO dos previews (embedding da intencao x catalogo premium) -> alerta de lead quente no Telegram; (4) clustering semanal dos 404s por significado (Agglomerative cosine sobre embeddings) -> oportunidades de produto em /ml + digest; (5) NOVO /ml publico: transparencia da camada de IA local; (6) /discover com reranker cross-encoder (ms-marco-MiniLM-L-6, 80MB ONNX) + modo MULTILINGUE sob demanda (paraphrase-MiniLM-L12: PT/ES/ZH acham o catalogo em ingles); (7) LLM LOCAL de ultimo recurso (LOCAL_LLM=1, llama-cpp-python + Qwen3-0.6B GGUF ~480MB em /data): se TODOS os provedores externos cairem, /llm responde com o modelo da casa em vez de 503 — OFF por padrao = custo zero; (8) detector de anomalias ganha severidade (volume puro -> log; comprador/receita -> Telegram) — fim do apito de hora em hora; (9) /live rotula scanner_noise como 'filtered noise' | requirements INALTERADOS (tudo roda sobre sklearn/fastembed ja instalados; llama-cpp-python e OPCIONAL e so e necessario com LOCAL_LLM=1) | base: v48.12.0-ML: camada de machine learning embarcada treinada nos dados do PROPRIO node (60k+ probes + ledger) — (1) classificador de demanda GradientBoosting com auto-rotulagem pelas regras atuais e retreino diario: pega scanner que o regex nunca viu (conf>=0.85 rebaixa new_product->scanner_noise) e anexa label+confianca ao painel/alertas; (2) detector de anomalias IsolationForest sobre agregados horarios de requests/revenue (min 72h): surto de comprador ou ataque vira log + Telegram (1/6h) + /data/ml_anomalies.json; (3) NOVO /discover gratis: busca semantica do catalogo por similaridade vetorial (MiniLM ONNX via fastembed, cache em /data) com fallback palavra-chave — funil de descoberta p/ agentes | tudo import-guarded (sem sklearn/fastembed o node roda como antes) + ML_DISABLED=1 | deps novas p/ requirements: scikit-learn fastembed | base: v48.11.0-GLOBAL: Moonshot/Kimi + OpenRouter como provedores premium DORMENTES (env-gated: sem chave = zero custo; ativar = MOONSHOT_API_KEY/OPENROUTER_API_KEY no Railway) | perfis de roteamento estilo ClawRouter: /llm?profile=eco|fast|premium e model=kimi|deepseek|eco|premium no /v1/chat/completions | NOVO /global-rates ($0.03): taxas de Fed/ECB/PBoC/BOJ/CBR/BCB numa chamada — BIS WS_CBPOL + cross-check ao vivo FRED/ECB-SDW/BCB-SGS, diferencial de carry vs Fed; nenhum concorrente x402 tem | rails Polygon (eip155:137) + Arbitrum (eip155:42161) PRONTAS, settle pelo mesmo facilitador CDP, env-gated OFF (X402_POLYGON=1/X402_ARBITRUM=1 so apos confirmar credito na Binance) | _SCAN_NOISE cobre /env.txt /env.js /settings.json /config/*.yml (scanner de credencial nao vira mais produto novo no radar) | _cap500 default 480->390 (x402lint P8: 24 descriptions na zona de risco; caminho p/ 100/100) | base: v48.10.3-REFINE: reprice consolidado no codigo (fonte unica, sem depender de env) — piso $0.01 em 12 endpoints de $0.003-0.008 (fear-greed, pyth-price, trust-hash, agent-market, bootstrap-trust, regime, mempool, web-search, ai-news + os 4 primitivos BR pix/bizdays/doc) e /br-archive $0.05->$0.09: a Coinbase cobra $0.001/settle apos 1k/mes (fazemos ~8k) — a $0.003 a taxa efetiva era 33%, a $0.01 cai a 10%; clientes x402 tem cap default 0.1 USDC, abaixo disso preco nao influencia decisao de maquina; referencia CoinGecko flat $0.01 | LLM_PROXY_PRICE agora le PRICE_LLM_PROXY (default $0.005 — a isca fica) | NOVO /.well-known/agent-registration.json (ERC-8004 registration-v1: A2A+MCP+x402+OAS, x402Support, supportedTrust) — registrar no Identity Registry 0x8004A169...a432 na Base | FIX telemetria: pos-refund nao loga mais "paid" (double-log inflava calls; Agent402 e /receipts leem isso) | refund agora carrega recommended_next (cross-sell na falha — falha vira retencao) | billing LLM com backoff persistente em /data (strikes 6h->12h->18h->24h; o 429 diario do Gemini parava de gritar a cada boot; provider saudavel zera) | base: v48.10.2-REFUND
 if __name__ == "__main__":
     cli()
 else:
