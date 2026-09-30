@@ -2884,15 +2884,23 @@ class LLM:
                 return r.json().get("response", ""), None
             return None, f"HTTP {r.status_code}"
 
+        def _try_local():
+            # v48.13.0-INTEL: LLM LOCAL de ultimo recurso (Qwen3-0.6B GGUF via
+            # llama.cpp CPU, modelo em /data). Se TODOS os provedores externos
+            # falharem, o node ainda responde — degrade, nunca morra.
+            _txt = _local_llm_complete(prompt, max_tokens=min(int(max_tokens), 220))
+            return (_txt, None) if _txt else (None, "local llm indisponivel")
+
         _CHAMADAS = {"deepseek": (_try_deepseek, DEEPSEEK_KEY),
                      "claude":   (_try_claude,   CLAUDE_KEY),
                      "groq":     (_try_groq,     GROQ_KEY),
                      "gemini":   (_try_gemini,   GEMINI_KEY),
                      "moonshot":   (_try_moonshot,   MOONSHOT_KEY),
                      "openrouter": (_try_openrouter, OPENROUTER_KEY),
-                     "ollama":   (_try_ollama,   OLLAMA_URL if OLLAMA_ENABLED else "")}
+                     "ollama":   (_try_ollama,   OLLAMA_URL if OLLAMA_ENABLED else ""),
+                     "local":    (_try_local,    "1" if _LOCAL_LLM_ON else "")}
 
-        for _prov in (order or _llm_chain(max_tokens)):
+        for _prov in list(order or _llm_chain(max_tokens)) + ["local"]:
             _fn, _cred = _CHAMADAS.get(_prov, (None, None))
             if not _fn or not _cred or _llm_is_down(_prov):
                 continue
@@ -6105,6 +6113,14 @@ def _build_402(endpoint: str, price_override: float = None):
     except Exception as _e:
         log.debug(f"v48.9.23 outputSchema v1 {endpoint}: {_e}")
 
+    # v48.13.0-INTEL: cross-sell dentro do proprio 402 — a recomendacao
+    # aparece no instante exato em que o agente ja decidiu pagar. Custo: zero.
+    try:
+        _ab = _also_bought(endpoint)
+        if _ab:
+            payload["also_bought"] = _ab[:3]
+    except Exception:
+        pass
     payload_hdr = _slim(payload)
     b64 = base64.b64encode(
         json.dumps(payload_hdr, separators=(",", ":")).encode()
@@ -7192,6 +7208,15 @@ def paid_endpoint(path):
                                             request.remote_addr or ""), kind="preview", ua=request.headers.get("User-Agent",""), params=_clean_params())
                     except Exception:
                         pass
+                    # v48.13.0-INTEL: lead scoring semantico do avaliador
+                    try:
+                        _ml_lead_score(path,
+                                       request.headers.get("X-Forwarded-For",
+                                                           request.remote_addr or ""),
+                                       request.headers.get("User-Agent", ""),
+                                       request.args)
+                    except Exception:
+                        pass
                     age = int(time.time() - cached["ts"])
                     # v40: 80% de quem avalia é humano em navegador. Máquina
                     # continua recebendo o mesmo JSON; humano recebe página.
@@ -7218,6 +7243,13 @@ def paid_endpoint(path):
                                        kind="preview",
                                        ua=request.headers.get("User-Agent", ""),
                                        params=_clean_params())
+                except Exception:
+                    pass
+                # v48.13.0-INTEL: lead scoring semantico do avaliador
+                try:
+                    _ml_lead_score(path, ip,
+                                   request.headers.get("User-Agent", ""),
+                                   request.args)
                 except Exception:
                     pass
                 # blindagem: um scanner não pode forçar geração repetida (os
@@ -8360,6 +8392,7 @@ for _p, (_h, _price, _desc, _tags) in PREMIUM_SUITE.items():
 # Previews premium são teasers (exceto o brief, cujo preview é o de ONTEM
 # — valor decaído no tempo é a degustação perfeita de um produto diário)
 PREMIUM_TEASER_PATHS.update(p for p in PREMIUM_SUITE if p != "/global-morning-brief")
+PREMIUM_TEASER_PATHS.add("/forecast")  # v48.13.0-INTEL
 
 # Premium na frente da vitrine — é onde está o dinheiro ($1+ = ~95% do volume)
 for _p in reversed(list(PREMIUM_SUITE)):
@@ -9098,7 +9131,11 @@ def health_providers():
     out["ml"] = {"sklearn": bool(_ML_SK),
                  "demand_classifier": _ML_CLF["n"] or ("file" if _ML_CLF_FILE.exists() else 0),
                  "anomaly_detector": _ML_IF["n"] or ("file" if _ML_IF_FILE.exists() else 0),
-                 "discover": "semantic" if _ML_EMB_OK else "keyword"}
+                 "discover": _ML_EMB.get("mode") or ("semantic" if _ML_EMB_OK else "keyword"),
+                 "forecast_symbols": len([s for s in _FC_FEEDS if s in _FC_MODELS]),
+                 "recommender_endpoints": len(_ALSO["map"]),
+                 "local_llm": "on" if _LOCAL_LLM_ON else "off",
+                 "public_status": "/ml"}
     # 2) mercados tradicionais: o que a auditoria reprovou
     checks = {}
     for path, fn in (("/stock-quote", Brain.stock_quote),
@@ -13686,7 +13723,9 @@ _ML_SK = None
 try:
     if not ML_DISABLED:
         import joblib as _joblib
-        from sklearn.ensemble import GradientBoostingClassifier, IsolationForest
+        from sklearn.ensemble import (GradientBoostingClassifier, IsolationForest,
+                                      HistGradientBoostingRegressor)
+        from sklearn.cluster import AgglomerativeClustering
         _ML_SK = True
 except Exception as _mle:
     _ML_SK = None
@@ -13886,10 +13925,16 @@ def _ml_score_current_hour() -> dict:
                     hist = json.loads(_ML_ANOM_FILE.read_text())
                 except Exception:
                     hist = []
+            # v48.13.0-INTEL: severidade. Anomalia de VOLUME puro (sem vendas
+            # nem pagadores) vira so log/arquivo — o retreino diario absorve o
+            # regime novo de trafego. So comportamento de COMPRADOR/receita
+            # acorda o operador no Telegram (fim do apito de hora em hora).
+            sev = "buyer" if (cur[2] > 0 or cur[3] > 0 or cur[4] > 0) else "volume"
+            out["severity"] = sev
             hist.append({"ts": int(time.time()), **out})
             _ML_ANOM_FILE.write_text(json.dumps(hist[-50:]))
             last = getattr(_ml_score_current_hour, "_last_alert", 0)
-            if time.time() - last > 6 * 3600:
+            if sev == "buyer" and time.time() - last > 6 * 3600:
                 _ml_score_current_hour._last_alert = time.time()
                 _notify_telegram(
                     f"🧠 *ANOMALIA OPERACIONAL*\n\n"
@@ -13906,20 +13951,29 @@ def _ml_score_current_hour() -> dict:
 
 def ml_ops_loop():
     """Ciclo ML: primeiro treino 10 min apos o boot; re-treina 1x/dia (o node
-    aprende com o trafego novo) e pontua a ultima hora fechada a cada hora."""
+    aprende com o trafego novo) e pontua a ultima hora fechada a cada hora.
+    v48.13.0: recomendador tambem recalcula 1x/dia e o clustering semantico
+    dos 404s roda 1x/semana com digest no Telegram."""
     time.sleep(600)
     if not _ML_SK:
         return
     _ml_train_demand()
     _ml_train_anomaly()
+    _ml_also_bought()
     ultimo_treino = time.time()
+    ultimo_cluster = time.time()  # primeiro clustering 7d apos o deploy
     while True:
         try:
             _ml_score_current_hour()
             if time.time() - ultimo_treino > 86400:
                 _ml_train_demand()
                 _ml_train_anomaly()
+                _ml_also_bought()
                 ultimo_treino = time.time()
+            if time.time() - ultimo_cluster > 7 * 86400:
+                if _ml_cluster_demand():
+                    _ml_cluster_digest()
+                ultimo_cluster = time.time()
         except Exception as e:
             log.debug(f"ml_ops: {e}")
         time.sleep(3600)
@@ -13954,34 +14008,40 @@ def _discover_keyword(q: str, n: int) -> list:
 
 
 def _discover_embed(q: str, n: int) -> list:
-    """Busca vetorial: MiniLM ONNX 100% local (nada sai do node), embeddings
-    do catalogo cacheados em /data e invalidados quando o catalogo muda."""
+    """Busca vetorial 100% local. v48.13.0: modo multilingue sob demanda
+    (query PT/ES/ZH -> catalogo EN) e reranker cross-encoder re-pontuando os
+    top-k (olha query+documento juntos — muito mais preciso que cosseno)."""
     if not _ML_EMB_OK:
         return []
-    if time.time() < _ML_EMB.get("backoff_until", 0):
-        return []  # download do modelo falhou ha pouco — nao trava toda chamada
+    key = "multi" if _needs_multi(q) else "base"
+    paths, vecs = _emb_catalog(key)
+    if paths is None and key == "multi":
+        key = "base"
+        paths, vecs = _emb_catalog("base")
+    if paths is None:
+        return []
     try:
-        import hashlib as _hl
         import numpy as _np
-        cat_hash = _hl.sha256("|".join(sorted(ENDPOINT_DESC)).encode()).hexdigest()[:16]
-        if _ML_EMB["model"] is None:
-            _ML_EMB["model"] = _TextEmbedding(
-                model_name="sentence-transformers/all-MiniLM-L6-v2",
-                cache_dir=str(_ML_DIR / "fastembed_cache"))
-        if _ML_EMB["hash"] != cat_hash:
-            paths = sorted(ENDPOINT_DESC)
-            docs = [f"{p}: {ENDPOINT_DESC[p]}" for p in paths]
-            _ML_EMB["vectors"] = list(_ML_EMB["model"].embed(docs))
-            _ML_EMB["paths"] = paths
-            _ML_EMB["hash"] = cat_hash
-        qv = _np.array(list(_ML_EMB["model"].embed([q]))[0])
-        V = _np.array(_ML_EMB["vectors"])
+        qlist = _emb_encode([q], key)
+        if not qlist:
+            return []
+        qv = _np.array(qlist[0])
+        V = _np.array(vecs)
         sims = (V @ qv) / (_np.linalg.norm(V, axis=1) * _np.linalg.norm(qv) + 1e-9)
-        idx = sims.argsort()[::-1][:n]
-        return [(_ML_EMB["paths"][int(i)], round(float(sims[int(i)]), 3)) for i in idx]
+        k = max(n, 8) if _ML_RERANK_ON else n
+        idx = sims.argsort()[::-1][:k]
+        cands = [(paths[int(i)], float(sims[int(i)])) for i in idx]
+        mode = "semantic-multilingual" if key == "multi" else "semantic"
+        if _ML_RERANK_ON and len(cands) > n:
+            rk = _rerank(q, [f"{p}: {ENDPOINT_DESC.get(p, '')}" for p, _s in cands])
+            if rk:
+                order = sorted(range(len(cands)), key=lambda i: rk[i], reverse=True)
+                cands = [(cands[i][0], float(rk[i])) for i in order]
+                mode += "+rerank"
+        _ML_EMB["mode"] = mode
+        return [(p, round(s, 3)) for p, s in cands[:n]]
     except Exception as e:
         log.warning(f"🧠 /discover embed: {e}")
-        _ML_EMB["backoff_until"] = time.time() + 6 * 3600
         return []
 
 
@@ -14003,7 +14063,7 @@ def discover():
                  "endpoints": len(ENDPOINT_DESC), "version": VERSION}, 400)
     t0 = time.perf_counter()
     hits = _discover_embed(q, n)
-    mode = "semantic-minilm-onnx"
+    mode = _ML_EMB.get("mode") or "semantic-minilm-onnx"
     if not hits:
         mode = "keyword-fallback"
         hits = [(p, None) for p in _discover_keyword(q, n)]
@@ -14025,6 +14085,790 @@ def discover():
             "compute_ms": round((time.perf_counter() - t0) * 1000, 1),
             "endpoints_indexed": len(ENDPOINT_DESC),
             "ts": int(time.time()), "version": VERSION}
+
+
+# ============================================================================
+# v48.13.0-INTEL — SEGUNDA CAMADA DE IA LOCAL (tudo roda no proprio node)
+# ----------------------------------------------------------------------------
+# (1) /forecast $0.05 — previsao p10/p50/p90 com HistGradientBoosting
+#     quantilico treinado NO HISTORICO QUE O NODE COLETA (snapshot Pyth a cada
+#     10min + backfill CoinGecko 90d). MAPE de walk-forward em toda resposta;
+#     sem historico suficiente = 503 e NAO cobra. (2) Recomendador
+#     "agents_also_bought" por co-ocorrencia real de pagadores no ledger — o
+#     402 agora faz cross-sell + /recommend gratis. (3) Lead scoring SEMANTICO
+#     dos previews -> lead quente no Telegram. (4) Clustering semanal dos 404s
+#     por significado -> oportunidades publicadas em /ml. (5) /ml publico.
+# (6) /discover com reranker cross-encoder + modo multilingue sob demanda.
+# (7) LLM local de ultimo recurso (LOCAL_LLM=1 + llama-cpp-python; Qwen3-0.6B
+#     GGUF): se TODOS os provedores externos cairem, /llm responde com o modelo
+#     da casa. OFF por padrao = custo zero ate o operador decidir ativar.
+# Cada subsistema tem guard + backoff: se uma peca falha, o node segue como na
+# v48.12.0. requirements.txt INALTERADO (sklearn/fastembed ja estao la).
+# ============================================================================
+
+# ---- helpers de embedding compartilhados (discover, lead, clustering) ------
+_EMB_MODELS = {"base":  "sentence-transformers/all-MiniLM-L6-v2",
+               "multi": "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"}
+_EMB_CACHE = {k: {"model": None, "vectors": None, "paths": [], "hash": "",
+                  "backoff_until": 0.0} for k in _EMB_MODELS}
+_ML_RERANK = {"model": None, "backoff_until": 0.0}
+_ML_RERANK_ON = os.environ.get("ML_RERANK", "1") != "0"
+
+
+def _emb_encode(texts, key="base"):
+    """Vetoriza textos com o modelo ONNX local; None se indisponivel (backoff
+    de 6h por modelo — uma falha de download nao trava nenhuma chamada)."""
+    if not _ML_EMB_OK:
+        return None
+    st = _EMB_CACHE[key]
+    if time.time() < st["backoff_until"]:
+        return None
+    try:
+        if st["model"] is None:
+            st["model"] = _TextEmbedding(model_name=_EMB_MODELS[key],
+                                         cache_dir=str(_ML_DIR / "fastembed_cache"))
+        return list(st["model"].embed(texts))
+    except Exception as e:
+        log.warning(f"🧠 emb[{key}]: {e}")
+        st["backoff_until"] = time.time() + 6 * 3600
+        return None
+
+
+def _emb_catalog(key="base"):
+    """(paths, vetores) do catalogo no modelo `key`, com cache invalidado por
+    hash — o catalogo muda a cada versao, o cache acompanha."""
+    st = _EMB_CACHE[key]
+    import hashlib as _hl
+    cat_hash = _hl.sha256("|".join(sorted(ENDPOINT_DESC)).encode()).hexdigest()[:16]
+    if st["hash"] != cat_hash:
+        paths = sorted(ENDPOINT_DESC)
+        docs = [f"{p}: {ENDPOINT_DESC[p]}" for p in paths]
+        vecs = _emb_encode(docs, key)
+        if vecs is None:
+            return None, None
+        st["vectors"] = vecs
+        st["paths"] = paths
+        st["hash"] = cat_hash
+    return st["paths"], st["vectors"]
+
+
+def _needs_multi(q: str) -> bool:
+    """Query claramente nao-inglesa (acentos/CJK ou stopwords PT/ES) pede o
+    modelo multilingue — agente busca na lingua dele, acha o catalogo em EN."""
+    if any(ord(c) > 127 for c in q):
+        return True
+    return bool(re.search(r"\b(para|uma|que|com|preço|preco|validar|el|la|los|"
+                          r"las|una|como|des|der|die|und|le|les|une)\b", q.lower()))
+
+
+def _rerank(q, docs):
+    """Cross-encoder ms-marco-MiniLM-L-6 (80MB ONNX): olha query+documento
+    JUNTOS (muito mais preciso que cosseno) e reordena os top-k."""
+    if time.time() < _ML_RERANK["backoff_until"]:
+        return None
+    try:
+        if _ML_RERANK["model"] is None:
+            from fastembed.rerank.cross_encoder import TextCrossEncoder
+            _ML_RERANK["model"] = TextCrossEncoder(
+                model_name="Xenova/ms-marco-MiniLM-L-6-v2",
+                cache_dir=str(_ML_DIR / "fastembed_cache"))
+        return list(_ML_RERANK["model"].rerank_pairs([(q, d) for d in docs]))
+    except Exception as e:
+        log.warning(f"🧠 reranker: {e}")
+        _ML_RERANK["backoff_until"] = time.time() + 6 * 3600
+        return None
+
+
+# ---- /forecast — previsao de preco 100% local, dados do proprio node -------
+_FC_FEEDS = {  # simbolo: (pyth feed id, coingecko id)
+    "BTC":  ("e62df6c8b4a85fe1a67db44dc12de5db330f7ac66b72dc658afedf0f4a415b43", "bitcoin"),
+    "ETH":  ("ff61491a931112ddf1bd8147cd1b641375f79f5825126d665480874634fd0ace", "ethereum"),
+    "SOL":  ("ef0d8b6fda2ceba41da15d4095d1da392a0d2f8ed0c6c7bc0f4cfac8c280b56d", "solana"),
+    "BNB":  ("2f95862b045670cd22bee3114c39763a4a08beeb663b145d283c31d7d1101c4f", "binancecoin"),
+    "XRP":  ("ec5d399846a9209f3fe5881d70aae9268c94339ff9817e8d18ff19fa05eea1c8", "ripple"),
+    "DOGE": ("dcef50dd0a4cd2dcc17e45df6476d336a4cba99c1a925a7f7a1db6f42335ccba", "dogecoin"),
+    "ADA":  ("2a01deaec9e51a579277b34b122399984d0bbf57e2458a7e42fecd2829867a0d", "cardano"),
+    "LINK": ("8ac0c70fff57e9aefdf5edf44b51d8c9d570653dcb242c8cd0cf63f80f9b5ea76", "chainlink"),
+}
+_FC_HORIZONS = {"6h": 6, "24h": 24, "3d": 72, "7d": 168}
+_FC_MIN_POINTS = 300
+_FC_DIR = _ML_DIR / "forecast"
+_FC_MODELS: dict = {}
+_FC_STATS = {"points": {}, "last_collect": 0, "last_train": 0}
+_FC_TABLE_OK = False
+
+try:
+    import numpy as _NP
+except Exception:
+    _NP = None
+
+
+def _fc_ensure():
+    global _FC_TABLE_OK
+    if _FC_TABLE_OK:
+        return True
+    try:
+        with LEDGER._conn() as c:
+            c.execute("""CREATE TABLE IF NOT EXISTS ml_price_history(
+                symbol TEXT NOT NULL, ts INTEGER NOT NULL, price REAL NOT NULL,
+                PRIMARY KEY (symbol, ts))""")
+        _FC_TABLE_OK = True
+    except Exception as e:
+        log.debug(f"fc ensure: {e}")
+    return _FC_TABLE_OK
+
+
+def _fc_collect():
+    """Snapshot de preco via Pyth Hermes (gratis, sem chave): UMA chamada com
+    todos os feeds. A memoria acumulada vira o ativo que ninguem copia."""
+    if not _fc_ensure():
+        return 0
+    try:
+        ids = "&".join(f"ids[]={fid}" for fid, _cg in _FC_FEEDS.values())
+        r = requests.get("https://hermes.pyth.network/v2/updates/price/latest?"
+                         + ids, timeout=8)
+        if not r.ok:
+            return 0
+        by_id = {}
+        for p in r.json().get("parsed", []):
+            by_id[str(p.get("id", "")).lower().lstrip("0x")] = p
+        n = 0
+        with LEDGER._conn() as c:
+            for sym, (fid, _cg) in _FC_FEEDS.items():
+                p = by_id.get(fid.lower().lstrip("0x"))
+                if not p:
+                    continue
+                pd2 = p.get("price", {})
+                try:
+                    price = float(pd2.get("price", 0)) * (10 ** float(pd2.get("expo", 0)))
+                except (TypeError, ValueError):
+                    continue
+                if price <= 0:
+                    continue
+                ts = int(pd2.get("publish_time") or p.get("publish_time") or time.time())
+                n += c.execute("INSERT OR IGNORE INTO ml_price_history VALUES (?,?,?)",
+                               (sym, int(ts // 600 * 600), round(price, 8))).rowcount
+        _FC_STATS["last_collect"] = int(time.time())
+        return n
+    except Exception as e:
+        log.debug(f"fc collect: {e}")
+        return 0
+
+
+def _fc_seed():
+    """Backfill de 90 dias (resolucao horaria) via CoinGecko — roda UMA vez por
+    simbolo (flag em meta). Sem o seed o /forecast ficaria semanas sem vender.
+    Sem chave: tier gratuito; com COINGECKO_KEY: header demo (401 -> pro)."""
+    if not _fc_ensure():
+        return
+    for sym, (_fid, cg_id) in _FC_FEEDS.items():
+        try:
+            with LEDGER._conn() as c:
+                done = c.execute("SELECT v FROM meta WHERE k=?",
+                                 (f"fc_seeded_{sym}",)).fetchone()
+                if done:
+                    continue
+                have = c.execute("SELECT COUNT(*) FROM ml_price_history WHERE symbol=?",
+                                 (sym,)).fetchone()[0]
+            if have >= _FC_MIN_POINTS:
+                with LEDGER._conn() as c:
+                    c.execute("INSERT OR REPLACE INTO meta VALUES (?,?)",
+                              (f"fc_seeded_{sym}", "1"))
+                continue
+            url = (f"https://api.coingecko.com/api/v3/coins/{cg_id}/market_chart"
+                   f"?vs_currency=usd&days=90")
+            headers = {"x-cg-demo-api-key": COINGECKO_KEY} if COINGECKO_KEY else {}
+            r = requests.get(url, headers=headers, timeout=20)
+            if r.status_code == 401 and COINGECKO_KEY:
+                r = requests.get(url, headers={"x-cg-pro-api-key": COINGECKO_KEY},
+                                 timeout=20)
+            if not r.ok:
+                log.info(f"🧠 /forecast seed {sym}: HTTP {r.status_code} — proximo boot tenta de novo")
+                time.sleep(3)
+                continue
+            pts = r.json().get("prices", [])
+            n = 0
+            with LEDGER._conn() as c:
+                for ms, pr in pts:
+                    n += c.execute("INSERT OR IGNORE INTO ml_price_history VALUES (?,?,?)",
+                                   (sym, int(int(ms) // 1000 // 3600 * 3600),
+                                    float(pr))).rowcount
+                c.execute("INSERT OR REPLACE INTO meta VALUES (?,?)",
+                          (f"fc_seeded_{sym}", "1"))
+            log.info(f"🧠 /forecast seed {sym}: {n} pontos horarios (90d CoinGecko)")
+            time.sleep(3)
+        except Exception as e:
+            log.info(f"🧠 /forecast seed {sym}: {e}")
+            time.sleep(3)
+
+
+def _fc_series(sym):
+    """Serie horaria [(hora, preco_medio)] — junta backfill + coleta viva."""
+    with LEDGER._conn() as c:
+        return c.execute("SELECT ts/3600 h, AVG(price) FROM ml_price_history "
+                         "WHERE symbol=? GROUP BY h ORDER BY h", (sym,)).fetchall()
+
+
+def _fc_feat(p, i, ts):
+    """Features ESTACIONARIAS (retornos, nao niveis): arvores nao extrapolam
+    preco — quem generaliza para maxima historica nova e o retorno."""
+    import math
+
+    def ret(k):
+        if i - k < 0:
+            return 0.0
+        return float(p[i] / max(float(p[i - k]), 1e-9) - 1.0)
+
+    rets24 = [float(p[j] / max(float(p[j - 1]), 1e-9) - 1.0)
+              for j in range(max(1, i - 23), i + 1)]
+    rets168 = [float(p[j] / max(float(p[j - 1]), 1e-9) - 1.0)
+               for j in range(max(1, i - 167), i + 1)]
+    vol24 = float(_NP.std(rets24)) if len(rets24) > 1 else 0.0
+    vol168 = float(_NP.std(rets168)) if len(rets168) > 1 else 0.0
+    hour = (ts % 86400) / 3600.0
+    dow = (ts // 86400) % 7
+    return [ret(1), ret(2), ret(3), ret(6), ret(12), ret(24), ret(48),
+            ret(72), ret(168), vol24, vol168,
+            math.sin(2 * math.pi * hour / 24), math.cos(2 * math.pi * hour / 24),
+            math.sin(2 * math.pi * dow / 7), math.cos(2 * math.pi * dow / 7)]
+
+
+def _fc_train(sym):
+    """Treina p10/p50/p90 por horizonte com walk-forward 85/15 e publica o
+    MAPE do trecho de teste — o cliente ve o erro real antes de confiar."""
+    if not _ML_SK or _NP is None:
+        return False
+    try:
+        rows = _fc_series(sym)
+        if len(rows) < _FC_MIN_POINTS:
+            return False
+        hrs = [int(r[0]) for r in rows]
+        p = _NP.array([r[1] for r in rows], dtype=float)
+        models, mapes = {}, {}
+        for h in _FC_HORIZONS.values():
+            X, Y, B = [], [], []
+            for i in range(168, len(p) - h):
+                X.append(_fc_feat(p, i, hrs[i] * 3600))
+                Y.append(p[i + h] / max(float(p[i]), 1e-9) - 1.0)
+                B.append(float(p[i]))
+            if len(X) < 200:
+                continue
+            X = _NP.array(X); Y = _NP.array(Y); B = _NP.array(B)
+            cut = int(len(X) * 0.85)
+            qs = {}
+            for q in (0.1, 0.5, 0.9):
+                m = HistGradientBoostingRegressor(
+                    loss="quantile", quantile=q, max_iter=250,
+                    learning_rate=0.06, max_leaf_nodes=31, random_state=42)
+                m.fit(X[:cut], Y[:cut])
+                qs[q] = m
+            pred_ret = qs[0.5].predict(X[cut:])
+            pred_price = B[cut:] * (1.0 + pred_ret)
+            actual = B[cut:] * (1.0 + Y[cut:])
+            mape = float(_NP.mean(_NP.abs(pred_price - actual) /
+                                  _NP.maximum(actual, 1e-9)) * 100)
+            models[h] = qs
+            mapes[h] = round(mape, 2)
+        if not models:
+            return False
+        _FC_MODELS[sym] = {"models": models, "mape": mapes, "n": len(p),
+                           "trained_at": int(time.time())}
+        _FC_STATS["points"][sym] = len(p)
+        try:
+            _FC_DIR.mkdir(parents=True, exist_ok=True)
+            _joblib.dump(_FC_MODELS[sym], _FC_DIR / f"{sym}.joblib")
+        except Exception as e:
+            log.debug(f"fc persist {sym}: {e}")
+        return True
+    except Exception as e:
+        log.info(f"🧠 /forecast train {sym}: {e}")
+        return False
+
+
+def _fc_load(sym):
+    try:
+        f = _FC_DIR / f"{sym}.joblib"
+        if f.exists():
+            ent = _joblib.load(f)
+            _FC_MODELS[sym] = ent
+            _FC_STATS["points"][sym] = ent.get("n", 0)
+            return ent
+    except Exception as e:
+        log.debug(f"fc load {sym}: {e}")
+    return None
+
+
+def _fc_predict(sym, h):
+    if not _ML_SK or _NP is None:
+        return None
+    ent = _FC_MODELS.get(sym) or _fc_load(sym)
+    if not ent or h not in ent.get("models", {}):
+        return None
+    rows = _fc_series(sym)
+    if len(rows) < _FC_MIN_POINTS:
+        return None
+    _FC_STATS["points"][sym] = len(rows)
+    last_h = int(rows[-1][0])
+    age = int(time.time()) - last_h * 3600
+    if age > 26 * 3600:
+        return None  # dado velho demais para vender — honestidade > receita
+    p = _NP.array([r[1] for r in rows], dtype=float)
+    x = _NP.array([_fc_feat(p, len(p) - 1, last_h * 3600)])
+    qs = ent["models"][h]
+    q10 = float(qs[0.1].predict(x)[0])
+    q50 = float(qs[0.5].predict(x)[0])
+    q90 = float(qs[0.9].predict(x)[0])
+    q10 = min(q10, q50)   # cruzamento de quantis acontece — a banda nunca inverte
+    q90 = max(q90, q50)
+    last = float(p[-1])
+    return {"symbol": sym,
+            "horizon": f"{h}h", "horizon_hours": h,
+            "last_price": round(last, 6),
+            "last_price_age_seconds": age,
+            "forecast": {"p10": round(max(last * (1 + q10), 0.0), 6),
+                         "p50": round(max(last * (1 + q50), 0.0), 6),
+                         "p90": round(max(last * (1 + q90), 0.0), 6),
+                         "expected_move_pct": round(q50 * 100, 2),
+                         "bandwidth_pct": round((q90 - q10) * 100, 2),
+                         "direction": ("up" if q50 > 0.005 else
+                                       "down" if q50 < -0.005 else "flat")},
+            "model": {"type": "HistGradientBoosting quantile regression — 100% local",
+                      "inference": "on-node (no external AI API, no GPU)",
+                      "trained_on_hours": ent["n"],
+                      "trained_at": ent["trained_at"],
+                      "backtest_mape_pct_walkforward": ent["mape"].get(h)},
+            "disclaimer": ("Statistical forecast from a local model trained on this "
+                           "node's own collected price history. The p10-p90 band is "
+                           "model uncertainty, not a guarantee. Not financial advice."),
+            "ts": int(time.time()), "version": VERSION}
+
+
+def _h_forecast():
+    """GET /forecast?symbol=BTC&horizon=24h — $0.05. Falhou/dado velho = 503
+    (e o paid_endpoint nao cobra 503)."""
+    sym = (request.args.get("symbol") or "BTC").upper()[:8]
+    hz = (request.args.get("horizon") or "24h").lower()[:4]
+    if sym not in _FC_FEEDS:
+        return ({"error": f"unknown symbol '{sym}'. Available: "
+                          + ", ".join(sorted(_FC_FEEDS))}, 503)
+    if hz not in _FC_HORIZONS:
+        return ({"error": f"unknown horizon '{hz}'. Available: "
+                          + ", ".join(_FC_HORIZONS)}, 503)
+    out = _fc_predict(sym, _FC_HORIZONS[hz])
+    if not out:
+        return ({"error": "forecast model still training — this node collects its "
+                          "own price history; try again shortly"}, 503)
+    return out
+
+
+def _fc_loop():
+    """Seed no primeiro minuto; coleta Pyth a cada 10min; retreino a cada 6h."""
+    if ML_DISABLED or not _ML_SK:
+        return
+    time.sleep(45)
+    try:
+        _fc_seed()
+    except Exception as e:
+        log.info(f"🧠 /forecast seed: {e}")
+    _last_train = 0.0
+    while True:
+        try:
+            _fc_collect()
+            if time.time() - _last_train > 6 * 3600:
+                ok = sum(1 for s in _FC_FEEDS if _fc_train(s))
+                _last_train = time.time()
+                if ok:
+                    log.info(f"🧠 /forecast: {ok}/{len(_FC_FEEDS)} simbolos treinados "
+                             f"({sum(_FC_STATS['points'].values())} pts acumulados)")
+        except Exception as e:
+            log.debug(f"fc loop: {e}")
+        time.sleep(600)
+
+
+# ---- recommender — "agents also bought" (co-ocorrencia real de pagadores) --
+_ALSO_FILE = _ML_DIR / "ml_also_bought.json"
+_ALSO = {"map": {}, "computed_at": 0}
+
+
+def _ml_also_bought(days=90):
+    """Quem pagou X tambem pagou Y. Ledger publico do proprio node — recomen-
+    dacao que nenhum concorrente consegue copiar sem as nossas vendas."""
+    try:
+        corte = int(time.time()) - days * 86400
+        with LEDGER._conn() as c:
+            rows = c.execute("SELECT payer, endpoint FROM revenue WHERE ts>? "
+                             "AND payer IS NOT NULL AND payer!=''", (corte,)).fetchall()
+        by_payer = {}
+        for payer, ep in rows:
+            by_payer.setdefault(payer, set()).add(ep)
+        pair, solo = {}, {}
+        for eps in by_payer.values():
+            for a in eps:
+                solo[a] = solo.get(a, 0) + 1
+                for b in eps:
+                    if a != b:
+                        pair[(a, b)] = pair.get((a, b), 0) + 1
+        out = {}
+        for (a, b), n in pair.items():
+            if n < 2:
+                continue
+            score = round(n / max(1, solo.get(a, 1)), 3)
+            out.setdefault(a, []).append((score, b))
+        _ALSO["map"] = {a: sorted(v, reverse=True)[:3] for a, v in out.items()}
+        _ALSO["computed_at"] = int(time.time())
+        try:
+            _ALSO_FILE.write_text(json.dumps(_ALSO))
+        except Exception:
+            pass
+        return len(_ALSO["map"])
+    except Exception as e:
+        log.debug(f"also_bought: {e}")
+        return 0
+
+
+def _also_bought(path):
+    """Top-3 recomendacoes para `path` (lazy-load do arquivo persistido)."""
+    if not _ALSO["map"] and _ALSO_FILE.exists():
+        try:
+            _ALSO.update(json.loads(_ALSO_FILE.read_text()))
+        except Exception:
+            pass
+    recs = []
+    for score, ep in (_ALSO["map"].get(path) or []):
+        recs.append({"endpoint": ep,
+                     "price_usd": round(BASE_PRICES.get(ep, 0.0), 4),
+                     "description": _cap500(ENDPOINT_DESC.get(ep, ""), 140),
+                     "co_purchase_score": score})
+    return recs
+
+
+@app.route("/recommend")
+def recommend():
+    """GET /recommend?endpoint=/x — o que os agentes que pagaram /x tambem
+    compraram. Gratis: recomendacao boa puxa a proxima venda."""
+    ep = (request.args.get("endpoint") or "").strip()[:80]
+    if not ep or not ep.startswith("/"):
+        return {"error": "usage: /recommend?endpoint=/global-rates"}, 400
+    recs = _also_bought(ep)
+    if not recs:
+        return {"endpoint": ep, "recommendations": [],
+                "note": "No co-purchase history yet for this endpoint.",
+                "ts": int(time.time()), "version": VERSION}
+    return {"endpoint": ep, "recommendations": recs,
+            "method": "co-occurrence of real payers in this node's public ledger (90d)",
+            "ts": int(time.time()), "version": VERSION}
+
+
+# ---- lead scoring semantico — avaliador com intencao de premium vira lead --
+_LEADS_FILE = _ML_DIR / "ml_leads.json"
+_LEADS = {"by_ip": {}, "last_alert": 0.0, "events": 0}
+_LEAD_EMB = {"hash": "", "paths": [], "vectors": None}
+
+
+def _lead_semantic(q: str) -> bool:
+    """O que o avaliador pediu 'cheira' a produto premium ($0.12+)?"""
+    try:
+        import hashlib as _hl
+        prem = [p for p in ENDPOINT_DESC if BASE_PRICES.get(p, 0.0) >= 0.12]
+        if not prem:
+            return False
+        h = _hl.sha256("|".join(sorted(prem)).encode()).hexdigest()[:16]
+        if _LEAD_EMB["hash"] != h:
+            pv = _emb_encode([f"{p}: {ENDPOINT_DESC[p]}" for p in sorted(prem)], "base")
+            if pv is None:
+                return False
+            _LEAD_EMB.update(hash=h, paths=sorted(prem), vectors=pv)
+        qv_l = _emb_encode([q], "base")
+        if not qv_l or _LEAD_EMB["vectors"] is None:
+            return False
+        qv = _NP.array(qv_l[0])
+        P = _NP.array(_LEAD_EMB["vectors"])
+        sims = (P @ qv) / (_NP.linalg.norm(P, axis=1) * _NP.linalg.norm(qv) + 1e-9)
+        return float(sims.max()) >= 0.55
+    except Exception:
+        return False
+
+
+def _ml_lead_score(path, ip, ua, args):
+    """Avaliador que (a) prova produto premium direto ou (b) pede algo
+    semanticamente proximo de premium acumula score; 3+ em 24h = lead quente
+    no Telegram (throttle 12h). Scanners/bots genericos nao pontuam."""
+    if not _ML_EMB_OK or not ip or _NP is None:
+        return
+    try:
+        if _ua_class(ua or "") in ("scanner", "generic_bot"):
+            return
+        direct = BASE_PRICES.get(path, 0.0) >= 0.12
+        sem = False
+        if not direct:
+            q = " ".join(str(v) for v in dict(args).values() if v)[:200]
+            if len(q) >= 6:
+                sem = _lead_semantic(q)
+        if not (direct or sem):
+            return
+        now = time.time()
+        rec = _LEADS["by_ip"].setdefault(ip, {"n": 0, "paths": [], "first": int(now)})
+        rec["n"] += 1
+        if path not in rec["paths"]:
+            rec["paths"].append(path)
+        _LEADS["events"] += 1
+        if len(_LEADS["by_ip"]) > 500:  # limpa janelas velhas p/ nao crescer sem fim
+            velhos = [k for k, v in _LEADS["by_ip"].items()
+                      if now - v.get("first", now) > 172800]
+            for k in velhos:
+                _LEADS["by_ip"].pop(k, None)
+        if _LEADS["events"] % 20 == 0:
+            try:
+                _LEADS_FILE.write_text(json.dumps(
+                    {"by_ip": _LEADS["by_ip"], "at": int(now)}))
+            except Exception:
+                pass
+        if rec["n"] >= 3 and now - _LEADS["last_alert"] > 12 * 3600:
+            _LEADS["last_alert"] = now
+            tipo = "premium direto" if direct else "intencao semantica"
+            _notify_telegram(
+                f"🔥 *LEAD QUENTE*\n\n"
+                f"IP `{ip}` ja avaliou {rec['n']}x em 24h ({tipo}):\n"
+                + ", ".join(f"`{p}`" for p in rec["paths"][:6])
+                + "\n\nVale contato direto ou plano sob medida.")
+    except Exception:
+        return
+
+
+# ---- clustering semanal dos 404s — o radar de demanda pensa em categorias --
+_CLUSTER_FILE = _ML_DIR / "ml_demand_clusters.json"
+
+
+def _ml_cluster_demand():
+    """Agrupa os not-found por SIGNIFICADO (embedding + Agglomerative cosine):
+    30 IPs pedindo /preco-btc, /btc-price e /cotacao-bitcoin viram UM cluster
+    'preco BTC' — sinal de produto muito mais claro que 30 linhas soltas."""
+    if not _ML_EMB_OK or not _ML_SK or _NP is None:
+        return 0
+    try:
+        corte = int(time.time()) - 7 * 86400
+        with LEDGER._conn() as c:
+            rows = c.execute("SELECT endpoint, COUNT(DISTINCT ip) ips FROM requests "
+                             "WHERE ts>? AND kind='notfound' GROUP BY endpoint "
+                             "HAVING ips>=2 ORDER BY ips DESC LIMIT 120",
+                             (corte,)).fetchall()
+        ips_map = {r[0]: int(r[1]) for r in rows}
+        paths = [r[0] for r in rows
+                 if _demand_classify(r[0])["kind"] == "new_product"]
+        if len(paths) < 8:
+            return 0
+        vecs = _emb_encode(paths, "base")
+        if vecs is None:
+            return 0
+        V = _NP.array(vecs)
+        V = V / (_NP.linalg.norm(V, axis=1, keepdims=True) + 1e-9)
+        lab = AgglomerativeClustering(n_clusters=None, distance_threshold=0.6,
+                                      metric="cosine", linkage="average").fit_predict(V)
+        clusters = {}
+        for p, lb in zip(paths, lab):
+            clusters.setdefault(int(lb), []).append(p)
+        out = []
+        for _lb, members in clusters.items():
+            if len(members) < 2:
+                continue
+            out.append({"example": members[0], "members": members[:8],
+                        "size": len(members),
+                        "unique_ips": sum(ips_map.get(m, 0) for m in members)})
+        out.sort(key=lambda c: -c["unique_ips"])
+        _CLUSTER_FILE.write_text(json.dumps({"at": int(time.time()),
+                                             "clusters": out[:10]}))
+        return len(out)
+    except Exception as e:
+        log.debug(f"cluster demand: {e}")
+        return 0
+
+
+def _ml_cluster_digest():
+    """Telegram semanal com os clusters que tem demanda real (>=5 IPs)."""
+    try:
+        d = json.loads(_CLUSTER_FILE.read_text())
+        cls = [c for c in d.get("clusters", []) if c.get("unique_ips", 0) >= 5]
+        if not cls:
+            return
+        linhas = "\n".join(f"• `{c['example']}` +{c['size'] - 1} similares "
+                           f"({c['unique_ips']} IPs)" for c in cls[:3])
+        _notify_telegram(
+            f"🧠 *RADAR SEMANAL DE DEMANDA*\n\n"
+            f"{len(d.get('clusters', []))} clusters semanticos de 404. Top:\n"
+            f"{linhas}\n\nDetalhe completo em /ml.")
+    except Exception:
+        pass
+
+
+# ---- /ml — vitrine publica da camada de IA local ---------------------------
+_ML_PUB = {"at": 0.0, "json": None}
+
+
+@app.route("/ml")
+def ml_public():
+    """GET /ml — transparencia: o que cada modelo local aprende, com quantos
+    dados proprios e quando treinou. Quem vende IA tem que mostrar a IA."""
+    if _ML_PUB["json"] is not None and time.time() - _ML_PUB["at"] < 60:
+        return _ML_PUB["json"]
+    hist = []
+    try:
+        hist = json.loads(_ML_ANOM_FILE.read_text())
+    except Exception:
+        pass
+    anom_24h = sum(1 for a in hist if time.time() - a.get("ts", 0) < 86400)
+    clusters = []
+    try:
+        clusters = json.loads(_CLUSTER_FILE.read_text()).get("clusters", [])[:3]
+    except Exception:
+        pass
+    fc_syms = {}
+    try:
+        with LEDGER._conn() as c:
+            for sym in _FC_FEEDS:
+                n = c.execute("SELECT COUNT(*) FROM ml_price_history WHERE symbol=?",
+                              (sym,)).fetchone()[0]
+                fc_syms[sym] = {"hours": n,
+                                "ready": bool(n >= _FC_MIN_POINTS and sym in _FC_MODELS)}
+    except Exception:
+        for sym in _FC_FEEDS:
+            fc_syms[sym] = {"hours": _FC_STATS["points"].get(sym, 0),
+                            "ready": sym in _FC_MODELS}
+    out = {
+        "node": "Losbeto", "version": VERSION,
+        "how_it_runs": ("All models below run 100% on this node (ONNX Runtime + "
+                        "scikit-learn; optional llama.cpp). No query, payload or "
+                        "training row ever leaves the machine."),
+        "models": {
+            "demand_classifier": {
+                "task": "classify 404 demand (scanner noise / alias / new product)",
+                "algorithm": "GradientBoosting, self-labeled, retrained daily",
+                "trained_on_paths": _ML_CLF["n"] or (
+                    "file" if _ML_CLF_FILE.exists() else 0)},
+            "anomaly_detector": {
+                "task": "hourly ops baseline (volume, payers, revenue)",
+                "algorithm": "IsolationForest on 30d of this node's own traffic",
+                "trained_on_hours": _ML_IF["n"] or (
+                    "file" if _ML_IF_FILE.exists() else 0),
+                "anomalies_last_24h": anom_24h},
+            "semantic_discovery": {
+                "endpoint": "/discover?q=... (free)",
+                "algorithm": "MiniLM ONNX embeddings + optional cross-encoder rerank",
+                "mode": _ML_EMB.get("mode") or ("semantic" if _ML_EMB_OK else "keyword"),
+                "multilingual_on_demand": True,
+                "reranker": "ms-marco-MiniLM-L-6 (local ONNX)" if _ML_RERANK_ON else "off"},
+            "price_forecast": {
+                "endpoint": "/forecast?symbol=BTC&horizon=24h ($0.05)",
+                "algorithm": "quantile HistGradientBoosting p10/p50/p90, 4 horizons",
+                "trained_on": "this node's own collected price history (Pyth + 90d backfill)",
+                "symbols": fc_syms},
+            "recommender": {
+                "endpoint": "/recommend?endpoint=/x (free)",
+                "algorithm": "payer co-occurrence in the node's public ledger (90d)",
+                "endpoints_covered": len(_ALSO["map"]),
+                "computed_at": _ALSO.get("computed_at", 0)},
+            "demand_clustering": {
+                "task": "weekly semantic clustering of 404 demand",
+                "top_clusters": clusters},
+            "local_llm": {
+                "role": "last-resort /llm fallback when every external provider is down",
+                "model": "Qwen3-0.6B (Q4_K_M GGUF, llama.cpp, CPU)",
+                "enabled": bool(_LOCAL_LLM_ON),
+                "loaded": bool(_LOCAL_LLM.get("llm") is not None),
+                "how_to_enable": "set LOCAL_LLM=1 and install llama-cpp-python (+~1GB RAM)"},
+        },
+        "ts": int(time.time()),
+    }
+    _ML_PUB.update(at=time.time(), json=out)
+    return out
+
+
+# ---- LLM local de ultimo recurso (LOCAL_LLM=1) ------------------------------
+_LOCAL_LLM_ON = (os.environ.get("LOCAL_LLM", "0") == "1") and not ML_DISABLED
+_LOCAL_LLM = {"llm": None, "backoff_until": 0.0, "lib_warned": False,
+              "downloading": False,
+              "repo": "bartowski/Qwen_Qwen3-0.6B-GGUF",
+              "file": "Qwen3-0.6B-Q4_K_M.gguf"}
+_LOCAL_LLM_PATH = _ML_DIR / "models" / "qwen3-0.6b-q4_k_m.gguf"
+
+
+def _local_llm_lib():
+    """llama-cpp-python NAO esta no requirements (wheel CPU quebra em musl
+    algumas distros) — quem ativa LOCAL_LLM instala uma vez. Nunca derruba o
+    build nem o boot."""
+    try:
+        from llama_cpp import Llama
+        return Llama
+    except Exception:
+        if not _LOCAL_LLM["lib_warned"]:
+            _LOCAL_LLM["lib_warned"] = True
+            log.info("🧠 local llm: llama-cpp-python ausente. Para ativar: "
+                     "pip install llama-cpp-python --only-binary llama-cpp-python "
+                     "--extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cpu")
+        return None
+
+
+def _local_llm_warm():
+    """Baixa (~480MB) e carrega o Qwen3-0.6B em background — o boot do
+    gunicorn nao pode esperar download. So roda com LOCAL_LLM=1."""
+    try:
+        if not _LOCAL_LLM_PATH.exists() and not _LOCAL_LLM["downloading"]:
+            _LOCAL_LLM["downloading"] = True
+            try:
+                _LOCAL_LLM_PATH.parent.mkdir(parents=True, exist_ok=True)
+                url = (f"https://huggingface.co/{_LOCAL_LLM['repo']}/resolve/main/"
+                       f"{_LOCAL_LLM['file']}")
+                with requests.get(url, stream=True, timeout=(15, 120)) as r:
+                    if not r.ok:
+                        raise RuntimeError(f"HTTP {r.status_code}")
+                    tmp = _LOCAL_LLM_PATH.with_suffix(".part")
+                    with open(tmp, "wb") as f:
+                        for chunk in r.iter_content(1 << 20):
+                            if chunk:
+                                f.write(chunk)
+                    tmp.rename(_LOCAL_LLM_PATH)
+                log.info("🧠 local llm: Qwen3-0.6B baixado (~480MB em /data/models)")
+            finally:
+                _LOCAL_LLM["downloading"] = False
+        if _LOCAL_LLM["llm"] is None and _LOCAL_LLM_PATH.exists():
+            Llama = _local_llm_lib()
+            if Llama is None:
+                return
+            _LOCAL_LLM["llm"] = Llama(
+                model_path=str(_LOCAL_LLM_PATH), n_ctx=2048,
+                n_threads=int(os.environ.get("LOCAL_LLM_THREADS", "4")),
+                verbose=False)
+            log.info("🧠 local llm: Qwen3-0.6B carregado — /llm tem fallback proprio")
+    except Exception as e:
+        log.warning(f"🧠 local llm warm: {e}")
+        _LOCAL_LLM["backoff_until"] = time.time() + 3600
+
+
+def _local_llm_complete(prompt, max_tokens=200):
+    """Completa com o modelo da casa; '' se indisponivel. /no_think desliga o
+    modo raciocinio do Qwen3 — fallback tem que ser rapido, nao filosofico."""
+    if not _LOCAL_LLM_ON:
+        return ""
+    if time.time() < _LOCAL_LLM["backoff_until"]:
+        return ""
+    llm = _LOCAL_LLM.get("llm")
+    if llm is None:
+        return ""  # warm thread baixa/carrega em background
+    try:
+        sys_p = ("You are the built-in fallback model of the Losbeto data node. "
+                 "Answer briefly and factually in English. If you don't know, say so.")
+        full = (f"<|im_start|>system\n{sys_p}<|im_end|>\n"
+                f"<|im_start|>user\n{str(prompt)[:2500]}\n/no_think<|im_end|>\n"
+                f"<|im_start|>assistant\n")
+        out = llm(full, max_tokens=max(32, min(int(max_tokens), 220)),
+                  temperature=0.3, stop=["<|im_end|>", "<|im_start|>"])
+        txt = (out["choices"][0].get("text") or "").strip()
+        if "<think>" in txt:
+            txt = re.sub(r"<think>.*?</think>", "", txt, flags=re.S).strip()
+        return txt
+    except Exception as e:
+        log.warning(f"🧠 local llm: {e}")
+        _LOCAL_LLM["backoff_until"] = time.time() + 3600
+        return ""
 
 
 def demand_watch_loop():
@@ -14418,7 +15262,7 @@ async function tick(){
 
     document.getElementById('dm').querySelector('tbody').innerHTML=
       (s.demand_404||[]).slice(0,6).map(function(d){
-        var tag=d.kind==='resolved'?'<span class="ok">live now</span>':(d.kind==='alias_candidate'?'alias exists':'not built');
+        var tag=d.kind==='resolved'?'<span class="ok">live now</span>':(d.kind==='alias_candidate'?'alias exists':(d.kind==='scanner_noise'?'filtered noise':'not built'));
         return '<tr><td>'+esc(d.path)+'</td><td>'+d.ips+' ip \u00b7 '+tag+'</td></tr>';
       }).join('')||'<tr><td>nothing requested outside the catalog</td><td></td></tr>';
 
@@ -20504,6 +21348,9 @@ def _start_background_once():
     threading.Thread(target=demand_watch_loop, daemon=True).start()
     threading.Thread(target=lead_watch_loop, daemon=True).start()  # v48.6.0-REGISTER
     threading.Thread(target=ml_ops_loop, daemon=True).start()      # v48.12.0-ML
+    threading.Thread(target=_fc_loop, daemon=True).start()         # v48.13.0-INTEL
+    if _LOCAL_LLM_ON:
+        threading.Thread(target=_local_llm_warm, daemon=True).start()
     threading.Thread(target=autopilot_report_loop, daemon=True).start()
     threading.Thread(target=llm_watchdog_loop, daemon=True).start()
     threading.Thread(target=acp_railway_seller_loop, daemon=True).start()
@@ -24447,6 +25294,16 @@ _V47_PRODUCTS = {
         "account — USDC via x402.",
         ["GlobalMacro", "Rates", "CentralBanks", "China", "Russia", "Europe", "US"],
         {}),
+    # v48.13.0-INTEL — o primeiro produto cujo MODELO e cujos DADOS sao do node
+    "/forecast": (_h_forecast, 0.050,
+        "Machine-learning price forecast running entirely on this node: "
+        "quantile gradient boosting (p10/p50/p90 bands) over 6h, 24h, 3d or 7d "
+        "horizons for BTC, ETH, SOL, BNB, XRP, DOGE, ADA and LINK, trained on "
+        "the node's OWN collected price history, with walk-forward backtest "
+        "error (MAPE) published in every answer. No external AI API, no GPU. "
+        "Not financial advice.",
+        ["Forecast", "ML", "Crypto", "LocalModel", "QuantileBands"],
+        {"symbol": "BTC", "horizon": "24h"}),
 }
 
 for _path, (_fn, _price, _desc, _tags, _hint) in _V47_PRODUCTS.items():
@@ -26331,7 +27188,7 @@ def config_json():
     return r
 
 
-VERSION = "48.12.0-ML"  # v48.12.0-ML: camada de machine learning embarcada treinada nos dados do PROPRIO node (60k+ probes + ledger) — (1) classificador de demanda GradientBoosting com auto-rotulagem pelas regras atuais e retreino diario: pega scanner que o regex nunca viu (conf>=0.85 rebaixa new_product->scanner_noise) e anexa label+confianca ao painel/alertas; (2) detector de anomalias IsolationForest sobre agregados horarios de requests/revenue (min 72h): surto de comprador ou ataque vira log + Telegram (1/6h) + /data/ml_anomalies.json; (3) NOVO /discover gratis: busca semantica do catalogo por similaridade vetorial (MiniLM ONNX via fastembed, cache em /data) com fallback palavra-chave — funil de descoberta p/ agentes | tudo import-guarded (sem sklearn/fastembed o node roda como antes) + ML_DISABLED=1 | deps novas p/ requirements: scikit-learn fastembed | base: v48.11.0-GLOBAL: Moonshot/Kimi + OpenRouter como provedores premium DORMENTES (env-gated: sem chave = zero custo; ativar = MOONSHOT_API_KEY/OPENROUTER_API_KEY no Railway) | perfis de roteamento estilo ClawRouter: /llm?profile=eco|fast|premium e model=kimi|deepseek|eco|premium no /v1/chat/completions | NOVO /global-rates ($0.03): taxas de Fed/ECB/PBoC/BOJ/CBR/BCB numa chamada — BIS WS_CBPOL + cross-check ao vivo FRED/ECB-SDW/BCB-SGS, diferencial de carry vs Fed; nenhum concorrente x402 tem | rails Polygon (eip155:137) + Arbitrum (eip155:42161) PRONTAS, settle pelo mesmo facilitador CDP, env-gated OFF (X402_POLYGON=1/X402_ARBITRUM=1 so apos confirmar credito na Binance) | _SCAN_NOISE cobre /env.txt /env.js /settings.json /config/*.yml (scanner de credencial nao vira mais produto novo no radar) | _cap500 default 480->390 (x402lint P8: 24 descriptions na zona de risco; caminho p/ 100/100) | base: v48.10.3-REFINE: reprice consolidado no codigo (fonte unica, sem depender de env) — piso $0.01 em 12 endpoints de $0.003-0.008 (fear-greed, pyth-price, trust-hash, agent-market, bootstrap-trust, regime, mempool, web-search, ai-news + os 4 primitivos BR pix/bizdays/doc) e /br-archive $0.05->$0.09: a Coinbase cobra $0.001/settle apos 1k/mes (fazemos ~8k) — a $0.003 a taxa efetiva era 33%, a $0.01 cai a 10%; clientes x402 tem cap default 0.1 USDC, abaixo disso preco nao influencia decisao de maquina; referencia CoinGecko flat $0.01 | LLM_PROXY_PRICE agora le PRICE_LLM_PROXY (default $0.005 — a isca fica) | NOVO /.well-known/agent-registration.json (ERC-8004 registration-v1: A2A+MCP+x402+OAS, x402Support, supportedTrust) — registrar no Identity Registry 0x8004A169...a432 na Base | FIX telemetria: pos-refund nao loga mais "paid" (double-log inflava calls; Agent402 e /receipts leem isso) | refund agora carrega recommended_next (cross-sell na falha — falha vira retencao) | billing LLM com backoff persistente em /data (strikes 6h->12h->18h->24h; o 429 diario do Gemini parava de gritar a cada boot; provider saudavel zera) | base: v48.10.2-REFUND
+VERSION = "48.13.0-INTEL"  # v48.13.0-INTEL: SEGUNDA CAMADA DE IA LOCAL — (1) NOVO /forecast $0.05: previsao p10/p50/p90 com HistGradientBoosting quantilico treinado NO HISTORICO QUE O PROPRIO NODE COLETA (Pyth a cada 10min + backfill CoinGecko 90d, 8 simbolos, 4 horizontes), MAPE de walk-forward publicado em toda resposta; sem historico = 503 e NAO cobra; (2) recomendador agents_also_bought por co-ocorrencia real de pagadores — cross-sell dentro do proprio 402 + /recommend gratis; (3) lead scoring SEMANTICO dos previews (embedding da intencao x catalogo premium) -> alerta de lead quente no Telegram; (4) clustering semanal dos 404s por significado (Agglomerative cosine sobre embeddings) -> oportunidades de produto em /ml + digest; (5) NOVO /ml publico: transparencia da camada de IA local; (6) /discover com reranker cross-encoder (ms-marco-MiniLM-L-6, 80MB ONNX) + modo MULTILINGUE sob demanda (paraphrase-MiniLM-L12: PT/ES/ZH acham o catalogo em ingles); (7) LLM LOCAL de ultimo recurso (LOCAL_LLM=1, llama-cpp-python + Qwen3-0.6B GGUF ~480MB em /data): se TODOS os provedores externos cairem, /llm responde com o modelo da casa em vez de 503 — OFF por padrao = custo zero; (8) detector de anomalias ganha severidade (volume puro -> log; comprador/receita -> Telegram) — fim do apito de hora em hora; (9) /live rotula scanner_noise como 'filtered noise' | requirements INALTERADOS (tudo roda sobre sklearn/fastembed ja instalados; llama-cpp-python e OPCIONAL e so e necessario com LOCAL_LLM=1) | base: v48.12.0-ML: camada de machine learning embarcada treinada nos dados do PROPRIO node (60k+ probes + ledger) — (1) classificador de demanda GradientBoosting com auto-rotulagem pelas regras atuais e retreino diario: pega scanner que o regex nunca viu (conf>=0.85 rebaixa new_product->scanner_noise) e anexa label+confianca ao painel/alertas; (2) detector de anomalias IsolationForest sobre agregados horarios de requests/revenue (min 72h): surto de comprador ou ataque vira log + Telegram (1/6h) + /data/ml_anomalies.json; (3) NOVO /discover gratis: busca semantica do catalogo por similaridade vetorial (MiniLM ONNX via fastembed, cache em /data) com fallback palavra-chave — funil de descoberta p/ agentes | tudo import-guarded (sem sklearn/fastembed o node roda como antes) + ML_DISABLED=1 | deps novas p/ requirements: scikit-learn fastembed | base: v48.11.0-GLOBAL: Moonshot/Kimi + OpenRouter como provedores premium DORMENTES (env-gated: sem chave = zero custo; ativar = MOONSHOT_API_KEY/OPENROUTER_API_KEY no Railway) | perfis de roteamento estilo ClawRouter: /llm?profile=eco|fast|premium e model=kimi|deepseek|eco|premium no /v1/chat/completions | NOVO /global-rates ($0.03): taxas de Fed/ECB/PBoC/BOJ/CBR/BCB numa chamada — BIS WS_CBPOL + cross-check ao vivo FRED/ECB-SDW/BCB-SGS, diferencial de carry vs Fed; nenhum concorrente x402 tem | rails Polygon (eip155:137) + Arbitrum (eip155:42161) PRONTAS, settle pelo mesmo facilitador CDP, env-gated OFF (X402_POLYGON=1/X402_ARBITRUM=1 so apos confirmar credito na Binance) | _SCAN_NOISE cobre /env.txt /env.js /settings.json /config/*.yml (scanner de credencial nao vira mais produto novo no radar) | _cap500 default 480->390 (x402lint P8: 24 descriptions na zona de risco; caminho p/ 100/100) | base: v48.10.3-REFINE: reprice consolidado no codigo (fonte unica, sem depender de env) — piso $0.01 em 12 endpoints de $0.003-0.008 (fear-greed, pyth-price, trust-hash, agent-market, bootstrap-trust, regime, mempool, web-search, ai-news + os 4 primitivos BR pix/bizdays/doc) e /br-archive $0.05->$0.09: a Coinbase cobra $0.001/settle apos 1k/mes (fazemos ~8k) — a $0.003 a taxa efetiva era 33%, a $0.01 cai a 10%; clientes x402 tem cap default 0.1 USDC, abaixo disso preco nao influencia decisao de maquina; referencia CoinGecko flat $0.01 | LLM_PROXY_PRICE agora le PRICE_LLM_PROXY (default $0.005 — a isca fica) | NOVO /.well-known/agent-registration.json (ERC-8004 registration-v1: A2A+MCP+x402+OAS, x402Support, supportedTrust) — registrar no Identity Registry 0x8004A169...a432 na Base | FIX telemetria: pos-refund nao loga mais "paid" (double-log inflava calls; Agent402 e /receipts leem isso) | refund agora carrega recommended_next (cross-sell na falha — falha vira retencao) | billing LLM com backoff persistente em /data (strikes 6h->12h->18h->24h; o 429 diario do Gemini parava de gritar a cada boot; provider saudavel zera) | base: v48.10.2-REFUND
 if __name__ == "__main__":
     cli()
 else:
