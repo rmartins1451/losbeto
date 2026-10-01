@@ -4233,13 +4233,12 @@ class Brain:
         }
         feed_id = feeds.get(symbol, feeds["SOL"])
         try:
-            r = requests.get(f"https://hermes.pyth.network/v2/updates/price/latest?ids[]={feed_id}", timeout=5)
-            parsed = r.json().get("parsed", [{}])[0]
-            pd2 = parsed.get("price", {})
-            price = float(pd2.get("price", 0)) * (10 ** float(pd2.get("expo", 0)))
-            conf  = float(pd2.get("conf", 0))  * (10 ** float(pd2.get("expo", 0)))
-            return {"symbol": symbol, "price_usd": round(price, 6), "confidence": round(conf, 6),
-                    "source": "Pyth Network", "ts": int(time.time()), "provider": "Losbeto/Pyth"}
+            # v48.14.1: Hermes sem chave morreu — fonte primaria Pyth (com
+            # PYTH_API_KEY) ou fallback CoinGecko, rotulo honesto na resposta.
+            px = _sym_price(symbol if symbol in feeds else "SOL")
+            return {"symbol": symbol, "price_usd": round(px["price"], 6),
+                    "confidence": px.get("conf"), "source": px["source"],
+                    "ts": int(time.time()), "provider": f"Losbeto/{px['source']}"}
         except Exception as e:
             return {"symbol": symbol, "error": str(e), "ts": int(time.time())}
 
@@ -13866,9 +13865,11 @@ ORACLE_SYMBOLS = {
 }
 
 def _oracle_pyth(feed_id):
-    r = requests.get(f"https://hermes.pyth.network/v2/updates/price/latest?ids[]={feed_id}",
-                     timeout=4)
-    p = r.json().get("parsed", [{}])[0].get("price", {})
+    # v48.14.1: sem chave o Hermes so responde 401 — falha rapido e deixa o
+    # consenso multi-oraculo seguir com as fontes restantes.
+    if not PYTH_API_KEY:
+        raise ValueError("pyth: PYTH_API_KEY ausente")
+    p = _pyth_latest([feed_id]).get(str(feed_id).lower().lstrip("0x"), {}).get("price", {})
     px = float(p.get("price", 0)) * (10 ** float(p.get("expo", 0)))
     conf = float(p.get("conf", 0)) * (10 ** float(p.get("expo", 0)))
     if px <= 0:
@@ -14691,40 +14692,105 @@ def _fc_ensure():
 
 
 def _fc_collect():
-    """Snapshot de preco via Pyth Hermes (gratis, sem chave): UMA chamada com
-    todos os feeds. A memoria acumulada vira o ativo que ninguem copia."""
+    """Snapshot de preco: Pyth Hermes (com PYTH_API_KEY) ou CoinGecko —
+    UMA chamada batch por ciclo. A memoria acumulada vira o ativo que ninguem copia."""
     if not _fc_ensure():
         return 0
     try:
-        ids = "&".join(f"ids[]={fid}" for fid, _cg in _FC_FEEDS.values())
-        r = requests.get("https://hermes.pyth.network/v2/updates/price/latest?"
-                         + ids, timeout=8)
-        if not r.ok:
-            return 0
-        by_id = {}
-        for p in r.json().get("parsed", []):
-            by_id[str(p.get("id", "")).lower().lstrip("0x")] = p
+        got = {}
+        if PYTH_API_KEY:
+            try:
+                by_id = _pyth_latest([fid for fid, _cg in _FC_FEEDS.values()])
+                for sym, (fid, _cg) in _FC_FEEDS.items():
+                    p = by_id.get(fid.lower().lstrip("0x"))
+                    if not p:
+                        continue
+                    pd2 = p.get("price", {})
+                    try:
+                        price = float(pd2.get("price", 0)) * (10 ** float(pd2.get("expo", 0)))
+                    except (TypeError, ValueError):
+                        continue
+                    if price > 0:
+                        ts = int(pd2.get("publish_time") or p.get("publish_time") or time.time())
+                        got[sym] = (int(ts // 600 * 600), round(price, 8))
+            except Exception as e:
+                log.info(f"🧠 collect pyth: {str(e)[:80]} — fallback CoinGecko")
+        if not got:
+            # v48.14.1: sem PYTH_API_KEY o coletor vive de CoinGecko (a chave
+            # que ja temos) — a serie do /forecast nunca para de crescer.
+            j = _cg_simple_prices([cg for _f, cg in _FC_FEEDS.values()])
+            for sym, (_f, cg) in _FC_FEEDS.items():
+                v = (j.get(cg) or {}).get("usd")
+                if v:
+                    got[sym] = (int(time.time() // 600 * 600), round(float(v), 8))
         n = 0
         with LEDGER._conn() as c:
-            for sym, (fid, _cg) in _FC_FEEDS.items():
-                p = by_id.get(fid.lower().lstrip("0x"))
-                if not p:
-                    continue
-                pd2 = p.get("price", {})
-                try:
-                    price = float(pd2.get("price", 0)) * (10 ** float(pd2.get("expo", 0)))
-                except (TypeError, ValueError):
-                    continue
-                if price <= 0:
-                    continue
-                ts = int(pd2.get("publish_time") or p.get("publish_time") or time.time())
+            for sym, (ts, price) in got.items():
                 n += c.execute("INSERT OR IGNORE INTO ml_price_history VALUES (?,?,?)",
-                               (sym, int(ts // 600 * 600), round(price, 8))).rowcount
+                               (sym, ts, price)).rowcount
         _FC_STATS["last_collect"] = int(time.time())
         return n
     except Exception as e:
         log.debug(f"fc collect: {e}")
         return 0
+
+
+
+# ---- v48.14.1-HOTFIX — Pyth pos-upgrade (chave) + fallback CoinGecko --------
+PYTH_API_KEY = os.environ.get("PYTH_API_KEY", "").strip()
+_PYTH_BASE = "https://pyth.dourolabs.app/hermes"
+
+
+def _pyth_latest(feed_ids):
+    """Hermes pos 26/ago/2026: TODA chamada exige Authorization: Bearer
+    (chave gratis no Pyth Terminal, plano Starter). Endpoint novo e drop-in;
+    o legado hermes.pyth.network responde 401 sem chave. Sem chave: levanta
+    na hora — o caller cai no fallback CoinGecko."""
+    if not PYTH_API_KEY:
+        raise RuntimeError("pyth: PYTH_API_KEY ausente (Hermes exige chave desde 26/ago/2026)")
+    ids = "&".join(f"ids[]={f}" for f in feed_ids)
+    r = requests.get(f"{_PYTH_BASE}/v2/updates/price/latest?{ids}",
+                     headers={"Authorization": f"Bearer {PYTH_API_KEY}"}, timeout=6)
+    if not r.ok:
+        raise RuntimeError(f"pyth HTTP {r.status_code}")
+    out = {}
+    for p in r.json().get("parsed", []):
+        out[str(p.get("id", "")).lower().lstrip("0x")] = p
+    return out
+
+
+def _cg_simple_prices(cg_ids):
+    """CoinGecko simple/price em batch — demo key no header, 401 -> pro."""
+    ids = ",".join(cg_ids)
+    url = f"https://api.coingecko.com/api/v3/simple/price?ids={ids}&vs_currencies=usd"
+    headers = {"x-cg-demo-api-key": COINGECKO_KEY} if COINGECKO_KEY else {}
+    r = requests.get(url, headers=headers, timeout=8)
+    if r.status_code == 401 and COINGECKO_KEY:
+        r = requests.get(url, headers={"x-cg-pro-api-key": COINGECKO_KEY}, timeout=8)
+    if not r.ok:
+        raise RuntimeError(f"coingecko HTTP {r.status_code}")
+    return r.json()
+
+
+def _sym_price(symbol):
+    """Preco USD de um simbolo do universo _FC_FEEDS: Pyth (se houver chave)
+    -> CoinGecko. Rotulo de fonte SEMPRE honesto na resposta."""
+    sym = symbol.upper()
+    fid, cg = _FC_FEEDS[sym]
+    try:
+        p = _pyth_latest([fid])[fid.lower().lstrip("0x")]
+        pd2 = p.get("price", {})
+        price = float(pd2.get("price", 0)) * (10 ** float(pd2.get("expo", 0)))
+        conf = float(pd2.get("conf", 0)) * (10 ** float(pd2.get("expo", 0)))
+        if price > 0:
+            return {"price": price, "conf": round(conf, 6), "source": "Pyth Network"}
+    except Exception:
+        pass
+    j = _cg_simple_prices([cg])
+    price = float((j.get(cg) or {}).get("usd", 0))
+    if price <= 0:
+        raise RuntimeError("sem preco em nenhuma fonte")
+    return {"price": price, "conf": None, "source": "CoinGecko (Pyth fallback)"}
 
 
 def _fc_seed():
@@ -14954,6 +15020,15 @@ def _fc_loop():
                 try:
                     if _fc_seed_needed():
                         _fc_seed()
+                        # v48.14.1: simbolo recem-semeado treina NA HORA —
+                        # sem isto o /forecast ficava 503 ate o tick de 6h.
+                        for _s in _FC_FEEDS:
+                            if _s not in _FC_MODELS:
+                                try:
+                                    if _fc_train(_s):
+                                        log.info(f"🧠 /forecast: {_s} treinado logo apos seed")
+                                except Exception:
+                                    pass
                 except Exception as _se:
                     log.debug(f"fc self-heal: {_se}")
             _fc_collect()
@@ -27691,7 +27766,7 @@ def config_json():
     return r
 
 
-VERSION = "48.14.0-MONETIZE"  # v48.14.0-MONETIZE: (1) MPP tempo/charge REAL push-mode — challenges method="tempo" (USDC.e + pathUSD, chainId 4217) em TODO 402 e verificacao on-chain do credential Authorization: Payment (receipt TIP-20 Transfer: valor/destino/moeda + anti-replay atomico + Payment-Receipt) — captura os saldos AgentCash que nascem na Tempo; sem Stripe, sem chave privada no servidor; (2) NOVO /ecosystem-pulse $0.05 — a inteligencia dos 64k probes/dia como produto: top sondados com heat score, tendencias 7d-vs-7d (z-score Poisson), IPs-agente unicos, share de monitores QoS, clusters de demanda emergente; (3) price-elasticity advisor semanal — funil probes->previews->vendas por endpoint vira sugestao de PRECO DE TABELA global (nunca por carteira) no Telegram; PRICE_AUTO=1 aplica com trava +-30%/semana persistida em /data (env do operador sempre vence); (4) radar auto-atendimento com fallback SEMANTICO — embeddings (multilingue se preciso) casam 404 pelo significado quando o lexical falha, limiar 0.72, mesmas travas de seguranca; (5) /forecast seed auto-recupera a cada 30min ate todos os 8 simbolos terem backfill (429 de IP compartilhado nao exige mais redeploy); (6) /health expoe mpp_tempo + modo do advisor | base: v48.13.0-INTEL  # v48.13.0-INTEL: SEGUNDA CAMADA DE IA LOCAL — (1) NOVO /forecast $0.05: previsao p10/p50/p90 com HistGradientBoosting quantilico treinado NO HISTORICO QUE O PROPRIO NODE COLETA (Pyth a cada 10min + backfill CoinGecko 90d, 8 simbolos, 4 horizontes), MAPE de walk-forward publicado em toda resposta; sem historico = 503 e NAO cobra; (2) recomendador agents_also_bought por co-ocorrencia real de pagadores — cross-sell dentro do proprio 402 + /recommend gratis; (3) lead scoring SEMANTICO dos previews (embedding da intencao x catalogo premium) -> alerta de lead quente no Telegram; (4) clustering semanal dos 404s por significado (Agglomerative cosine sobre embeddings) -> oportunidades de produto em /ml + digest; (5) NOVO /ml publico: transparencia da camada de IA local; (6) /discover com reranker cross-encoder (ms-marco-MiniLM-L-6, 80MB ONNX) + modo MULTILINGUE sob demanda (paraphrase-MiniLM-L12: PT/ES/ZH acham o catalogo em ingles); (7) LLM LOCAL de ultimo recurso (LOCAL_LLM=1, llama-cpp-python + Qwen3-0.6B GGUF ~480MB em /data): se TODOS os provedores externos cairem, /llm responde com o modelo da casa em vez de 503 — OFF por padrao = custo zero; (8) detector de anomalias ganha severidade (volume puro -> log; comprador/receita -> Telegram) — fim do apito de hora em hora; (9) /live rotula scanner_noise como 'filtered noise' | requirements INALTERADOS (tudo roda sobre sklearn/fastembed ja instalados; llama-cpp-python e OPCIONAL e so e necessario com LOCAL_LLM=1) | base: v48.12.0-ML: camada de machine learning embarcada treinada nos dados do PROPRIO node (60k+ probes + ledger) — (1) classificador de demanda GradientBoosting com auto-rotulagem pelas regras atuais e retreino diario: pega scanner que o regex nunca viu (conf>=0.85 rebaixa new_product->scanner_noise) e anexa label+confianca ao painel/alertas; (2) detector de anomalias IsolationForest sobre agregados horarios de requests/revenue (min 72h): surto de comprador ou ataque vira log + Telegram (1/6h) + /data/ml_anomalies.json; (3) NOVO /discover gratis: busca semantica do catalogo por similaridade vetorial (MiniLM ONNX via fastembed, cache em /data) com fallback palavra-chave — funil de descoberta p/ agentes | tudo import-guarded (sem sklearn/fastembed o node roda como antes) + ML_DISABLED=1 | deps novas p/ requirements: scikit-learn fastembed | base: v48.11.0-GLOBAL: Moonshot/Kimi + OpenRouter como provedores premium DORMENTES (env-gated: sem chave = zero custo; ativar = MOONSHOT_API_KEY/OPENROUTER_API_KEY no Railway) | perfis de roteamento estilo ClawRouter: /llm?profile=eco|fast|premium e model=kimi|deepseek|eco|premium no /v1/chat/completions | NOVO /global-rates ($0.03): taxas de Fed/ECB/PBoC/BOJ/CBR/BCB numa chamada — BIS WS_CBPOL + cross-check ao vivo FRED/ECB-SDW/BCB-SGS, diferencial de carry vs Fed; nenhum concorrente x402 tem | rails Polygon (eip155:137) + Arbitrum (eip155:42161) PRONTAS, settle pelo mesmo facilitador CDP, env-gated OFF (X402_POLYGON=1/X402_ARBITRUM=1 so apos confirmar credito na Binance) | _SCAN_NOISE cobre /env.txt /env.js /settings.json /config/*.yml (scanner de credencial nao vira mais produto novo no radar) | _cap500 default 480->390 (x402lint P8: 24 descriptions na zona de risco; caminho p/ 100/100) | base: v48.10.3-REFINE: reprice consolidado no codigo (fonte unica, sem depender de env) — piso $0.01 em 12 endpoints de $0.003-0.008 (fear-greed, pyth-price, trust-hash, agent-market, bootstrap-trust, regime, mempool, web-search, ai-news + os 4 primitivos BR pix/bizdays/doc) e /br-archive $0.05->$0.09: a Coinbase cobra $0.001/settle apos 1k/mes (fazemos ~8k) — a $0.003 a taxa efetiva era 33%, a $0.01 cai a 10%; clientes x402 tem cap default 0.1 USDC, abaixo disso preco nao influencia decisao de maquina; referencia CoinGecko flat $0.01 | LLM_PROXY_PRICE agora le PRICE_LLM_PROXY (default $0.005 — a isca fica) | NOVO /.well-known/agent-registration.json (ERC-8004 registration-v1: A2A+MCP+x402+OAS, x402Support, supportedTrust) — registrar no Identity Registry 0x8004A169...a432 na Base | FIX telemetria: pos-refund nao loga mais "paid" (double-log inflava calls; Agent402 e /receipts leem isso) | refund agora carrega recommended_next (cross-sell na falha — falha vira retencao) | billing LLM com backoff persistente em /data (strikes 6h->12h->18h->24h; o 429 diario do Gemini parava de gritar a cada boot; provider saudavel zera) | base: v48.10.2-REFUND
+VERSION = "48.14.1-HOTFIX"  # v48.14.1-HOTFIX: Pyth Hermes passou a EXIGIR API key no upgrade Pyth Core de 26/ago/2026 (401 sem chave — derrubou /pyth-price e o coletor do /forecast) — _pyth_latest usa o endpoint novo pyth.dourolabs.app/hermes com Bearer quando PYTH_API_KEY estiver no Railway + fallback CoinGecko simple/price (reusa COINGECKO_KEY) em /pyth-price, _oracle_pyth e _fc_collect — o coletor do ML nunca mais morre em silencio; self-heal do seed agora TREINA o simbolo recem-semeado na hora (antes: /forecast ficava 503 ate o tick de 6h) | base: v48.14.0-MONETIZE: (1) MPP tempo/charge REAL push-mode — challenges method="tempo" (USDC.e + pathUSD, chainId 4217) em TODO 402 e verificacao on-chain do credential Authorization: Payment (receipt TIP-20 Transfer: valor/destino/moeda + anti-replay atomico + Payment-Receipt) — captura os saldos AgentCash que nascem na Tempo; sem Stripe, sem chave privada no servidor; (2) NOVO /ecosystem-pulse $0.05 — a inteligencia dos 64k probes/dia como produto: top sondados com heat score, tendencias 7d-vs-7d (z-score Poisson), IPs-agente unicos, share de monitores QoS, clusters de demanda emergente; (3) price-elasticity advisor semanal — funil probes->previews->vendas por endpoint vira sugestao de PRECO DE TABELA global (nunca por carteira) no Telegram; PRICE_AUTO=1 aplica com trava +-30%/semana persistida em /data (env do operador sempre vence); (4) radar auto-atendimento com fallback SEMANTICO — embeddings (multilingue se preciso) casam 404 pelo significado quando o lexical falha, limiar 0.72, mesmas travas de seguranca; (5) /forecast seed auto-recupera a cada 30min ate todos os 8 simbolos terem backfill (429 de IP compartilhado nao exige mais redeploy); (6) /health expoe mpp_tempo + modo do advisor | base: v48.13.0-INTEL  # v48.13.0-INTEL: SEGUNDA CAMADA DE IA LOCAL — (1) NOVO /forecast $0.05: previsao p10/p50/p90 com HistGradientBoosting quantilico treinado NO HISTORICO QUE O PROPRIO NODE COLETA (Pyth a cada 10min + backfill CoinGecko 90d, 8 simbolos, 4 horizontes), MAPE de walk-forward publicado em toda resposta; sem historico = 503 e NAO cobra; (2) recomendador agents_also_bought por co-ocorrencia real de pagadores — cross-sell dentro do proprio 402 + /recommend gratis; (3) lead scoring SEMANTICO dos previews (embedding da intencao x catalogo premium) -> alerta de lead quente no Telegram; (4) clustering semanal dos 404s por significado (Agglomerative cosine sobre embeddings) -> oportunidades de produto em /ml + digest; (5) NOVO /ml publico: transparencia da camada de IA local; (6) /discover com reranker cross-encoder (ms-marco-MiniLM-L-6, 80MB ONNX) + modo MULTILINGUE sob demanda (paraphrase-MiniLM-L12: PT/ES/ZH acham o catalogo em ingles); (7) LLM LOCAL de ultimo recurso (LOCAL_LLM=1, llama-cpp-python + Qwen3-0.6B GGUF ~480MB em /data): se TODOS os provedores externos cairem, /llm responde com o modelo da casa em vez de 503 — OFF por padrao = custo zero; (8) detector de anomalias ganha severidade (volume puro -> log; comprador/receita -> Telegram) — fim do apito de hora em hora; (9) /live rotula scanner_noise como 'filtered noise' | requirements INALTERADOS (tudo roda sobre sklearn/fastembed ja instalados; llama-cpp-python e OPCIONAL e so e necessario com LOCAL_LLM=1) | base: v48.12.0-ML: camada de machine learning embarcada treinada nos dados do PROPRIO node (60k+ probes + ledger) — (1) classificador de demanda GradientBoosting com auto-rotulagem pelas regras atuais e retreino diario: pega scanner que o regex nunca viu (conf>=0.85 rebaixa new_product->scanner_noise) e anexa label+confianca ao painel/alertas; (2) detector de anomalias IsolationForest sobre agregados horarios de requests/revenue (min 72h): surto de comprador ou ataque vira log + Telegram (1/6h) + /data/ml_anomalies.json; (3) NOVO /discover gratis: busca semantica do catalogo por similaridade vetorial (MiniLM ONNX via fastembed, cache em /data) com fallback palavra-chave — funil de descoberta p/ agentes | tudo import-guarded (sem sklearn/fastembed o node roda como antes) + ML_DISABLED=1 | deps novas p/ requirements: scikit-learn fastembed | base: v48.11.0-GLOBAL: Moonshot/Kimi + OpenRouter como provedores premium DORMENTES (env-gated: sem chave = zero custo; ativar = MOONSHOT_API_KEY/OPENROUTER_API_KEY no Railway) | perfis de roteamento estilo ClawRouter: /llm?profile=eco|fast|premium e model=kimi|deepseek|eco|premium no /v1/chat/completions | NOVO /global-rates ($0.03): taxas de Fed/ECB/PBoC/BOJ/CBR/BCB numa chamada — BIS WS_CBPOL + cross-check ao vivo FRED/ECB-SDW/BCB-SGS, diferencial de carry vs Fed; nenhum concorrente x402 tem | rails Polygon (eip155:137) + Arbitrum (eip155:42161) PRONTAS, settle pelo mesmo facilitador CDP, env-gated OFF (X402_POLYGON=1/X402_ARBITRUM=1 so apos confirmar credito na Binance) | _SCAN_NOISE cobre /env.txt /env.js /settings.json /config/*.yml (scanner de credencial nao vira mais produto novo no radar) | _cap500 default 480->390 (x402lint P8: 24 descriptions na zona de risco; caminho p/ 100/100) | base: v48.10.3-REFINE: reprice consolidado no codigo (fonte unica, sem depender de env) — piso $0.01 em 12 endpoints de $0.003-0.008 (fear-greed, pyth-price, trust-hash, agent-market, bootstrap-trust, regime, mempool, web-search, ai-news + os 4 primitivos BR pix/bizdays/doc) e /br-archive $0.05->$0.09: a Coinbase cobra $0.001/settle apos 1k/mes (fazemos ~8k) — a $0.003 a taxa efetiva era 33%, a $0.01 cai a 10%; clientes x402 tem cap default 0.1 USDC, abaixo disso preco nao influencia decisao de maquina; referencia CoinGecko flat $0.01 | LLM_PROXY_PRICE agora le PRICE_LLM_PROXY (default $0.005 — a isca fica) | NOVO /.well-known/agent-registration.json (ERC-8004 registration-v1: A2A+MCP+x402+OAS, x402Support, supportedTrust) — registrar no Identity Registry 0x8004A169...a432 na Base | FIX telemetria: pos-refund nao loga mais "paid" (double-log inflava calls; Agent402 e /receipts leem isso) | refund agora carrega recommended_next (cross-sell na falha — falha vira retencao) | billing LLM com backoff persistente em /data (strikes 6h->12h->18h->24h; o 429 diario do Gemini parava de gritar a cada boot; provider saudavel zera) | base: v48.10.2-REFUND
 if __name__ == "__main__":
     cli()
 else:
