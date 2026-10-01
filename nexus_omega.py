@@ -2824,55 +2824,74 @@ class LLM:
             return None, "modelo descomissionado e redescoberta falhou"
 
         def _try_gemini():
-            _gm = gemini_model()          # v39.6: descoberto, não fixo
-            # v47.2.0: os flash atuais "pensam" (thinking) antes de responder.
-            # Com maxOutputTokens baixo o thinking consome tudo e o texto vem
-            # vazio com HTTP 200 — mesma queda silenciosa do Groq. Piso de 512
-            # e thinkingBudget=0 (flash) devolvem resposta direta.
-            _cfg = {"maxOutputTokens": max(int(max_tokens), 512),
-                    "temperature": temperature}
-            if "flash" in _gm:
-                _cfg["thinkingConfig"] = {"thinkingBudget": 0}
-            def _gem_post():
-                return requests.post(
-                    f"https://generativelanguage.googleapis.com/v1beta/models/"
-                    f"{_gm}:generateContent?key={GEMINI_KEY}",
-                    json={"contents": [{"parts": [{"text": prompt}]}],
-                          "generationConfig": _cfg},
-                    timeout=25)
-            r = _gem_post()
-            # v48.10.1: 503 "high demand" aparece a cada ~8 min nos logs e é
-            # transitório — 1 retry com jitter recupera a maioria sem descer a
-            # cadeia nem marcar o provedor. 500 idem. 429 NÃO entra: no free
-            # tier é quota diária/TPD ou billing — irrecuperável em <1.5s, o
-            # retry só queimaria latência e bateria numa quota morta; quem
-            # trata 429 é a quarentena do _llm_mark.
-            if r.status_code in (500, 503):
-                time.sleep(0.7 + random.random() * 0.8)
+            # v48.14.2-RESILIENCE: a quota do Google e POR MODELO — a chave
+            # lista 44 modelos e o preferido pode estar billing-gated (429)
+            # enquanto outro flash responde normal. Em 404/429: bane o modelo
+            # (persistente), limpa o cache de descoberta e TROCA de modelo na
+            # mesma chamada, ate 3 tentativas. Erro so sobe ao _llm_mark quando
+            # os preferidos se esgotam — a mensagem final mantem "HTTP 429" +
+            # "billing" para a quarentena de provedor seguir valendo como
+            # ultimo recurso. GEMINI_MODEL fixo via env nao rotaciona.
+            _gm = gemini_model()          # v39.6: descoberto, nao fixo
+            for _rot in range(3):
+                # v47.2.0: os flash atuais "pensam" (thinking) antes de
+                # responder. Com maxOutputTokens baixo o thinking consome tudo
+                # e o texto vem vazio com HTTP 200 — mesma queda silenciosa do
+                # Groq. Piso de 512 e thinkingBudget=0 (flash) devolvem
+                # resposta direta.
+                _cfg = {"maxOutputTokens": max(int(max_tokens), 512),
+                        "temperature": temperature}
+                if "flash" in _gm:
+                    _cfg["thinkingConfig"] = {"thinkingBudget": 0}
+                def _gem_post():
+                    return requests.post(
+                        f"https://generativelanguage.googleapis.com/v1beta/"
+                        f"models/{_gm}:generateContent?key={GEMINI_KEY}",
+                        json={"contents": [{"parts": [{"text": prompt}]}],
+                              "generationConfig": _cfg},
+                        timeout=25)
                 r = _gem_post()
-            if r.ok:
-                j = r.json()
-                cands = j.get("candidates") or []
-                if not cands:
-                    return None, f"no candidates: {str(j)[:120]}"
-                parts = (cands[0].get("content") or {}).get("parts") or []
-                if not parts:
-                    # v39.5: MAX_TOKENS ou filtro de segurança devolvem
-                    # candidato sem parts. Antes isso estourava IndexError e
-                    # virava "exceção", escondendo a causa real.
-                    return None, (f"empty parts, finishReason="
-                                  f"{cands[0].get('finishReason')}")
-                return parts[0].get("text", ""), None
-            # Modelo retirado: limpa o cache para redescobrir na próxima.
-            if r.status_code == 404:
-                global _GEMINI_RESOLVED
-                with _GEMINI_LOCK:
-                    _GEMINI_RESOLVED = None
-                    _GEMINI_BANNED.add(_gm)  # v48.3.4: anti-loop
-                    _gemini_banned_add(_gm)  # v48.4.0: sobrevive a restart
-                log.warning(f"Gemini: modelo '{_gm}' retirado — banido "
-                            "(persistente), redescobrindo outro")
-            return None, f"HTTP {r.status_code} (modelo={_gm}): {r.text[:160]}"
+                # v48.10.1: 503 "high demand" aparece a cada ~8 min nos logs e
+                # e transitorio — 1 retry com jitter recupera a maioria sem
+                # descer a cadeia nem marcar o provedor. 500 idem.
+                if r.status_code in (500, 503):
+                    time.sleep(0.7 + random.random() * 0.8)
+                    r = _gem_post()
+                if r.ok:
+                    j = r.json()
+                    cands = j.get("candidates") or []
+                    if not cands:
+                        return None, f"no candidates: {str(j)[:120]}"
+                    parts = (cands[0].get("content") or {}).get("parts") or []
+                    if not parts:
+                        # v39.5: MAX_TOKENS ou filtro de seguranca devolvem
+                        # candidato sem parts. Antes isso estourava IndexError
+                        # e virava "excecao", escondendo a causa real.
+                        return None, (f"empty parts, finishReason="
+                                      f"{cands[0].get('finishReason')}")
+                    return parts[0].get("text", ""), None
+                # Modelo retirado (404) ou sem quota (429): bane e troca na
+                # mesma chamada — o 429 deixa de derrubar o provedor inteiro.
+                if r.status_code in (404, 429):
+                    global _GEMINI_RESOLVED
+                    with _GEMINI_LOCK:
+                        _GEMINI_RESOLVED = None
+                        _GEMINI_BANNED.add(_gm)  # v48.3.4: anti-loop
+                        _gemini_banned_add(_gm)  # v48.4.0: sobrevive a restart
+                    _porque = ("retirado" if r.status_code == 404
+                               else "quota/billing esgotada neste modelo")
+                    log.warning(f"Gemini: modelo '{_gm}' {_porque} — banido "
+                                "(persistente), tentando o proximo preferido")
+                    _prox = gemini_model()
+                    if not _prox or _prox == _gm:
+                        return None, (f"HTTP {r.status_code} (modelo={_gm}, "
+                                      f"sem proximo modelo disponivel): "
+                                      f"{r.text[:120]}")
+                    _gm = _prox
+                    continue
+                return None, f"HTTP {r.status_code} (modelo={_gm}): {r.text[:160]}"
+            return None, ("HTTP 429 (gemini: modelos preferidos esgotados por "
+                          "quota/billing — provedor segue para quarentena)")
 
         def _try_ollama():
             r = requests.post(f"{OLLAMA_URL}/api/generate",
@@ -4104,7 +4123,9 @@ class Brain:
     def sec_filing():
         company = request.args.get("company", "COIN")
         try:
-            r = requests.get(f"https://efts.sec.gov/LATEST/search-index?q=%22{company}%22&forms=8-K,10-Q", timeout=8)
+            r = requests.get(f"https://efts.sec.gov/LATEST/search-index?q=%22{company}%22&forms=8-K,10-Q",
+                            headers={"User-Agent": "Losbeto research@losbeto.xyz",
+                                     "Accept-Encoding": "identity"}, timeout=8)  # v48.14.2: SEC 403 "undeclared" sem UA
             hits = r.json().get("hits", {}).get("hits", [])[:3]
             filings = [{"form": h.get("_source", {}).get("form_type"),
                         "date": h.get("_source", {}).get("file_date"),
@@ -27766,7 +27787,7 @@ def config_json():
     return r
 
 
-VERSION = "48.14.1-HOTFIX"  # v48.14.1-HOTFIX: Pyth Hermes passou a EXIGIR API key no upgrade Pyth Core de 26/ago/2026 (401 sem chave — derrubou /pyth-price e o coletor do /forecast) — _pyth_latest usa o endpoint novo pyth.dourolabs.app/hermes com Bearer quando PYTH_API_KEY estiver no Railway + fallback CoinGecko simple/price (reusa COINGECKO_KEY) em /pyth-price, _oracle_pyth e _fc_collect — o coletor do ML nunca mais morre em silencio; self-heal do seed agora TREINA o simbolo recem-semeado na hora (antes: /forecast ficava 503 ate o tick de 6h) | base: v48.14.0-MONETIZE: (1) MPP tempo/charge REAL push-mode — challenges method="tempo" (USDC.e + pathUSD, chainId 4217) em TODO 402 e verificacao on-chain do credential Authorization: Payment (receipt TIP-20 Transfer: valor/destino/moeda + anti-replay atomico + Payment-Receipt) — captura os saldos AgentCash que nascem na Tempo; sem Stripe, sem chave privada no servidor; (2) NOVO /ecosystem-pulse $0.05 — a inteligencia dos 64k probes/dia como produto: top sondados com heat score, tendencias 7d-vs-7d (z-score Poisson), IPs-agente unicos, share de monitores QoS, clusters de demanda emergente; (3) price-elasticity advisor semanal — funil probes->previews->vendas por endpoint vira sugestao de PRECO DE TABELA global (nunca por carteira) no Telegram; PRICE_AUTO=1 aplica com trava +-30%/semana persistida em /data (env do operador sempre vence); (4) radar auto-atendimento com fallback SEMANTICO — embeddings (multilingue se preciso) casam 404 pelo significado quando o lexical falha, limiar 0.72, mesmas travas de seguranca; (5) /forecast seed auto-recupera a cada 30min ate todos os 8 simbolos terem backfill (429 de IP compartilhado nao exige mais redeploy); (6) /health expoe mpp_tempo + modo do advisor | base: v48.13.0-INTEL  # v48.13.0-INTEL: SEGUNDA CAMADA DE IA LOCAL — (1) NOVO /forecast $0.05: previsao p10/p50/p90 com HistGradientBoosting quantilico treinado NO HISTORICO QUE O PROPRIO NODE COLETA (Pyth a cada 10min + backfill CoinGecko 90d, 8 simbolos, 4 horizontes), MAPE de walk-forward publicado em toda resposta; sem historico = 503 e NAO cobra; (2) recomendador agents_also_bought por co-ocorrencia real de pagadores — cross-sell dentro do proprio 402 + /recommend gratis; (3) lead scoring SEMANTICO dos previews (embedding da intencao x catalogo premium) -> alerta de lead quente no Telegram; (4) clustering semanal dos 404s por significado (Agglomerative cosine sobre embeddings) -> oportunidades de produto em /ml + digest; (5) NOVO /ml publico: transparencia da camada de IA local; (6) /discover com reranker cross-encoder (ms-marco-MiniLM-L-6, 80MB ONNX) + modo MULTILINGUE sob demanda (paraphrase-MiniLM-L12: PT/ES/ZH acham o catalogo em ingles); (7) LLM LOCAL de ultimo recurso (LOCAL_LLM=1, llama-cpp-python + Qwen3-0.6B GGUF ~480MB em /data): se TODOS os provedores externos cairem, /llm responde com o modelo da casa em vez de 503 — OFF por padrao = custo zero; (8) detector de anomalias ganha severidade (volume puro -> log; comprador/receita -> Telegram) — fim do apito de hora em hora; (9) /live rotula scanner_noise como 'filtered noise' | requirements INALTERADOS (tudo roda sobre sklearn/fastembed ja instalados; llama-cpp-python e OPCIONAL e so e necessario com LOCAL_LLM=1) | base: v48.12.0-ML: camada de machine learning embarcada treinada nos dados do PROPRIO node (60k+ probes + ledger) — (1) classificador de demanda GradientBoosting com auto-rotulagem pelas regras atuais e retreino diario: pega scanner que o regex nunca viu (conf>=0.85 rebaixa new_product->scanner_noise) e anexa label+confianca ao painel/alertas; (2) detector de anomalias IsolationForest sobre agregados horarios de requests/revenue (min 72h): surto de comprador ou ataque vira log + Telegram (1/6h) + /data/ml_anomalies.json; (3) NOVO /discover gratis: busca semantica do catalogo por similaridade vetorial (MiniLM ONNX via fastembed, cache em /data) com fallback palavra-chave — funil de descoberta p/ agentes | tudo import-guarded (sem sklearn/fastembed o node roda como antes) + ML_DISABLED=1 | deps novas p/ requirements: scikit-learn fastembed | base: v48.11.0-GLOBAL: Moonshot/Kimi + OpenRouter como provedores premium DORMENTES (env-gated: sem chave = zero custo; ativar = MOONSHOT_API_KEY/OPENROUTER_API_KEY no Railway) | perfis de roteamento estilo ClawRouter: /llm?profile=eco|fast|premium e model=kimi|deepseek|eco|premium no /v1/chat/completions | NOVO /global-rates ($0.03): taxas de Fed/ECB/PBoC/BOJ/CBR/BCB numa chamada — BIS WS_CBPOL + cross-check ao vivo FRED/ECB-SDW/BCB-SGS, diferencial de carry vs Fed; nenhum concorrente x402 tem | rails Polygon (eip155:137) + Arbitrum (eip155:42161) PRONTAS, settle pelo mesmo facilitador CDP, env-gated OFF (X402_POLYGON=1/X402_ARBITRUM=1 so apos confirmar credito na Binance) | _SCAN_NOISE cobre /env.txt /env.js /settings.json /config/*.yml (scanner de credencial nao vira mais produto novo no radar) | _cap500 default 480->390 (x402lint P8: 24 descriptions na zona de risco; caminho p/ 100/100) | base: v48.10.3-REFINE: reprice consolidado no codigo (fonte unica, sem depender de env) — piso $0.01 em 12 endpoints de $0.003-0.008 (fear-greed, pyth-price, trust-hash, agent-market, bootstrap-trust, regime, mempool, web-search, ai-news + os 4 primitivos BR pix/bizdays/doc) e /br-archive $0.05->$0.09: a Coinbase cobra $0.001/settle apos 1k/mes (fazemos ~8k) — a $0.003 a taxa efetiva era 33%, a $0.01 cai a 10%; clientes x402 tem cap default 0.1 USDC, abaixo disso preco nao influencia decisao de maquina; referencia CoinGecko flat $0.01 | LLM_PROXY_PRICE agora le PRICE_LLM_PROXY (default $0.005 — a isca fica) | NOVO /.well-known/agent-registration.json (ERC-8004 registration-v1: A2A+MCP+x402+OAS, x402Support, supportedTrust) — registrar no Identity Registry 0x8004A169...a432 na Base | FIX telemetria: pos-refund nao loga mais "paid" (double-log inflava calls; Agent402 e /receipts leem isso) | refund agora carrega recommended_next (cross-sell na falha — falha vira retencao) | billing LLM com backoff persistente em /data (strikes 6h->12h->18h->24h; o 429 diario do Gemini parava de gritar a cada boot; provider saudavel zera) | base: v48.10.2-REFUND
+VERSION = "48.14.2-RESILIENCE"  # v48.14.2-RESILIENCE: (1) quota 429 do Google e POR MODELO — _try_gemini bane o modelo sem quota e troca para o proximo preferido NA MESMA chamada (ate 3); quarentena de provedor so quando esgotam. (2) /sec-filing envia User-Agent identificado (SEC 403 "undeclared" -> 200 JSON). | base: v48.14.1-HOTFIX: Pyth Hermes passou a EXIGIR API key no upgrade Pyth Core de 26/ago/2026 (401 sem chave — derrubou /pyth-price e o coletor do /forecast) — _pyth_latest usa o endpoint novo pyth.dourolabs.app/hermes com Bearer quando PYTH_API_KEY estiver no Railway + fallback CoinGecko simple/price (reusa COINGECKO_KEY) em /pyth-price, _oracle_pyth e _fc_collect — o coletor do ML nunca mais morre em silencio; self-heal do seed agora TREINA o simbolo recem-semeado na hora (antes: /forecast ficava 503 ate o tick de 6h) | base: v48.14.0-MONETIZE: (1) MPP tempo/charge REAL push-mode — challenges method="tempo" (USDC.e + pathUSD, chainId 4217) em TODO 402 e verificacao on-chain do credential Authorization: Payment (receipt TIP-20 Transfer: valor/destino/moeda + anti-replay atomico + Payment-Receipt) — captura os saldos AgentCash que nascem na Tempo; sem Stripe, sem chave privada no servidor; (2) NOVO /ecosystem-pulse $0.05 — a inteligencia dos 64k probes/dia como produto: top sondados com heat score, tendencias 7d-vs-7d (z-score Poisson), IPs-agente unicos, share de monitores QoS, clusters de demanda emergente; (3) price-elasticity advisor semanal — funil probes->previews->vendas por endpoint vira sugestao de PRECO DE TABELA global (nunca por carteira) no Telegram; PRICE_AUTO=1 aplica com trava +-30%/semana persistida em /data (env do operador sempre vence); (4) radar auto-atendimento com fallback SEMANTICO — embeddings (multilingue se preciso) casam 404 pelo significado quando o lexical falha, limiar 0.72, mesmas travas de seguranca; (5) /forecast seed auto-recupera a cada 30min ate todos os 8 simbolos terem backfill (429 de IP compartilhado nao exige mais redeploy); (6) /health expoe mpp_tempo + modo do advisor | base: v48.13.0-INTEL  # v48.13.0-INTEL: SEGUNDA CAMADA DE IA LOCAL — (1) NOVO /forecast $0.05: previsao p10/p50/p90 com HistGradientBoosting quantilico treinado NO HISTORICO QUE O PROPRIO NODE COLETA (Pyth a cada 10min + backfill CoinGecko 90d, 8 simbolos, 4 horizontes), MAPE de walk-forward publicado em toda resposta; sem historico = 503 e NAO cobra; (2) recomendador agents_also_bought por co-ocorrencia real de pagadores — cross-sell dentro do proprio 402 + /recommend gratis; (3) lead scoring SEMANTICO dos previews (embedding da intencao x catalogo premium) -> alerta de lead quente no Telegram; (4) clustering semanal dos 404s por significado (Agglomerative cosine sobre embeddings) -> oportunidades de produto em /ml + digest; (5) NOVO /ml publico: transparencia da camada de IA local; (6) /discover com reranker cross-encoder (ms-marco-MiniLM-L-6, 80MB ONNX) + modo MULTILINGUE sob demanda (paraphrase-MiniLM-L12: PT/ES/ZH acham o catalogo em ingles); (7) LLM LOCAL de ultimo recurso (LOCAL_LLM=1, llama-cpp-python + Qwen3-0.6B GGUF ~480MB em /data): se TODOS os provedores externos cairem, /llm responde com o modelo da casa em vez de 503 — OFF por padrao = custo zero; (8) detector de anomalias ganha severidade (volume puro -> log; comprador/receita -> Telegram) — fim do apito de hora em hora; (9) /live rotula scanner_noise como 'filtered noise' | requirements INALTERADOS (tudo roda sobre sklearn/fastembed ja instalados; llama-cpp-python e OPCIONAL e so e necessario com LOCAL_LLM=1) | base: v48.12.0-ML: camada de machine learning embarcada treinada nos dados do PROPRIO node (60k+ probes + ledger) — (1) classificador de demanda GradientBoosting com auto-rotulagem pelas regras atuais e retreino diario: pega scanner que o regex nunca viu (conf>=0.85 rebaixa new_product->scanner_noise) e anexa label+confianca ao painel/alertas; (2) detector de anomalias IsolationForest sobre agregados horarios de requests/revenue (min 72h): surto de comprador ou ataque vira log + Telegram (1/6h) + /data/ml_anomalies.json; (3) NOVO /discover gratis: busca semantica do catalogo por similaridade vetorial (MiniLM ONNX via fastembed, cache em /data) com fallback palavra-chave — funil de descoberta p/ agentes | tudo import-guarded (sem sklearn/fastembed o node roda como antes) + ML_DISABLED=1 | deps novas p/ requirements: scikit-learn fastembed | base: v48.11.0-GLOBAL: Moonshot/Kimi + OpenRouter como provedores premium DORMENTES (env-gated: sem chave = zero custo; ativar = MOONSHOT_API_KEY/OPENROUTER_API_KEY no Railway) | perfis de roteamento estilo ClawRouter: /llm?profile=eco|fast|premium e model=kimi|deepseek|eco|premium no /v1/chat/completions | NOVO /global-rates ($0.03): taxas de Fed/ECB/PBoC/BOJ/CBR/BCB numa chamada — BIS WS_CBPOL + cross-check ao vivo FRED/ECB-SDW/BCB-SGS, diferencial de carry vs Fed; nenhum concorrente x402 tem | rails Polygon (eip155:137) + Arbitrum (eip155:42161) PRONTAS, settle pelo mesmo facilitador CDP, env-gated OFF (X402_POLYGON=1/X402_ARBITRUM=1 so apos confirmar credito na Binance) | _SCAN_NOISE cobre /env.txt /env.js /settings.json /config/*.yml (scanner de credencial nao vira mais produto novo no radar) | _cap500 default 480->390 (x402lint P8: 24 descriptions na zona de risco; caminho p/ 100/100) | base: v48.10.3-REFINE: reprice consolidado no codigo (fonte unica, sem depender de env) — piso $0.01 em 12 endpoints de $0.003-0.008 (fear-greed, pyth-price, trust-hash, agent-market, bootstrap-trust, regime, mempool, web-search, ai-news + os 4 primitivos BR pix/bizdays/doc) e /br-archive $0.05->$0.09: a Coinbase cobra $0.001/settle apos 1k/mes (fazemos ~8k) — a $0.003 a taxa efetiva era 33%, a $0.01 cai a 10%; clientes x402 tem cap default 0.1 USDC, abaixo disso preco nao influencia decisao de maquina; referencia CoinGecko flat $0.01 | LLM_PROXY_PRICE agora le PRICE_LLM_PROXY (default $0.005 — a isca fica) | NOVO /.well-known/agent-registration.json (ERC-8004 registration-v1: A2A+MCP+x402+OAS, x402Support, supportedTrust) — registrar no Identity Registry 0x8004A169...a432 na Base | FIX telemetria: pos-refund nao loga mais "paid" (double-log inflava calls; Agent402 e /receipts leem isso) | refund agora carrega recommended_next (cross-sell na falha — falha vira retencao) | billing LLM com backoff persistente em /data (strikes 6h->12h->18h->24h; o 429 diario do Gemini parava de gritar a cada boot; provider saudavel zera) | base: v48.10.2-REFUND
 if __name__ == "__main__":
     cli()
 else:
