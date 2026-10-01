@@ -2437,6 +2437,7 @@ def llm_health_report() -> dict:
             "quarantined": {p: {"until": int(_LLM_DOWN_UNTIL[p]),
                                 "last_error": _LLM_LAST_ERROR.get(p, "")}
                             for p in cfg if time.time() < _LLM_DOWN_UNTIL.get(p, 0)},
+            "bandit": _llm_bandit_stats(),  # v48.15.0: o que o roteador aprendeu
             "models": {"deepseek": DEEPSEEK_MODEL, "claude": CLAUDE_MODEL,
                        "groq": (groq_model() if GROQ_KEY else "(sem chave)"),
                        "gemini": GEMINI_MODEL or gemini_model(),
@@ -2663,6 +2664,114 @@ def _groq_esquece():
         _GROQ_RESOLVED = None
 
 
+
+# ---------------------------------------------------------------------------
+# v48.15.0-BANDIT — ROTEADOR ADAPTATIVO ε-GREEDY (ML persistido em /data)
+#
+# A cadeia de provedores era uma heurística FIXA (tamanho do prompt decide
+# groq×gemini). Heurística fixa não aprende: se o Groq fica lento às 14h ou o
+# Gemini começa a devolver 503 intermitente, a fila continua a mesma. Agora
+# cada tentativa alimenta um bandit: recompensa = sucesso × fator de latência
+# (<2s=1.0, <8s=0.9, <20s=0.7, ≥20s=0.4; falha=0), EWMA α=0.15, persistido em
+# /data/llm_bandit.json (sobrevive a redeploy e é compartilhado por workers).
+# Na hora de rotear: com probabilidade ε (10%) embaralha — exploração, é como
+# o bandit descobre que um provedor se recuperou; senão ordena pela
+# recompensa aprendida. Provedor nunca visto entra com prior otimista (0.75)
+# para ser experimentado cedo. Quarentena (_LLM_DOWN_UNTIL) e LLM_ORDER
+# continuam mandando mais — o bandit só ordena quem está apto.
+# LLM_BANDIT=0 desliga; LLM_BANDIT_EPSILON ajusta a exploração.
+# ---------------------------------------------------------------------------
+_LLM_BANDIT: Dict[str, Dict[str, float]] = {}
+_LLM_BANDIT_LOCK = threading.Lock()
+_LLM_BANDIT_LAST_SAVE = {"ts": 0.0}
+_LLM_BANDIT_ON = os.environ.get("LLM_BANDIT", "1") != "0"
+_LLM_BANDIT_EPS = float(os.environ.get("LLM_BANDIT_EPSILON", "0.10"))
+_LLM_BANDIT_ALPHA = float(os.environ.get("LLM_BANDIT_ALPHA", "0.15"))
+_LLM_BANDIT_PRIOR = 0.75
+
+
+def _llm_bandit_file() -> str:
+    return os.path.join(os.path.dirname(DB_PATH), "llm_bandit.json")
+
+
+def _llm_bandit_load() -> None:
+    global _LLM_BANDIT
+    try:
+        _f = _llm_bandit_file()
+        if os.path.exists(_f):
+            _d = json.load(open(_f))
+            if isinstance(_d, dict):
+                with _LLM_BANDIT_LOCK:
+                    _LLM_BANDIT = {str(k): v for k, v in _d.items()
+                                   if isinstance(v, dict)}
+    except Exception:
+        pass
+
+
+def _llm_bandit_save() -> None:
+    try:
+        agora = time.time()
+        if agora - _LLM_BANDIT_LAST_SAVE["ts"] < 20:
+            return                      # no máximo 1 escrita a cada 20s
+        with _LLM_BANDIT_LOCK:
+            snap = dict(_LLM_BANDIT)
+        json.dump(snap, open(_llm_bandit_file(), "w"))
+        _LLM_BANDIT_LAST_SAVE["ts"] = agora
+    except Exception:
+        pass
+
+
+def _llm_bandit_update(provider: str, ok: bool, lat_s: float) -> None:
+    if not _LLM_BANDIT_ON or provider == "local":
+        return
+    try:
+        if ok:
+            fator = (1.0 if lat_s < 2 else 0.9 if lat_s < 8
+                     else 0.7 if lat_s < 20 else 0.4)
+        else:
+            fator = 0.0
+        with _LLM_BANDIT_LOCK:
+            st = _LLM_BANDIT.setdefault(provider,
+                                        {"ok": 0, "fail": 0, "lat": 0.0,
+                                         "reward": _LLM_BANDIT_PRIOR})
+            st["ok" if ok else "fail"] = int(st.get("ok" if ok else "fail", 0)) + 1
+            st["lat"] = (float(lat_s) if float(st.get("lat", 0.0)) <= 0
+                         else 0.7 * float(st["lat"]) + 0.3 * float(lat_s))
+            st["reward"] = ((1 - _LLM_BANDIT_ALPHA) * float(st.get("reward", _LLM_BANDIT_PRIOR))
+                            + _LLM_BANDIT_ALPHA * fator)
+        _llm_bandit_save()
+    except Exception:
+        pass
+
+
+def _llm_bandit_order(cands: List[str]) -> List[str]:
+    """ε-greedy sobre a camada recebida: explora (embaralha) com prob. ε,
+    senão explota (ordena pela recompensa aprendida, maior primeiro)."""
+    if not _LLM_BANDIT_ON or len(cands) < 2:
+        return cands
+    try:
+        if random.random() < _LLM_BANDIT_EPS:
+            c = list(cands)
+            random.shuffle(c)
+            return c
+        with _LLM_BANDIT_LOCK:
+            snap = dict(_LLM_BANDIT)
+        return sorted(cands, key=lambda p: -float(snap.get(p, {}).get(
+            "reward", _LLM_BANDIT_PRIOR)))
+    except Exception:
+        return cands
+
+
+def _llm_bandit_stats() -> dict:
+    with _LLM_BANDIT_LOCK:
+        return {p: {"reward": round(float(s.get("reward", _LLM_BANDIT_PRIOR)), 3),
+                    "ok": int(s.get("ok", 0)), "fail": int(s.get("fail", 0)),
+                    "lat_s": round(float(s.get("lat", 0.0)), 2)}
+                for p, s in _LLM_BANDIT.items()}
+
+
+_llm_bandit_load()
+
 LLM_SMALL_TOKENS = int(os.environ.get("LLM_SMALL_TOKENS", "300"))
 _LLM_ORDER_ENV = [x.strip().lower() for x in
                   os.environ.get("LLM_ORDER", "").split(",") if x.strip()]
@@ -2690,7 +2799,9 @@ def _llm_chain(max_tokens: int) -> List[str]:
     else:
         gratis = ["gemini", "groq"]      # longo: preserva o TPD do Groq
     # Provedores pagos, se configurados, vêm antes — quem paga quer qualidade.
-    return pagos + gratis + ["ollama"]
+    # v48.15.0-BANDIT: dentro de cada camada a ordem é APRENDIDA — o bandit
+    # põe primeiro quem vem respondendo rápido e sem falhar em produção.
+    return _llm_bandit_order(pagos) + _llm_bandit_order(gratis) + ["ollama"]
 
 
 class LLM:
@@ -2923,14 +3034,18 @@ class LLM:
             _fn, _cred = _CHAMADAS.get(_prov, (None, None))
             if not _fn or not _cred or _llm_is_down(_prov):
                 continue
+            _t0prov = time.time()  # v48.15.0: latência alimenta o bandit
             try:
                 _txt, _err = _fn()
                 if _txt:
+                    _llm_bandit_update(_prov, True, time.time() - _t0prov)
                     return _done(_prov, _txt)
                 _llm_mark(_prov, False, _err or "empty response")
+                _llm_bandit_update(_prov, False, time.time() - _t0prov)
                 log.warning(f"LLM {_prov}: {_err}")
             except Exception as e:
                 _llm_mark(_prov, False, str(e))
+                _llm_bandit_update(_prov, False, time.time() - _t0prov)
                 log.warning(f"LLM {_prov}: {e}")
 
         # v39: nunca mais devolver um placeholder legível. A v38 devolvia
@@ -9365,6 +9480,136 @@ def robots_txt():
         f"User-agent: ClaudeBot\nAllow: /\n"
         f"User-agent: PerplexityBot\nAllow: /\n",
         mimetype="text/plain")
+
+# ---------------------------------------------------------------------------
+# v48.15.0-BANDIT — SALDO+BLOCKHASH SOLANA SERVER-SIDE para o checkout /pay.
+# O browser do comprador às vezes não alcança NENHUM RPC público (rede
+# corporativa, DNS, extensão de privacidade) e o checkout morria com
+# "Could not reach the Solana network" mesmo com saldo na carteira. O
+# Railway enxerga a Solana muito melhor: esta rota gratuita consulta o
+# saldo de USDC (ATA passada pelo cliente; se vazia, varre TODAS as token
+# accounts do mint via dataSlice de 8 bytes) e devolve também um blockhash
+# fresco — o browser deixa de depender de RPC próprio. Cache 8s/carteira,
+# 30 req/min/IP. Nunca expõe nada além do que a própria chain expõe.
+# ---------------------------------------------------------------------------
+_SOL_BAL_CACHE: Dict[str, dict] = {}
+_SOL_BAL_RL: Dict[str, list] = {}
+_SOL_BAL_RPCS = [u for u in [
+    os.environ.get("SOLANA_RPC", ""), os.environ.get("X402_SOLANA_RPC", ""),
+    "https://solana-rpc.publicnode.com", "https://api.mainnet-beta.solana.com",
+    "https://solana.drpc.org"] if u]
+_seen_sol_rpcs: set = set()
+_SOL_BAL_RPCS = [u for u in _SOL_BAL_RPCS if not (u in _seen_sol_rpcs or _seen_sol_rpcs.add(u))]
+
+
+def _sol_rpc_call(url: str, method: str, params: list, timeout: int = 6):
+    r = requests.post(url, json={"jsonrpc": "2.0", "id": 1,
+                                 "method": method, "params": params},
+                      timeout=timeout)
+    j = r.json()
+    if isinstance(j, dict) and j.get("error"):
+        raise RuntimeError(str(j["error"])[:120])
+    return j.get("result")
+
+
+@app.route("/api/sol-usdc-balance")
+def api_sol_usdc_balance():
+    owner = (request.args.get("owner") or "").strip()
+    ata   = (request.args.get("ata") or "").strip()
+    mint  = (request.args.get("mint") or "").strip() or USDC_MINT
+    if not owner or len(owner) < 32:
+        return jsonify({"ok": False, "error": "owner_required"}), 400
+    ip = request.headers.get("CF-Connecting-IP") or request.remote_addr or "?"
+    agora = time.time()
+    rl = [t for t in _SOL_BAL_RL.get(ip, []) if agora - t < 60]
+    if len(rl) >= 30:
+        return jsonify({"ok": False, "error": "rate_limited"}), 429
+    rl.append(agora)
+    _SOL_BAL_RL[ip] = rl
+    if len(_SOL_BAL_RL) > 2000:
+        for k in [k for k, v in _SOL_BAL_RL.items()
+                  if not v or agora - v[-1] > 300][:500]:
+            _SOL_BAL_RL.pop(k, None)
+    ck = f"{owner}:{mint}"
+    hit = _SOL_BAL_CACHE.get(ck)
+    if hit and agora - hit["ts"] < 8:
+        return jsonify(hit["data"])
+    out = {"ok": True, "answered": False, "found": False, "have": 0.0,
+           "src": ata or None, "blockhash": None,
+           "lastValidBlockHeight": None, "rpc": None}
+    for url in _SOL_BAL_RPCS[:4]:
+        try:
+            found, have, src_addr = False, 0.0, (ata or None)
+            if ata:
+                try:
+                    bal = _sol_rpc_call(url, "getTokenAccountBalance",
+                                        [ata, {"commitment": "confirmed"}])
+                    have = int(bal["value"]["amount"]) / 1e6
+                    found = True
+                except Exception:
+                    found = False   # ATA inexistente — varre pelo owner
+            if not found:
+                accs = _sol_rpc_call(
+                    url, "getTokenAccountsByOwner",
+                    [owner, {"mint": mint},
+                     {"encoding": "base64",
+                      "dataSlice": {"offset": 64, "length": 8},
+                      "commitment": "confirmed"}])
+                best_amt, best_key = -1, None
+                for a in (accs or {}).get("value", []):
+                    try:
+                        raw = base64.b64decode(a["account"]["data"][0])
+                        amt = int.from_bytes(raw[:8], "little")
+                        if amt > best_amt:
+                            best_amt, best_key = amt, a["pubkey"]
+                    except Exception:
+                        continue
+                # resposta VÁLIDA da rede: sem conta => saldo zero honesto
+                found = True
+                if best_key is not None:
+                    have, src_addr = best_amt / 1e6, best_key
+            bh = _sol_rpc_call(url, "getLatestBlockhash",
+                               [{"commitment": "confirmed"}])
+            out.update({"answered": True, "found": found,
+                        "have": round(have, 6), "src": src_addr,
+                        "blockhash": bh["value"]["blockhash"],
+                        "lastValidBlockHeight": bh["value"]["lastValidBlockHeight"],
+                        "rpc": url})
+            break
+        except Exception:
+            continue
+    _SOL_BAL_CACHE[ck] = {"ts": agora, "data": out}
+    if len(_SOL_BAL_CACHE) > 500:
+        for k in sorted(_SOL_BAL_CACHE,
+                        key=lambda x: _SOL_BAL_CACHE[x]["ts"])[:100]:
+            _SOL_BAL_CACHE.pop(k, None)
+    return jsonify(out)
+
+
+# ---------------------------------------------------------------------------
+# v48.15.0 — RSL (Really Simple Licensing): padrão aberto (set/2025, RSS
+# co-author + Reddit/Yahoo/Medium/Fastly) para licenciar conteúdo a crawlers
+# de IA de forma machine-readable. O robots.txt aponta para este documento;
+# aqui dizemos: uso permitido mediante pagamento por uso, e o "caixa" é o
+# nosso catálogo x402. Custo zero, alinhamento com para onde a indústria vai.
+# ---------------------------------------------------------------------------
+@app.route("/.well-known/rsl.xml")
+def rsl_xml():
+    base = _public_base()
+    body = (
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        '<rsl xmlns="https://rslstandard.org/rsl">\n'
+        f'  <content url="{base}/">\n'
+        '    <license>\n'
+        '      <permits type="usage">all</permits>\n'
+        '      <payment type="pay-per-crawl">\n'
+        f'        <custom>{base}/.well-known/x402.json</custom>\n'
+        '      </payment>\n'
+        '    </license>\n'
+        '  </content>\n'
+        '</rsl>\n')
+    return app.response_class(body, mimetype="application/xml")
+
 
 @app.route("/sitemap.xml")
 def sitemap_xml():
@@ -21434,6 +21679,25 @@ def _warm_once(paths: List[str], label: str) -> int:
     return ok
 
 
+def _demand_rank(paths: List[str]) -> List[str]:
+    """v48.15.0-BANDIT: aquece primeiro o que a DEMANDA real pede.
+    Score = hits 24h + 2x previews 24h por endpoint (ledger SQLite). O warmer
+    deixa de ser uma lista fixa cega: o preview que os avaliadores mais
+    pedem fica sempre fresco; endpoint sem demanda vai para o fim da fila,
+    poupando chamadas às fontes externas. Falha => ordem original."""
+    try:
+        lim = int(time.time()) - 86400
+        with LEDGER.lock, LEDGER._conn() as c:
+            rows = c.execute(
+                "SELECT endpoint, COUNT(*), "
+                "SUM(CASE WHEN kind='preview' THEN 1 ELSE 0 END) "
+                "FROM requests WHERE ts > ? GROUP BY endpoint", (lim,)).fetchall()
+        score = {ep: int(n) + 2 * int(pv or 0) for ep, n, pv in rows}
+        return sorted(paths, key=lambda p: -score.get(p, 0))
+    except Exception:
+        return paths
+
+
 def preview_warm_loop():
     """Aquece o cache de ?preview=1 chamando os handlers INTERNAMENTE.
     Sem isto, num node sem vendas o funil 'avalie grátis → pague' começa
@@ -21442,7 +21706,7 @@ def preview_warm_loop():
     log.info(f"🔥 Autopilot warmer (dados): {len(AUTOPILOT_WARM)} endpoints "
              f"a cada {AUTOPILOT_WARM_SECS}s")
     while True:
-        _warm_once(AUTOPILOT_WARM, "dados")
+        _warm_once(_demand_rank(AUTOPILOT_WARM), "dados")
         time.sleep(AUTOPILOT_WARM_SECS)
 
 
@@ -21459,7 +21723,7 @@ def preview_warm_ai_loop():
             time.sleep(AUTOPILOT_WARM_AI_SECS)
             continue
         if llm_healthy():
-            _warm_once(AUTOPILOT_WARM_AI, "IA")
+            _warm_once(_demand_rank(AUTOPILOT_WARM_AI), "IA")
         else:
             log.info("🔥 warmer[IA]: pulado — nenhum provedor de LLM saudável")
         time.sleep(AUTOPILOT_WARM_AI_SECS)
@@ -22849,6 +23113,7 @@ def robots_txt_v27():
         "User-agent: *\n"
         "Allow: /\n"
         f"Sitemap: {base}/sitemap.xml\n"
+        f"License: {base}/.well-known/rsl.xml\n"  # v48.15.0: RSL pay-per-crawl
         "\n"
         "# === AI AGENT DISCOVERY (2026 spec) ===\n"
         f"# Primary manifest: {base}/.well-known/agentic.json\n"
@@ -27030,54 +27295,69 @@ async function paySolana(){
     let rpc   = new w3.Connection(SOL_RPC, 'confirmed');  // v48.14.3: reatribuido ao RPC saudavel
     const dstAta = await ataOf(w3, new w3.PublicKey(SOL_ACCEPT.payTo), mint);
     const need = Number(BigInt(SOL_ACCEPT.amount)) / 1e6;
-    // v48.14.3: check de saldo a prova de RPC instavel. Antes QUALQUER erro
-    // (429/rede do RPC publico) caia no catch e acusava "sem conta de USDC"
-    // — falso negativo que custou vendas (o operador TINHA saldo). Agora:
-    // tenta varios RPCs; ATA inexistente -> varre TODAS as token accounts do
-    // mint (USDC fora da ATA); "sem USDC" so com resposta valida da rede.
-    const SOL_RPCS = [SOL_RPC, 'https://solana-rpc.publicnode.com', 'https://rpc.ankr.com/solana'];
+    // v48.15.0: saldo + blockhash via SERVIDOR (/api/sol-usdc-balance,
+    // gratuito, same-origin). O Railway enxerga a Solana melhor que o
+    // browser do comprador — fim dos falsos "Could not reach the Solana
+    // network". Fallback: multi-RPC no browser (drpc no lugar do ankr,
+    // que virou 403 sem chave de API).
     let srcAta = await ataOf(w3, owner, mint);
-    let have = 0, found = false, answered = false;
-    const u64le = (bytes, off) => { let v = 0n; for (let i = 7; i >= 0; i--) v = (v << 8n) | BigInt(bytes[off + i]); return v; };
-    const b64bytes = (s) => { const bin = atob(s); const u = new Uint8Array(bin.length); for (let i = 0; i < bin.length; i++) u[i] = bin.charCodeAt(i); return u; };
-    for (const endpoint of SOL_RPCS){
-      try{
-        const rpcX = new w3.Connection(endpoint, 'confirmed');
+    let have = 0, found = false, answered = false, blockhash = null;
+    try{
+      const r = await fetch('/api/sol-usdc-balance?owner=' + owner.toBase58() +
+                            '&ata=' + srcAta.toBase58() + '&mint=' + mint.toBase58());
+      const j = await r.json();
+      if (j && j.answered){
+        answered = true; found = !!j.found; have = Number(j.have || 0);
+        if (j.src) srcAta = new w3.PublicKey(j.src);
+        blockhash = j.blockhash || null;
+      }
+    }catch(eSrv){ /* servidor indisponivel — cai no fallback do browser */ }
+    if (!answered){
+      const SOL_RPCS = [SOL_RPC, 'https://solana-rpc.publicnode.com', 'https://solana.drpc.org'];
+      const u64le = (bytes, off) => { let v = 0n; for (let i = 7; i >= 0; i--) v = (v << 8n) | BigInt(bytes[off + i]); return v; };
+      const b64bytes = (s) => { const bin = atob(s); const u = new Uint8Array(bin.length); for (let i = 0; i < bin.length; i++) u[i] = bin.charCodeAt(i); return u; };
+      for (const endpoint of SOL_RPCS){
         try{
-          const bal = await rpcX.getTokenAccountBalance(srcAta);
-          have = Number(bal.value.amount) / 1e6; found = true;
-        }catch(eAta){
-          const accs = await rpcX.getTokenAccountsByOwner(owner, { mint: mint }, { encoding: 'base64' });
-          let bestAmt = 0n, bestKey = null;
-          for (const a of accs.value){
-            const d = a.account.data;
-            const bytes = Array.isArray(d) ? b64bytes(d[0]) : new Uint8Array(d);
-            if (bytes.length < 72) continue;
-            const amt = u64le(bytes, 64);   // layout SPL token: mint(32)+owner(32)+amount(8)
-            if (amt > bestAmt){ bestAmt = amt; bestKey = a.pubkey; }
+          const rpcX = new w3.Connection(endpoint, 'confirmed');
+          try{
+            const bal = await rpcX.getTokenAccountBalance(srcAta);
+            have = Number(bal.value.amount) / 1e6; found = true;
+          }catch(eAta){
+            const accs = await rpcX.getTokenAccountsByOwner(owner, { mint: mint }, { encoding: 'base64' });
+            let bestAmt = 0n, bestKey = null;
+            for (const a of accs.value){
+              const d = a.account.data;
+              const bytes = Array.isArray(d) ? b64bytes(d[0]) : new Uint8Array(d);
+              if (bytes.length < 72) continue;
+              const amt = u64le(bytes, 64);   // layout SPL token: mint(32)+owner(32)+amount(8)
+              if (amt > bestAmt){ bestAmt = amt; bestKey = a.pubkey; }
+            }
+            if (bestKey){ srcAta = bestKey; have = Number(bestAmt) / 1e6; found = true; }
           }
-          if (bestKey){ srcAta = bestKey; have = Number(bestAmt) / 1e6; found = true; }
-        }
-        rpc = rpcX; answered = true; break;
-      }catch(eRpc){ /* RPC fora — tenta o proximo */ }
+          rpc = rpcX; answered = true; break;
+        }catch(eRpc){ /* RPC fora — tenta o proximo */ }
+      }
     }
     if (!answered){
-      setS('⚠ Could not reach the Solana network right now (public RPC unstable). ' +
+      setS('\u26a0 Could not reach the Solana network right now (public RPC unstable). ' +
            'Your balance was NOT checked — please retry in a few seconds.', 'err');
       btnS.disabled = false; return;
     }
     if (!found){
-      setS('⚠ No USDC token account on Solana for this wallet. Add USDC on the Solana network ' +
+      setS('\u26a0 No USDC token account on Solana for this wallet. Add USDC on the Solana network ' +
            'in Phantom first (or use the Base option above).', 'err');
       btnS.disabled = false; return;
     }
     if (have < need){
-      setS('⚠ USDC on Solana: ' + have.toFixed(4) + ' — this payment needs ' + need.toFixed(4) +
+      setS('\u26a0 USDC on Solana: ' + have.toFixed(4) + ' — this payment needs ' + need.toFixed(4) +
            '. Top up USDC (Solana network) in Phantom first.', 'err');
       btnS.disabled = false; return;
     }
     setS('Building transaction — the facilitator pays the gas…');
-    const bh = await rpc.getLatestBlockhash();
+    if (!blockhash){
+      const bh = await rpc.getLatestBlockhash();
+      blockhash = bh.blockhash;
+    }
     const tx = new w3.Transaction({ feePayer: new w3.PublicKey(SOL_ACCEPT.extra.feePayer),
                                     recentBlockhash: bh.blockhash });
     tx.add(ixTransferChecked(w3, srcAta, mint, dstAta, owner, SOL_ACCEPT.amount));
@@ -27832,7 +28112,7 @@ def config_json():
     return r
 
 
-VERSION = "48.14.3-CHECKOUT"  # v48.14.3-CHECKOUT: (1) quota 429 do Google e POR MODELO — _try_gemini bane o modelo sem quota e troca para o proximo preferido NA MESMA chamada (ate 3); quarentena de provedor so quando esgotam. (2) /sec-filing envia User-Agent identificado (SEC 403 "undeclared" -> 200 JSON). | base: v48.14.1-HOTFIX: Pyth Hermes passou a EXIGIR API key no upgrade Pyth Core de 26/ago/2026 (401 sem chave — derrubou /pyth-price e o coletor do /forecast) — _pyth_latest usa o endpoint novo pyth.dourolabs.app/hermes com Bearer quando PYTH_API_KEY estiver no Railway + fallback CoinGecko simple/price (reusa COINGECKO_KEY) em /pyth-price, _oracle_pyth e _fc_collect — o coletor do ML nunca mais morre em silencio; self-heal do seed agora TREINA o simbolo recem-semeado na hora (antes: /forecast ficava 503 ate o tick de 6h) | base: v48.14.0-MONETIZE: (1) MPP tempo/charge REAL push-mode — challenges method="tempo" (USDC.e + pathUSD, chainId 4217) em TODO 402 e verificacao on-chain do credential Authorization: Payment (receipt TIP-20 Transfer: valor/destino/moeda + anti-replay atomico + Payment-Receipt) — captura os saldos AgentCash que nascem na Tempo; sem Stripe, sem chave privada no servidor; (2) NOVO /ecosystem-pulse $0.05 — a inteligencia dos 64k probes/dia como produto: top sondados com heat score, tendencias 7d-vs-7d (z-score Poisson), IPs-agente unicos, share de monitores QoS, clusters de demanda emergente; (3) price-elasticity advisor semanal — funil probes->previews->vendas por endpoint vira sugestao de PRECO DE TABELA global (nunca por carteira) no Telegram; PRICE_AUTO=1 aplica com trava +-30%/semana persistida em /data (env do operador sempre vence); (4) radar auto-atendimento com fallback SEMANTICO — embeddings (multilingue se preciso) casam 404 pelo significado quando o lexical falha, limiar 0.72, mesmas travas de seguranca; (5) /forecast seed auto-recupera a cada 30min ate todos os 8 simbolos terem backfill (429 de IP compartilhado nao exige mais redeploy); (6) /health expoe mpp_tempo + modo do advisor | base: v48.13.0-INTEL  # v48.13.0-INTEL: SEGUNDA CAMADA DE IA LOCAL — (1) NOVO /forecast $0.05: previsao p10/p50/p90 com HistGradientBoosting quantilico treinado NO HISTORICO QUE O PROPRIO NODE COLETA (Pyth a cada 10min + backfill CoinGecko 90d, 8 simbolos, 4 horizontes), MAPE de walk-forward publicado em toda resposta; sem historico = 503 e NAO cobra; (2) recomendador agents_also_bought por co-ocorrencia real de pagadores — cross-sell dentro do proprio 402 + /recommend gratis; (3) lead scoring SEMANTICO dos previews (embedding da intencao x catalogo premium) -> alerta de lead quente no Telegram; (4) clustering semanal dos 404s por significado (Agglomerative cosine sobre embeddings) -> oportunidades de produto em /ml + digest; (5) NOVO /ml publico: transparencia da camada de IA local; (6) /discover com reranker cross-encoder (ms-marco-MiniLM-L-6, 80MB ONNX) + modo MULTILINGUE sob demanda (paraphrase-MiniLM-L12: PT/ES/ZH acham o catalogo em ingles); (7) LLM LOCAL de ultimo recurso (LOCAL_LLM=1, llama-cpp-python + Qwen3-0.6B GGUF ~480MB em /data): se TODOS os provedores externos cairem, /llm responde com o modelo da casa em vez de 503 — OFF por padrao = custo zero; (8) detector de anomalias ganha severidade (volume puro -> log; comprador/receita -> Telegram) — fim do apito de hora em hora; (9) /live rotula scanner_noise como 'filtered noise' | requirements INALTERADOS (tudo roda sobre sklearn/fastembed ja instalados; llama-cpp-python e OPCIONAL e so e necessario com LOCAL_LLM=1) | base: v48.12.0-ML: camada de machine learning embarcada treinada nos dados do PROPRIO node (60k+ probes + ledger) — (1) classificador de demanda GradientBoosting com auto-rotulagem pelas regras atuais e retreino diario: pega scanner que o regex nunca viu (conf>=0.85 rebaixa new_product->scanner_noise) e anexa label+confianca ao painel/alertas; (2) detector de anomalias IsolationForest sobre agregados horarios de requests/revenue (min 72h): surto de comprador ou ataque vira log + Telegram (1/6h) + /data/ml_anomalies.json; (3) NOVO /discover gratis: busca semantica do catalogo por similaridade vetorial (MiniLM ONNX via fastembed, cache em /data) com fallback palavra-chave — funil de descoberta p/ agentes | tudo import-guarded (sem sklearn/fastembed o node roda como antes) + ML_DISABLED=1 | deps novas p/ requirements: scikit-learn fastembed | base: v48.11.0-GLOBAL: Moonshot/Kimi + OpenRouter como provedores premium DORMENTES (env-gated: sem chave = zero custo; ativar = MOONSHOT_API_KEY/OPENROUTER_API_KEY no Railway) | perfis de roteamento estilo ClawRouter: /llm?profile=eco|fast|premium e model=kimi|deepseek|eco|premium no /v1/chat/completions | NOVO /global-rates ($0.03): taxas de Fed/ECB/PBoC/BOJ/CBR/BCB numa chamada — BIS WS_CBPOL + cross-check ao vivo FRED/ECB-SDW/BCB-SGS, diferencial de carry vs Fed; nenhum concorrente x402 tem | rails Polygon (eip155:137) + Arbitrum (eip155:42161) PRONTAS, settle pelo mesmo facilitador CDP, env-gated OFF (X402_POLYGON=1/X402_ARBITRUM=1 so apos confirmar credito na Binance) | _SCAN_NOISE cobre /env.txt /env.js /settings.json /config/*.yml (scanner de credencial nao vira mais produto novo no radar) | _cap500 default 480->390 (x402lint P8: 24 descriptions na zona de risco; caminho p/ 100/100) | base: v48.10.3-REFINE: reprice consolidado no codigo (fonte unica, sem depender de env) — piso $0.01 em 12 endpoints de $0.003-0.008 (fear-greed, pyth-price, trust-hash, agent-market, bootstrap-trust, regime, mempool, web-search, ai-news + os 4 primitivos BR pix/bizdays/doc) e /br-archive $0.05->$0.09: a Coinbase cobra $0.001/settle apos 1k/mes (fazemos ~8k) — a $0.003 a taxa efetiva era 33%, a $0.01 cai a 10%; clientes x402 tem cap default 0.1 USDC, abaixo disso preco nao influencia decisao de maquina; referencia CoinGecko flat $0.01 | LLM_PROXY_PRICE agora le PRICE_LLM_PROXY (default $0.005 — a isca fica) | NOVO /.well-known/agent-registration.json (ERC-8004 registration-v1: A2A+MCP+x402+OAS, x402Support, supportedTrust) — registrar no Identity Registry 0x8004A169...a432 na Base | FIX telemetria: pos-refund nao loga mais "paid" (double-log inflava calls; Agent402 e /receipts leem isso) | refund agora carrega recommended_next (cross-sell na falha — falha vira retencao) | billing LLM com backoff persistente em /data (strikes 6h->12h->18h->24h; o 429 diario do Gemini parava de gritar a cada boot; provider saudavel zera) | base: v48.10.2-REFUND
+VERSION = "48.15.0-BANDIT"  # v48.15.0-BANDIT: (1) ROTEADOR DE LLM COM BANDIT ε-GREEDY persistido em /data (llm_bandit.json): recompensa = sucesso x fator de latencia, EWMA, ε=10% exploracao, ordena cada camada do _llm_chain pelo que APRENDEU em producao — provedor lento/falhando desce na fila sozinho e volta quando se recupera; stats visiveis em llm_health_report; LLM_ORDER e LLM_BANDIT=0 seguem como override. (2) /api/sol-usdc-balance — saldo USDC + blockhash Solana SERVER-SIDE (gratis, cache 8s, 30/min/IP): o Railway enxerga a rede Solana melhor que o browser do comprador; /pay consulta o servidor primeiro e so cai no multi-RPC do browser (ankr->drpc, ankr virou 403 sem chave) se o servidor nao responder — fim do falso "Could not reach the Solana network". (3) Warmer orientado por DEMANDA: _demand_rank ordena o aquecimento pelos probes+previews reais do ledger — preview fresco primeiro onde os avaliadores batem. (4) RSL (Really Simple Licensing): robots.txt ganha diretiva License -> /.well-known/rsl.xml com termos pay-per-crawl apontando para o catalogo x402 — alinhamento com o padrao que Reddit/Yahoo/Fastly adotaram p/ licenciar conteudo a crawlers de IA. | base: v48.14.3-CHECKOUT  # v48.14.3-CHECKOUT: (1) quota 429 do Google e POR MODELO — _try_gemini bane o modelo sem quota e troca para o proximo preferido NA MESMA chamada (ate 3); quarentena de provedor so quando esgotam. (2) /sec-filing envia User-Agent identificado (SEC 403 "undeclared" -> 200 JSON). | base: v48.14.1-HOTFIX: Pyth Hermes passou a EXIGIR API key no upgrade Pyth Core de 26/ago/2026 (401 sem chave — derrubou /pyth-price e o coletor do /forecast) — _pyth_latest usa o endpoint novo pyth.dourolabs.app/hermes com Bearer quando PYTH_API_KEY estiver no Railway + fallback CoinGecko simple/price (reusa COINGECKO_KEY) em /pyth-price, _oracle_pyth e _fc_collect — o coletor do ML nunca mais morre em silencio; self-heal do seed agora TREINA o simbolo recem-semeado na hora (antes: /forecast ficava 503 ate o tick de 6h) | base: v48.14.0-MONETIZE: (1) MPP tempo/charge REAL push-mode — challenges method="tempo" (USDC.e + pathUSD, chainId 4217) em TODO 402 e verificacao on-chain do credential Authorization: Payment (receipt TIP-20 Transfer: valor/destino/moeda + anti-replay atomico + Payment-Receipt) — captura os saldos AgentCash que nascem na Tempo; sem Stripe, sem chave privada no servidor; (2) NOVO /ecosystem-pulse $0.05 — a inteligencia dos 64k probes/dia como produto: top sondados com heat score, tendencias 7d-vs-7d (z-score Poisson), IPs-agente unicos, share de monitores QoS, clusters de demanda emergente; (3) price-elasticity advisor semanal — funil probes->previews->vendas por endpoint vira sugestao de PRECO DE TABELA global (nunca por carteira) no Telegram; PRICE_AUTO=1 aplica com trava +-30%/semana persistida em /data (env do operador sempre vence); (4) radar auto-atendimento com fallback SEMANTICO — embeddings (multilingue se preciso) casam 404 pelo significado quando o lexical falha, limiar 0.72, mesmas travas de seguranca; (5) /forecast seed auto-recupera a cada 30min ate todos os 8 simbolos terem backfill (429 de IP compartilhado nao exige mais redeploy); (6) /health expoe mpp_tempo + modo do advisor | base: v48.13.0-INTEL  # v48.13.0-INTEL: SEGUNDA CAMADA DE IA LOCAL — (1) NOVO /forecast $0.05: previsao p10/p50/p90 com HistGradientBoosting quantilico treinado NO HISTORICO QUE O PROPRIO NODE COLETA (Pyth a cada 10min + backfill CoinGecko 90d, 8 simbolos, 4 horizontes), MAPE de walk-forward publicado em toda resposta; sem historico = 503 e NAO cobra; (2) recomendador agents_also_bought por co-ocorrencia real de pagadores — cross-sell dentro do proprio 402 + /recommend gratis; (3) lead scoring SEMANTICO dos previews (embedding da intencao x catalogo premium) -> alerta de lead quente no Telegram; (4) clustering semanal dos 404s por significado (Agglomerative cosine sobre embeddings) -> oportunidades de produto em /ml + digest; (5) NOVO /ml publico: transparencia da camada de IA local; (6) /discover com reranker cross-encoder (ms-marco-MiniLM-L-6, 80MB ONNX) + modo MULTILINGUE sob demanda (paraphrase-MiniLM-L12: PT/ES/ZH acham o catalogo em ingles); (7) LLM LOCAL de ultimo recurso (LOCAL_LLM=1, llama-cpp-python + Qwen3-0.6B GGUF ~480MB em /data): se TODOS os provedores externos cairem, /llm responde com o modelo da casa em vez de 503 — OFF por padrao = custo zero; (8) detector de anomalias ganha severidade (volume puro -> log; comprador/receita -> Telegram) — fim do apito de hora em hora; (9) /live rotula scanner_noise como 'filtered noise' | requirements INALTERADOS (tudo roda sobre sklearn/fastembed ja instalados; llama-cpp-python e OPCIONAL e so e necessario com LOCAL_LLM=1) | base: v48.12.0-ML: camada de machine learning embarcada treinada nos dados do PROPRIO node (60k+ probes + ledger) — (1) classificador de demanda GradientBoosting com auto-rotulagem pelas regras atuais e retreino diario: pega scanner que o regex nunca viu (conf>=0.85 rebaixa new_product->scanner_noise) e anexa label+confianca ao painel/alertas; (2) detector de anomalias IsolationForest sobre agregados horarios de requests/revenue (min 72h): surto de comprador ou ataque vira log + Telegram (1/6h) + /data/ml_anomalies.json; (3) NOVO /discover gratis: busca semantica do catalogo por similaridade vetorial (MiniLM ONNX via fastembed, cache em /data) com fallback palavra-chave — funil de descoberta p/ agentes | tudo import-guarded (sem sklearn/fastembed o node roda como antes) + ML_DISABLED=1 | deps novas p/ requirements: scikit-learn fastembed | base: v48.11.0-GLOBAL: Moonshot/Kimi + OpenRouter como provedores premium DORMENTES (env-gated: sem chave = zero custo; ativar = MOONSHOT_API_KEY/OPENROUTER_API_KEY no Railway) | perfis de roteamento estilo ClawRouter: /llm?profile=eco|fast|premium e model=kimi|deepseek|eco|premium no /v1/chat/completions | NOVO /global-rates ($0.03): taxas de Fed/ECB/PBoC/BOJ/CBR/BCB numa chamada — BIS WS_CBPOL + cross-check ao vivo FRED/ECB-SDW/BCB-SGS, diferencial de carry vs Fed; nenhum concorrente x402 tem | rails Polygon (eip155:137) + Arbitrum (eip155:42161) PRONTAS, settle pelo mesmo facilitador CDP, env-gated OFF (X402_POLYGON=1/X402_ARBITRUM=1 so apos confirmar credito na Binance) | _SCAN_NOISE cobre /env.txt /env.js /settings.json /config/*.yml (scanner de credencial nao vira mais produto novo no radar) | _cap500 default 480->390 (x402lint P8: 24 descriptions na zona de risco; caminho p/ 100/100) | base: v48.10.3-REFINE: reprice consolidado no codigo (fonte unica, sem depender de env) — piso $0.01 em 12 endpoints de $0.003-0.008 (fear-greed, pyth-price, trust-hash, agent-market, bootstrap-trust, regime, mempool, web-search, ai-news + os 4 primitivos BR pix/bizdays/doc) e /br-archive $0.05->$0.09: a Coinbase cobra $0.001/settle apos 1k/mes (fazemos ~8k) — a $0.003 a taxa efetiva era 33%, a $0.01 cai a 10%; clientes x402 tem cap default 0.1 USDC, abaixo disso preco nao influencia decisao de maquina; referencia CoinGecko flat $0.01 | LLM_PROXY_PRICE agora le PRICE_LLM_PROXY (default $0.005 — a isca fica) | NOVO /.well-known/agent-registration.json (ERC-8004 registration-v1: A2A+MCP+x402+OAS, x402Support, supportedTrust) — registrar no Identity Registry 0x8004A169...a432 na Base | FIX telemetria: pos-refund nao loga mais "paid" (double-log inflava calls; Agent402 e /receipts leem isso) | refund agora carrega recommended_next (cross-sell na falha — falha vira retencao) | billing LLM com backoff persistente em /data (strikes 6h->12h->18h->24h; o 429 diario do Gemini parava de gritar a cada boot; provider saudavel zera) | base: v48.10.2-REFUND
 if __name__ == "__main__":
     cli()
 else:
