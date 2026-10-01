@@ -9621,7 +9621,7 @@ def health_providers():
                  "demand_classifier": _ML_CLF["n"] or ("file" if _ML_CLF_FILE.exists() else 0),
                  "anomaly_detector": _ML_IF["n"] or ("file" if _ML_IF_FILE.exists() else 0),
                  "discover": _ML_EMB.get("mode") or ("semantic" if _ML_EMB_OK else "keyword"),
-                 "forecast_symbols": len([s for s in _FC_FEEDS if s in _FC_MODELS]),
+                 "forecast_symbols": _fc_health_symbols(),
                  "recommender_endpoints": len(_ALSO["map"]),
                  "local_llm": "on" if _LOCAL_LLM_ON else "off",
                  "public_status": "/ml",
@@ -14955,6 +14955,19 @@ def _fc_load(sym):
     except Exception as e:
         log.debug(f"fc load {sym}: {e}")
     return None
+
+
+def _fc_health_symbols() -> int:
+    """v48.14.3: simbolos treinados olhando memoria E disco — com varios
+    workers gunicorn, _FC_MODELS so reflete o worker que respondeu /health;
+    os .joblib no volume /data sao o estado real compartilhado. Uniao dos
+    dois conjuntos (max() subcontaria quando parte so existe em um lado)."""
+    syms = {s for s in _FC_FEEDS if s in _FC_MODELS}
+    try:
+        syms |= {s for s in _FC_FEEDS if (_FC_DIR / f"{s}.joblib").exists()}
+    except Exception:
+        pass
+    return len(syms)
 
 
 def _fc_predict(sym, h):
@@ -27014,21 +27027,53 @@ async function paySolana(){
     const conn = await window.solana.connect();
     const owner = new w3.PublicKey(conn.publicKey.toString());
     const mint  = new w3.PublicKey(SOL_ACCEPT.asset);
-    const rpc   = new w3.Connection(SOL_RPC, 'confirmed');
-    const srcAta = await ataOf(w3, owner, mint);
+    let rpc   = new w3.Connection(SOL_RPC, 'confirmed');  // v48.14.3: reatribuido ao RPC saudavel
     const dstAta = await ataOf(w3, new w3.PublicKey(SOL_ACCEPT.payTo), mint);
     const need = Number(BigInt(SOL_ACCEPT.amount)) / 1e6;
-    try{
-      const bal = await rpc.getTokenAccountBalance(srcAta);
-      const have = Number(bal.value.amount) / 1e6;
-      if(have < need){
-        setS('⚠ USDC on Solana: ' + have.toFixed(4) + ' — this payment needs ' + need.toFixed(4) +
-             '. Top up USDC (Solana network) in Phantom first.', 'err');
-        btnS.disabled = false; return;
-      }
-    }catch(e){
+    // v48.14.3: check de saldo a prova de RPC instavel. Antes QUALQUER erro
+    // (429/rede do RPC publico) caia no catch e acusava "sem conta de USDC"
+    // — falso negativo que custou vendas (o operador TINHA saldo). Agora:
+    // tenta varios RPCs; ATA inexistente -> varre TODAS as token accounts do
+    // mint (USDC fora da ATA); "sem USDC" so com resposta valida da rede.
+    const SOL_RPCS = [SOL_RPC, 'https://solana-rpc.publicnode.com', 'https://rpc.ankr.com/solana'];
+    let srcAta = await ataOf(w3, owner, mint);
+    let have = 0, found = false, answered = false;
+    const u64le = (bytes, off) => { let v = 0n; for (let i = 7; i >= 0; i--) v = (v << 8n) | BigInt(bytes[off + i]); return v; };
+    const b64bytes = (s) => { const bin = atob(s); const u = new Uint8Array(bin.length); for (let i = 0; i < bin.length; i++) u[i] = bin.charCodeAt(i); return u; };
+    for (const endpoint of SOL_RPCS){
+      try{
+        const rpcX = new w3.Connection(endpoint, 'confirmed');
+        try{
+          const bal = await rpcX.getTokenAccountBalance(srcAta);
+          have = Number(bal.value.amount) / 1e6; found = true;
+        }catch(eAta){
+          const accs = await rpcX.getTokenAccountsByOwner(owner, { mint: mint }, { encoding: 'base64' });
+          let bestAmt = 0n, bestKey = null;
+          for (const a of accs.value){
+            const d = a.account.data;
+            const bytes = Array.isArray(d) ? b64bytes(d[0]) : new Uint8Array(d);
+            if (bytes.length < 72) continue;
+            const amt = u64le(bytes, 64);   // layout SPL token: mint(32)+owner(32)+amount(8)
+            if (amt > bestAmt){ bestAmt = amt; bestKey = a.pubkey; }
+          }
+          if (bestKey){ srcAta = bestKey; have = Number(bestAmt) / 1e6; found = true; }
+        }
+        rpc = rpcX; answered = true; break;
+      }catch(eRpc){ /* RPC fora — tenta o proximo */ }
+    }
+    if (!answered){
+      setS('⚠ Could not reach the Solana network right now (public RPC unstable). ' +
+           'Your balance was NOT checked — please retry in a few seconds.', 'err');
+      btnS.disabled = false; return;
+    }
+    if (!found){
       setS('⚠ No USDC token account on Solana for this wallet. Add USDC on the Solana network ' +
            'in Phantom first (or use the Base option above).', 'err');
+      btnS.disabled = false; return;
+    }
+    if (have < need){
+      setS('⚠ USDC on Solana: ' + have.toFixed(4) + ' — this payment needs ' + need.toFixed(4) +
+           '. Top up USDC (Solana network) in Phantom first.', 'err');
       btnS.disabled = false; return;
     }
     setS('Building transaction — the facilitator pays the gas…');
@@ -27787,7 +27832,7 @@ def config_json():
     return r
 
 
-VERSION = "48.14.2-RESILIENCE"  # v48.14.2-RESILIENCE: (1) quota 429 do Google e POR MODELO — _try_gemini bane o modelo sem quota e troca para o proximo preferido NA MESMA chamada (ate 3); quarentena de provedor so quando esgotam. (2) /sec-filing envia User-Agent identificado (SEC 403 "undeclared" -> 200 JSON). | base: v48.14.1-HOTFIX: Pyth Hermes passou a EXIGIR API key no upgrade Pyth Core de 26/ago/2026 (401 sem chave — derrubou /pyth-price e o coletor do /forecast) — _pyth_latest usa o endpoint novo pyth.dourolabs.app/hermes com Bearer quando PYTH_API_KEY estiver no Railway + fallback CoinGecko simple/price (reusa COINGECKO_KEY) em /pyth-price, _oracle_pyth e _fc_collect — o coletor do ML nunca mais morre em silencio; self-heal do seed agora TREINA o simbolo recem-semeado na hora (antes: /forecast ficava 503 ate o tick de 6h) | base: v48.14.0-MONETIZE: (1) MPP tempo/charge REAL push-mode — challenges method="tempo" (USDC.e + pathUSD, chainId 4217) em TODO 402 e verificacao on-chain do credential Authorization: Payment (receipt TIP-20 Transfer: valor/destino/moeda + anti-replay atomico + Payment-Receipt) — captura os saldos AgentCash que nascem na Tempo; sem Stripe, sem chave privada no servidor; (2) NOVO /ecosystem-pulse $0.05 — a inteligencia dos 64k probes/dia como produto: top sondados com heat score, tendencias 7d-vs-7d (z-score Poisson), IPs-agente unicos, share de monitores QoS, clusters de demanda emergente; (3) price-elasticity advisor semanal — funil probes->previews->vendas por endpoint vira sugestao de PRECO DE TABELA global (nunca por carteira) no Telegram; PRICE_AUTO=1 aplica com trava +-30%/semana persistida em /data (env do operador sempre vence); (4) radar auto-atendimento com fallback SEMANTICO — embeddings (multilingue se preciso) casam 404 pelo significado quando o lexical falha, limiar 0.72, mesmas travas de seguranca; (5) /forecast seed auto-recupera a cada 30min ate todos os 8 simbolos terem backfill (429 de IP compartilhado nao exige mais redeploy); (6) /health expoe mpp_tempo + modo do advisor | base: v48.13.0-INTEL  # v48.13.0-INTEL: SEGUNDA CAMADA DE IA LOCAL — (1) NOVO /forecast $0.05: previsao p10/p50/p90 com HistGradientBoosting quantilico treinado NO HISTORICO QUE O PROPRIO NODE COLETA (Pyth a cada 10min + backfill CoinGecko 90d, 8 simbolos, 4 horizontes), MAPE de walk-forward publicado em toda resposta; sem historico = 503 e NAO cobra; (2) recomendador agents_also_bought por co-ocorrencia real de pagadores — cross-sell dentro do proprio 402 + /recommend gratis; (3) lead scoring SEMANTICO dos previews (embedding da intencao x catalogo premium) -> alerta de lead quente no Telegram; (4) clustering semanal dos 404s por significado (Agglomerative cosine sobre embeddings) -> oportunidades de produto em /ml + digest; (5) NOVO /ml publico: transparencia da camada de IA local; (6) /discover com reranker cross-encoder (ms-marco-MiniLM-L-6, 80MB ONNX) + modo MULTILINGUE sob demanda (paraphrase-MiniLM-L12: PT/ES/ZH acham o catalogo em ingles); (7) LLM LOCAL de ultimo recurso (LOCAL_LLM=1, llama-cpp-python + Qwen3-0.6B GGUF ~480MB em /data): se TODOS os provedores externos cairem, /llm responde com o modelo da casa em vez de 503 — OFF por padrao = custo zero; (8) detector de anomalias ganha severidade (volume puro -> log; comprador/receita -> Telegram) — fim do apito de hora em hora; (9) /live rotula scanner_noise como 'filtered noise' | requirements INALTERADOS (tudo roda sobre sklearn/fastembed ja instalados; llama-cpp-python e OPCIONAL e so e necessario com LOCAL_LLM=1) | base: v48.12.0-ML: camada de machine learning embarcada treinada nos dados do PROPRIO node (60k+ probes + ledger) — (1) classificador de demanda GradientBoosting com auto-rotulagem pelas regras atuais e retreino diario: pega scanner que o regex nunca viu (conf>=0.85 rebaixa new_product->scanner_noise) e anexa label+confianca ao painel/alertas; (2) detector de anomalias IsolationForest sobre agregados horarios de requests/revenue (min 72h): surto de comprador ou ataque vira log + Telegram (1/6h) + /data/ml_anomalies.json; (3) NOVO /discover gratis: busca semantica do catalogo por similaridade vetorial (MiniLM ONNX via fastembed, cache em /data) com fallback palavra-chave — funil de descoberta p/ agentes | tudo import-guarded (sem sklearn/fastembed o node roda como antes) + ML_DISABLED=1 | deps novas p/ requirements: scikit-learn fastembed | base: v48.11.0-GLOBAL: Moonshot/Kimi + OpenRouter como provedores premium DORMENTES (env-gated: sem chave = zero custo; ativar = MOONSHOT_API_KEY/OPENROUTER_API_KEY no Railway) | perfis de roteamento estilo ClawRouter: /llm?profile=eco|fast|premium e model=kimi|deepseek|eco|premium no /v1/chat/completions | NOVO /global-rates ($0.03): taxas de Fed/ECB/PBoC/BOJ/CBR/BCB numa chamada — BIS WS_CBPOL + cross-check ao vivo FRED/ECB-SDW/BCB-SGS, diferencial de carry vs Fed; nenhum concorrente x402 tem | rails Polygon (eip155:137) + Arbitrum (eip155:42161) PRONTAS, settle pelo mesmo facilitador CDP, env-gated OFF (X402_POLYGON=1/X402_ARBITRUM=1 so apos confirmar credito na Binance) | _SCAN_NOISE cobre /env.txt /env.js /settings.json /config/*.yml (scanner de credencial nao vira mais produto novo no radar) | _cap500 default 480->390 (x402lint P8: 24 descriptions na zona de risco; caminho p/ 100/100) | base: v48.10.3-REFINE: reprice consolidado no codigo (fonte unica, sem depender de env) — piso $0.01 em 12 endpoints de $0.003-0.008 (fear-greed, pyth-price, trust-hash, agent-market, bootstrap-trust, regime, mempool, web-search, ai-news + os 4 primitivos BR pix/bizdays/doc) e /br-archive $0.05->$0.09: a Coinbase cobra $0.001/settle apos 1k/mes (fazemos ~8k) — a $0.003 a taxa efetiva era 33%, a $0.01 cai a 10%; clientes x402 tem cap default 0.1 USDC, abaixo disso preco nao influencia decisao de maquina; referencia CoinGecko flat $0.01 | LLM_PROXY_PRICE agora le PRICE_LLM_PROXY (default $0.005 — a isca fica) | NOVO /.well-known/agent-registration.json (ERC-8004 registration-v1: A2A+MCP+x402+OAS, x402Support, supportedTrust) — registrar no Identity Registry 0x8004A169...a432 na Base | FIX telemetria: pos-refund nao loga mais "paid" (double-log inflava calls; Agent402 e /receipts leem isso) | refund agora carrega recommended_next (cross-sell na falha — falha vira retencao) | billing LLM com backoff persistente em /data (strikes 6h->12h->18h->24h; o 429 diario do Gemini parava de gritar a cada boot; provider saudavel zera) | base: v48.10.2-REFUND
+VERSION = "48.14.3-CHECKOUT"  # v48.14.3-CHECKOUT: (1) quota 429 do Google e POR MODELO — _try_gemini bane o modelo sem quota e troca para o proximo preferido NA MESMA chamada (ate 3); quarentena de provedor so quando esgotam. (2) /sec-filing envia User-Agent identificado (SEC 403 "undeclared" -> 200 JSON). | base: v48.14.1-HOTFIX: Pyth Hermes passou a EXIGIR API key no upgrade Pyth Core de 26/ago/2026 (401 sem chave — derrubou /pyth-price e o coletor do /forecast) — _pyth_latest usa o endpoint novo pyth.dourolabs.app/hermes com Bearer quando PYTH_API_KEY estiver no Railway + fallback CoinGecko simple/price (reusa COINGECKO_KEY) em /pyth-price, _oracle_pyth e _fc_collect — o coletor do ML nunca mais morre em silencio; self-heal do seed agora TREINA o simbolo recem-semeado na hora (antes: /forecast ficava 503 ate o tick de 6h) | base: v48.14.0-MONETIZE: (1) MPP tempo/charge REAL push-mode — challenges method="tempo" (USDC.e + pathUSD, chainId 4217) em TODO 402 e verificacao on-chain do credential Authorization: Payment (receipt TIP-20 Transfer: valor/destino/moeda + anti-replay atomico + Payment-Receipt) — captura os saldos AgentCash que nascem na Tempo; sem Stripe, sem chave privada no servidor; (2) NOVO /ecosystem-pulse $0.05 — a inteligencia dos 64k probes/dia como produto: top sondados com heat score, tendencias 7d-vs-7d (z-score Poisson), IPs-agente unicos, share de monitores QoS, clusters de demanda emergente; (3) price-elasticity advisor semanal — funil probes->previews->vendas por endpoint vira sugestao de PRECO DE TABELA global (nunca por carteira) no Telegram; PRICE_AUTO=1 aplica com trava +-30%/semana persistida em /data (env do operador sempre vence); (4) radar auto-atendimento com fallback SEMANTICO — embeddings (multilingue se preciso) casam 404 pelo significado quando o lexical falha, limiar 0.72, mesmas travas de seguranca; (5) /forecast seed auto-recupera a cada 30min ate todos os 8 simbolos terem backfill (429 de IP compartilhado nao exige mais redeploy); (6) /health expoe mpp_tempo + modo do advisor | base: v48.13.0-INTEL  # v48.13.0-INTEL: SEGUNDA CAMADA DE IA LOCAL — (1) NOVO /forecast $0.05: previsao p10/p50/p90 com HistGradientBoosting quantilico treinado NO HISTORICO QUE O PROPRIO NODE COLETA (Pyth a cada 10min + backfill CoinGecko 90d, 8 simbolos, 4 horizontes), MAPE de walk-forward publicado em toda resposta; sem historico = 503 e NAO cobra; (2) recomendador agents_also_bought por co-ocorrencia real de pagadores — cross-sell dentro do proprio 402 + /recommend gratis; (3) lead scoring SEMANTICO dos previews (embedding da intencao x catalogo premium) -> alerta de lead quente no Telegram; (4) clustering semanal dos 404s por significado (Agglomerative cosine sobre embeddings) -> oportunidades de produto em /ml + digest; (5) NOVO /ml publico: transparencia da camada de IA local; (6) /discover com reranker cross-encoder (ms-marco-MiniLM-L-6, 80MB ONNX) + modo MULTILINGUE sob demanda (paraphrase-MiniLM-L12: PT/ES/ZH acham o catalogo em ingles); (7) LLM LOCAL de ultimo recurso (LOCAL_LLM=1, llama-cpp-python + Qwen3-0.6B GGUF ~480MB em /data): se TODOS os provedores externos cairem, /llm responde com o modelo da casa em vez de 503 — OFF por padrao = custo zero; (8) detector de anomalias ganha severidade (volume puro -> log; comprador/receita -> Telegram) — fim do apito de hora em hora; (9) /live rotula scanner_noise como 'filtered noise' | requirements INALTERADOS (tudo roda sobre sklearn/fastembed ja instalados; llama-cpp-python e OPCIONAL e so e necessario com LOCAL_LLM=1) | base: v48.12.0-ML: camada de machine learning embarcada treinada nos dados do PROPRIO node (60k+ probes + ledger) — (1) classificador de demanda GradientBoosting com auto-rotulagem pelas regras atuais e retreino diario: pega scanner que o regex nunca viu (conf>=0.85 rebaixa new_product->scanner_noise) e anexa label+confianca ao painel/alertas; (2) detector de anomalias IsolationForest sobre agregados horarios de requests/revenue (min 72h): surto de comprador ou ataque vira log + Telegram (1/6h) + /data/ml_anomalies.json; (3) NOVO /discover gratis: busca semantica do catalogo por similaridade vetorial (MiniLM ONNX via fastembed, cache em /data) com fallback palavra-chave — funil de descoberta p/ agentes | tudo import-guarded (sem sklearn/fastembed o node roda como antes) + ML_DISABLED=1 | deps novas p/ requirements: scikit-learn fastembed | base: v48.11.0-GLOBAL: Moonshot/Kimi + OpenRouter como provedores premium DORMENTES (env-gated: sem chave = zero custo; ativar = MOONSHOT_API_KEY/OPENROUTER_API_KEY no Railway) | perfis de roteamento estilo ClawRouter: /llm?profile=eco|fast|premium e model=kimi|deepseek|eco|premium no /v1/chat/completions | NOVO /global-rates ($0.03): taxas de Fed/ECB/PBoC/BOJ/CBR/BCB numa chamada — BIS WS_CBPOL + cross-check ao vivo FRED/ECB-SDW/BCB-SGS, diferencial de carry vs Fed; nenhum concorrente x402 tem | rails Polygon (eip155:137) + Arbitrum (eip155:42161) PRONTAS, settle pelo mesmo facilitador CDP, env-gated OFF (X402_POLYGON=1/X402_ARBITRUM=1 so apos confirmar credito na Binance) | _SCAN_NOISE cobre /env.txt /env.js /settings.json /config/*.yml (scanner de credencial nao vira mais produto novo no radar) | _cap500 default 480->390 (x402lint P8: 24 descriptions na zona de risco; caminho p/ 100/100) | base: v48.10.3-REFINE: reprice consolidado no codigo (fonte unica, sem depender de env) — piso $0.01 em 12 endpoints de $0.003-0.008 (fear-greed, pyth-price, trust-hash, agent-market, bootstrap-trust, regime, mempool, web-search, ai-news + os 4 primitivos BR pix/bizdays/doc) e /br-archive $0.05->$0.09: a Coinbase cobra $0.001/settle apos 1k/mes (fazemos ~8k) — a $0.003 a taxa efetiva era 33%, a $0.01 cai a 10%; clientes x402 tem cap default 0.1 USDC, abaixo disso preco nao influencia decisao de maquina; referencia CoinGecko flat $0.01 | LLM_PROXY_PRICE agora le PRICE_LLM_PROXY (default $0.005 — a isca fica) | NOVO /.well-known/agent-registration.json (ERC-8004 registration-v1: A2A+MCP+x402+OAS, x402Support, supportedTrust) — registrar no Identity Registry 0x8004A169...a432 na Base | FIX telemetria: pos-refund nao loga mais "paid" (double-log inflava calls; Agent402 e /receipts leem isso) | refund agora carrega recommended_next (cross-sell na falha — falha vira retencao) | billing LLM com backoff persistente em /data (strikes 6h->12h->18h->24h; o 429 diario do Gemini parava de gritar a cada boot; provider saudavel zera) | base: v48.10.2-REFUND
 if __name__ == "__main__":
     cli()
 else:
