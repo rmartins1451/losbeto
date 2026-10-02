@@ -440,6 +440,7 @@ BASE_PRICES = {
     # --- DISCOVERY ($0.01–0.03): commodities — preço de mercado, volume e trust ---
     "/fear-greed":       0.010,   # v48.10.3: piso $0.01 — taxa facilitator 33%→10%
     "/pyth-price":       0.010,   # v48.10.3: idem (CoinGecko cobra flat $0.01 — referência)
+    "/weather":          0.010,   # v48.17.0-RADAR: 8 IPs/7d pediam — produto novo
     "/trust-hash":       0.010,
     "/agent-market":     0.010,
     "/bootstrap-trust":  0.010,
@@ -583,6 +584,7 @@ ENDPOINT_DESC = {
 
     # ---- Discovery / commodities de dado ---------------------------------
     "/pyth-price":      "Real-time SOL/USD from the Pyth Network oracle with its confidence interval and publish slot. Sub-second freshness, straight from the on-chain price account.",
+    "/weather":         "Live weather for any city or lat/lon on Earth: WMO-decoded current conditions, next 24h hourly and 7-day daily forecast with precipitation probability, sunrise/sunset and wind — from Open-Meteo's fused national-model grid (ECMWF/NOAA/DWD), no API key on your side.",
     "/fear-greed":      "Is the crowd greedy or fearful right now? The Fear & Greed Index (0-100) at this exact instant, with classification — a point-in-time reading your model's training data cannot contain.",
     "/trust-hash":      "SHA-256 proof-of-data hash for audit trails: a verifiable cryptographic receipt of any Losbeto response, for agents that must prove what they were told and when.",
     "/agent-market":    "Machine-readable commercial map of this catalog: featured endpoints, cheapest calls, the free tier and the credit plans, so an agent can plan a budget in one request.",
@@ -707,6 +709,7 @@ ENDPOINT_TAGS = {
     "/sanctions":       ["Search", "Compliance"],
     "/agent-market":    ["AI", "Marketplace"],
     "/pyth-price":      ["Utility", "Oracle"],
+    "/weather":         ["Utility", "Weather"],
     "/market-brief":    ["AI", "Bundle", "Featured"],
     "/portfolio-copilot":["AI", "Bundle", "Featured"],
     "/launch-risk":     ["Trading", "Memecoin", "AI", "Featured"],
@@ -2690,6 +2693,25 @@ _LLM_BANDIT_ALPHA = float(os.environ.get("LLM_BANDIT_ALPHA", "0.15"))
 _LLM_BANDIT_PRIOR = 0.75
 
 
+def _llm_bandit_eps_eff() -> float:
+    """v48.17.0-RADAR: ε ADAPTATIVO — decai com a experiência acumulada:
+    ε_eff = max(0.02, ε0 / sqrt(1 + N/50)), N = pulls totais (ok+fail de
+    todos os provedores). No começo o roteador explora bastante para aprender
+    rápido quem é bom; depois de centenas de pulls converge para o piso de 2%
+    — menos chamadas desperdiçadas no provedor pior, sem NUNCA parar de
+    testar se um provedor em quarentena se recuperou. LLM_BANDIT_EPSILON=0
+    segue zerando tudo (modo determinístico, usado nos testes)."""
+    if _LLM_BANDIT_EPS <= 0:
+        return 0.0
+    try:
+        with _LLM_BANDIT_LOCK:
+            n = sum(int(s.get("ok", 0)) + int(s.get("fail", 0))
+                    for s in _LLM_BANDIT.values())
+        return max(0.02, _LLM_BANDIT_EPS / math.sqrt(1.0 + n / 50.0))
+    except Exception:
+        return _LLM_BANDIT_EPS
+
+
 def _llm_bandit_file() -> str:
     return os.path.join(os.path.dirname(DB_PATH), "llm_bandit.json")
 
@@ -2750,7 +2772,7 @@ def _llm_bandit_order(cands: List[str]) -> List[str]:
     if not _LLM_BANDIT_ON or len(cands) < 2:
         return cands
     try:
-        if random.random() < _LLM_BANDIT_EPS:
+        if random.random() < _llm_bandit_eps_eff():   # v48.17.0: ε decai com a experiência
             c = list(cands)
             random.shuffle(c)
             return c
@@ -3193,6 +3215,41 @@ def _ofac_sdn_text() -> str:
             pass
     threading.Thread(target=_ofac_download_bg, daemon=True).start()
     return ""
+
+
+# ---------------------------------------------------------------------------
+# v48.17.0-RADAR — helpers do /weather (produto pedido pelo radar de demanda:
+# 8 IPs/7d tomavam 404). WMO 4677 = tabela oficial de weather codes que a
+# Open-Meteo devolve; decodificar aqui evita que o cliente precise da tabela.
+# ---------------------------------------------------------------------------
+_WMO_CODES = {
+    0: "clear sky", 1: "mainly clear", 2: "partly cloudy", 3: "overcast",
+    45: "fog", 48: "depositing rime fog",
+    51: "light drizzle", 53: "drizzle", 55: "dense drizzle",
+    56: "light freezing drizzle", 57: "freezing drizzle",
+    61: "light rain", 63: "rain", 65: "heavy rain",
+    66: "light freezing rain", 67: "freezing rain",
+    71: "light snow", 73: "snow", 75: "heavy snow", 77: "snow grains",
+    80: "light showers", 81: "showers", 82: "violent showers",
+    85: "light snow showers", 86: "snow showers",
+    95: "thunderstorm", 96: "thunderstorm with light hail",
+    99: "thunderstorm with hail",
+}
+
+
+def _wmo_code(c) -> str:
+    try:
+        return _WMO_CODES.get(int(c), f"wmo code {c}")
+    except Exception:
+        return "unknown"
+
+
+def _ig(lst, i):
+    """Index-get tolerante: listas hourly/daily da API podem vir curtas."""
+    try:
+        return lst[i] if i < len(lst) else None
+    except Exception:
+        return None
 
 
 class Brain:
@@ -4377,6 +4434,123 @@ class Brain:
                     "ts": int(time.time()), "provider": f"Losbeto/{px['source']}"}
         except Exception as e:
             return {"symbol": symbol, "error": str(e), "ts": int(time.time())}
+
+    # ---------- v48.17.0-RADAR: WEATHER (demanda medida: 8 IPs/7d) ----------
+    @staticmethod
+    def weather():
+        """GET /weather?city=São Paulo  |  ?lat=-23.55&lon=-46.63 — $0.01.
+        Fonte: Open-Meteo (grade fundida de modelos nacionais — ECMWF/NOAA/
+        DWD etc. — sem chave de API, dado CC-BY 4.0). Sem parâmetro, cai na
+        cidade default (São Paulo) para o preview ?preview=1 nunca ficar
+        preso em warming_up."""
+        ts = int(time.time())
+        city = (request.args.get("city") or "").strip()[:80]
+        lat = (request.args.get("lat") or "").strip()[:16]
+        lon = (request.args.get("lon") or "").strip()[:16]
+        try:
+            if lat and lon:
+                flat, flon = float(lat), float(lon)
+                if not (-90.0 <= flat <= 90.0 and -180.0 <= flon <= 180.0):
+                    return {"error": "lat/lon out of range",
+                            "hint": "lat in [-90,90], lon in [-180,180]", "ts": ts}
+                label = f"{flat:.4f},{flon:.4f}"
+                tz_name = "auto"
+            else:
+                q = city or "São Paulo"
+                g = requests.get("https://geocoding-api.open-meteo.com/v1/search",
+                                 params={"name": q, "count": 1, "language": "en",
+                                         "format": "json"}, timeout=8)
+                results = (g.json().get("results") or []) if g.ok else []
+                if not results:
+                    return {"error": f"city '{q}' not found",
+                            "hint": "check the spelling, or use ?lat=..&lon=.. "
+                                    "for exact coordinates", "ts": ts}
+                top = results[0]
+                flat, flon = float(top["latitude"]), float(top["longitude"])
+                label = top.get("name") or q
+                if top.get("admin1"):
+                    label += f" ({top['admin1']})"
+                if top.get("country"):
+                    label += ", " + top["country"]
+                tz_name = top.get("timezone") or "auto"
+            w = requests.get("https://api.open-meteo.com/v1/forecast", params={
+                "latitude": flat, "longitude": flon,
+                "current": ("temperature_2m,relative_humidity_2m,"
+                            "apparent_temperature,precipitation,weather_code,"
+                            "cloud_cover,wind_speed_10m,wind_direction_10m,"
+                            "surface_pressure,is_day"),
+                "hourly": "temperature_2m,precipitation_probability,weather_code",
+                "daily": ("weather_code,temperature_2m_max,temperature_2m_min,"
+                          "precipitation_sum,precipitation_probability_max,"
+                          "sunrise,sunset,wind_speed_10m_max"),
+                "timezone": "auto", "forecast_days": 7,
+                "wind_speed_unit": "kmh"}, timeout=10)
+            if not w.ok:
+                raise RuntimeError(f"open-meteo HTTP {w.status_code}")
+            j = w.json()
+            cur = j.get("current") or {}
+            code = cur.get("weather_code")
+            hourly = j.get("hourly") or {}
+            h_times = hourly.get("time") or []
+            h_temp = hourly.get("temperature_2m") or []
+            h_prec = hourly.get("precipitation_probability") or []
+            h_code = hourly.get("weather_code") or []
+            now_iso = (cur.get("time") or "")[:13]
+            start = 0
+            for i, tt in enumerate(h_times):
+                if str(tt)[:13] >= now_iso:
+                    start = i
+                    break
+            next24 = [{"time": _ig(h_times, i),
+                       "temp_c": _ig(h_temp, i),
+                       "precip_prob_pct": _ig(h_prec, i),
+                       "condition": _wmo_code(_ig(h_code, i))}
+                      for i in range(start, min(start + 24, len(h_times)))]
+            daily = j.get("daily") or {}
+            d_time = daily.get("time") or []
+            d_code = daily.get("weather_code") or []
+            d_tmax = daily.get("temperature_2m_max") or []
+            d_tmin = daily.get("temperature_2m_min") or []
+            d_psum = daily.get("precipitation_sum") or []
+            d_pmax = daily.get("precipitation_probability_max") or []
+            d_rise = daily.get("sunrise") or []
+            d_set = daily.get("sunset") or []
+            d_wind = daily.get("wind_speed_10m_max") or []
+            next7 = [{"date": _ig(d_time, i),
+                      "condition": _wmo_code(_ig(d_code, i)),
+                      "temp_max_c": _ig(d_tmax, i),
+                      "temp_min_c": _ig(d_tmin, i),
+                      "precip_mm": _ig(d_psum, i),
+                      "precip_prob_max_pct": _ig(d_pmax, i),
+                      "sunrise": _ig(d_rise, i),
+                      "sunset": _ig(d_set, i),
+                      "wind_max_kmh": _ig(d_wind, i)}
+                     for i in range(len(d_time))]
+            return {"location": {"query": city or None, "resolved": label,
+                                 "latitude": flat, "longitude": flon,
+                                 "timezone": j.get("timezone") or tz_name},
+                    "current": {"temp_c": cur.get("temperature_2m"),
+                                "feels_like_c": cur.get("apparent_temperature"),
+                                "humidity_pct": cur.get("relative_humidity_2m"),
+                                "condition": _wmo_code(code),
+                                "wmo_code": code,
+                                "cloud_cover_pct": cur.get("cloud_cover"),
+                                "precip_mm": cur.get("precipitation"),
+                                "wind_kmh": cur.get("wind_speed_10m"),
+                                "wind_dir_deg": cur.get("wind_direction_10m"),
+                                "pressure_hpa": cur.get("surface_pressure"),
+                                "is_day": cur.get("is_day"),
+                                "observed_at": cur.get("time")},
+                    "next_24h": next24,
+                    "next_7d": next7,
+                    "units": {"temperature": "°C", "wind": "km/h",
+                              "precipitation": "mm", "pressure": "hPa"},
+                    "source": ("Open-Meteo — fused national weather model grid "
+                               "(ECMWF/NOAA/DWD); data CC-BY 4.0"),
+                    "provider": "Losbeto/Open-Meteo",
+                    "ts": ts, "version": VERSION}
+        except Exception as e:
+            return {"error": str(e)[:120], "source": "open-meteo", "ts": ts}
 
     # ---------- v24: GLOBAL MARKETS ----------
     @staticmethod
@@ -8365,6 +8539,7 @@ ENDPOINT_HANDLERS = {
     "/sanctions":       Brain.sanctions,
     "/agent-market":    Brain.agent_market,
     "/pyth-price":      Brain.pyth_price,
+    "/weather":         Brain.weather,
     "/market-brief":    Brain.market_brief,
     "/portfolio-copilot": Brain.portfolio_copilot,
     "/launch-sniper":   Brain.launch_sniper,
@@ -10174,6 +10349,7 @@ def health_providers():
                  "discover": _ML_EMB.get("mode") or ("semantic" if _ML_EMB_OK else "keyword"),
                  "forecast_symbols": _fc_health_symbols(),
                  "llm_bandit": _llm_bandit_stats(),  # v48.16.1: roteador ML visível p/ auditoria
+                 "llm_bandit_eps_eff": round(_llm_bandit_eps_eff(), 4),  # v48.17.0: ε adaptativo
                  "recommender_endpoints": len(_ALSO["map"]),
                  "local_llm": "on" if _LOCAL_LLM_ON else "off",
                  "public_status": "/ml",
@@ -12482,6 +12658,8 @@ _MCP_SYNONYMS = {
     "rug": ["rug", "rugpull", "scam", "honeypot", "safety", "risk"],
     "whale": ["whale", "whales", "large", "holder", "holders", "concentration"],
     "correlation": ["correlation", "correlated", "diversif", "hedge"],
+    "weather": ["weather", "forecast", "temperature", "rain", "precipitation",
+                "humidity", "wind", "climate", "sunny", "cloud", "storm"],
     "sentiment": ["sentiment", "fear", "greed", "mood", "bullish", "bearish"],
     "oracle": ["oracle", "consensus", "median", "pyth", "feed", "feeds"],
 }
@@ -15462,7 +15640,7 @@ def _fc_train(sym):
             return False
         hrs = [int(r[0]) for r in rows]
         p = _NP.array([r[1] for r in rows], dtype=float)
-        models, mapes = {}, {}
+        models, mapes, calib = {}, {}, {}
         for h in _FC_HORIZONS.values():
             X, Y, B = [], [], []
             for i in range(168, len(p) - h):
@@ -15485,12 +15663,26 @@ def _fc_train(sym):
             actual = B[cut:] * (1.0 + Y[cut:])
             mape = float(_NP.mean(_NP.abs(pred_price - actual) /
                                   _NP.maximum(actual, 1e-9)) * 100)
+            # v48.17.0-RADAR: CALIBRACAO CONFORMAL (split-conformal no proprio
+            # trecho de teste walk-forward). Mede-se o erro de intervalo
+            # E = max(lo - real, real - hi)/real e guarda-se o quantil 90 de E
+            # como raio relativo + a cobertura empirica real da banda p10-p90.
+            # O cliente deixa de confiar no escuro: ve o quanto a banda cobriu
+            # no passado recente e recebe uma banda calibrada ao lado da crua.
+            lo_p = B[cut:] * (1.0 + qs[0.1].predict(X[cut:]))
+            hi_p = B[cut:] * (1.0 + qs[0.9].predict(X[cut:]))
+            coverage = float(_NP.mean((actual >= lo_p) & (actual <= hi_p)))
+            nonconf = (_NP.maximum(lo_p - actual, actual - hi_p)
+                       / _NP.maximum(actual, 1e-9))
+            radius_rel = float(_NP.quantile(_NP.maximum(nonconf, 0.0), 0.9))
+            calib[h] = {"radius_rel": round(radius_rel, 5),
+                        "coverage80_empirical": round(coverage, 3)}
             models[h] = qs
             mapes[h] = round(mape, 2)
         if not models:
             return False
-        _FC_MODELS[sym] = {"models": models, "mape": mapes, "n": len(p),
-                           "trained_at": int(time.time())}
+        _FC_MODELS[sym] = {"models": models, "mape": mapes, "calib": calib,
+                           "n": len(p), "trained_at": int(time.time())}
         _FC_STATS["points"][sym] = len(p)
         try:
             _FC_DIR.mkdir(parents=True, exist_ok=True)
@@ -15552,13 +15744,25 @@ def _fc_predict(sym, h):
     q10 = min(q10, q50)   # cruzamento de quantis acontece — a banda nunca inverte
     q90 = max(q90, q50)
     last = float(p[-1])
+    # v48.17.0-RADAR: aplica a calibracao conformal aprendida no walk-forward.
+    # .joblib antigo (sem "calib") segue servindo a banda crua ate o retreino.
+    calib_h = (ent.get("calib") or {}).get(h) or {}
+    radius = float(calib_h.get("radius_rel") or 0.0)
+    coverage = calib_h.get("coverage80_empirical")
+    p10_px = max(last * (1 + q10), 0.0)
+    p50_px = max(last * (1 + q50), 0.0)
+    p90_px = max(last * (1 + q90), 0.0)
+    p10_cal = round(max(p10_px * (1.0 - radius), 0.0), 6) if radius > 0 else None
+    p90_cal = round(p90_px * (1.0 + radius), 6) if radius > 0 else None
     return {"symbol": sym,
             "horizon": f"{h}h", "horizon_hours": h,
             "last_price": round(last, 6),
             "last_price_age_seconds": age,
-            "forecast": {"p10": round(max(last * (1 + q10), 0.0), 6),
-                         "p50": round(max(last * (1 + q50), 0.0), 6),
-                         "p90": round(max(last * (1 + q90), 0.0), 6),
+            "forecast": {"p10": round(p10_px, 6),
+                         "p50": round(p50_px, 6),
+                         "p90": round(p90_px, 6),
+                         "p10_calibrated": p10_cal,
+                         "p90_calibrated": p90_cal,
                          "expected_move_pct": round(q50 * 100, 2),
                          "bandwidth_pct": round((q90 - q10) * 100, 2),
                          "direction": ("up" if q50 > 0.005 else
@@ -15567,7 +15771,13 @@ def _fc_predict(sym, h):
                       "inference": "on-node (no external AI API, no GPU)",
                       "trained_on_hours": ent["n"],
                       "trained_at": ent["trained_at"],
-                      "backtest_mape_pct_walkforward": ent["mape"].get(h)},
+                      "backtest_mape_pct_walkforward": ent["mape"].get(h),
+                      "interval_coverage80_empirical": coverage,
+                      "conformal_radius_rel": (radius or None),
+                      "calibration": ("split-conformal on the walk-forward test "
+                                      "slice" if radius > 0 else
+                                      "uncalibrated (pre-48.17 model file — "
+                                      "retrains within 6h)")},
             "disclaimer": ("Statistical forecast from a local model trained on this "
                            "node's own collected price history. The p10-p90 band is "
                            "model uncertainty, not a guarantee. Not financial advice."),
@@ -28362,6 +28572,10 @@ log.warning("🎯 v48.16.6-EXACT3 — checkout Phantom: tx Solana com EXATAMENTE
             "smart_wallet_program_not_allowed) · vigia da camada 7: ATA de USDC "
             "do payTo exposta em /health/providers (sol_dest_ata)")
 _sol_dest_ata_status()  # dispara a 1ª checagem da ATA em background (daemon)
+log.warning("📡 v48.17.0-RADAR — radar virou produto: /weather (8 ip/7d) · "
+            "/auth.json · /app.js (mini-SDK) | ML: bandit com ε adaptativo "
+            "(explora menos conforme aprende) + /forecast com calibração "
+            "conformal (cobertura empírica da banda publicada)")
 
 
 # --- v48.5.0-FUNIL: /blog/ e /login — gaps medidos pelo radar ---------------
@@ -28593,7 +28807,102 @@ def config_json():
     return r
 
 
-VERSION = "48.16.6-EXACT3"  # v48.16.6-EXACT3: FIX DA 6a CAMADA do checkout Phantom — a tx Solana volta a ter EXATAMENTE 3 instrucoes [SetComputeUnitLimit(30000), SetComputeUnitPrice(1000), TransferChecked], sem o Memo adicionado na 48.16.5. Prova em producao (logs Railway 02/10 12:08:48/12:12:00 UTC): invalid_exact_svm_smart_wallet_program_not_allowed apontando Tokenkeg — nome ENGANOSO; a matriz de conformidade publica dos facilitadores mapeia extra_instruction => smart_wallet_program_not_allowed ("the real cause is extra instruction present"; a tx de pagamento deve conter limit -> price -> transferChecked "and nothing else"). A spec §3.2 pede Memo, mas ela descreve o layout maximo (3-7 instrucoes); a VERIFICACAO ESTATICA path 1 do facilitador e a autoridade de facto e so aceita 3. ixMemo removido; comentario no codigo documenta a armadilha p/ ninguem readicionar. (2) VIGIA DA CAMADA 7 server-side: _sol_ata_of deriva a ATA de USDC do payTo (PDA ed25519 puro, sem dependencia nova) e /health/providers expoe "sol_dest_ata" {ata, exists, balance} com refresh em background (TTL 6h, nunca bloqueia, nunca derruba premium_ready) — a exigencia "ATA de destino pre-existente" dos facilitadores deixa de ser rejeicao silenciosa; se exists=False, a correcao e 1 envio comum de USDC ao payTo (tx separada, fora do fluxo x402) | base: v48.16.5-FRESHPAY  # v48.16.5-FRESHPAY: (1) HANDSHAKE DE VERSAO no checkout — a pagina carrega __PAY_VERSION__ e, ANTES de assinar (Base ou Solana), confere /health/providers: se o servidor subiu versao nova, ela se recarrega sozinha em vez de assinar com JS defasado (a causa REAL dos testes falhos de 02/10 00:07 e 07:45 BRT — abas abertas antes dos deploys 48.16.2/48.16.4; o no-store da 48.16.3 so protege carregamentos futuros). (2) Layout SVM completo da spec x402 §3.1 path 1: SetComputeUnitLimit(30k — cabe em teto de politica de 40k reportado, default 400k) -> SetComputeUnitPrice(1000 microlamports — dentro do teto 5 lamports/CU e de minimos comuns 1000; ~30 lamports de prioridade pagos PELO FACILITADOR) -> TransferChecked -> Memo(nonce 16B hex — spec EXIGE memo p/ unicidade; Phantom pode injetar ate 3 Lighthouse depois, layout segue <=7 instrucoes) | base: v48.16.4-SVMFIX  # v48.16.4-SVMFIX: /pay Phantom agora monta a transacao na ordem EXIGIDA pela spec x402 SVM e pelo PayAI — SetComputeUnitLimit(200k) -> SetComputeUnitPrice(1 microlamport) -> TransferChecked (spec: "MUST contain 3 to 7 instructions in this order: Compute Budget Set Compute Unit Limit; Set Compute Unit Price; SPL TransferChecked"); sem as duas ComputeBudget o verify devolvia invalid_exact_svm_payload_transaction_instructions_compute_limit_instruction (log Railway 02/10 00:47:33 UTC). Instrucoes hand-rolled no programa ComputeBudget111111111111111111111111111111 — zero dependencia de versao do web3.js | base: v48.16.3-NOCACHE  # v48.16.3-NOCACHE: /pay responde Cache-Control: no-store — pagina de checkout nunca mais envelhece no navegador (causa do teste de 01/10 20:16 BRT: aba aberta antes do deploy rodou o JS ANTIGO sem "accepted"; com no-store todo carregamento puxa o JS atual e o pagamento nao morre por codigo defasado) | base: v48.16.2-PHANTOMFIX  # v48.16.2-PHANTOMFIX: (1) FIX DEFINITIVO Phantom/Solana — o X-PAYMENT montado no /pay NAO levava o campo "accepted" (exigido pelo schema v2 do PayAI: verify 400 invalid_payload "accepted: expected object, received undefined", log Railway 01/10 21:43:56) -> o fallback on-chain tratava o BLOB base64 da tx como ASSINATURA -> getTransaction(lixo) -> "tx-not-found" + 15s de retries (o erro que o comprador via). Agora accepted:SOL_ACCEPT, espelhando o fluxo Base (provado). (2) GUARDA no fallback Solana de _verify_payment: tx_sig que nao parece assinatura base58 (blob v2, txid zerado porque o feePayer e o facilitator) pula o lookup impossivel com motivo claro — sem queimar 15s nem mentir "tx-not-found". (3) /api/claim-transfer BI-CHAIN: aceita hash 0x (Base) OU assinatura base58 (Solana) — verificacao on-chain direta via SOL.verify_payment, anti-replay atomico, tolerancia 97%, retry curto p/ lag de RPC; cartao manual do /pay mostra os DOIS payTos. Rail Solana INDEPENDENTE de facilitator (Phantom send, Binance Web3, ate saque de exchange viram venda). (4) erros do /pay Solana amigaveis + destaque automatico do cartao manual quando o facilitator falha. | base: v48.16.1-OBSERVE  # v48.16.1-OBSERVE: /health/providers passa a expor "llm_bandit" (recompensa/ok/fail/lat por provedor, aprendida pelo roteador e-greedy da 48.15) — antes as stats so apareciam em /llm/status; observabilidade pedida no indexar v4.3 | base: v48.16.0-SETTLE  # v48.16.0-SETTLE: (1) HOTFIX CRITICO /pay Phantom — "Error: bh is not defined": a v48.15.0 moveu const bh para dentro do bloco de fallback mas recentBlockhash continuou bh.blockhash (ReferenceError em runtime; node --check nao pega). Agora recentBlockhash: blockhash. (2) SOLUCAO DEFINITIVA p/ smart wallets (x402#623): NOVO POST /api/claim-transfer — pagamento por TRANSFERENCIA DIRETA de USDC na Base (sem assinatura EIP-3009/1271: transfer() funciona de Coinbase Smart Wallet, Binance Web3, passkey e ate saque de exchange): verificacao on-chain do receipt (status, contrato USDC, evento Transfer->payTo, valor>=97% da tabela, >=2 confirmacoes, anti-replay atomico, replay devolvido em falha transitoria) e entrega do conteudo na hora; /pay ganha o cartao "Signature rejected? Pay by plain transfer" com destaque automatico quando smart wallet detectada. (3) CROSS-SELL no checkout: "Agents also bought" no /pay alimentado pelo recomendador de co-compra real. | base: v48.15.0-BANDIT  # v48.15.0-BANDIT: (1) ROTEADOR DE LLM COM BANDIT ε-GREEDY persistido em /data (llm_bandit.json): recompensa = sucesso x fator de latencia, EWMA, ε=10% exploracao, ordena cada camada do _llm_chain pelo que APRENDEU em producao — provedor lento/falhando desce na fila sozinho e volta quando se recupera; stats visiveis em llm_health_report; LLM_ORDER e LLM_BANDIT=0 seguem como override. (2) /api/sol-usdc-balance — saldo USDC + blockhash Solana SERVER-SIDE (gratis, cache 8s, 30/min/IP): o Railway enxerga a rede Solana melhor que o browser do comprador; /pay consulta o servidor primeiro e so cai no multi-RPC do browser (ankr->drpc, ankr virou 403 sem chave) se o servidor nao responder — fim do falso "Could not reach the Solana network". (3) Warmer orientado por DEMANDA: _demand_rank ordena o aquecimento pelos probes+previews reais do ledger — preview fresco primeiro onde os avaliadores batem. (4) RSL (Really Simple Licensing): robots.txt ganha diretiva License -> /.well-known/rsl.xml com termos pay-per-crawl apontando para o catalogo x402 — alinhamento com o padrao que Reddit/Yahoo/Fastly adotaram p/ licenciar conteudo a crawlers de IA. | base: v48.14.3-CHECKOUT  # v48.14.3-CHECKOUT: (1) quota 429 do Google e POR MODELO — _try_gemini bane o modelo sem quota e troca para o proximo preferido NA MESMA chamada (ate 3); quarentena de provedor so quando esgotam. (2) /sec-filing envia User-Agent identificado (SEC 403 "undeclared" -> 200 JSON). | base: v48.14.1-HOTFIX: Pyth Hermes passou a EXIGIR API key no upgrade Pyth Core de 26/ago/2026 (401 sem chave — derrubou /pyth-price e o coletor do /forecast) — _pyth_latest usa o endpoint novo pyth.dourolabs.app/hermes com Bearer quando PYTH_API_KEY estiver no Railway + fallback CoinGecko simple/price (reusa COINGECKO_KEY) em /pyth-price, _oracle_pyth e _fc_collect — o coletor do ML nunca mais morre em silencio; self-heal do seed agora TREINA o simbolo recem-semeado na hora (antes: /forecast ficava 503 ate o tick de 6h) | base: v48.14.0-MONETIZE: (1) MPP tempo/charge REAL push-mode — challenges method="tempo" (USDC.e + pathUSD, chainId 4217) em TODO 402 e verificacao on-chain do credential Authorization: Payment (receipt TIP-20 Transfer: valor/destino/moeda + anti-replay atomico + Payment-Receipt) — captura os saldos AgentCash que nascem na Tempo; sem Stripe, sem chave privada no servidor; (2) NOVO /ecosystem-pulse $0.05 — a inteligencia dos 64k probes/dia como produto: top sondados com heat score, tendencias 7d-vs-7d (z-score Poisson), IPs-agente unicos, share de monitores QoS, clusters de demanda emergente; (3) price-elasticity advisor semanal — funil probes->previews->vendas por endpoint vira sugestao de PRECO DE TABELA global (nunca por carteira) no Telegram; PRICE_AUTO=1 aplica com trava +-30%/semana persistida em /data (env do operador sempre vence); (4) radar auto-atendimento com fallback SEMANTICO — embeddings (multilingue se preciso) casam 404 pelo significado quando o lexical falha, limiar 0.72, mesmas travas de seguranca; (5) /forecast seed auto-recupera a cada 30min ate todos os 8 simbolos terem backfill (429 de IP compartilhado nao exige mais redeploy); (6) /health expoe mpp_tempo + modo do advisor | base: v48.13.0-INTEL  # v48.13.0-INTEL: SEGUNDA CAMADA DE IA LOCAL — (1) NOVO /forecast $0.05: previsao p10/p50/p90 com HistGradientBoosting quantilico treinado NO HISTORICO QUE O PROPRIO NODE COLETA (Pyth a cada 10min + backfill CoinGecko 90d, 8 simbolos, 4 horizontes), MAPE de walk-forward publicado em toda resposta; sem historico = 503 e NAO cobra; (2) recomendador agents_also_bought por co-ocorrencia real de pagadores — cross-sell dentro do proprio 402 + /recommend gratis; (3) lead scoring SEMANTICO dos previews (embedding da intencao x catalogo premium) -> alerta de lead quente no Telegram; (4) clustering semanal dos 404s por significado (Agglomerative cosine sobre embeddings) -> oportunidades de produto em /ml + digest; (5) NOVO /ml publico: transparencia da camada de IA local; (6) /discover com reranker cross-encoder (ms-marco-MiniLM-L-6, 80MB ONNX) + modo MULTILINGUE sob demanda (paraphrase-MiniLM-L12: PT/ES/ZH acham o catalogo em ingles); (7) LLM LOCAL de ultimo recurso (LOCAL_LLM=1, llama-cpp-python + Qwen3-0.6B GGUF ~480MB em /data): se TODOS os provedores externos cairem, /llm responde com o modelo da casa em vez de 503 — OFF por padrao = custo zero; (8) detector de anomalias ganha severidade (volume puro -> log; comprador/receita -> Telegram) — fim do apito de hora em hora; (9) /live rotula scanner_noise como 'filtered noise' | requirements INALTERADOS (tudo roda sobre sklearn/fastembed ja instalados; llama-cpp-python e OPCIONAL e so e necessario com LOCAL_LLM=1) | base: v48.12.0-ML: camada de machine learning embarcada treinada nos dados do PROPRIO node (60k+ probes + ledger) — (1) classificador de demanda GradientBoosting com auto-rotulagem pelas regras atuais e retreino diario: pega scanner que o regex nunca viu (conf>=0.85 rebaixa new_product->scanner_noise) e anexa label+confianca ao painel/alertas; (2) detector de anomalias IsolationForest sobre agregados horarios de requests/revenue (min 72h): surto de comprador ou ataque vira log + Telegram (1/6h) + /data/ml_anomalies.json; (3) NOVO /discover gratis: busca semantica do catalogo por similaridade vetorial (MiniLM ONNX via fastembed, cache em /data) com fallback palavra-chave — funil de descoberta p/ agentes | tudo import-guarded (sem sklearn/fastembed o node roda como antes) + ML_DISABLED=1 | deps novas p/ requirements: scikit-learn fastembed | base: v48.11.0-GLOBAL: Moonshot/Kimi + OpenRouter como provedores premium DORMENTES (env-gated: sem chave = zero custo; ativar = MOONSHOT_API_KEY/OPENROUTER_API_KEY no Railway) | perfis de roteamento estilo ClawRouter: /llm?profile=eco|fast|premium e model=kimi|deepseek|eco|premium no /v1/chat/completions | NOVO /global-rates ($0.03): taxas de Fed/ECB/PBoC/BOJ/CBR/BCB numa chamada — BIS WS_CBPOL + cross-check ao vivo FRED/ECB-SDW/BCB-SGS, diferencial de carry vs Fed; nenhum concorrente x402 tem | rails Polygon (eip155:137) + Arbitrum (eip155:42161) PRONTAS, settle pelo mesmo facilitador CDP, env-gated OFF (X402_POLYGON=1/X402_ARBITRUM=1 so apos confirmar credito na Binance) | _SCAN_NOISE cobre /env.txt /env.js /settings.json /config/*.yml (scanner de credencial nao vira mais produto novo no radar) | _cap500 default 480->390 (x402lint P8: 24 descriptions na zona de risco; caminho p/ 100/100) | base: v48.10.3-REFINE: reprice consolidado no codigo (fonte unica, sem depender de env) — piso $0.01 em 12 endpoints de $0.003-0.008 (fear-greed, pyth-price, trust-hash, agent-market, bootstrap-trust, regime, mempool, web-search, ai-news + os 4 primitivos BR pix/bizdays/doc) e /br-archive $0.05->$0.09: a Coinbase cobra $0.001/settle apos 1k/mes (fazemos ~8k) — a $0.003 a taxa efetiva era 33%, a $0.01 cai a 10%; clientes x402 tem cap default 0.1 USDC, abaixo disso preco nao influencia decisao de maquina; referencia CoinGecko flat $0.01 | LLM_PROXY_PRICE agora le PRICE_LLM_PROXY (default $0.005 — a isca fica) | NOVO /.well-known/agent-registration.json (ERC-8004 registration-v1: A2A+MCP+x402+OAS, x402Support, supportedTrust) — registrar no Identity Registry 0x8004A169...a432 na Base | FIX telemetria: pos-refund nao loga mais "paid" (double-log inflava calls; Agent402 e /receipts leem isso) | refund agora carrega recommended_next (cross-sell na falha — falha vira retencao) | billing LLM com backoff persistente em /data (strikes 6h->12h->18h->24h; o 429 diario do Gemini parava de gritar a cada boot; provider saudavel zera) | base: v48.10.2-REFUND
+# ---------------------------------------------------------------------------
+# v48.17.0-RADAR — /auth.json (demanda medida: 8 IPs/7d tomavam 404). Agentes
+# seguem o playbook "procurar o descriptor de auth na raiz" (estilo OAuth
+# discovery). Num node x402 a resposta honesta: NÃO HÁ login — o pagamento É
+# a credencial. Reusa _register_doc() para a verdade ser UMA só em /login,
+# /register, /config.js e aqui — nunca dessincroniza. Grátis: descoberta não
+# se vende, ela vende.
+# ---------------------------------------------------------------------------
+@app.route("/auth.json")
+def auth_json_descriptor():
+    doc = _register_doc()
+    doc["descriptor"] = "auth.json"
+    doc["oauth"] = "not supported — x402 payment is the credential"
+    r = jsonify(doc)
+    r.headers["Cache-Control"] = "public, max-age=300"
+    return r
+
+
+# ---------------------------------------------------------------------------
+# v48.17.0-RADAR — /app.js (demanda medida: 8 IPs/7d). Avaliadores e agentes
+# procuram o bundle JS do serviço na raiz (o mesmo instinto de /config.js).
+# Entregamos um mini-SDK REAL, zero dependências, que roda em browser e Node
+# 18+: catalog/preview/payUrl/welcome/health/fetchPaid/creditsUrl. Grátis de
+# propósito — SDK é porta de entrada, não produto. __VERSION__ é resolvido a
+# cada render (5min de cache), então o SDK nunca mente a versão do nó.
+# ---------------------------------------------------------------------------
+_APP_JS = """/* ==========================================================================
+   Losbeto mini-SDK (node v__VERSION__) — https://api.losbeto.xyz
+   Zero-dependency client for the x402 payment node. Browser and Node 18+.
+
+   <script src="https://api.losbeto.xyz/app.js"></script>
+
+   const cat  = await Losbeto.catalog();                 // endpoints + prices
+   const peek = await Losbeto.preview('/pyth-price');    // free delayed sample
+   location.href = Losbeto.payUrl('/pyth-price', {symbol: 'SOL'});  // humans
+   const d = await Losbeto.fetchPaid('/pyth-price', xpaymentHeader); // agents
+   ========================================================================== */
+(function (global) {
+  "use strict";
+  var BASE = "https://api.losbeto.xyz";
+  function _j(r) { return r.json(); }
+  function _qs(params) {
+    if (!params) { return ""; }
+    var s = Object.keys(params).map(function (k) {
+      return encodeURIComponent(k) + "=" + encodeURIComponent(params[k]);
+    }).join("&");
+    return s ? "?" + s : "";
+  }
+  var Losbeto = {
+    base: BASE,
+    nodeVersion: "__VERSION__",
+    /* Full catalog: {endpoint: {price_usd, description}} — always fresh. */
+    catalog: function () { return fetch(BASE + "/get-pricing").then(_j); },
+    /* FREE real sample, ~15min delayed, no wallet: ?preview=1 on any path. */
+    preview: function (endpoint, params) {
+      var q = _qs(params);
+      return fetch(BASE + endpoint + q + (q ? "&" : "?") + "preview=1").then(_j);
+    },
+    /* Human checkout (MetaMask/Coinbase Wallet on Base, Phantom on Solana —
+       the facilitator pays the Solana gas; Pix card on plans >= $0.99). */
+    payUrl: function (endpoint, params) {
+      return BASE + "/pay" + endpoint + _qs(params);
+    },
+    /* One real-time call free for evaluation (once per wallet/IP). */
+    welcome: function () { return fetch(BASE + "/welcome").then(_j); },
+    /* Public node health: data sources, AI providers, ML bandit, Solana ATA. */
+    health: function () { return fetch(BASE + "/health/providers").then(_j); },
+    /* Agent flow: GET the endpoint, read the HTTP 402 {accepts}, pay it with
+       any x402 client (x402-fetch, x402-axios, agentcash), then retry with
+       the X-PAYMENT header it produced. Without the header you get the raw
+       402 challenge back — which is itself the price quote. */
+    fetchPaid: function (endpoint, xpaymentHeader, params) {
+      var headers = { "Accept": "application/json" };
+      if (xpaymentHeader) { headers["X-PAYMENT"] = xpaymentHeader; }
+      return fetch(BASE + endpoint + _qs(params), { headers: headers }).then(_j);
+    },
+    /* Credits: one on-chain payment -> reusable X-API-Key, ~1ms per call. */
+    creditsUrl: function () { return BASE + "/pay/buy-credits"; },
+    /* MCP transport for agent frameworks: POST JSON-RPC 2.0 here. */
+    mcpUrl: function () { return BASE + "/mcp"; }
+  };
+  global.Losbeto = Losbeto;
+})(typeof window !== "undefined" ? window : globalThis);
+"""
+
+
+@app.route("/app.js")
+def app_js_sdk():
+    body = _APP_JS.replace("__VERSION__", VERSION)
+    r = app.response_class(body, mimetype="application/javascript")
+    r.headers["Cache-Control"] = "public, max-age=300"
+    return r
+
+
+
+VERSION = "48.17.0-RADAR"  # v48.17.0-RADAR: O RADAR VIRO PRODUTO + ML MAIS INTELIGENTE — (1) /weather $0.01: demanda MEDIDA (8 IPs/7d tomavam 404) — clima real p/ qualquer cidade ou lat/lon via Open-Meteo (grade fundida ECMWF/NOAA/DWD, sem chave): condicoes atuais WMO-decodificadas, 24h horarias e 7d diarios com probabilidade de precipitacao, nascer/por do sol e vento; cidade default Sao Paulo p/ o preview universal nunca travar; sinonimos weather->catalogo no search MCP | (2) /auth.json (8 IPs/7d): descriptor de auth machine-readable que reusa _register_doc() — uma verdade so em /login, /register, /config.js e aqui | (3) /app.js (8 IPs/7d): mini-SDK REAL zero-dependencias (browser+Node 18+): catalog/preview/payUrl/welcome/health/fetchPaid/creditsUrl/mcpUrl, versao do no embutida a cada render | (4) BANDIT ε ADAPTATIVO: exploracao decai com a experiencia (ε0/sqrt(1+N/50), piso 2%) — roteador aprende rapido no inicio e para de desperdicar calls quando ja sabe quem e bom; LLM_BANDIT_EPSILON=0 segue deterministico; eps_efetivo exposto em /health/providers (llm_bandit_eps_eff) | (5) FORECAST COM CALIBRACAO CONFORMAL: split-conformal sobre o proprio teste walk-forward — publica interval_coverage80_empirical (quanto a banda p10-p90 REALMENTE cobriu) + banda calibrada p10/p90_calibrated ao lado da crua; joblib antigo sem "calib" segue servindo ate o retreino de 6h | base: v48.16.6-EXACT3  # v48.16.6-EXACT3: FIX DA 6a CAMADA do checkout Phantom — a tx Solana volta a ter EXATAMENTE 3 instrucoes [SetComputeUnitLimit(30000), SetComputeUnitPrice(1000), TransferChecked], sem o Memo adicionado na 48.16.5. Prova em producao (logs Railway 02/10 12:08:48/12:12:00 UTC): invalid_exact_svm_smart_wallet_program_not_allowed apontando Tokenkeg — nome ENGANOSO; a matriz de conformidade publica dos facilitadores mapeia extra_instruction => smart_wallet_program_not_allowed ("the real cause is extra instruction present"; a tx de pagamento deve conter limit -> price -> transferChecked "and nothing else"). A spec §3.2 pede Memo, mas ela descreve o layout maximo (3-7 instrucoes); a VERIFICACAO ESTATICA path 1 do facilitador e a autoridade de facto e so aceita 3. ixMemo removido; comentario no codigo documenta a armadilha p/ ninguem readicionar. (2) VIGIA DA CAMADA 7 server-side: _sol_ata_of deriva a ATA de USDC do payTo (PDA ed25519 puro, sem dependencia nova) e /health/providers expoe "sol_dest_ata" {ata, exists, balance} com refresh em background (TTL 6h, nunca bloqueia, nunca derruba premium_ready) — a exigencia "ATA de destino pre-existente" dos facilitadores deixa de ser rejeicao silenciosa; se exists=False, a correcao e 1 envio comum de USDC ao payTo (tx separada, fora do fluxo x402) | base: v48.16.5-FRESHPAY  # v48.16.5-FRESHPAY: (1) HANDSHAKE DE VERSAO no checkout — a pagina carrega __PAY_VERSION__ e, ANTES de assinar (Base ou Solana), confere /health/providers: se o servidor subiu versao nova, ela se recarrega sozinha em vez de assinar com JS defasado (a causa REAL dos testes falhos de 02/10 00:07 e 07:45 BRT — abas abertas antes dos deploys 48.16.2/48.16.4; o no-store da 48.16.3 so protege carregamentos futuros). (2) Layout SVM completo da spec x402 §3.1 path 1: SetComputeUnitLimit(30k — cabe em teto de politica de 40k reportado, default 400k) -> SetComputeUnitPrice(1000 microlamports — dentro do teto 5 lamports/CU e de minimos comuns 1000; ~30 lamports de prioridade pagos PELO FACILITADOR) -> TransferChecked -> Memo(nonce 16B hex — spec EXIGE memo p/ unicidade; Phantom pode injetar ate 3 Lighthouse depois, layout segue <=7 instrucoes) | base: v48.16.4-SVMFIX  # v48.16.4-SVMFIX: /pay Phantom agora monta a transacao na ordem EXIGIDA pela spec x402 SVM e pelo PayAI — SetComputeUnitLimit(200k) -> SetComputeUnitPrice(1 microlamport) -> TransferChecked (spec: "MUST contain 3 to 7 instructions in this order: Compute Budget Set Compute Unit Limit; Set Compute Unit Price; SPL TransferChecked"); sem as duas ComputeBudget o verify devolvia invalid_exact_svm_payload_transaction_instructions_compute_limit_instruction (log Railway 02/10 00:47:33 UTC). Instrucoes hand-rolled no programa ComputeBudget111111111111111111111111111111 — zero dependencia de versao do web3.js | base: v48.16.3-NOCACHE  # v48.16.3-NOCACHE: /pay responde Cache-Control: no-store — pagina de checkout nunca mais envelhece no navegador (causa do teste de 01/10 20:16 BRT: aba aberta antes do deploy rodou o JS ANTIGO sem "accepted"; com no-store todo carregamento puxa o JS atual e o pagamento nao morre por codigo defasado) | base: v48.16.2-PHANTOMFIX  # v48.16.2-PHANTOMFIX: (1) FIX DEFINITIVO Phantom/Solana — o X-PAYMENT montado no /pay NAO levava o campo "accepted" (exigido pelo schema v2 do PayAI: verify 400 invalid_payload "accepted: expected object, received undefined", log Railway 01/10 21:43:56) -> o fallback on-chain tratava o BLOB base64 da tx como ASSINATURA -> getTransaction(lixo) -> "tx-not-found" + 15s de retries (o erro que o comprador via). Agora accepted:SOL_ACCEPT, espelhando o fluxo Base (provado). (2) GUARDA no fallback Solana de _verify_payment: tx_sig que nao parece assinatura base58 (blob v2, txid zerado porque o feePayer e o facilitator) pula o lookup impossivel com motivo claro — sem queimar 15s nem mentir "tx-not-found". (3) /api/claim-transfer BI-CHAIN: aceita hash 0x (Base) OU assinatura base58 (Solana) — verificacao on-chain direta via SOL.verify_payment, anti-replay atomico, tolerancia 97%, retry curto p/ lag de RPC; cartao manual do /pay mostra os DOIS payTos. Rail Solana INDEPENDENTE de facilitator (Phantom send, Binance Web3, ate saque de exchange viram venda). (4) erros do /pay Solana amigaveis + destaque automatico do cartao manual quando o facilitator falha. | base: v48.16.1-OBSERVE  # v48.16.1-OBSERVE: /health/providers passa a expor "llm_bandit" (recompensa/ok/fail/lat por provedor, aprendida pelo roteador e-greedy da 48.15) — antes as stats so apareciam em /llm/status; observabilidade pedida no indexar v4.3 | base: v48.16.0-SETTLE  # v48.16.0-SETTLE: (1) HOTFIX CRITICO /pay Phantom — "Error: bh is not defined": a v48.15.0 moveu const bh para dentro do bloco de fallback mas recentBlockhash continuou bh.blockhash (ReferenceError em runtime; node --check nao pega). Agora recentBlockhash: blockhash. (2) SOLUCAO DEFINITIVA p/ smart wallets (x402#623): NOVO POST /api/claim-transfer — pagamento por TRANSFERENCIA DIRETA de USDC na Base (sem assinatura EIP-3009/1271: transfer() funciona de Coinbase Smart Wallet, Binance Web3, passkey e ate saque de exchange): verificacao on-chain do receipt (status, contrato USDC, evento Transfer->payTo, valor>=97% da tabela, >=2 confirmacoes, anti-replay atomico, replay devolvido em falha transitoria) e entrega do conteudo na hora; /pay ganha o cartao "Signature rejected? Pay by plain transfer" com destaque automatico quando smart wallet detectada. (3) CROSS-SELL no checkout: "Agents also bought" no /pay alimentado pelo recomendador de co-compra real. | base: v48.15.0-BANDIT  # v48.15.0-BANDIT: (1) ROTEADOR DE LLM COM BANDIT ε-GREEDY persistido em /data (llm_bandit.json): recompensa = sucesso x fator de latencia, EWMA, ε=10% exploracao, ordena cada camada do _llm_chain pelo que APRENDEU em producao — provedor lento/falhando desce na fila sozinho e volta quando se recupera; stats visiveis em llm_health_report; LLM_ORDER e LLM_BANDIT=0 seguem como override. (2) /api/sol-usdc-balance — saldo USDC + blockhash Solana SERVER-SIDE (gratis, cache 8s, 30/min/IP): o Railway enxerga a rede Solana melhor que o browser do comprador; /pay consulta o servidor primeiro e so cai no multi-RPC do browser (ankr->drpc, ankr virou 403 sem chave) se o servidor nao responder — fim do falso "Could not reach the Solana network". (3) Warmer orientado por DEMANDA: _demand_rank ordena o aquecimento pelos probes+previews reais do ledger — preview fresco primeiro onde os avaliadores batem. (4) RSL (Really Simple Licensing): robots.txt ganha diretiva License -> /.well-known/rsl.xml com termos pay-per-crawl apontando para o catalogo x402 — alinhamento com o padrao que Reddit/Yahoo/Fastly adotaram p/ licenciar conteudo a crawlers de IA. | base: v48.14.3-CHECKOUT  # v48.14.3-CHECKOUT: (1) quota 429 do Google e POR MODELO — _try_gemini bane o modelo sem quota e troca para o proximo preferido NA MESMA chamada (ate 3); quarentena de provedor so quando esgotam. (2) /sec-filing envia User-Agent identificado (SEC 403 "undeclared" -> 200 JSON). | base: v48.14.1-HOTFIX: Pyth Hermes passou a EXIGIR API key no upgrade Pyth Core de 26/ago/2026 (401 sem chave — derrubou /pyth-price e o coletor do /forecast) — _pyth_latest usa o endpoint novo pyth.dourolabs.app/hermes com Bearer quando PYTH_API_KEY estiver no Railway + fallback CoinGecko simple/price (reusa COINGECKO_KEY) em /pyth-price, _oracle_pyth e _fc_collect — o coletor do ML nunca mais morre em silencio; self-heal do seed agora TREINA o simbolo recem-semeado na hora (antes: /forecast ficava 503 ate o tick de 6h) | base: v48.14.0-MONETIZE: (1) MPP tempo/charge REAL push-mode — challenges method="tempo" (USDC.e + pathUSD, chainId 4217) em TODO 402 e verificacao on-chain do credential Authorization: Payment (receipt TIP-20 Transfer: valor/destino/moeda + anti-replay atomico + Payment-Receipt) — captura os saldos AgentCash que nascem na Tempo; sem Stripe, sem chave privada no servidor; (2) NOVO /ecosystem-pulse $0.05 — a inteligencia dos 64k probes/dia como produto: top sondados com heat score, tendencias 7d-vs-7d (z-score Poisson), IPs-agente unicos, share de monitores QoS, clusters de demanda emergente; (3) price-elasticity advisor semanal — funil probes->previews->vendas por endpoint vira sugestao de PRECO DE TABELA global (nunca por carteira) no Telegram; PRICE_AUTO=1 aplica com trava +-30%/semana persistida em /data (env do operador sempre vence); (4) radar auto-atendimento com fallback SEMANTICO — embeddings (multilingue se preciso) casam 404 pelo significado quando o lexical falha, limiar 0.72, mesmas travas de seguranca; (5) /forecast seed auto-recupera a cada 30min ate todos os 8 simbolos terem backfill (429 de IP compartilhado nao exige mais redeploy); (6) /health expoe mpp_tempo + modo do advisor | base: v48.13.0-INTEL  # v48.13.0-INTEL: SEGUNDA CAMADA DE IA LOCAL — (1) NOVO /forecast $0.05: previsao p10/p50/p90 com HistGradientBoosting quantilico treinado NO HISTORICO QUE O PROPRIO NODE COLETA (Pyth a cada 10min + backfill CoinGecko 90d, 8 simbolos, 4 horizontes), MAPE de walk-forward publicado em toda resposta; sem historico = 503 e NAO cobra; (2) recomendador agents_also_bought por co-ocorrencia real de pagadores — cross-sell dentro do proprio 402 + /recommend gratis; (3) lead scoring SEMANTICO dos previews (embedding da intencao x catalogo premium) -> alerta de lead quente no Telegram; (4) clustering semanal dos 404s por significado (Agglomerative cosine sobre embeddings) -> oportunidades de produto em /ml + digest; (5) NOVO /ml publico: transparencia da camada de IA local; (6) /discover com reranker cross-encoder (ms-marco-MiniLM-L-6, 80MB ONNX) + modo MULTILINGUE sob demanda (paraphrase-MiniLM-L12: PT/ES/ZH acham o catalogo em ingles); (7) LLM LOCAL de ultimo recurso (LOCAL_LLM=1, llama-cpp-python + Qwen3-0.6B GGUF ~480MB em /data): se TODOS os provedores externos cairem, /llm responde com o modelo da casa em vez de 503 — OFF por padrao = custo zero; (8) detector de anomalias ganha severidade (volume puro -> log; comprador/receita -> Telegram) — fim do apito de hora em hora; (9) /live rotula scanner_noise como 'filtered noise' | requirements INALTERADOS (tudo roda sobre sklearn/fastembed ja instalados; llama-cpp-python e OPCIONAL e so e necessario com LOCAL_LLM=1) | base: v48.12.0-ML: camada de machine learning embarcada treinada nos dados do PROPRIO node (60k+ probes + ledger) — (1) classificador de demanda GradientBoosting com auto-rotulagem pelas regras atuais e retreino diario: pega scanner que o regex nunca viu (conf>=0.85 rebaixa new_product->scanner_noise) e anexa label+confianca ao painel/alertas; (2) detector de anomalias IsolationForest sobre agregados horarios de requests/revenue (min 72h): surto de comprador ou ataque vira log + Telegram (1/6h) + /data/ml_anomalies.json; (3) NOVO /discover gratis: busca semantica do catalogo por similaridade vetorial (MiniLM ONNX via fastembed, cache em /data) com fallback palavra-chave — funil de descoberta p/ agentes | tudo import-guarded (sem sklearn/fastembed o node roda como antes) + ML_DISABLED=1 | deps novas p/ requirements: scikit-learn fastembed | base: v48.11.0-GLOBAL: Moonshot/Kimi + OpenRouter como provedores premium DORMENTES (env-gated: sem chave = zero custo; ativar = MOONSHOT_API_KEY/OPENROUTER_API_KEY no Railway) | perfis de roteamento estilo ClawRouter: /llm?profile=eco|fast|premium e model=kimi|deepseek|eco|premium no /v1/chat/completions | NOVO /global-rates ($0.03): taxas de Fed/ECB/PBoC/BOJ/CBR/BCB numa chamada — BIS WS_CBPOL + cross-check ao vivo FRED/ECB-SDW/BCB-SGS, diferencial de carry vs Fed; nenhum concorrente x402 tem | rails Polygon (eip155:137) + Arbitrum (eip155:42161) PRONTAS, settle pelo mesmo facilitador CDP, env-gated OFF (X402_POLYGON=1/X402_ARBITRUM=1 so apos confirmar credito na Binance) | _SCAN_NOISE cobre /env.txt /env.js /settings.json /config/*.yml (scanner de credencial nao vira mais produto novo no radar) | _cap500 default 480->390 (x402lint P8: 24 descriptions na zona de risco; caminho p/ 100/100) | base: v48.10.3-REFINE: reprice consolidado no codigo (fonte unica, sem depender de env) — piso $0.01 em 12 endpoints de $0.003-0.008 (fear-greed, pyth-price, trust-hash, agent-market, bootstrap-trust, regime, mempool, web-search, ai-news + os 4 primitivos BR pix/bizdays/doc) e /br-archive $0.05->$0.09: a Coinbase cobra $0.001/settle apos 1k/mes (fazemos ~8k) — a $0.003 a taxa efetiva era 33%, a $0.01 cai a 10%; clientes x402 tem cap default 0.1 USDC, abaixo disso preco nao influencia decisao de maquina; referencia CoinGecko flat $0.01 | LLM_PROXY_PRICE agora le PRICE_LLM_PROXY (default $0.005 — a isca fica) | NOVO /.well-known/agent-registration.json (ERC-8004 registration-v1: A2A+MCP+x402+OAS, x402Support, supportedTrust) — registrar no Identity Registry 0x8004A169...a432 na Base | FIX telemetria: pos-refund nao loga mais "paid" (double-log inflava calls; Agent402 e /receipts leem isso) | refund agora carrega recommended_next (cross-sell na falha — falha vira retencao) | billing LLM com backoff persistente em /data (strikes 6h->12h->18h->24h; o 429 diario do Gemini parava de gritar a cada boot; provider saudavel zera) | base: v48.10.2-REFUND
 if __name__ == "__main__":
     cli()
 else:
