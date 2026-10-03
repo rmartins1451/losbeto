@@ -2075,6 +2075,134 @@ def _cdp_note_success():
     except Exception:
         pass
 
+# ---------------------------------------------------------------------------
+# v48.17.6-RAILGUARD — DISJUNTOR PAYAI (espelho do da CDP)
+#
+# Produção 03/10 03:04 UTC: o PayAI passou a devolver 403 em TODO settle —
+# "free_tier_exhausted: This resource host or client IP has exhausted its
+# pooled free-credit allowance" (o pool de créditos grátis é compartilhado
+# entre os merchants atrás do mesmo host/IP — o egresso compartilhado do
+# Railway esgota rápido). Com a CDP já em disjuntor (payment-method-required),
+# os DOIS rails ficaram mortos: 177 vendas perdidas em 8,5h, cada uma pagando
+# ~2 round-trips de facilitator antes de falhar.
+#
+# Igual ao da CDP: falha de CONTA (free_tier_exhausted / 401 / 403) abre o
+# disjuntor compartilhado (/data/payai_breaker.json — os 4 workers respeitam),
+# settle seguinte nem tenta (comprador não espera falha certa) e, com os dois
+# rails abertos, o 402 passa a carregar o rail manual (ver _with_manual_rail).
+# Cooldown menor que o da CDP (30min): a cadência de reset do free tier é
+# desconhecida — sondar mais cedo custa 1 request e pode salvar a hora.
+# ---------------------------------------------------------------------------
+_PAYAI_BREAKER = {"fails": 0, "open_until": 0.0, "broken": False}
+PAYAI_BREAKER_THRESHOLD = int(os.environ.get("PAYAI_BREAKER_THRESHOLD", "3"))
+PAYAI_BREAKER_COOLDOWN  = int(os.environ.get("PAYAI_BREAKER_COOLDOWN", "1800"))
+_PAYAI_BREAKER_FILE = HOME_DIR / "payai_breaker.json"
+_PAYAI_BREAKER_SYNC = {"ts": 0.0}
+
+def _payai_breaker_read_shared() -> float:
+    now = time.time()
+    if now - _PAYAI_BREAKER_SYNC["ts"] > 10:
+        _PAYAI_BREAKER_SYNC["ts"] = now
+        try:
+            if _PAYAI_BREAKER_FILE.exists():
+                fu = float(json.loads(_PAYAI_BREAKER_FILE.read_text()).get("open_until") or 0)
+                if fu > _PAYAI_BREAKER["open_until"]:
+                    _PAYAI_BREAKER["open_until"] = fu
+                    _PAYAI_BREAKER["broken"] = fu > now
+        except Exception:
+            pass
+    return _PAYAI_BREAKER["open_until"]
+
+def _payai_breaker_write_shared():
+    try:
+        _PAYAI_BREAKER_FILE.write_text(json.dumps(
+            {"open_until": _PAYAI_BREAKER["open_until"], "ts": time.time()}))
+    except Exception:
+        pass
+
+def _payai_failure_is_account_level(reason) -> bool:
+    # free_tier_exhausted = pool de créditos do host esgotado (conta/host, não
+    # do pagador). 401/403 do PayAI também são de conta. Saldo do comprador e
+    # assinatura inválida voltam como 200 isValid=false ou 400 — NUNCA 403.
+    r = str(reason or "").lower()
+    return ("free_tier_exhausted" in r or "free-credit" in r
+            or "facilitator-401" in r or "facilitator-403" in r)
+
+def _payai_available() -> bool:
+    return time.time() >= _payai_breaker_read_shared()
+
+def _payai_note_failure(reason):
+    if not _payai_failure_is_account_level(reason):
+        return   # falha do pagador não diz nada sobre a conta PayAI
+    _PAYAI_BREAKER["fails"] += 1
+    if (_PAYAI_BREAKER["fails"] >= PAYAI_BREAKER_THRESHOLD
+            and time.time() >= _PAYAI_BREAKER["open_until"]):
+        _PAYAI_BREAKER["open_until"] = time.time() + PAYAI_BREAKER_COOLDOWN
+        _PAYAI_BREAKER["broken"] = True
+        _PAYAI_BREAKER["fails"] = 0
+        _payai_breaker_write_shared()
+        log.warning(f"🔌 DISJUNTOR PAYAI ABERTO por {PAYAI_BREAKER_COOLDOWN // 60}min — "
+                    f"{str(reason)[:110]}. Enquanto durar, o 402 já oferece o "
+                    f"rail manual (transferência direta + /api/claim-transfer). "
+                    f"Restauração: créditos em merchant.payai.network.")
+
+def _payai_note_success():
+    if _PAYAI_BREAKER["broken"]:
+        log.info("✅ PAYAI RECUPERADO — settle voltou a passar; rail principal "
+                 "Solana/Base-fallback restabelecido.")
+    _PAYAI_BREAKER["fails"] = 0
+    _PAYAI_BREAKER["open_until"] = 0.0
+    _PAYAI_BREAKER["broken"] = False
+    try:
+        _PAYAI_BREAKER_FILE.unlink(missing_ok=True)
+    except Exception:
+        pass
+
+def _rails_facilitator_down() -> bool:
+    """v48.17.6: True quando NENHUM rail de facilitator está utilizável.
+    CDP e PayAI são os únicos do nó; com os dois em disjuntor, toda tentativa
+    de settle é falha garantida — hora de oferecer o rail manual no 402."""
+    return (not _cdp_available()) and (not _payai_available())
+
+def _manual_rail_block(endpoint: str) -> dict:
+    """v48.17.6: bloco de contingência embutido no 402 quando os facilitators
+    estão fora — um AGENTE consegue concluir a compra sem facilitator: envia
+    USDC direto ao payTo e resgata com o hash. Mesmo preço, anti-replay e
+    verificação on-chain do /api/claim-transfer (bi-chain desde a 48.16.2)."""
+    return {
+        "note": ("Facilitator settlement is temporarily unavailable (both "
+                 "CDP and PayAI are rejecting). You can still buy this "
+                 "resource right now: send the exact USDC amount to a payTo "
+                 "below, then claim delivery with the tx hash — on-chain "
+                 "verification, no facilitator, same price."),
+        "chains": {c: a for c, a in (("base", BASE_PAYTO_EVM),
+                                     ("solana", RECEIVE_ADDRESS)) if a},
+        "claim": {"url": f"{_public_base()}/api/claim-transfer",
+                  "method": "POST",
+                  "body": {"endpoint": endpoint, "tx": "0x… (Base) or base58 signature (Solana)"}},
+        "human_checkout": f"{_public_base()}/pay{endpoint}",
+    }
+
+def _with_manual_rail(resp, endpoint: str):
+    """v48.17.6-RAILGUARD: com os DOIS facilitators em disjuntor, o 402 ganha
+    o bloco manual_rail — a venda não morre com eles. Injetado PÓS-cache: o
+    corpo cacheado fica limpo e o bloco some sozinho quando um rail volta."""
+    try:
+        if not _rails_facilitator_down():
+            return resp
+        j = json.loads(resp.get_data())
+        if not isinstance(j, dict) or "accepts" not in j:
+            return resp
+        j["facilitators_down"] = True
+        j["manual_rail"] = _manual_rail_block(endpoint)
+        r = app.response_class(json.dumps(j), status=resp.status_code,
+                               mimetype="application/json")
+        for k, v in resp.headers:
+            r.headers[k] = v
+        return r
+    except Exception:
+        return resp
+
 # ============================================================================
 # 6. MARKET DATA
 # ============================================================================
@@ -7244,19 +7372,24 @@ def _verify_payment(endpoint: str, payment_header: str):
             # v2 mantém CDP-first: clientes v2 (stipend/indexar/@x402) alimentam
             # o Bazaar, que é o índice de descoberta de compradores.
             _is_v1_pay = int((payload or {}).get("x402Version", 2) or 2) == 1
+            # v48.17.6-RAILGUARD: PayAI também tem disjuntor — com ele aberto
+            # (free_tier_exhausted desde 03/10 03:04 UTC) o settle falharia
+            # com certeza; pular economiza o round-trip e o comprador recebe
+            # o rail manual no 402 em vez de uma assinatura morta.
+            _payai_up = _payai_available()
             if CDP_FAC and _req_net.startswith("eip155") and _cdp_available() and not _is_v1_pay:
                 facs = [CDP_FAC]
-                if FACILITATOR and CDP_FALLBACK_PAYAI:
+                if FACILITATOR and CDP_FALLBACK_PAYAI and _payai_up:
                     facs.append(FACILITATOR)
             elif _is_v1_pay and FACILITATOR:
-                facs = [FACILITATOR]
+                facs = [FACILITATOR] if _payai_up else []
             elif GO_FAC and _req_net.startswith("algorand"):
                 # v44.7.0: pagamento AVM vai SÓ ao GoPlausible — regra do
                 # challenge (settle fora dele não conta no leaderboard) e
                 # fato técnico (PayAI/CDP não verificam ASA).
                 facs = [GO_FAC]
             else:
-                facs = [FACILITATOR] if FACILITATOR else []
+                facs = [FACILITATOR] if (FACILITATOR and _payai_up) else []
             if not facs:
                 continue
             # v44.2.3 FIX — O FALLBACK AGORA COBRE O SETLE TAMBÉM.
@@ -7308,6 +7441,8 @@ def _verify_payment(endpoint: str, payment_header: str):
                     log.warning(f"⚠️ {_tag}.verify falhou p/ {endpoint}: {reason} | vdata={vdata}")
                     if _tag == 'CDP':
                         _cdp_note_failure(reason)   # v44.3.3: alimenta o disjuntor
+                    elif _tag == 'PayAI':
+                        _payai_note_failure(reason)   # v48.17.6: idem PayAI
                     continue
                 # v21.2 FIX: verify() só confirma a assinatura — quem move o
                 # dinheiro on-chain é settle(). bazaar blob/resource só na CDP.
@@ -7321,11 +7456,15 @@ def _verify_payment(endpoint: str, payment_header: str):
                     settled, sdata, fac = True, _sdata, _f
                     if _tag == 'CDP':
                         _cdp_note_success()   # v44.3.3: fecha o disjuntor na hora
+                    elif _tag == 'PayAI':
+                        _payai_note_success()   # v48.17.6: idem PayAI
                     break
                 fac_reasons[_tag] = f"settle:{str(_sdata.get('error', _sdata))[:120]}"
                 log.warning(f"⚠️ {_tag}.settle falhou p/ {endpoint}: {_sdata}")
                 if _tag == 'CDP':
                     _cdp_note_failure(str(_sdata))   # v44.3.3: alimenta o disjuntor
+                elif _tag == 'PayAI':
+                    _payai_note_failure(str(_sdata))   # v48.17.6: idem PayAI
             if fac_reasons:
                 last_reason = "; ".join(f"{k}:{v}" for k, v in fac_reasons.items())
             if not settled or not fac:
@@ -10438,6 +10577,19 @@ def health_providers():
         out["sol_dest_ata"] = _sol_dest_ata_status()
     except Exception:
         out["sol_dest_ata"] = {"ata": None, "exists": None, "balance": None}
+    # v48.17.6-RAILGUARD: estado dos DOIS rails de facilitator, visível de
+    # fora. "available": false = disjuntor aberto (conta irregular / free
+    # tier esgotado) — settles daquele rail nem são tentados até o cooldown.
+    try:
+        out["facilitators"] = {
+            "cdp": {"available": _cdp_available(),
+                    "retry_in_s": max(0, int(_CDP_BREAKER["open_until"] - time.time()))},
+            "payai": {"available": _payai_available(),
+                      "retry_in_s": max(0, int(_PAYAI_BREAKER["open_until"] - time.time()))},
+            "manual_rail": "always on — direct USDC send + POST /api/claim-transfer",
+        }
+    except Exception:
+        pass
     out["note"] = ("premium_ready=false means AI or market sources are down; "
                    "premium endpoints return HTTP 503 and do not charge.")
     return jsonify(out)
@@ -25718,7 +25870,7 @@ def _build_402(endpoint: str, price_override: float = None):  # noqa: F811 — v
     # pelo cache — cachear vazaria o desconto para todos os visitantes por
     # CHALLENGE_CACHE_TTL segundos e quebraria a unicidade da oferta.
     if price_override:
-        return _v46_build_402_orig(endpoint, price_override)
+        return _with_manual_rail(_v46_build_402_orig(endpoint, price_override), endpoint)
     now = time.time()
     with _chal_lock:
         hit = _chal_cache.get(endpoint)
@@ -25732,7 +25884,7 @@ def _build_402(endpoint: str, price_override: float = None):  # noqa: F811 — v
                 else:
                     r.headers[k] = v
             r.headers["X-Challenge-Cache"] = "hit"
-            return r
+            return _with_manual_rail(r, endpoint)
     resp = _v46_build_402_orig(endpoint)
     try:
         with _chal_lock:
@@ -25742,7 +25894,7 @@ def _build_402(endpoint: str, price_override: float = None):  # noqa: F811 — v
         resp.headers["X-Challenge-Cache"] = "miss"
     except Exception:
         pass
-    return resp
+    return _with_manual_rail(resp, endpoint)
 
 
 @app.errorhandler(500)
@@ -27729,6 +27881,8 @@ pre{background:#0d0f13;border:1px solid var(--line);border-radius:8px;
 <p class="d">__DESC__</p>
 <div class="price">$__PRICE__ <span>USDC · Base · one call</span></div>
 
+__RAILS_BANNER__
+
 <div class="card" id="cardInjected" style="display:none">
   <div id="warnBox" class="status err" style="margin:0 0 12px"></div>
   <div id="walletPick" style="display:none;margin:0 0 12px"></div>
@@ -28370,7 +28524,25 @@ def _pay_bridge_handler(raw_endpoint):
                             .replace("__PIX_EMV__", emv))
         except Exception:
             pix_card = ""
+    # v48.17.6-RAILGUARD: com os DOIS facilitators em disjuntor, avisar ANTES
+    # do clique — o comprador não assina à toa e vai direto ao cartão manual,
+    # que é o rail que funciona agora (transferência comum + verificação
+    # on-chain, mesmo preço, sem facilitator).
+    rails_banner = ""
+    try:
+        if _rails_facilitator_down():
+            rails_banner = (
+                '<div class="card" style="border-color:#f59e0b">'
+                '<p style="margin:0;font-size:14px;color:#fbbf24">'
+                '<b>⚠ Facilitator rails are temporarily down</b> (CDP + PayAI '
+                'both rejecting settlements at the moment). Wallet signatures '
+                'will fail — use the <b>manual transfer card below</b>: a plain '
+                'USDC send, verified on-chain, same price, instant delivery. '
+                'It works right now.</p></div>')
+    except Exception:
+        rails_banner = ""
     html = (_PAY_BRIDGE_HTML
+            .replace("__RAILS_BANNER__", rails_banner)
             .replace("__PIX_CARD__", pix_card)
             .replace("__ENDPOINT__", ep)
             .replace("__ENDPOINT_URL__", f"{_public_base()}{ep}")
@@ -28737,6 +28909,7 @@ log.warning("🐕 v48.17.2-WATCHDOG — vigia ATA anti-travamento (ts na largada
 log.warning("🔗 v48.17.3-LINKFIX — id do feed LINK/USD corrigido (o 400 do batch Pyth era ele) · CoinGecko cobre símbolos faltantes do coletor")
 log.warning("🧹 v48.17.4-FEEDCLEAN — coletor Pyth auto-curativo: id culpado lido do erro, excluído em /data/fc_skip.json, batch refeito sem ele, CoinGecko cobre o símbolo")
 log.warning("🎟 v48.17.5-ENTITLED — parser do coletor cobre 'Not entitled' (ADA fora da grant Starter se auto-exclui) · BCB com retry+backoff anti-DNS · /global-rates degrada linha em vez de 503")
+log.warning("🛡 v48.17.6-RAILGUARD — disjuntor PayAI compartilhado (free_tier_exhausted = conta, não pagador) · 402 ganha manual_rail quando CDP+PayAI caem · /pay avisa antes do clique · facilitators no /health/providers")
 
 
 # --- v48.5.0-FUNIL: /blog/ e /login — gaps medidos pelo radar ---------------
@@ -29063,7 +29236,7 @@ def app_js_sdk():
 
 
 
-VERSION = "48.17.5-ENTITLED"  # v48.17.5-ENTITLED: O AUTO-CURATIVO ENCONTROU O 3º PADRÃO — "HTTP 403: Not entitled: feed 2a01de…7a0d" (ADA fora da grant Starter; Pyth aposenta/restringe por plano). O parser do coletor agora cobre os 3 formatos ("not valid", "not found", "not entitled: feed") — qualquer feed fora da grant se auto-exclui no 1º ciclo e o CoinGecko cobra o símbolo. E o DNS do BCB falhando 1x/hora no Railway (3 ocorrências: 23:11/00:23/01:27, NameResolutionError em api.bcb.gov.br) ganhou _http_get_retry (3 tentativas, backoff 0.8s/1.6s) nos dois call sites do BCB; o /global-rates agora degrada a linha BR em vez de tomar 503. | base: v48.17.4-FEEDCLEAN: COLETOR PYTH AUTO-CURATIVO — o LINKFIX revelou o próximo: DOGE aposentado no endpoint novo ("Price IDs not found"). A Pyth documenta que feeds expiram e que UM id inválido derruba o lote inteiro — então o coletor agora lê o id culpado no corpo do erro, exclui em /data/fc_skip.json (persiste entre deploys), refaz o batch sem ele e o CoinGecko cobre o símbolo. Classe inteira de falha morre aqui: feed aposentado nunca mais gera 400/404 em loop nem perde ciclo. | base: v48.17.3-LINKFIX: O LOG DETALHADO PAGOU — o corpo do 400 revelou o culpado em texto puro: "Price IDs not valid: 8ac0c70f…5ea76" = id do feed LINK/USD errado em _FC_FEEDS desde sempre (correto: …1d62c2d4…04d221, lista oficial Pyth). O endpoint novo rejeita o LOTE inteiro por 1 id inválido → 7 símbolos bons perdiam o coletor a cada ciclo. Corrigido o id + CoinGecko agora cobre os símbolos FALTANTES (antes só rodava se NADA viesse do Pyth). | base: v48.17.2-WATCHDOG: TRÊS FERIMENTOS DE PRODUÇÃO FECHADOS — (1) vigia da ATA travava num RPC drip-feed: thread ficava presa no 1º getAccountInfo, checking=True eterno e ts=0 no /health/providers (ata derivado aparecia, exists/balance nulos). Agora ts é marcado na largada, timeout vira (connect=3s, read=6s), orçamento total de 25s, flag checking se auto-libera após 150s e o resultado sai no log. (2) disjuntor da CDP era POR WORKER: 3 falhas × 4 workers = até 12 vendas Base condenadas antes de todos abrirem (visto no log 02/10 22:10-22:12, payment-method-required). Agora o open_until é compartilhado via /data/cdp_breaker.json — um worker abre, todos respeitam. (3) coletor do /forecast: batch de 8 feeds Pyth tomando HTTP 400 (feed único ok) — agora cai feed a feed antes do CoinGecko e o corpo do erro vai pro log p/ diagnóstico. | base: v48.17.1-HOMEPAGE: A PÁGINA PRINCIPAL ALCANÇA O CÓDIGO — auditoria pós-deploy da 48.17.0 achou 4 lacunas na landing (os números são dinâmicos e estavam certos; faltavam os PRODUTOS novos): (1) /weather entra na grade Flagships com preço dinâmico __P_WEATHER__ (era o 404 mais pedido do radar — 8 ip/7d — e não aparecia em lugar nenhum da página); (2) /app.js vira seção do quick-start "Use it from an agent" (uma <script> tag e o mini-SDK zero-dep roda em browser/Node — a integração mais barata do nó estava invisível); (3) /auth.json + /app.js entram na tabela Machine-readable discovery (era o 2º path mais pedido do radar); (4) a tabela Honest-by-default ganha a linha de ML publicado — bandit ε adaptativo + cobertura conformal do /forecast expostos em /ml. /weather também entra em FEATURED_ENDPOINTS (JSON da raiz p/ máquinas). Nenhum número hardcoded foi adicionado — contadores (__N__, __P_MIN__) já eram dinâmicos. | base: v48.17.0-RADAR: O RADAR VIRO PRODUTO + ML MAIS INTELIGENTE — (1) /weather $0.01: demanda MEDIDA (8 IPs/7d tomavam 404) — clima real p/ qualquer cidade ou lat/lon via Open-Meteo (grade fundida ECMWF/NOAA/DWD, sem chave): condicoes atuais WMO-decodificadas, 24h horarias e 7d diarios com probabilidade de precipitacao, nascer/por do sol e vento; cidade default Sao Paulo p/ o preview universal nunca travar; sinonimos weather->catalogo no search MCP | (2) /auth.json (8 IPs/7d): descriptor de auth machine-readable que reusa _register_doc() — uma verdade so em /login, /register, /config.js e aqui | (3) /app.js (8 IPs/7d): mini-SDK REAL zero-dependencias (browser+Node 18+): catalog/preview/payUrl/welcome/health/fetchPaid/creditsUrl/mcpUrl, versao do no embutida a cada render | (4) BANDIT ε ADAPTATIVO: exploracao decai com a experiencia (ε0/sqrt(1+N/50), piso 2%) — roteador aprende rapido no inicio e para de desperdicar calls quando ja sabe quem e bom; LLM_BANDIT_EPSILON=0 segue deterministico; eps_efetivo exposto em /health/providers (llm_bandit_eps_eff) | (5) FORECAST COM CALIBRACAO CONFORMAL: split-conformal sobre o proprio teste walk-forward — publica interval_coverage80_empirical (quanto a banda p10-p90 REALMENTE cobriu) + banda calibrada p10/p90_calibrated ao lado da crua; joblib antigo sem "calib" segue servindo ate o retreino de 6h | base: v48.16.6-EXACT3  # v48.16.6-EXACT3: FIX DA 6a CAMADA do checkout Phantom — a tx Solana volta a ter EXATAMENTE 3 instrucoes [SetComputeUnitLimit(30000), SetComputeUnitPrice(1000), TransferChecked], sem o Memo adicionado na 48.16.5. Prova em producao (logs Railway 02/10 12:08:48/12:12:00 UTC): invalid_exact_svm_smart_wallet_program_not_allowed apontando Tokenkeg — nome ENGANOSO; a matriz de conformidade publica dos facilitadores mapeia extra_instruction => smart_wallet_program_not_allowed ("the real cause is extra instruction present"; a tx de pagamento deve conter limit -> price -> transferChecked "and nothing else"). A spec §3.2 pede Memo, mas ela descreve o layout maximo (3-7 instrucoes); a VERIFICACAO ESTATICA path 1 do facilitador e a autoridade de facto e so aceita 3. ixMemo removido; comentario no codigo documenta a armadilha p/ ninguem readicionar. (2) VIGIA DA CAMADA 7 server-side: _sol_ata_of deriva a ATA de USDC do payTo (PDA ed25519 puro, sem dependencia nova) e /health/providers expoe "sol_dest_ata" {ata, exists, balance} com refresh em background (TTL 6h, nunca bloqueia, nunca derruba premium_ready) — a exigencia "ATA de destino pre-existente" dos facilitadores deixa de ser rejeicao silenciosa; se exists=False, a correcao e 1 envio comum de USDC ao payTo (tx separada, fora do fluxo x402) | base: v48.16.5-FRESHPAY  # v48.16.5-FRESHPAY: (1) HANDSHAKE DE VERSAO no checkout — a pagina carrega __PAY_VERSION__ e, ANTES de assinar (Base ou Solana), confere /health/providers: se o servidor subiu versao nova, ela se recarrega sozinha em vez de assinar com JS defasado (a causa REAL dos testes falhos de 02/10 00:07 e 07:45 BRT — abas abertas antes dos deploys 48.16.2/48.16.4; o no-store da 48.16.3 so protege carregamentos futuros). (2) Layout SVM completo da spec x402 §3.1 path 1: SetComputeUnitLimit(30k — cabe em teto de politica de 40k reportado, default 400k) -> SetComputeUnitPrice(1000 microlamports — dentro do teto 5 lamports/CU e de minimos comuns 1000; ~30 lamports de prioridade pagos PELO FACILITADOR) -> TransferChecked -> Memo(nonce 16B hex — spec EXIGE memo p/ unicidade; Phantom pode injetar ate 3 Lighthouse depois, layout segue <=7 instrucoes) | base: v48.16.4-SVMFIX  # v48.16.4-SVMFIX: /pay Phantom agora monta a transacao na ordem EXIGIDA pela spec x402 SVM e pelo PayAI — SetComputeUnitLimit(200k) -> SetComputeUnitPrice(1 microlamport) -> TransferChecked (spec: "MUST contain 3 to 7 instructions in this order: Compute Budget Set Compute Unit Limit; Set Compute Unit Price; SPL TransferChecked"); sem as duas ComputeBudget o verify devolvia invalid_exact_svm_payload_transaction_instructions_compute_limit_instruction (log Railway 02/10 00:47:33 UTC). Instrucoes hand-rolled no programa ComputeBudget111111111111111111111111111111 — zero dependencia de versao do web3.js | base: v48.16.3-NOCACHE  # v48.16.3-NOCACHE: /pay responde Cache-Control: no-store — pagina de checkout nunca mais envelhece no navegador (causa do teste de 01/10 20:16 BRT: aba aberta antes do deploy rodou o JS ANTIGO sem "accepted"; com no-store todo carregamento puxa o JS atual e o pagamento nao morre por codigo defasado) | base: v48.16.2-PHANTOMFIX  # v48.16.2-PHANTOMFIX: (1) FIX DEFINITIVO Phantom/Solana — o X-PAYMENT montado no /pay NAO levava o campo "accepted" (exigido pelo schema v2 do PayAI: verify 400 invalid_payload "accepted: expected object, received undefined", log Railway 01/10 21:43:56) -> o fallback on-chain tratava o BLOB base64 da tx como ASSINATURA -> getTransaction(lixo) -> "tx-not-found" + 15s de retries (o erro que o comprador via). Agora accepted:SOL_ACCEPT, espelhando o fluxo Base (provado). (2) GUARDA no fallback Solana de _verify_payment: tx_sig que nao parece assinatura base58 (blob v2, txid zerado porque o feePayer e o facilitator) pula o lookup impossivel com motivo claro — sem queimar 15s nem mentir "tx-not-found". (3) /api/claim-transfer BI-CHAIN: aceita hash 0x (Base) OU assinatura base58 (Solana) — verificacao on-chain direta via SOL.verify_payment, anti-replay atomico, tolerancia 97%, retry curto p/ lag de RPC; cartao manual do /pay mostra os DOIS payTos. Rail Solana INDEPENDENTE de facilitator (Phantom send, Binance Web3, ate saque de exchange viram venda). (4) erros do /pay Solana amigaveis + destaque automatico do cartao manual quando o facilitator falha. | base: v48.16.1-OBSERVE  # v48.16.1-OBSERVE: /health/providers passa a expor "llm_bandit" (recompensa/ok/fail/lat por provedor, aprendida pelo roteador e-greedy da 48.15) — antes as stats so apareciam em /llm/status; observabilidade pedida no indexar v4.3 | base: v48.16.0-SETTLE  # v48.16.0-SETTLE: (1) HOTFIX CRITICO /pay Phantom — "Error: bh is not defined": a v48.15.0 moveu const bh para dentro do bloco de fallback mas recentBlockhash continuou bh.blockhash (ReferenceError em runtime; node --check nao pega). Agora recentBlockhash: blockhash. (2) SOLUCAO DEFINITIVA p/ smart wallets (x402#623): NOVO POST /api/claim-transfer — pagamento por TRANSFERENCIA DIRETA de USDC na Base (sem assinatura EIP-3009/1271: transfer() funciona de Coinbase Smart Wallet, Binance Web3, passkey e ate saque de exchange): verificacao on-chain do receipt (status, contrato USDC, evento Transfer->payTo, valor>=97% da tabela, >=2 confirmacoes, anti-replay atomico, replay devolvido em falha transitoria) e entrega do conteudo na hora; /pay ganha o cartao "Signature rejected? Pay by plain transfer" com destaque automatico quando smart wallet detectada. (3) CROSS-SELL no checkout: "Agents also bought" no /pay alimentado pelo recomendador de co-compra real. | base: v48.15.0-BANDIT  # v48.15.0-BANDIT: (1) ROTEADOR DE LLM COM BANDIT ε-GREEDY persistido em /data (llm_bandit.json): recompensa = sucesso x fator de latencia, EWMA, ε=10% exploracao, ordena cada camada do _llm_chain pelo que APRENDEU em producao — provedor lento/falhando desce na fila sozinho e volta quando se recupera; stats visiveis em llm_health_report; LLM_ORDER e LLM_BANDIT=0 seguem como override. (2) /api/sol-usdc-balance — saldo USDC + blockhash Solana SERVER-SIDE (gratis, cache 8s, 30/min/IP): o Railway enxerga a rede Solana melhor que o browser do comprador; /pay consulta o servidor primeiro e so cai no multi-RPC do browser (ankr->drpc, ankr virou 403 sem chave) se o servidor nao responder — fim do falso "Could not reach the Solana network". (3) Warmer orientado por DEMANDA: _demand_rank ordena o aquecimento pelos probes+previews reais do ledger — preview fresco primeiro onde os avaliadores batem. (4) RSL (Really Simple Licensing): robots.txt ganha diretiva License -> /.well-known/rsl.xml com termos pay-per-crawl apontando para o catalogo x402 — alinhamento com o padrao que Reddit/Yahoo/Fastly adotaram p/ licenciar conteudo a crawlers de IA. | base: v48.14.3-CHECKOUT  # v48.14.3-CHECKOUT: (1) quota 429 do Google e POR MODELO — _try_gemini bane o modelo sem quota e troca para o proximo preferido NA MESMA chamada (ate 3); quarentena de provedor so quando esgotam. (2) /sec-filing envia User-Agent identificado (SEC 403 "undeclared" -> 200 JSON). | base: v48.14.1-HOTFIX: Pyth Hermes passou a EXIGIR API key no upgrade Pyth Core de 26/ago/2026 (401 sem chave — derrubou /pyth-price e o coletor do /forecast) — _pyth_latest usa o endpoint novo pyth.dourolabs.app/hermes com Bearer quando PYTH_API_KEY estiver no Railway + fallback CoinGecko simple/price (reusa COINGECKO_KEY) em /pyth-price, _oracle_pyth e _fc_collect — o coletor do ML nunca mais morre em silencio; self-heal do seed agora TREINA o simbolo recem-semeado na hora (antes: /forecast ficava 503 ate o tick de 6h) | base: v48.14.0-MONETIZE: (1) MPP tempo/charge REAL push-mode — challenges method="tempo" (USDC.e + pathUSD, chainId 4217) em TODO 402 e verificacao on-chain do credential Authorization: Payment (receipt TIP-20 Transfer: valor/destino/moeda + anti-replay atomico + Payment-Receipt) — captura os saldos AgentCash que nascem na Tempo; sem Stripe, sem chave privada no servidor; (2) NOVO /ecosystem-pulse $0.05 — a inteligencia dos 64k probes/dia como produto: top sondados com heat score, tendencias 7d-vs-7d (z-score Poisson), IPs-agente unicos, share de monitores QoS, clusters de demanda emergente; (3) price-elasticity advisor semanal — funil probes->previews->vendas por endpoint vira sugestao de PRECO DE TABELA global (nunca por carteira) no Telegram; PRICE_AUTO=1 aplica com trava +-30%/semana persistida em /data (env do operador sempre vence); (4) radar auto-atendimento com fallback SEMANTICO — embeddings (multilingue se preciso) casam 404 pelo significado quando o lexical falha, limiar 0.72, mesmas travas de seguranca; (5) /forecast seed auto-recupera a cada 30min ate todos os 8 simbolos terem backfill (429 de IP compartilhado nao exige mais redeploy); (6) /health expoe mpp_tempo + modo do advisor | base: v48.13.0-INTEL  # v48.13.0-INTEL: SEGUNDA CAMADA DE IA LOCAL — (1) NOVO /forecast $0.05: previsao p10/p50/p90 com HistGradientBoosting quantilico treinado NO HISTORICO QUE O PROPRIO NODE COLETA (Pyth a cada 10min + backfill CoinGecko 90d, 8 simbolos, 4 horizontes), MAPE de walk-forward publicado em toda resposta; sem historico = 503 e NAO cobra; (2) recomendador agents_also_bought por co-ocorrencia real de pagadores — cross-sell dentro do proprio 402 + /recommend gratis; (3) lead scoring SEMANTICO dos previews (embedding da intencao x catalogo premium) -> alerta de lead quente no Telegram; (4) clustering semanal dos 404s por significado (Agglomerative cosine sobre embeddings) -> oportunidades de produto em /ml + digest; (5) NOVO /ml publico: transparencia da camada de IA local; (6) /discover com reranker cross-encoder (ms-marco-MiniLM-L-6, 80MB ONNX) + modo MULTILINGUE sob demanda (paraphrase-MiniLM-L12: PT/ES/ZH acham o catalogo em ingles); (7) LLM LOCAL de ultimo recurso (LOCAL_LLM=1, llama-cpp-python + Qwen3-0.6B GGUF ~480MB em /data): se TODOS os provedores externos cairem, /llm responde com o modelo da casa em vez de 503 — OFF por padrao = custo zero; (8) detector de anomalias ganha severidade (volume puro -> log; comprador/receita -> Telegram) — fim do apito de hora em hora; (9) /live rotula scanner_noise como 'filtered noise' | requirements INALTERADOS (tudo roda sobre sklearn/fastembed ja instalados; llama-cpp-python e OPCIONAL e so e necessario com LOCAL_LLM=1) | base: v48.12.0-ML: camada de machine learning embarcada treinada nos dados do PROPRIO node (60k+ probes + ledger) — (1) classificador de demanda GradientBoosting com auto-rotulagem pelas regras atuais e retreino diario: pega scanner que o regex nunca viu (conf>=0.85 rebaixa new_product->scanner_noise) e anexa label+confianca ao painel/alertas; (2) detector de anomalias IsolationForest sobre agregados horarios de requests/revenue (min 72h): surto de comprador ou ataque vira log + Telegram (1/6h) + /data/ml_anomalies.json; (3) NOVO /discover gratis: busca semantica do catalogo por similaridade vetorial (MiniLM ONNX via fastembed, cache em /data) com fallback palavra-chave — funil de descoberta p/ agentes | tudo import-guarded (sem sklearn/fastembed o node roda como antes) + ML_DISABLED=1 | deps novas p/ requirements: scikit-learn fastembed | base: v48.11.0-GLOBAL: Moonshot/Kimi + OpenRouter como provedores premium DORMENTES (env-gated: sem chave = zero custo; ativar = MOONSHOT_API_KEY/OPENROUTER_API_KEY no Railway) | perfis de roteamento estilo ClawRouter: /llm?profile=eco|fast|premium e model=kimi|deepseek|eco|premium no /v1/chat/completions | NOVO /global-rates ($0.03): taxas de Fed/ECB/PBoC/BOJ/CBR/BCB numa chamada — BIS WS_CBPOL + cross-check ao vivo FRED/ECB-SDW/BCB-SGS, diferencial de carry vs Fed; nenhum concorrente x402 tem | rails Polygon (eip155:137) + Arbitrum (eip155:42161) PRONTAS, settle pelo mesmo facilitador CDP, env-gated OFF (X402_POLYGON=1/X402_ARBITRUM=1 so apos confirmar credito na Binance) | _SCAN_NOISE cobre /env.txt /env.js /settings.json /config/*.yml (scanner de credencial nao vira mais produto novo no radar) | _cap500 default 480->390 (x402lint P8: 24 descriptions na zona de risco; caminho p/ 100/100) | base: v48.10.3-REFINE: reprice consolidado no codigo (fonte unica, sem depender de env) — piso $0.01 em 12 endpoints de $0.003-0.008 (fear-greed, pyth-price, trust-hash, agent-market, bootstrap-trust, regime, mempool, web-search, ai-news + os 4 primitivos BR pix/bizdays/doc) e /br-archive $0.05->$0.09: a Coinbase cobra $0.001/settle apos 1k/mes (fazemos ~8k) — a $0.003 a taxa efetiva era 33%, a $0.01 cai a 10%; clientes x402 tem cap default 0.1 USDC, abaixo disso preco nao influencia decisao de maquina; referencia CoinGecko flat $0.01 | LLM_PROXY_PRICE agora le PRICE_LLM_PROXY (default $0.005 — a isca fica) | NOVO /.well-known/agent-registration.json (ERC-8004 registration-v1: A2A+MCP+x402+OAS, x402Support, supportedTrust) — registrar no Identity Registry 0x8004A169...a432 na Base | FIX telemetria: pos-refund nao loga mais "paid" (double-log inflava calls; Agent402 e /receipts leem isso) | refund agora carrega recommended_next (cross-sell na falha — falha vira retencao) | billing LLM com backoff persistente em /data (strikes 6h->12h->18h->24h; o 429 diario do Gemini parava de gritar a cada boot; provider saudavel zera) | base: v48.10.2-REFUND
+VERSION = "48.17.6-RAILGUARD"  # v48.17.6-RAILGUARD: AS VENDAS PARARAM ÀS 03:04 UTC — o PayAI esgotou o pool de créditos grátis do host ("free_tier_exhausted", 403 em TODO settle; pool compartilhado entre merchants no mesmo egresso Railway) com a CDP já em disjuntor (payment-method-required): 177 vendas perdidas em 8,5h, cada uma pagando ~2 round-trips de facilitator antes de falhar. (1) DISJUNTOR PAYAI espelhando o da CDP: free_tier_exhausted/401/403 = falha de CONTA → disjuntor compartilhado /data/payai_breaker.json (threshold 3, cooldown 30min — a cadência de reset é desconhecida, sonda mais cedo que a CDP); com ele aberto o settle nem tenta (comprador não espera falha certa). (2) RAIL MANUAL NO 402: com os dois facilitators fora, todo 402 JSON ganha manual_rail {chains, claim, human_checkout} — um AGENTE conclui a compra sem facilitator (transferência direta ao payTo + POST /api/claim-transfer, mesmo preço, anti-replay, verificação on-chain); injeção PÓS-cache, o bloco some sozinho quando um rail volta. (3) /pay avisa ANTES do clique: banner âmbar no topo apontando o cartão manual como o rail que funciona agora. (4) /health/providers expõe facilitators{cdp,payai,manual_rail} com retry_in_s. A correção definitiva é operacional (não de código): créditos em merchant.payai.network + payment method na CDP. | base: v48.17.5-ENTITLED: O AUTO-CURATIVO ENCONTROU O 3º PADRÃO — "HTTP 403: Not entitled: feed 2a01de…7a0d" (ADA fora da grant Starter; Pyth aposenta/restringe por plano). O parser do coletor agora cobre os 3 formatos ("not valid", "not found", "not entitled: feed") — qualquer feed fora da grant se auto-exclui no 1º ciclo e o CoinGecko cobra o símbolo. E o DNS do BCB falhando 1x/hora no Railway (3 ocorrências: 23:11/00:23/01:27, NameResolutionError em api.bcb.gov.br) ganhou _http_get_retry (3 tentativas, backoff 0.8s/1.6s) nos dois call sites do BCB; o /global-rates agora degrada a linha BR em vez de tomar 503. | base: v48.17.4-FEEDCLEAN: COLETOR PYTH AUTO-CURATIVO — o LINKFIX revelou o próximo: DOGE aposentado no endpoint novo ("Price IDs not found"). A Pyth documenta que feeds expiram e que UM id inválido derruba o lote inteiro — então o coletor agora lê o id culpado no corpo do erro, exclui em /data/fc_skip.json (persiste entre deploys), refaz o batch sem ele e o CoinGecko cobre o símbolo. Classe inteira de falha morre aqui: feed aposentado nunca mais gera 400/404 em loop nem perde ciclo. | base: v48.17.3-LINKFIX: O LOG DETALHADO PAGOU — o corpo do 400 revelou o culpado em texto puro: "Price IDs not valid: 8ac0c70f…5ea76" = id do feed LINK/USD errado em _FC_FEEDS desde sempre (correto: …1d62c2d4…04d221, lista oficial Pyth). O endpoint novo rejeita o LOTE inteiro por 1 id inválido → 7 símbolos bons perdiam o coletor a cada ciclo. Corrigido o id + CoinGecko agora cobre os símbolos FALTANTES (antes só rodava se NADA viesse do Pyth). | base: v48.17.2-WATCHDOG: TRÊS FERIMENTOS DE PRODUÇÃO FECHADOS — (1) vigia da ATA travava num RPC drip-feed: thread ficava presa no 1º getAccountInfo, checking=True eterno e ts=0 no /health/providers (ata derivado aparecia, exists/balance nulos). Agora ts é marcado na largada, timeout vira (connect=3s, read=6s), orçamento total de 25s, flag checking se auto-libera após 150s e o resultado sai no log. (2) disjuntor da CDP era POR WORKER: 3 falhas × 4 workers = até 12 vendas Base condenadas antes de todos abrirem (visto no log 02/10 22:10-22:12, payment-method-required). Agora o open_until é compartilhado via /data/cdp_breaker.json — um worker abre, todos respeitam. (3) coletor do /forecast: batch de 8 feeds Pyth tomando HTTP 400 (feed único ok) — agora cai feed a feed antes do CoinGecko e o corpo do erro vai pro log p/ diagnóstico. | base: v48.17.1-HOMEPAGE: A PÁGINA PRINCIPAL ALCANÇA O CÓDIGO — auditoria pós-deploy da 48.17.0 achou 4 lacunas na landing (os números são dinâmicos e estavam certos; faltavam os PRODUTOS novos): (1) /weather entra na grade Flagships com preço dinâmico __P_WEATHER__ (era o 404 mais pedido do radar — 8 ip/7d — e não aparecia em lugar nenhum da página); (2) /app.js vira seção do quick-start "Use it from an agent" (uma <script> tag e o mini-SDK zero-dep roda em browser/Node — a integração mais barata do nó estava invisível); (3) /auth.json + /app.js entram na tabela Machine-readable discovery (era o 2º path mais pedido do radar); (4) a tabela Honest-by-default ganha a linha de ML publicado — bandit ε adaptativo + cobertura conformal do /forecast expostos em /ml. /weather também entra em FEATURED_ENDPOINTS (JSON da raiz p/ máquinas). Nenhum número hardcoded foi adicionado — contadores (__N__, __P_MIN__) já eram dinâmicos. | base: v48.17.0-RADAR: O RADAR VIRO PRODUTO + ML MAIS INTELIGENTE — (1) /weather $0.01: demanda MEDIDA (8 IPs/7d tomavam 404) — clima real p/ qualquer cidade ou lat/lon via Open-Meteo (grade fundida ECMWF/NOAA/DWD, sem chave): condicoes atuais WMO-decodificadas, 24h horarias e 7d diarios com probabilidade de precipitacao, nascer/por do sol e vento; cidade default Sao Paulo p/ o preview universal nunca travar; sinonimos weather->catalogo no search MCP | (2) /auth.json (8 IPs/7d): descriptor de auth machine-readable que reusa _register_doc() — uma verdade so em /login, /register, /config.js e aqui | (3) /app.js (8 IPs/7d): mini-SDK REAL zero-dependencias (browser+Node 18+): catalog/preview/payUrl/welcome/health/fetchPaid/creditsUrl/mcpUrl, versao do no embutida a cada render | (4) BANDIT ε ADAPTATIVO: exploracao decai com a experiencia (ε0/sqrt(1+N/50), piso 2%) — roteador aprende rapido no inicio e para de desperdicar calls quando ja sabe quem e bom; LLM_BANDIT_EPSILON=0 segue deterministico; eps_efetivo exposto em /health/providers (llm_bandit_eps_eff) | (5) FORECAST COM CALIBRACAO CONFORMAL: split-conformal sobre o proprio teste walk-forward — publica interval_coverage80_empirical (quanto a banda p10-p90 REALMENTE cobriu) + banda calibrada p10/p90_calibrated ao lado da crua; joblib antigo sem "calib" segue servindo ate o retreino de 6h | base: v48.16.6-EXACT3  # v48.16.6-EXACT3: FIX DA 6a CAMADA do checkout Phantom — a tx Solana volta a ter EXATAMENTE 3 instrucoes [SetComputeUnitLimit(30000), SetComputeUnitPrice(1000), TransferChecked], sem o Memo adicionado na 48.16.5. Prova em producao (logs Railway 02/10 12:08:48/12:12:00 UTC): invalid_exact_svm_smart_wallet_program_not_allowed apontando Tokenkeg — nome ENGANOSO; a matriz de conformidade publica dos facilitadores mapeia extra_instruction => smart_wallet_program_not_allowed ("the real cause is extra instruction present"; a tx de pagamento deve conter limit -> price -> transferChecked "and nothing else"). A spec §3.2 pede Memo, mas ela descreve o layout maximo (3-7 instrucoes); a VERIFICACAO ESTATICA path 1 do facilitador e a autoridade de facto e so aceita 3. ixMemo removido; comentario no codigo documenta a armadilha p/ ninguem readicionar. (2) VIGIA DA CAMADA 7 server-side: _sol_ata_of deriva a ATA de USDC do payTo (PDA ed25519 puro, sem dependencia nova) e /health/providers expoe "sol_dest_ata" {ata, exists, balance} com refresh em background (TTL 6h, nunca bloqueia, nunca derruba premium_ready) — a exigencia "ATA de destino pre-existente" dos facilitadores deixa de ser rejeicao silenciosa; se exists=False, a correcao e 1 envio comum de USDC ao payTo (tx separada, fora do fluxo x402) | base: v48.16.5-FRESHPAY  # v48.16.5-FRESHPAY: (1) HANDSHAKE DE VERSAO no checkout — a pagina carrega __PAY_VERSION__ e, ANTES de assinar (Base ou Solana), confere /health/providers: se o servidor subiu versao nova, ela se recarrega sozinha em vez de assinar com JS defasado (a causa REAL dos testes falhos de 02/10 00:07 e 07:45 BRT — abas abertas antes dos deploys 48.16.2/48.16.4; o no-store da 48.16.3 so protege carregamentos futuros). (2) Layout SVM completo da spec x402 §3.1 path 1: SetComputeUnitLimit(30k — cabe em teto de politica de 40k reportado, default 400k) -> SetComputeUnitPrice(1000 microlamports — dentro do teto 5 lamports/CU e de minimos comuns 1000; ~30 lamports de prioridade pagos PELO FACILITADOR) -> TransferChecked -> Memo(nonce 16B hex — spec EXIGE memo p/ unicidade; Phantom pode injetar ate 3 Lighthouse depois, layout segue <=7 instrucoes) | base: v48.16.4-SVMFIX  # v48.16.4-SVMFIX: /pay Phantom agora monta a transacao na ordem EXIGIDA pela spec x402 SVM e pelo PayAI — SetComputeUnitLimit(200k) -> SetComputeUnitPrice(1 microlamport) -> TransferChecked (spec: "MUST contain 3 to 7 instructions in this order: Compute Budget Set Compute Unit Limit; Set Compute Unit Price; SPL TransferChecked"); sem as duas ComputeBudget o verify devolvia invalid_exact_svm_payload_transaction_instructions_compute_limit_instruction (log Railway 02/10 00:47:33 UTC). Instrucoes hand-rolled no programa ComputeBudget111111111111111111111111111111 — zero dependencia de versao do web3.js | base: v48.16.3-NOCACHE  # v48.16.3-NOCACHE: /pay responde Cache-Control: no-store — pagina de checkout nunca mais envelhece no navegador (causa do teste de 01/10 20:16 BRT: aba aberta antes do deploy rodou o JS ANTIGO sem "accepted"; com no-store todo carregamento puxa o JS atual e o pagamento nao morre por codigo defasado) | base: v48.16.2-PHANTOMFIX  # v48.16.2-PHANTOMFIX: (1) FIX DEFINITIVO Phantom/Solana — o X-PAYMENT montado no /pay NAO levava o campo "accepted" (exigido pelo schema v2 do PayAI: verify 400 invalid_payload "accepted: expected object, received undefined", log Railway 01/10 21:43:56) -> o fallback on-chain tratava o BLOB base64 da tx como ASSINATURA -> getTransaction(lixo) -> "tx-not-found" + 15s de retries (o erro que o comprador via). Agora accepted:SOL_ACCEPT, espelhando o fluxo Base (provado). (2) GUARDA no fallback Solana de _verify_payment: tx_sig que nao parece assinatura base58 (blob v2, txid zerado porque o feePayer e o facilitator) pula o lookup impossivel com motivo claro — sem queimar 15s nem mentir "tx-not-found". (3) /api/claim-transfer BI-CHAIN: aceita hash 0x (Base) OU assinatura base58 (Solana) — verificacao on-chain direta via SOL.verify_payment, anti-replay atomico, tolerancia 97%, retry curto p/ lag de RPC; cartao manual do /pay mostra os DOIS payTos. Rail Solana INDEPENDENTE de facilitator (Phantom send, Binance Web3, ate saque de exchange viram venda). (4) erros do /pay Solana amigaveis + destaque automatico do cartao manual quando o facilitator falha. | base: v48.16.1-OBSERVE  # v48.16.1-OBSERVE: /health/providers passa a expor "llm_bandit" (recompensa/ok/fail/lat por provedor, aprendida pelo roteador e-greedy da 48.15) — antes as stats so apareciam em /llm/status; observabilidade pedida no indexar v4.3 | base: v48.16.0-SETTLE  # v48.16.0-SETTLE: (1) HOTFIX CRITICO /pay Phantom — "Error: bh is not defined": a v48.15.0 moveu const bh para dentro do bloco de fallback mas recentBlockhash continuou bh.blockhash (ReferenceError em runtime; node --check nao pega). Agora recentBlockhash: blockhash. (2) SOLUCAO DEFINITIVA p/ smart wallets (x402#623): NOVO POST /api/claim-transfer — pagamento por TRANSFERENCIA DIRETA de USDC na Base (sem assinatura EIP-3009/1271: transfer() funciona de Coinbase Smart Wallet, Binance Web3, passkey e ate saque de exchange): verificacao on-chain do receipt (status, contrato USDC, evento Transfer->payTo, valor>=97% da tabela, >=2 confirmacoes, anti-replay atomico, replay devolvido em falha transitoria) e entrega do conteudo na hora; /pay ganha o cartao "Signature rejected? Pay by plain transfer" com destaque automatico quando smart wallet detectada. (3) CROSS-SELL no checkout: "Agents also bought" no /pay alimentado pelo recomendador de co-compra real. | base: v48.15.0-BANDIT  # v48.15.0-BANDIT: (1) ROTEADOR DE LLM COM BANDIT ε-GREEDY persistido em /data (llm_bandit.json): recompensa = sucesso x fator de latencia, EWMA, ε=10% exploracao, ordena cada camada do _llm_chain pelo que APRENDEU em producao — provedor lento/falhando desce na fila sozinho e volta quando se recupera; stats visiveis em llm_health_report; LLM_ORDER e LLM_BANDIT=0 seguem como override. (2) /api/sol-usdc-balance — saldo USDC + blockhash Solana SERVER-SIDE (gratis, cache 8s, 30/min/IP): o Railway enxerga a rede Solana melhor que o browser do comprador; /pay consulta o servidor primeiro e so cai no multi-RPC do browser (ankr->drpc, ankr virou 403 sem chave) se o servidor nao responder — fim do falso "Could not reach the Solana network". (3) Warmer orientado por DEMANDA: _demand_rank ordena o aquecimento pelos probes+previews reais do ledger — preview fresco primeiro onde os avaliadores batem. (4) RSL (Really Simple Licensing): robots.txt ganha diretiva License -> /.well-known/rsl.xml com termos pay-per-crawl apontando para o catalogo x402 — alinhamento com o padrao que Reddit/Yahoo/Fastly adotaram p/ licenciar conteudo a crawlers de IA. | base: v48.14.3-CHECKOUT  # v48.14.3-CHECKOUT: (1) quota 429 do Google e POR MODELO — _try_gemini bane o modelo sem quota e troca para o proximo preferido NA MESMA chamada (ate 3); quarentena de provedor so quando esgotam. (2) /sec-filing envia User-Agent identificado (SEC 403 "undeclared" -> 200 JSON). | base: v48.14.1-HOTFIX: Pyth Hermes passou a EXIGIR API key no upgrade Pyth Core de 26/ago/2026 (401 sem chave — derrubou /pyth-price e o coletor do /forecast) — _pyth_latest usa o endpoint novo pyth.dourolabs.app/hermes com Bearer quando PYTH_API_KEY estiver no Railway + fallback CoinGecko simple/price (reusa COINGECKO_KEY) em /pyth-price, _oracle_pyth e _fc_collect — o coletor do ML nunca mais morre em silencio; self-heal do seed agora TREINA o simbolo recem-semeado na hora (antes: /forecast ficava 503 ate o tick de 6h) | base: v48.14.0-MONETIZE: (1) MPP tempo/charge REAL push-mode — challenges method="tempo" (USDC.e + pathUSD, chainId 4217) em TODO 402 e verificacao on-chain do credential Authorization: Payment (receipt TIP-20 Transfer: valor/destino/moeda + anti-replay atomico + Payment-Receipt) — captura os saldos AgentCash que nascem na Tempo; sem Stripe, sem chave privada no servidor; (2) NOVO /ecosystem-pulse $0.05 — a inteligencia dos 64k probes/dia como produto: top sondados com heat score, tendencias 7d-vs-7d (z-score Poisson), IPs-agente unicos, share de monitores QoS, clusters de demanda emergente; (3) price-elasticity advisor semanal — funil probes->previews->vendas por endpoint vira sugestao de PRECO DE TABELA global (nunca por carteira) no Telegram; PRICE_AUTO=1 aplica com trava +-30%/semana persistida em /data (env do operador sempre vence); (4) radar auto-atendimento com fallback SEMANTICO — embeddings (multilingue se preciso) casam 404 pelo significado quando o lexical falha, limiar 0.72, mesmas travas de seguranca; (5) /forecast seed auto-recupera a cada 30min ate todos os 8 simbolos terem backfill (429 de IP compartilhado nao exige mais redeploy); (6) /health expoe mpp_tempo + modo do advisor | base: v48.13.0-INTEL  # v48.13.0-INTEL: SEGUNDA CAMADA DE IA LOCAL — (1) NOVO /forecast $0.05: previsao p10/p50/p90 com HistGradientBoosting quantilico treinado NO HISTORICO QUE O PROPRIO NODE COLETA (Pyth a cada 10min + backfill CoinGecko 90d, 8 simbolos, 4 horizontes), MAPE de walk-forward publicado em toda resposta; sem historico = 503 e NAO cobra; (2) recomendador agents_also_bought por co-ocorrencia real de pagadores — cross-sell dentro do proprio 402 + /recommend gratis; (3) lead scoring SEMANTICO dos previews (embedding da intencao x catalogo premium) -> alerta de lead quente no Telegram; (4) clustering semanal dos 404s por significado (Agglomerative cosine sobre embeddings) -> oportunidades de produto em /ml + digest; (5) NOVO /ml publico: transparencia da camada de IA local; (6) /discover com reranker cross-encoder (ms-marco-MiniLM-L-6, 80MB ONNX) + modo MULTILINGUE sob demanda (paraphrase-MiniLM-L12: PT/ES/ZH acham o catalogo em ingles); (7) LLM LOCAL de ultimo recurso (LOCAL_LLM=1, llama-cpp-python + Qwen3-0.6B GGUF ~480MB em /data): se TODOS os provedores externos cairem, /llm responde com o modelo da casa em vez de 503 — OFF por padrao = custo zero; (8) detector de anomalias ganha severidade (volume puro -> log; comprador/receita -> Telegram) — fim do apito de hora em hora; (9) /live rotula scanner_noise como 'filtered noise' | requirements INALTERADOS (tudo roda sobre sklearn/fastembed ja instalados; llama-cpp-python e OPCIONAL e so e necessario com LOCAL_LLM=1) | base: v48.12.0-ML: camada de machine learning embarcada treinada nos dados do PROPRIO node (60k+ probes + ledger) — (1) classificador de demanda GradientBoosting com auto-rotulagem pelas regras atuais e retreino diario: pega scanner que o regex nunca viu (conf>=0.85 rebaixa new_product->scanner_noise) e anexa label+confianca ao painel/alertas; (2) detector de anomalias IsolationForest sobre agregados horarios de requests/revenue (min 72h): surto de comprador ou ataque vira log + Telegram (1/6h) + /data/ml_anomalies.json; (3) NOVO /discover gratis: busca semantica do catalogo por similaridade vetorial (MiniLM ONNX via fastembed, cache em /data) com fallback palavra-chave — funil de descoberta p/ agentes | tudo import-guarded (sem sklearn/fastembed o node roda como antes) + ML_DISABLED=1 | deps novas p/ requirements: scikit-learn fastembed | base: v48.11.0-GLOBAL: Moonshot/Kimi + OpenRouter como provedores premium DORMENTES (env-gated: sem chave = zero custo; ativar = MOONSHOT_API_KEY/OPENROUTER_API_KEY no Railway) | perfis de roteamento estilo ClawRouter: /llm?profile=eco|fast|premium e model=kimi|deepseek|eco|premium no /v1/chat/completions | NOVO /global-rates ($0.03): taxas de Fed/ECB/PBoC/BOJ/CBR/BCB numa chamada — BIS WS_CBPOL + cross-check ao vivo FRED/ECB-SDW/BCB-SGS, diferencial de carry vs Fed; nenhum concorrente x402 tem | rails Polygon (eip155:137) + Arbitrum (eip155:42161) PRONTAS, settle pelo mesmo facilitador CDP, env-gated OFF (X402_POLYGON=1/X402_ARBITRUM=1 so apos confirmar credito na Binance) | _SCAN_NOISE cobre /env.txt /env.js /settings.json /config/*.yml (scanner de credencial nao vira mais produto novo no radar) | _cap500 default 480->390 (x402lint P8: 24 descriptions na zona de risco; caminho p/ 100/100) | base: v48.10.3-REFINE: reprice consolidado no codigo (fonte unica, sem depender de env) — piso $0.01 em 12 endpoints de $0.003-0.008 (fear-greed, pyth-price, trust-hash, agent-market, bootstrap-trust, regime, mempool, web-search, ai-news + os 4 primitivos BR pix/bizdays/doc) e /br-archive $0.05->$0.09: a Coinbase cobra $0.001/settle apos 1k/mes (fazemos ~8k) — a $0.003 a taxa efetiva era 33%, a $0.01 cai a 10%; clientes x402 tem cap default 0.1 USDC, abaixo disso preco nao influencia decisao de maquina; referencia CoinGecko flat $0.01 | LLM_PROXY_PRICE agora le PRICE_LLM_PROXY (default $0.005 — a isca fica) | NOVO /.well-known/agent-registration.json (ERC-8004 registration-v1: A2A+MCP+x402+OAS, x402Support, supportedTrust) — registrar no Identity Registry 0x8004A169...a432 na Base | FIX telemetria: pos-refund nao loga mais "paid" (double-log inflava calls; Agent402 e /receipts leem isso) | refund agora carrega recommended_next (cross-sell na falha — falha vira retencao) | billing LLM com backoff persistente em /data (strikes 6h->12h->18h->24h; o 429 diario do Gemini parava de gritar a cada boot; provider saudavel zera) | base: v48.10.2-REFUND
 if __name__ == "__main__":
     cli()
 else:
