@@ -625,7 +625,7 @@ ENDPOINT_DESC = {
 
     # ---- Pro: inteligência composta ---------------------------------------
     "/deep-think":      "Structured reasoning on a thesis: the setup, the scenario tree, what would invalidate it, and the level where the thesis is simply wrong.",
-    "/agent-call":      "Agent-to-agent (A2A) call into another node of the swarm: relay a question and get that node's own answer back, priced per call.",
+    "/agent-call":      "One call, any task: describe what you need in plain English (?task=) and this node routes it — local semantic search (MiniLM ONNX, cross-encoder rerank) over its own live catalog — to the best in-budget endpoint, EXECUTES it in-process and returns the real data plus a routing receipt. Extra params (?symbol=, ?wallet=, ?token=…) flow straight to the chosen endpoint; ?endpoint=/name skips routing. If nothing in-budget can deliver, the payment is auto-refunded as credit — you never pay for a non-delivery.",
     "/whale-alert":     "Large on-chain USDC/SOL movements watchlist with the wallets involved. Follow smart money flow as it settles.",
     "/smart-money":     "Institutional wallet directory joined with real on-chain holders via Helius, plus the tracking method used, so the result is auditable rather than a black box.",
     "/sanctions":       "Real screening against the official OFAC-SDN list, downloaded daily from treasury.gov. Wallet or name in, match detail and confidence out.",
@@ -688,7 +688,7 @@ ENDPOINT_TAGS = {
     "/tg-premium":      ["Premium", "Alerts"],
     "/relatorio":       ["Search", "AI", "Research"],
     "/backtest":        ["Trading", "Quant"],
-    "/agent-call":      ["AI", "A2A"],
+    "/agent-call":      ["Routing", "Execution", "A2A"],
     "/onchain-credit":  ["Utility", "Score"],
     "/cross-chain":     ["Trading", "Bridge"],
     "/whale-alert":     ["Trading", "Alert"],
@@ -3957,21 +3957,236 @@ class Brain:
 
     @staticmethod
     def agent_call():
-        target = request.args.get("target", "").strip()
-        skill = request.args.get("skill", "").strip()
-        peers = LEDGER.active_peers()
-        if target:
-            peers = [p for p in peers if p[0].startswith(target)]
-        if not peers:
-            return {"error": "no peers available", "version": VERSION}
-        chosen = peers[0]
+        """v48.17.14-REALCALL — ROTEADOR QUE EXECUTA DE VERDADE.
+
+        O design original prometia "chamada roteada à rede de peers A2A" e
+        falhava duas vezes: (a) a tabela de peers vive vazia — não existe
+        supply público de agents A2A pagáveis para rotear (out/2026: a spec
+        A2A v1.0 está estável na Linux Foundation, mas os registries públicos
+        ainda estão em beta e a descoberta real é por URL direta entre partes
+        que já se conhecem); (b) mesmo COM peer, o handler só baixava o
+        agent-card e devolvia metadado — nunca executava nada. Resultado: 503
+        eterno (gate v48.17.11) ou card inútil.
+
+        O conserto real: o PRÓPRIO catálogo deste nó é a rede de skills. O
+        comprador manda ?task= em linguagem natural; a busca semântica local
+        (MiniLM ONNX + rerank cross-encoder, fallback palavra-chave) elege o
+        melhor endpoint ELEGÍVEL (handler real, vendável agora, dependências
+        estruturais ok) DENTRO do teto anti-arbitragem (preço dinâmico ≤ o
+        preço pago nesta chamada) — e o handler é EXECUTADO in-process. Como
+        é a mesma request, ?symbol= ?wallet= &token= etc. fluem direto para o
+        endpoint escolhido. Entrega real ou estorno automático em crédito
+        (v48.10.2) — nunca cobrar sem entregar.
+
+        ?endpoint=/nome pula o roteamento (execução direta validada).
+        ?target= preserva o caminho A2A externo para quando houver peer
+        ativo (sem peer → erro com estorno, ensinando o modo task=)."""
+        # --- caminho legado: peer A2A externo explícito ---------------------
+        target_peer = request.args.get("target", "").strip()
+        if target_peer:
+            peers = LEDGER.active_peers()
+            peers = [p for p in peers if p[0].startswith(target_peer)]
+            if not peers:
+                return {"error": f"no active A2A peer matching '{target_peer[:40]}'",
+                        "note": ("External A2A routing needs a live peer and none is "
+                                 "active right now (see /peers). The default mode "
+                                 "works today: pass ?task=<plain English> and this "
+                                 "node routes AND executes the best endpoint of its "
+                                 "own live catalog for you."),
+                        "example": f"{_public_base()}/agent-call?task=screen this token for rug risk",
+                        "version": VERSION}
+            chosen = peers[0]
+            try:
+                r = requests.get(f"{chosen[1]}/.well-known/agent.json", timeout=5)
+                return {"target_node": chosen[0], "url": chosen[1],
+                        "agent_card": r.json() if r.ok else None,
+                        "skill_requested": request.args.get("skill", "").strip(),
+                        "version": VERSION}
+            except Exception as e:
+                return {"error": str(e), "version": VERSION}
+
+        # --- modo principal: roteamento semântico + EXECUÇÃO interna --------
+        base = _public_base()
+        task = (request.args.get("task") or request.args.get("skill")
+                or "").strip()[:300]
+        explicit = (request.args.get("endpoint") or "").strip()[:64]
+        if explicit and not explicit.startswith("/"):
+            explicit = "/" + explicit
+
+        # Preços memoizados por request (get_dynamic_price consulta o ledger;
+        # 100+ leituras por chamada seriam desperdício).
+        _price_memo = {}
+        def _price_of(p):
+            if p not in _price_memo:
+                try:
+                    _price_memo[p] = get_dynamic_price(p)
+                except Exception:
+                    _price_memo[p] = BASE_PRICES.get(p, 0.05)
+            return _price_memo[p]
+
+        # Teto anti-arbitragem: só executamos endpoint cujo preço ≤ o pago
+        # nesta chamada — flagship nunca vaza com desconto via roteador.
+        cap = _price_of("/agent-call")
+
+        # Nunca roteável: ele mesmo (recursão), o meta-concierge (passo
+        # anterior do funil), planos de crédito (billing, não produto), o
+        # POST-only OpenAI-compatible e o bootstrap (pago só no POST).
+        _NOROUTE = {"/agent-call", "/api/v1/best",
+                    "/v1/chat/completions", "/bootstrap-trust"}
         try:
-            r = requests.get(f"{chosen[1]}/.well-known/agent.json", timeout=5)
-            return {"target_node": chosen[0], "url": chosen[1],
-                    "agent_card": r.json() if r.ok else None,
-                    "skill_requested": skill, "version": VERSION}
+            _llm_ok = llm_healthy()
+        except Exception:
+            _llm_ok = True
+
+        def _eligible(p):
+            """Dependências estruturais ok + vendável agora (sem preço)."""
+            if p in _NOROUTE or p in CREDIT_PLANS or p not in BASE_PRICES:
+                return False
+            if p not in ENDPOINT_HANDLERS:
+                return False
+            if not _sellable_now(p):
+                return False
+            if p in AI_REQUIRED_ENDPOINTS and not _llm_ok:
+                return False
+            _need = PROVIDER_REQUIRED_ENDPOINTS.get(p)
+            if _need:
+                try:
+                    if not _need():
+                        return False
+                except Exception:
+                    return False
+            return True
+
+        eligible_count = sum(1 for p in BASE_PRICES if _eligible(p))
+
+        def _fail(reason, **extra):
+            # Qualquer falha AQUI volta como dict com "error" → o wrapper
+            # v48.10.2 converte em estorno-em-crédito automático pós-settle.
+            body = {"error": reason, "routed": False,
+                    "catalog_eligible": eligible_count,
+                    "how_to_use": (f"GET {base}/agent-call?task=<plain English> "
+                                   "[&endpoint=/name] — extra params like &symbol= "
+                                   "or &wallet= flow straight to the chosen endpoint"),
+                    "version": VERSION}
+            body.update(extra)
+            return body
+
+        def _alt_item(p):
+            return {"endpoint": p, "price_usd": round(_price_of(p), 4),
+                    "buy_direct": f"{base}{p}",
+                    "human_checkout": f"{base}/pay{p}"}
+
+        # ---------- escolha do alvo ----------
+        target, score, mode = None, None, "explicit"
+        premium = None
+        alts = []
+        if explicit:
+            if explicit in _NOROUTE or explicit in CREDIT_PLANS or explicit not in BASE_PRICES:
+                return _fail(f"endpoint '{explicit[:64]}' is not routable here",
+                             hint=f"browse the live catalog at {base}/get-pricing")
+            if not _eligible(explicit):
+                return _fail(f"'{explicit}' is temporarily unavailable (dependency gate) — "
+                             "it is not being sold right now",
+                             retry_after_seconds=300)
+            if _price_of(explicit) > cap + 1e-9:
+                return _fail(f"'{explicit}' costs ${_price_of(explicit):.3f} — above this "
+                             f"call's ${cap:.3f} budget. Buy it directly instead.",
+                             premium_match=_alt_item(explicit))
+            target = explicit
+        else:
+            if not task:
+                return _fail("missing task",
+                             usage=f"{base}/agent-call?task=check if this token is a rug pull")
+            sem = _discover_embed(task, 8)
+            if sem:
+                mode = _ML_EMB.get("mode") or "semantic"
+                hits = [(p, s) for p, s in sem]
+            else:
+                mode = "keyword"
+                hits = [(p, None) for p in _discover_keyword(task, 8)]
+            for p, s in hits:
+                if not _eligible(p):
+                    continue
+                if _price_of(p) <= cap + 1e-9:
+                    if target is None:
+                        target, score = p, s
+                    elif len(alts) < 3 and p != target:
+                        alts.append(p)
+                elif premium is None:
+                    premium = p
+            if target is None:
+                if premium is not None:
+                    return _fail(f"best match '{premium}' costs "
+                                 f"${_price_of(premium):.3f} — above this call's "
+                                 f"${cap:.3f} budget. Buy it directly instead.",
+                                 premium_match=_alt_item(premium))
+                return _fail("no endpoint matched this task well enough to execute",
+                             alternatives=[_alt_item(p) for p, _s in hits[:3]
+                                           if p in BASE_PRICES],
+                             tip=f"rephrase in plain English — or try free discovery: "
+                                 f"{base}/discover?q={task[:80]}")
+            # anti-alucinação do roteador: match semântico fraco demais =
+            # executar um endpoint aleatório. Só se aplica ao cosseno puro —
+            # com rerank o cross-encoder já viu query+documento juntos, e no
+            # fallback keyword não há escala comparável.
+            if (score is not None and isinstance(score, (int, float))
+                    and mode.startswith("semantic") and "rerank" not in mode
+                    and score < 0.28):
+                return _fail(f"best semantic match '{target}' is too weak "
+                             f"(score {score:.2f}) to justify execution",
+                             alternatives=[_alt_item(p) for p, _s in hits[:3]
+                                           if p in BASE_PRICES])
+
+        # ---------- execução real ----------
+        t0x = time.perf_counter()
+        try:
+            raw = ENDPOINT_HANDLERS[target]()
         except Exception as e:
-            return {"error": str(e), "version": VERSION}
+            log.error(f"🚨 /agent-call: execução interna de {target} falhou: {e}")
+            return _fail(f"routed endpoint '{target}' raised an internal error",
+                         routed_to=target, detail=str(e)[:200])
+        exec_ms = round((time.perf_counter() - t0x) * 1000, 1)
+
+        # Response cru (raríssimo) — passa como veio, com recibo no header.
+        if isinstance(raw, Response):
+            try:
+                raw.headers["X-Losbeto-Routed-To"] = target
+            except Exception:
+                pass
+            return raw
+
+        body, status = raw, 200
+        if isinstance(raw, tuple):
+            body = raw[0]
+            if len(raw) > 1 and isinstance(raw[1], int):
+                status = raw[1]
+        if status >= 400 or _is_error_result(raw):
+            log.warning(f"↩️ /agent-call: {target} não entregou (status {status}) — "
+                        "estorno automático")
+            return _fail(f"routed endpoint '{target}' did not deliver",
+                         routed_to=target,
+                         target_response=(body if isinstance(body, dict)
+                                          else {"raw": str(body)[:200]}))
+
+        log.info(f"🤖 /agent-call: '{(task or explicit)[:60]}' → {target} "
+                 f"({mode}, {exec_ms}ms)")
+        return {"task": task or None,
+                "routed_to": target,
+                "executed": True,
+                "match_mode": mode,
+                "match_score": score,
+                "execution_ms": exec_ms,
+                "result": body,
+                "alternatives": [_alt_item(p) for p in alts],
+                "routing": {"catalog_eligible": eligible_count,
+                            "budget_cap_usd": round(cap, 4),
+                            "engine": ("local semantic routing (MiniLM ONNX + "
+                                       "cross-encoder rerank when available) over "
+                                       "this node's own live catalog — the query "
+                                       "never leaves the node"),
+                            "explicit_endpoint": bool(explicit)},
+                "ts": int(time.time()),
+                "version": VERSION}
 
     @staticmethod
     def onchain_credit():
@@ -8358,27 +8573,18 @@ def _sellability_block(path):
     Regra do operador (a mesma lida ao Beck): 'a source that returns 200 is
     not alive' — endpoint cuja dependência ESTRUTURAL está vazia recusa a
     venda (503 grátis, sem 402) em vez de cobrar e falhar.
-    Caso real: /agent-call vende chamada roteada à rede de peers A2A; com a
-    tabela de peers vazia, TODO comprador tomava 502 charged:true + crédito
-    (passe Algorand de 05/out, chamada 37/91). O refund automático
-    (v48.10.2) já protegia o dinheiro — mas vender o que certamente falha
-    corrói o fail-rate nos índices de descoberta. Agora a venda é recusada
-    ANTES do desafio; quando um peer estiver ativo (ver GET /peers), o
-    endpoint volta a vender sozinho, sem redeploy.
+    Histórico do caso que originou o gate: /agent-call vendia chamada
+    roteada à rede de peers A2A; com a tabela de peers vazia, TODO comprador
+    tomava 502 charged:true + crédito (passe Algorand de 05/out, chamada
+    37/91). O refund automático (v48.10.2) já protegia o dinheiro — mas
+    vender o que certamente falha corrói o fail-rate nos índices de
+    descoberta. A v48.17.14-REALCALL resolveu o caso NA RAIZ: o endpoint
+    agora roteia e executa o PRÓPRIO catálogo (não depende mais de peers
+    externos) e voltou à vitrine. O hook permanece para futuras dependên-
+    cias estruturais: dict aqui = venda recusada (503 grátis) + saída
+    automática dos catálogos (v48.17.13), com retorno espontâneo quando a
+    dependência voltar.
     Retorna None quando a venda pode acontecer; dict = corpo do 503 grátis."""
-    try:
-        if path == "/agent-call" and not LEDGER.active_peers():
-            return {"status": "unavailable", "charged": False,
-                    "error": "no peers available",
-                    "note": ("This endpoint sells routed calls to the live A2A "
-                             "peer network. The network currently has zero "
-                             "active peers, so the sale is refused instead of "
-                             "charged. It reopens automatically when a peer "
-                             "becomes active — live list at /peers."),
-                    "retry_after_seconds": 3600,
-                    "version": VERSION}
-    except Exception:
-        pass
     return None
 
 
@@ -14949,7 +15155,11 @@ _V32_REPRICE = {
     "/multi-chain-arbitrage": 0.06,
     "/sinais":                0.05,
     "/deep-think":            0.05,
-    "/agent-call":            0.05,
+    # v48.17.14-REALCALL: /agent-call VOLTA a $0.10 — o produto agora é
+    # roteamento + EXECUÇÃO real do melhor endpoint, e o teto anti-arbitragem
+    # é o preço pago: a $0.05 o universo roteável perderia exatamente os
+    # produtos que agentes mais recompram (wallet-scan, token-intel,
+    # sanctions, smart-money, whale-alert — todos $0.05–0.10).
     "/whale-alert":           0.05,
     "/smart-money":           0.05,
     "/sanctions":             0.05,
@@ -19670,9 +19880,12 @@ def _build_openapi():
                            {"name": "days", "in": "query", "required": False,
                             "description": "Days of history",
                             "schema": {"type": "integer", "example": 30}}],
-        "/agent-call":    [{"name": "target", "in": "query", "required": False,
-                            "description": "Target node address",
-                            "schema": {"type": "string", "example": "https://peer.example.com"}}],
+        "/agent-call":    [{"name": "task", "in": "query", "required": False,
+                            "description": "Plain-English task — the node routes to the best in-budget endpoint of its own catalog and EXECUTES it",
+                            "schema": {"type": "string", "example": "screen this solana token for rug risk"}},
+                           {"name": "endpoint", "in": "query", "required": False,
+                            "description": "Explicit endpoint to execute (skips semantic routing)",
+                            "schema": {"type": "string", "example": "/rugcheck"}}],
         "/onchain-credit":[{"name": "wallet", "in": "query", "required": False,
                             "description": "Solana address to evaluate",
                             "schema": {"type": "string", "example": "7xKX..."}}],
@@ -29725,6 +29938,27 @@ VERSION = "48.17.11-SELLABLE"  # v48.17.11-SELLABLE: /agent-call deixava de entr
 VERSION = "48.17.12-BESTBACK"  # v48.17.12-BESTBACK: /api/v1/best ressuscitado como concierge semântico pago ($0.01) — rota morta no x402-list (404) volta viva e melhor; textos de chains da landing e do /pay viram dinâmicos (__CHAINS__ conforme flags X402_*). | base: v48.17.11-SELLABLE
 
 VERSION = "48.17.13-SHELFSYNC"  # v48.17.13-SHELFSYNC: VITRINE CONSISTENTE — o 503 honesto do /agent-call (48.17.11) protegeu o comprador mas o endpoint seguia ANUNCIADO como pago: x402lint marcou FAIL P6 price-integrity (A 93/100, única falha do scan 06/10), x402scan pulou o registro ("no valid x402 response"), x402-list degradou o badge. Novo _sellable_now(): invendável some do manifesto x402/.well-known/slim, openapi, bazaar.json, get-pricing, /api/for-you e do recommended_next — e VOLTA sozinho quando um peer A2A estiver ativo, sem redeploy. __N__ da landing conta só os vendáveis. WARN P7 (2 payTos) é intencional: multi-chain exige 1 payTo por chain. | base: v48.17.12-BESTBACK
+
+# ---------------------------------------------------------------------------
+# v48.17.14-REALCALL — /agent-call CONSERTADO DE VERDADE (roteia E executa)
+# Pedido do operador (06/10): "não é possível consertar o GET /agent-call?"
+# em vez de só escondê-lo dos catálogos (48.17.13). Diagnóstico: o design
+# original dependia de peers A2A externos — supply inexistente (spec v1.0
+# estável, mas registries públicos ainda em beta; descoberta real é URL
+# direta) — e, mesmo com peer, só devolvia o agent-card. O fix transforma o
+# endpoint em roteador semântico que EXECUTA o melhor endpoint do PRÓPRIO
+# catálogo dentro do teto anti-arbitragem (preço ≤ o pago na chamada), com
+# estorno automático (v48.10.2) em qualquer não-entrega. Com a dependência
+# estrutural morta, o gate de vendabilidade saiu e o endpoint volta a todos
+# os catálogos de máquinas por conta própria (_sellable_now → True).
+# ---------------------------------------------------------------------------
+ENDPOINT_PARAM_HINTS["/agent-call"] = {"task": "check if this token is a rug pull",
+                                       "endpoint": "/rugcheck"}
+log.info("🤖 /agent-call REALCALL: roteador semântico que EXECUTA o endpoint "
+         "eleito do próprio catálogo (cap = preço pago; estorno automático)")
+
+
+VERSION = "48.17.14-REALCALL"  # v48.17.14-REALCALL: /agent-call CONSERTADO DE VERDADE — de "busca o agent-card de um peer que não existe" para ROTEADOR SEMÂNTICO QUE EXECUTA: ?task= em linguagem natural → busca local (MiniLM ONNX + rerank cross-encoder, fallback palavra-chave) sobre o catálogo ELEGÍVEL (handler real + _sellable_now + gates de IA/provedor) dentro do TETO ANTI-ARBITRAGEM (get_dynamic_price do alvo ≤ o preço pago na chamada) → handler executado in-process na mesma request (parâmetros extras ?symbol=/?wallet= fluem direto) → envelope com resultado real + recibo de roteamento + alternativas. Qualquer não-entrega (sem match, match fraco <0.28 no cosseno puro, match premium acima do teto, alvo indisponível, exceção, corpo de erro, status ≥400) cai no caminho v48.10.2: estorno automático em crédito — nunca cobrar sem entregar. ?endpoint=/nome pula o roteamento (execução direta validada); ?target= preserva o caminho A2A externo para quando houver peer. Preço volta a $0.10 (saía do _V32_REPRICE) para o universo roteável cobrir os produtos que agentes mais recompram (wallet-scan, token-intel, sanctions…). Descrição/tags/OpenAPI/param-hints reescritos para o produto real. | base: v48.17.13-SHELFSYNC
 
 if __name__ == "__main__":
     cli()
