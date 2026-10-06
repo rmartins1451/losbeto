@@ -11574,7 +11574,7 @@ def agents_txt():
         "# Losbeto — machine-readable catalog (text)",
         f"# base: {base}",
         f"# version: {VERSION}",
-        "# payment: x402 (USDC on Base, Solana, Algorand) — HTTP 402 challenge per call",
+        "# payment: x402 (USDC on Base, Polygon, Solana, Algorand) — HTTP 402 challenge per call",
         "# free: ?preview=1 on every endpoint · /try tasting menu · /welcome first realtime call",
         "",
     ]
@@ -11603,7 +11603,7 @@ def mpp_discovery():
         "version": "1.0",
         "provider": "losbeto",
         "description": "Cross-asset market data for AI agents. Settlement via "
-                       "x402 (USDC on Base, Solana, Algorand) — HTTP 402 "
+                       "x402 (USDC on Base, Polygon, Solana, Algorand) — HTTP 402 "
                        "challenge with JSON body per x402 v2.",
         "endpoints": endpoints,
         "payment_methods": ["x402"],
@@ -11646,7 +11646,7 @@ def agent_registration_8004():
                         "on x402 (PIX BR Code tools, du/252 business-day rates math, BCB "
                         "series, B3 equities, point-in-time macro archive), market data, "
                         "an OpenAI-compatible LLM inference gateway, and transform APIs "
-                        "(/extract, /translate). USDC via x402 on Base, Solana and "
+                        "(/extract, /translate). USDC via x402 on Base, Polygon, Solana and "
                         "Algorand. Free delayed preview on every endpoint; "
                         "delivery-or-refund on every paid call."),
         "image": f"{base}/favicon.png",
@@ -11801,7 +11801,7 @@ tr:hover td{background:var(--bg2)}
 <div class="hero">
   <div class="badge-live"><span class="pulse"></span>NODE ONLINE — v__V__</div>
   <h1>APIs pagas por AI Agents.<br>Instant. Onchain. Zero setup.</h1>
-  <p class="sub">__EPS__ monetized endpoints over <b>x402</b> — real-time crypto, equities, forex, commodities &amp; macro, anchored by a <b>signed point-in-time Brazilian macro archive</b> (IPCA, Selic, PTAX as originally published, no look-ahead, Ed25519). Pay per call with USDC on <b>Base, Solana or Algorand</b>, delivered in <b>&lt;500ms</b>.</p>
+  <p class="sub">__EPS__ monetized endpoints over <b>x402</b> — real-time crypto, equities, forex, commodities &amp; macro, anchored by a <b>signed point-in-time Brazilian macro archive</b> (IPCA, Selic, PTAX as originally published, no look-ahead, Ed25519). Pay per call with USDC on <b>Base, Polygon, Solana or Algorand</b>, delivered in <b>&lt;500ms</b>.</p>
   <div class="cta">
     <a href="/try" class="btn btn-p">🍽️ Free tasting — 6 endpoints in 1 call →</a>
     <a href="/br-pit-proof" class="btn btn-s">📐 Brazil archive proof (free) — Merkle + Ed25519</a>
@@ -11971,7 +11971,7 @@ def _is_bot(ua: str) -> bool:
 CLEAN_LANDING = r"""<!doctype html><html lang="en"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Losbeto — LLM inference + cross-asset market data for AI agents (x402)</title>
-<meta name="description" content="OpenAI-compatible LLM gateway at $0.005/call — change base_url, pay in USDC. Plus pay-per-call market data: multi-oracle price consensus, sentiment, forex, equities, commodities, Brazil macro (BCB/B3) and crypto. No API keys, no accounts. USDC on Base, Solana and Algorand via x402.">
+<meta name="description" content="OpenAI-compatible LLM gateway at $0.005/call — change base_url, pay in USDC. Plus pay-per-call market data: multi-oracle price consensus, sentiment, forex, equities, commodities, Brazil macro (BCB/B3) and crypto. No API keys, no accounts. USDC on Base, Polygon, Solana and Algorand via x402.">
 <link rel="canonical" href="__BASE__/">
 <meta property="og:type" content="website">
 <meta property="og:title" content="Losbeto — cross-asset market data for AI agents">
@@ -14595,7 +14595,7 @@ ENDPOINT_DESC["/v1/chat/completions"] = (
     "OpenAI-compatible chat completions over x402: POST the standard "
     "{model, messages, max_tokens} body and receive a standard chat.completion "
     "response — any OpenAI SDK works by changing only base_url. Payment is the "
-    "x402 challenge (USDC on Base, Solana or Algorand), so an agent needs no "
+    "x402 challenge (USDC on Base, Polygon, Solana or Algorand), so an agent needs no "
     "provider account, no credit card, no API key. Failover chain behind the "
     "door: Groq first for speed, Gemini and paid tiers as backup. v1: no "
     "streaming, tools or vision — declared in every error response.")
@@ -16025,10 +16025,10 @@ def _discover_embed(q: str, n: int) -> list:
     if not _ML_EMB_OK:
         return []
     key = "multi" if _needs_multi(q) else "base"
-    paths, vecs = _emb_catalog(key)
+    paths, vecs = _emb_catalog_async(key)
     if paths is None and key == "multi":
         key = "base"
-        paths, vecs = _emb_catalog("base")
+        paths, vecs = _emb_catalog_async("base")
     if paths is None:
         return []
     try:
@@ -16161,6 +16161,53 @@ def _emb_catalog(key="base"):
         st["paths"] = paths
         st["hash"] = cat_hash
     return st["paths"], st["vectors"]
+
+
+_EMB_BUILDING = set()
+
+
+def _emb_catalog_async(key="base"):
+    """Versao NAO-BLOQUEANTE do _emb_catalog (v48.17.15).
+
+    Causa-raiz do WORKER TIMEOUT recorrente no boot: com 4 workers gunicorn,
+    cada worker construia os embeddings do catalogo INLINE na 1a request
+    semantica que recebia (~30-70s de CPU) — o gunicorn matava o worker por
+    timeout (SIGKILL) e o boot ficava 'sujo'. Agora: cache quente -> retorna;
+    cache frio -> dispara o build numa thread daemon e retorna (None, None)
+    IMEDIATAMENTE, derrubando o caller no fallback keyword (instantaneo).
+    Segundos depois o catalogo esta quente e o modo semantico assume."""
+    st = _EMB_CACHE[key]
+    import hashlib as _hl
+    cat_hash = _hl.sha256("|".join(sorted(ENDPOINT_DESC)).encode()).hexdigest()[:16]
+    if st["hash"] == cat_hash and st["vectors"] is not None:
+        return st["paths"], st["vectors"]
+    if key not in _EMB_BUILDING:
+        _EMB_BUILDING.add(key)
+        def _build():
+            try:
+                _emb_catalog(key)
+            except Exception as _e:
+                log.warning(f"\U0001f9e0 emb build bg ({key}): {_e}")
+            finally:
+                _EMB_BUILDING.discard(key)
+        threading.Thread(target=_build, daemon=True).start()
+    return None, None
+
+
+def _ml_boot_warm():
+    """v48.17.15: aquece embeddings do catalogo + reranker cross-encoder numa
+    thread de boot de CADA worker — quando a 1a request semantica chegar, esta
+    tudo pronto (adeus WORKER TIMEOUT de 30s do gunicorn no caminho quente)."""
+    try:
+        if _ML_EMB_OK:
+            _emb_catalog("base")
+    except Exception as _e:
+        log.warning(f"\U0001f9e0 warm emb: {_e}")
+    try:
+        if _ML_RERANK_ON:
+            _rerank("warmup", ["warmup: document"])
+    except Exception as _e:
+        log.warning(f"\U0001f9e0 warm rerank: {_e}")
 
 
 def _needs_multi(q: str) -> bool:
@@ -18827,7 +18874,7 @@ def terms_page():
         "effective": "2026-08-04",
         "terms": {
             "what_you_buy": ("Per-call access to market data APIs, paid in USDC via "
-                             "x402 on Base, Solana or Algorand, or prepaid credit keys. No "
+                             "x402 on Base, Polygon, Solana or Algorand, or prepaid credit keys. No "
                              "accounts, no subscriptions unless explicitly purchased."),
             "pricing": ("Prices are quoted in the 402 response before you sign anything. "
                         "You never pay a price you did not see first."),
@@ -18895,7 +18942,7 @@ def privacy_page():
             "what_we_log": ("Caller IP, requested path, user-agent and payment metadata "
                             "(tx hash, network, amount), kept for operations, abuse "
                             "prevention and the public transparency pages (/receipts, /live)."),
-            "on_chain_nature": ("Payments settle on public blockchains (Base, Solana, "
+            "on_chain_nature": ("Payments settle on public blockchains (Base, Polygon, Solana, "
                                 "Algorand). Transaction hashes and wallet addresses are "
                                 "inherently public — that is a property of the networks, "
                                 "not a choice of this node."),
@@ -20329,7 +20376,7 @@ def llms_txt():
         "Every 402 response also carries an inline `upsell.sample` with real output.",
         "",
         "## FLAGSHIP — LLM GATEWAY (OpenAI-compatible, pay-per-call)",
-        f"POST {base}/v1/chat/completions — any OpenAI SDK works; change only base_url. Flat ${LLM_PROXY_PRICE:.4f}/call, USDC via x402 (Base, Solana, Algorand).",
+        f"POST {base}/v1/chat/completions — any OpenAI SDK works; change only base_url. Flat ${LLM_PROXY_PRICE:.4f}/call, USDC via x402 (Base, Polygon, Solana, Algorand).",
         f"GET  {base}/llm?q=your+prompt — same engine over GET, same price.",
         f"FREE: GET {base}/v1/models (model list) · GET {base}/llm/status (live backend telemetry + beta caps)",
         f"Beta caps: {LLM_DAILY_KEY_CAP} calls/day per key, {LLM_DAILY_GLOBAL_CAP}/day global (free-tier backends, honest limits; paid tiers lift them).",
@@ -23605,6 +23652,7 @@ def _start_background_once():
     threading.Thread(target=autopilot_report_loop, daemon=True).start()
     threading.Thread(target=llm_watchdog_loop, daemon=True).start()
     threading.Thread(target=acp_railway_seller_loop, daemon=True).start()
+    threading.Thread(target=_ml_boot_warm, daemon=True).start()  # v48.17.15: mata WORKER TIMEOUT de boot
     log.info("✅ Autopilot: loops de background ativos neste worker")
 
 def run_server():
@@ -29933,6 +29981,22 @@ app.add_url_rule("/api/v1/best", "api_v1_best",
                  paid_endpoint("/api/v1/best")(_api_v1_best_handler))
 log.info("🧭 /api/v1/best registrado ($0.01) — concierge semântico do catálogo")
 
+# v48.17.15-DEMANDA — radar 7d flagrou: /mcp/sse (6req/5ip; transporte MCP
+# legado procurando este nó), /keys.json (6/3; key-discovery estilo A2A) e
+# /auth/login (6/3; probe genérico de login). Em vez de 404, todos recebem o
+# concierge pago do catálogo ($0.01) — que apresenta tudo o que o nó faz e
+# como pagar. NOTA DE SEGURANÇA: /vendor/composer/installed.json (5/5 no
+# radar) é scanner de vulnerabilidade PHP — NUNCA servir; fica 404 para sempre.
+for _alias in ("/mcp/sse", "/keys.json", "/auth/login"):
+    if _alias not in app.view_functions and not any(r.rule == _alias for r in app.url_map.iter_rules()):
+        app.add_url_rule(
+            _alias,
+            "alias" + _alias.replace("/", "_").replace("-", "_").replace(".", "_"),
+            paid_endpoint("/api/v1/best")(_api_v1_best_handler),
+            methods=["GET", "POST"],
+        )
+        log.info(f"🔗 apelido {_alias} → /api/v1/best registrado (radar de demanda)")
+
 
 VERSION = "48.17.11-SELLABLE"  # v48.17.11-SELLABLE: /agent-call deixava de entregar SEM deixar de cobrar ("no peers available" → 502 charged:true no passe Algorand 05/out, chamada 37/91). Novo gate _sellability_block ANTES do 402: dependência estrutural vazia (rede A2A com zero peers ativos) → 503 grátis charged:false + Retry-After + nota honesta, logado como refused_unsellable; o endpoint volta a vender sozinho quando um peer estiver ativo (GET /peers), sem redeploy. Refund automático v48.10.2 segue como cinto-e-suspensório para a corrida peer-sai-entre-402-e-settle. | base: v48.17.10-FUNNEL
 VERSION = "48.17.12-BESTBACK"  # v48.17.12-BESTBACK: /api/v1/best ressuscitado como concierge semântico pago ($0.01) — rota morta no x402-list (404) volta viva e melhor; textos de chains da landing e do /pay viram dinâmicos (__CHAINS__ conforme flags X402_*). | base: v48.17.11-SELLABLE
@@ -29959,6 +30023,9 @@ log.info("🤖 /agent-call REALCALL: roteador semântico que EXECUTA o endpoint 
 
 
 VERSION = "48.17.14-REALCALL"  # v48.17.14-REALCALL: /agent-call CONSERTADO DE VERDADE — de "busca o agent-card de um peer que não existe" para ROTEADOR SEMÂNTICO QUE EXECUTA: ?task= em linguagem natural → busca local (MiniLM ONNX + rerank cross-encoder, fallback palavra-chave) sobre o catálogo ELEGÍVEL (handler real + _sellable_now + gates de IA/provedor) dentro do TETO ANTI-ARBITRAGEM (get_dynamic_price do alvo ≤ o preço pago na chamada) → handler executado in-process na mesma request (parâmetros extras ?symbol=/?wallet= fluem direto) → envelope com resultado real + recibo de roteamento + alternativas. Qualquer não-entrega (sem match, match fraco <0.28 no cosseno puro, match premium acima do teto, alvo indisponível, exceção, corpo de erro, status ≥400) cai no caminho v48.10.2: estorno automático em crédito — nunca cobrar sem entregar. ?endpoint=/nome pula o roteamento (execução direta validada); ?target= preserva o caminho A2A externo para quando houver peer. Preço volta a $0.10 (saía do _V32_REPRICE) para o universo roteável cobrir os produtos que agentes mais recompram (wallet-scan, token-intel, sanctions…). Descrição/tags/OpenAPI/param-hints reescritos para o produto real. | base: v48.17.13-SHELFSYNC
+
+VERSION = "48.17.15-WARMBOOT"  # v48.17.15-WARMBOOT: embeddings/reranker aquecidos em thread no boot de cada worker + _discover_embed não-bloqueante (mata WORKER TIMEOUT de boot); aliases de demanda /mcp/sse, /keys.json, /auth/login → /api/v1/best; textos de chains incluem Polygon (blurb x402scan vinha do meta description)
+
 
 if __name__ == "__main__":
     cli()
