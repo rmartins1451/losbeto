@@ -15112,17 +15112,23 @@ _V4818_PRODUCTS = {
         ["GET", "POST"]),
 }
 
-for _path, (_fn, _price, _ai, _desc, _tags, _hint, _methods) in _V4818_PRODUCTS.items():
+# v48.18.2-HOTFIX: a variável de desempacotamento chamava-se `_ai` e
+# SOBRESCREVIA a função global _ai() (linha ~9292) ao fim do loop — todos os
+# endpoints premium que chamam _ai()/_ai_required() passaram a 500ar com
+# "'bool' object is not callable" (16 endpoints: /analise /council /relatorio…).
+for _path, (_fn, _price, _uses_ai, _desc, _tags, _hint, _methods) in _V4818_PRODUCTS.items():
     BASE_PRICES[_path] = float(os.environ.get(
         "PRICE_" + _path.strip("/").replace("-", "_").upper(), str(_price)))
     ENDPOINT_DESC[_path] = _desc
     ENDPOINT_TAGS[_path] = _tags
     ENDPOINT_PARAM_HINTS[_path] = _hint
     ENDPOINT_HANDLERS[_path] = _fn
-    if _ai:
+    if _uses_ai:
         AI_REQUIRED_ENDPOINTS.add(_path)
     app.add_url_rule(_path, "v4818" + _path.replace("/", "_").replace("-", "_"),
                      paid_endpoint(_path)(_fn), methods=_methods)
+assert callable(_ai), "REGRESSÃO: loop de registro sobrescreveu _ai()"  # v48.18.2
+del _path, _fn, _price, _uses_ai, _desc, _tags, _hint, _methods  # não vaza nome p/ o módulo
 log.info("🧾 v48.18.0-REGISTRY: /br-cnpj /br-cep /classify /summarize registrados")
 
 # ---------------------------------------------------------------------------
@@ -30364,6 +30370,7 @@ log.info("🤖 /agent-call REALCALL: roteador semântico que EXECUTA o endpoint 
 VERSION = "48.18.0-REGISTRY"  # v48.17.14-REALCALL: /agent-call CONSERTADO DE VERDADE — de "busca o agent-card de um peer que não existe" para ROTEADOR SEMÂNTICO QUE EXECUTA: ?task= em linguagem natural → busca local (MiniLM ONNX + rerank cross-encoder, fallback palavra-chave) sobre o catálogo ELEGÍVEL (handler real + _sellable_now + gates de IA/provedor) dentro do TETO ANTI-ARBITRAGEM (get_dynamic_price do alvo ≤ o preço pago na chamada) → handler executado in-process na mesma request (parâmetros extras ?symbol=/?wallet= fluem direto) → envelope com resultado real + recibo de roteamento + alternativas. Qualquer não-entrega (sem match, match fraco <0.28 no cosseno puro, match premium acima do teto, alvo indisponível, exceção, corpo de erro, status ≥400) cai no caminho v48.10.2: estorno automático em crédito — nunca cobrar sem entregar. ?endpoint=/nome pula o roteamento (execução direta validada); ?target= preserva o caminho A2A externo para quando houver peer. Preço volta a $0.10 (saía do _V32_REPRICE) para o universo roteável cobrir os produtos que agentes mais recompram (wallet-scan, token-intel, sanctions…). Descrição/tags/OpenAPI/param-hints reescritos para o produto real. | base: v48.17.13-SHELFSYNC
 
 VERSION = "48.18.1-MERGE"  # v48.18.1-MERGE: 48.18.0-REGISTRY (Claude: painel orgânico, radar anti-scanner, cache /live/api+/dash, /br-cnpj /br-cep /classify /summarize) + 48.17.15-WARMBOOT (Kimi: _discover_embed não-bloqueante + warmer de embeddings/reranker no boot — mata WORKER TIMEOUT; aliases /mcp/sse /keys.json /auth/login; textos de chains com Polygon — corrige o blurb do x402scan). Base deployada: 48.17.14-REALCALL.
+VERSION = "48.18.2-HOTFIX"  # v48.18.2-HOTFIX: fix CRITICO — o loop de registro da 48.18.0 usava `_ai` como variavel de desempacotamento do tuple e SOBRESCREVIA a funcao global _ai() (~l.9292) ao fim do import (ficava _ai=True); os 16 endpoints premium que chamam _ai()/_ai_required() 500avam com "'bool' object is not callable" (traceback real: analise l.3734 -> _ai_required l.9311). Renomeado p/ _uses_ai + assert callable(_ai) + del dos nomes do loop. | base: v48.18.1-MERGE
 
 
 if __name__ == "__main__":
