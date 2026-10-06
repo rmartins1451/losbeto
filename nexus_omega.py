@@ -589,7 +589,7 @@ ENDPOINT_DESC = {
     "/fear-greed":      "Is the crowd greedy or fearful right now? The Fear & Greed Index (0-100) at this exact instant, with classification — a point-in-time reading your model's training data cannot contain.",
     "/trust-hash":      "SHA-256 proof-of-data hash for audit trails: a verifiable cryptographic receipt of any Losbeto response, for agents that must prove what they were told and when.",
     "/agent-market":    "Machine-readable commercial map of this catalog: featured endpoints, cheapest calls, the free tier and the credit plans, so an agent can plan a budget in one request.",
-    "/bootstrap-trust": "Trust bootstrap endpoint. POST a minimal self-payment to seed an on-chain settlement record; GET returns the instructions for free.",
+    "/bootstrap-trust": "Payment flow smoke test. POST any small payment to verify your x402 client end-to-end (headers, facilitator, settlement) and get a signed receipt; GET returns the instructions for free.",
     "/regime":          "Bull, bear or chop — right now? Regime classification from the last 24h-7d of momentum and realized volatility, with a confidence score. The 'now' is the product: models do not know today.",
     "/mempool":         "Live Solana network conditions: pending transaction pressure, current fee levels and priority-fee guidance for agents timing an execution.",
     "/web-search":      "What is the web saying right now? Live search results condensed into clean text for agent reasoning — answers beyond any model's training cutoff. Google-grade when the node's search provider is configured.",
@@ -14836,6 +14836,295 @@ for _path, (_fn, _price, _desc, _tags, _hint) in _XF_PRODUCTS.items():
 
 log.info("🔁 v48.10.1-TRANSFORM: /extract e /translate registrados (mesmo gateway LLM, contrato estrito)")
 
+
+# ============================================================================
+# v48.18.0-REGISTRY — mais 4 SKUs, escolhidos pelo que já aparece nos logs
+#
+#  · /br-cnpj  — o /br-doc diz em letras miúdas "NÃO prova que está ativo; para
+#    situação cadastral é preciso consulta oficial". Este é o passo seguinte do
+#    mesmo agente: situação, CNAE, porte, UF. Fonte pública (BrasilAPI), cache 24h.
+#    Sócios: só contagem e qualificação — nomes/CPF ficam de fora (LGPD).
+#  · /br-cep   — endereço por CEP (BrasilAPI v2), cache 30 dias.
+#  · /classify — texto -> um rótulo de um conjunto FECHADO que o comprador define.
+#  · /summarize— resumo com teto de frases. Mesmo gateway/failover do /extract.
+#  As duas primeiras NÃO usam LLM (custo ~0, sem teto diário). Falha de fonte ou
+#  entrada inválida devolve dict com "error": o wrapper v48.10.2 converte em
+#  crédito automaticamente (nunca cobra sem entregar).
+# ============================================================================
+
+BRCNPJ_PRICE  = float(os.environ.get("PRICE_BR_CNPJ", "0.02"))
+BRCEP_PRICE   = float(os.environ.get("PRICE_BR_CEP", "0.01"))
+CLASSIFY_PRICE  = float(os.environ.get("PRICE_CLASSIFY", "0.008"))
+SUMMARIZE_PRICE = float(os.environ.get("PRICE_SUMMARIZE", "0.008"))
+_REG_CACHE: Dict[str, Any] = {}
+_REG_CACHE_MAX = 4000
+
+
+def _reg_get(url: str, ttl: int) -> Tuple[Optional[dict], str]:
+    """GET JSON com cache em memória. Devolve (dados, erro)."""
+    now = time.time()
+    hit = _REG_CACHE.get(url)
+    if hit and now - hit[0] < ttl:
+        return hit[1], ""
+    try:
+        r = requests.get(url, timeout=8,
+                         headers={"User-Agent": f"Losbeto/{VERSION} (+https://api.losbeto.xyz)"})
+    except Exception as e:
+        return None, f"upstream unreachable: {type(e).__name__}"
+    if r.status_code == 404:
+        return None, "not-found"
+    if not r.ok:
+        return None, f"upstream HTTP {r.status_code}"
+    try:
+        data = r.json()
+    except Exception:
+        return None, "upstream returned non-JSON"
+    if not isinstance(data, dict):
+        return None, "upstream returned unexpected shape"
+    if len(_REG_CACHE) > _REG_CACHE_MAX:
+        _REG_CACHE.clear()
+    _REG_CACHE[url] = (now, data)
+    return data, ""
+
+
+def _h_br_cnpj():
+    v = (request.args.get("cnpj") or request.args.get("doc") or "").strip()
+    ts_now = int(time.time())
+    digits = re.sub(r"\D", "", v)
+    if len(digits) != 14:
+        return ({"status": "bad_request", "charged": False,
+                 "error": "cnpj=<14 digits, formatting optional> is required",
+                 "ts": ts_now, "version": VERSION}, 400)
+    if not _cnpj_valid(digits):
+        return ({"status": "bad_request", "charged": False,
+                 "error": "check digits do not match — this CNPJ is malformed "
+                          "(use /br-doc to validate for $0.01 first)",
+                 "ts": ts_now, "version": VERSION}, 400)
+    d, err = _reg_get(f"https://brasilapi.com.br/api/cnpj/v1/{digits}", 86400)
+    if d is None:
+        if err == "not-found":
+            return ({"status": "not_found", "charged": False,
+                     "error": "well-formed CNPJ but not found in the federal registry",
+                     "cnpj": digits, "ts": ts_now, "version": VERSION}, 404)
+        return ({"status": "unavailable", "charged": False,
+                 "error": f"registry source unavailable ({err})",
+                 "retry_after_seconds": 120, "ts": ts_now, "version": VERSION}, 503)
+    qsa = d.get("qsa") if isinstance(d.get("qsa"), list) else []
+    sit = (d.get("descricao_situacao_cadastral") or "").strip()
+    return {
+        "cnpj": digits,
+        "formatted": (f"{digits[:2]}.{digits[2:5]}.{digits[5:8]}/"
+                      f"{digits[8:12]}-{digits[12:]}"),
+        "legal_name": d.get("razao_social"),
+        "trade_name": d.get("nome_fantasia") or None,
+        "registry_status": sit or None,
+        "is_active": (sit.upper() == "ATIVA") if sit else None,
+        "status_date": d.get("data_situacao_cadastral"),
+        "opened": d.get("data_inicio_atividade"),
+        "branch_type": d.get("descricao_matriz_filial") or d.get("descricao_identificador_matriz_filial"),
+        "main_activity": d.get("cnae_fiscal_descricao"),
+        "legal_nature": d.get("natureza_juridica"),
+        "size": d.get("porte"),
+        "share_capital_brl": d.get("capital_social"),
+        "state": d.get("uf"), "city": d.get("municipio"), "zip": d.get("cep"),
+        "partners_count": len(qsa),
+        "partners_roles": sorted({str(q.get("qualificacao_socio"))
+                                  for q in qsa if isinstance(q, dict) and q.get("qualificacao_socio")})[:8],
+        "partners_note": "names and tax IDs of individuals are deliberately omitted (LGPD)",
+        "source": "Receita Federal public registry via BrasilAPI",
+        "cache_ttl_hours": 24,
+        "ts": ts_now, "version": VERSION}
+
+
+def _h_br_cep():
+    v = (request.args.get("cep") or "").strip()
+    ts_now = int(time.time())
+    digits = re.sub(r"\D", "", v)
+    if len(digits) != 8:
+        return ({"status": "bad_request", "charged": False,
+                 "error": "cep=<8 digits> is required", "ts": ts_now, "version": VERSION}, 400)
+    d, err = _reg_get(f"https://brasilapi.com.br/api/cep/v2/{digits}", 30 * 86400)
+    if d is None:
+        if err == "not-found":
+            return ({"status": "not_found", "charged": False,
+                     "error": "CEP not found", "cep": digits,
+                     "ts": ts_now, "version": VERSION}, 404)
+        return ({"status": "unavailable", "charged": False,
+                 "error": f"CEP source unavailable ({err})",
+                 "retry_after_seconds": 120, "ts": ts_now, "version": VERSION}, 503)
+    loc = (d.get("location") or {}).get("coordinates") if isinstance(d.get("location"), dict) else {}
+    return {"cep": digits, "street": d.get("street"), "neighborhood": d.get("neighborhood"),
+            "city": d.get("city"), "state": d.get("state"),
+            "latitude": (loc or {}).get("latitude"), "longitude": (loc or {}).get("longitude"),
+            "source": "BrasilAPI CEP v2", "cache_ttl_days": 30,
+            "ts": ts_now, "version": VERSION}
+
+
+def _xf_labels(body: dict) -> List[str]:
+    raw = body.get("labels") if "labels" in body else request.args.get("labels", "")
+    if isinstance(raw, str):
+        t = raw.strip()
+        if t.startswith("["):
+            try:
+                raw = json.loads(t)
+            except Exception:
+                raw = t
+    if isinstance(raw, list):
+        items = [str(x).strip() for x in raw]
+    else:
+        items = [x.strip() for x in str(raw or "").split(",")]
+    out, seen = [], set()
+    for x in items:
+        if x and x.lower() not in seen:
+            seen.add(x.lower())
+            out.append(x[:60])
+    return out[:30]
+
+
+def xf_classify():
+    body = _xf_body()
+    text = _xf_arg("text", body)[:_XF_MAX_CHARS]
+    labels = _xf_labels(body)
+    if request.args.get("preview") == "1" and not text.strip():
+        text, labels = "My card was charged twice for the same order", ["billing", "shipping", "technical", "other"]
+    if not text.strip() or len(labels) < 2:
+        return ({"error": "invalid-request",
+                 "message": 'Send {"text": "...", "labels": ["billing","shipping","other"]} '
+                            "(2 to 30 labels) or GET ?text=...&labels=a,b,c",
+                 "ts": int(time.time())}, 400)
+    if not llm_healthy():
+        return _llm_proxy_down()
+    _g = _llm_gate()
+    if _g:
+        return _g
+    prompt = ("Classify the TEXT into exactly ONE of these labels: " + json.dumps(labels) +
+              '.\nReturn ONLY a JSON object: {"label": <one of the labels, copied exactly>, '
+              '"confidence": <number 0 to 1>}. If nothing fits, choose the closest label '
+              "and lower the confidence.\n\nTEXT:\n" + text)
+    ans = LLM.ask(prompt, max_tokens=60, temperature=0.0, cache=False)
+    data = _xf_json_from(ans) or {}
+    lab = str(data.get("label", "")).strip()
+    match = next((l for l in labels if l.lower() == lab.lower()), None)
+    if match is None:
+        return _llm_proxy_down()
+    try:
+        conf = max(0.0, min(1.0, float(data.get("confidence"))))
+    except Exception:
+        conf = None
+    _llm_count()
+    return {"label": match, "confidence": conf, "labels": labels, "chars_in": len(text),
+            "guarantee": "label is always one of the labels you sent, copied verbatim",
+            "limits": _llm_limits_block(), "ts": int(time.time()),
+            "provider": "Losbeto/Transform", "version": VERSION}
+
+
+def xf_summarize():
+    body = _xf_body()
+    text = _xf_arg("text", body)[:_XF_MAX_CHARS]
+    if request.args.get("preview") == "1" and not text.strip():
+        text = ("The central bank held the policy rate at 15% for a third straight meeting, "
+                "citing sticky services inflation and unanchored expectations, while signalling "
+                "that cuts depend on sustained disinflation in the coming quarters.")
+    try:
+        n = int(_xf_arg("sentences", body, "3"))
+    except Exception:
+        n = 3
+    n = max(1, min(8, n))
+    lang = (_xf_arg("lang", body) or "").strip()[:40]
+    if len(text.strip()) < 40:
+        return ({"error": "invalid-request",
+                 "message": 'Send {"text": "... (40+ chars)", "sentences": 3, "lang": "en"}',
+                 "ts": int(time.time())}, 400)
+    if not llm_healthy():
+        return _llm_proxy_down()
+    _g = _llm_gate()
+    if _g:
+        return _g
+    prompt = (f"Summarize the TEXT in at most {n} sentences" +
+              (f", written in {lang}" if lang else ", in the same language as the text") +
+              ". Output ONLY the summary. Use only facts stated in the text; keep numbers "
+              "exact; no preamble.\n\nTEXT:\n" + text)
+    ans = LLM.ask(prompt, max_tokens=400, temperature=0.1, cache=False)
+    if not ans or not ans.strip():
+        return _llm_proxy_down()
+    _llm_count()
+    return {"summary": ans.strip(), "max_sentences": n, "chars_in": len(text),
+            "limits": _llm_limits_block(), "ts": int(time.time()),
+            "provider": "Losbeto/Transform", "version": VERSION}
+
+
+ENDPOINT_BODY_SCHEMAS["/classify"] = {
+    "method": "POST", "contentType": "application/json",
+    "schema": {"type": "object", "properties": {
+        "text": {"type": "string", "description": "Text to classify (max 6000 chars)."},
+        "labels": {"type": "array", "items": {"type": "string"},
+                   "description": "2-30 candidate labels; the answer is always one of them."}},
+        "required": ["text", "labels"]},
+    "example": {"text": "My card was charged twice", "labels": ["billing", "shipping", "technical", "other"]},
+    "outputSchema": {"type": "object", "properties": {
+        "label": {"type": "string"}, "confidence": {"type": "number"}}, "required": ["label"]}}
+ENDPOINT_BODY_SCHEMAS["/summarize"] = {
+    "method": "POST", "contentType": "application/json",
+    "schema": {"type": "object", "properties": {
+        "text": {"type": "string", "description": "Text to summarize (40-6000 chars)."},
+        "sentences": {"type": "integer", "description": "Max sentences, 1-8 (default 3)."},
+        "lang": {"type": "string", "description": "Optional output language."}},
+        "required": ["text"]},
+    "example": {"text": "The central bank held the policy rate at 15% for a third straight meeting...",
+                "sentences": 2},
+    "outputSchema": {"type": "object", "properties": {"summary": {"type": "string"}},
+                     "required": ["summary"]}}
+
+_V4818_PRODUCTS = {
+    "/br-cnpj": (_h_br_cnpj, BRCNPJ_PRICE, False,
+        "Look up a Brazilian company by CNPJ in the federal registry: legal name, "
+        "registry status (ATIVA / BAIXADA / SUSPENSA / INAPTA), opening date, main "
+        "CNAE activity, size, state and city, partner count. The step after /br-doc: "
+        "checksum says the number is well-formed, this says the company is real and "
+        "active — the check an onboarding or payment agent runs before paying a "
+        "Brazilian supplier. Individuals' names and tax IDs are omitted (LGPD). "
+        "Cached 24h. Do NOT use for CPF lookups — personal data is not served.",
+        ["Brazil", "KYB", "Registry", "Compliance"],
+        {"cnpj": "00.000.000/0001-91"}, ["GET"]),
+    "/br-cep": (_h_br_cep, BRCEP_PRICE, False,
+        "Brazilian postal code to address: street, neighborhood, city, state and "
+        "coordinates when available. Normalizes the address an agent must put on a "
+        "boleto, invoice or shipment. Cached 30 days. Do NOT use to validate a full "
+        "street number — CEP resolves to a street, not a door.",
+        ["Brazil", "Address", "Logistics"],
+        {"cep": "01310100"}, ["GET"]),
+    "/classify": (xf_classify, CLASSIFY_PRICE, True,
+        "Assign text to exactly one label from a closed set you provide — support "
+        "triage, intent routing, spam/not-spam, sentiment buckets. The answer is "
+        "always one of your labels, copied verbatim, with a 0-1 confidence; if the "
+        "model returns anything else the payment is returned as call credit. Do NOT "
+        "use for open-ended tagging — that is /extract.",
+        ["AI", "Classification", "Routing", "Transform"],
+        {"text": "My card was charged twice", "labels": "billing,shipping,technical,other"},
+        ["GET", "POST"]),
+    "/summarize": (xf_summarize, SUMMARIZE_PRICE, True,
+        "Summarize text in at most N sentences (1-8) in the language you choose, using "
+        "only facts stated in the text with numbers kept exact. Built for agents that "
+        "must shrink a page, email thread or filing before spending context on it. Do "
+        "NOT use for free-form writing — that is /llm.",
+        ["AI", "Summarization", "Transform"],
+        {"text": "The central bank held the policy rate at 15% ...", "sentences": "2"},
+        ["GET", "POST"]),
+}
+
+for _path, (_fn, _price, _ai, _desc, _tags, _hint, _methods) in _V4818_PRODUCTS.items():
+    BASE_PRICES[_path] = float(os.environ.get(
+        "PRICE_" + _path.strip("/").replace("-", "_").upper(), str(_price)))
+    ENDPOINT_DESC[_path] = _desc
+    ENDPOINT_TAGS[_path] = _tags
+    ENDPOINT_PARAM_HINTS[_path] = _hint
+    ENDPOINT_HANDLERS[_path] = _fn
+    if _ai:
+        AI_REQUIRED_ENDPOINTS.add(_path)
+    app.add_url_rule(_path, "v4818" + _path.replace("/", "_").replace("-", "_"),
+                     paid_endpoint(_path)(_fn), methods=_methods)
+log.info("🧾 v48.18.0-REGISTRY: /br-cnpj /br-cep /classify /summarize registrados")
+
 # ---------------------------------------------------------------------------
 # v48.0.0 — DESCOBERTA GRATUITA DO GATEWAY (padrão OpenAI + telemetria honesta)
 def llm_models():
@@ -15660,7 +15949,13 @@ _SCAN_NOISE = re.compile(
     # pedia config. com ponto, nao config/ com barra). Mesma familia: caca a
     # credencial vazada, nao demanda.
     r"(^|/)\.?env\.(txt|js|json|ya?ml|local|prod(uction)?)$|"
-    r"(^|/)settings\.json$|(^|/)config/[^/]+\.(ya?ml|xml|ini|conf)$)", re.I)
+    r"(^|/)settings\.json$|(^|/)config/[^/]+\.(ya?ml|xml|ini|conf)$|"
+    # v48.18.0: o radar de 06/10 listava como "produto novo" /vendor/composer/
+    # installed.json (5 IPs), /keys.json, /auth/login e /wallet.json — é caça a
+    # dependência vulnerável, chave vazada e formulário de login, não cliente.
+    r"(^|/)vendor/|composer\.(json|lock)$|installed\.json$|node_modules|"
+    r"(^|/)(keys?|keystore|mnemonic|seed|wallet)s?\.json$|"
+    r"(^|/)auth/(login|signin|register|token)$|package(-lock)?\.json$)", re.I)
 
 def _is_scan_noise(path: str) -> bool:
     return bool(_SCAN_NOISE.search(path or ""))
@@ -16167,15 +16462,14 @@ _EMB_BUILDING = set()
 
 
 def _emb_catalog_async(key="base"):
-    """Versao NAO-BLOQUEANTE do _emb_catalog (v48.17.15).
+    """Versao NAO-BLOQUEANTE do _emb_catalog (v48.18.1-MERGE, vinda da 48.17.15).
 
     Causa-raiz do WORKER TIMEOUT recorrente no boot: com 4 workers gunicorn,
     cada worker construia os embeddings do catalogo INLINE na 1a request
     semantica que recebia (~30-70s de CPU) — o gunicorn matava o worker por
-    timeout (SIGKILL) e o boot ficava 'sujo'. Agora: cache quente -> retorna;
-    cache frio -> dispara o build numa thread daemon e retorna (None, None)
-    IMEDIATAMENTE, derrubando o caller no fallback keyword (instantaneo).
-    Segundos depois o catalogo esta quente e o modo semantico assume."""
+    timeout (SIGKILL). Agora: cache quente -> retorna; cache frio -> dispara
+    o build numa thread daemon e retorna (None, None) IMEDIATAMENTE, caindo no
+    fallback keyword (instantaneo). Segundos depois o modo semantico assume."""
     st = _EMB_CACHE[key]
     import hashlib as _hl
     cat_hash = _hl.sha256("|".join(sorted(ENDPOINT_DESC)).encode()).hexdigest()[:16]
@@ -16195,9 +16489,9 @@ def _emb_catalog_async(key="base"):
 
 
 def _ml_boot_warm():
-    """v48.17.15: aquece embeddings do catalogo + reranker cross-encoder numa
-    thread de boot de CADA worker — quando a 1a request semantica chegar, esta
-    tudo pronto (adeus WORKER TIMEOUT de 30s do gunicorn no caminho quente)."""
+    """v48.18.1-MERGE: aquece embeddings do catalogo + reranker cross-encoder
+    numa thread de boot de CADA worker — quando a 1a request semantica chegar,
+    esta tudo pronto (adeus WORKER TIMEOUT de 30s do gunicorn)."""
     try:
         if _ML_EMB_OK:
             _emb_catalog("base")
@@ -19636,8 +19930,7 @@ def live_page():
     a torna visível em movimento, não só num JSON."""
     return app.response_class(LIVE_HTML, mimetype="text/html")
 
-@app.route("/live/api")
-def live_api():
+def _live_api_build():
     """Alimenta /live. Público e sem token — expõe apenas agregados que já
     são públicos em /receipts e /health/providers. Nada sensível."""
     try:
@@ -19652,6 +19945,10 @@ def live_api():
     # "revenue". O split honesto (v45) vai junto, e o KPI usa ele.
     try:
         publico["revenue_truth_24h"] = revenue_split(86400)
+        # v48.18.0: a conversão pública não pode misturar settles do operador.
+        _o = publico["revenue_truth_24h"].get("organic_tx", 0)
+        _pv = publico.get("previews_24h") or 0
+        publico["conv_evaluators"] = round(_o / (_o + _pv) * 100, 1) if (_o + _pv) else 0.0
     except Exception:
         pass
     publico["demand_404"] = [{"path": d.get("path"), "ips": d.get("ips"),
@@ -19665,6 +19962,28 @@ def live_api():
     return jsonify({"stats": publico, "health": saude,
                     "endpoints": len(BASE_PRICES),
                     "version": VERSION, "ts": int(time.time())})
+
+_LIVE_API_CACHE = {"ts": 0.0, "body": None}
+LIVE_API_TTL = float(os.environ.get("LIVE_API_TTL", "15"))
+
+
+@app.route("/live/api")
+def live_api():
+    """v48.18.0: /live/api custava 670–1000 ms por chamada e é repetido a cada
+    poucos segundos por qualquer aba aberta (visto no log do Railway). Cache de
+    15 s libera as threads do gunicorn para o 402, que é onde está o dinheiro."""
+    now = time.time()
+    c = _LIVE_API_CACHE
+    if c["body"] is not None and now - c["ts"] < LIVE_API_TTL:
+        return app.response_class(c["body"], mimetype="application/json",
+                                  headers={"X-Cache": "hit"})
+    resp = _live_api_build()
+    try:
+        c["body"], c["ts"] = resp.get_data(), now
+    except Exception:
+        pass
+    return resp
+
 
 @app.route("/about")
 @app.route("/contact")
@@ -22258,9 +22577,18 @@ async function reload(){
 
   const avgTicket = (j.stats.avg_ticket!==undefined) ? j.stats.avg_ticket : 0;
 
+  // v48.18.0: 563 settles/24h eram quase todos do operador (scripts de indexação).
+  // A manchete passa a ser o que veio de carteira EXTERNA; o bruto fica rotulado.
+  const rt24=((j.revenue_truth||{}).last_24h)||{};
+  const orgTx=rt24.organic_tx||0, orgUsd=rt24.organic_usdc||0;
+  const prevN=j.stats.previews_24h||0;
+  const convOrg=(orgTx+prevN)>0 ? (orgTx/(orgTx+prevN)*100) : 0;
   const cards=[
-    ["💰 Receita Total",`$${j.stats.total_usdc.toFixed(4)}`,"USDC acumulado","hero"],
-    ["📅 Hoje (24h)",`$${j.stats.today_usdc.toFixed(4)}`,j.stats.paid_24h+" pagamentos",""],
+    ["💰 Receita ORGÂNICA (24h)",`$${orgUsd.toFixed(4)}`,
+       orgTx+" vendas · "+(rt24.organic_buyers||0)+" compradores externos","hero"],
+    ["🧾 Bruto liquidado (acumulado)",`$${j.stats.total_usdc.toFixed(4)}`,
+       "inclui compras do operador — não é receita de clientes",""],
+    ["📅 Bruto 24h (incl. operador)",`$${j.stats.today_usdc.toFixed(4)}`,j.stats.paid_24h+" settlements",""],
     ["⏱️ Última hora",`$${j.stats.hour_usdc.toFixed(4)}`,"USDC",""],
     ["🎯 Win Rate (heurístico)",`${j.stats.win_rate.toFixed(1)}%`,"sinal por regras",""],
     ["⚡ PoI Multiplier",
@@ -22271,8 +22599,8 @@ async function reload(){
        "previews servidos — prospectos reais",(j.stats.previews_24h>0)?"green":""],
     ["🤖 Sondagens (24h)",j.stats.probes_24h!==undefined?j.stats.probes_24h:j.stats.requests_24h,
        "scanners/catálogos — não compram",""],
-    ["📊 Conversão real",`${(j.stats.conv_evaluators!==undefined?j.stats.conv_evaluators:0).toFixed(1)}%`,
-       "pagas ÷ (pagas+avaliações)",""],
+    ["📊 Conversão orgânica",`${convOrg.toFixed(1)}%`,
+       "vendas externas ÷ (vendas externas + avaliações)",""],
     ["👥 Compradores",j.stats.buyers,"únicos",""],
     ["💵 Ticket médio",`$${avgTicket.toFixed(4)}`,"por venda liquidada",""],
     ["⛓️ Chains",(j.chains||["solana"]).map(c=>c.split(":")[0]).join(" · "),"ativas",""],
@@ -22406,11 +22734,18 @@ def dash():
     return app.response_class(DASH_HTML.replace("__TOKEN__", DASH_TOKEN).replace("__DASHV__", VERSION),
                               mimetype="text/html")
 
+_DASH_API_CACHE = {"ts": 0.0, "body": None}
+
+
 @app.route("/dash/api/stats")
 def dash_api():
     if not _dash_token_ok(request.args.get("token", "")):
         return jsonify({"error": "forbidden"}), 403
-    return jsonify({
+    _dc = _DASH_API_CACHE
+    if _dc["body"] is not None and time.time() - _dc["ts"] < 10:
+        return app.response_class(_dc["body"], mimetype="application/json",
+                                  headers={"X-Cache": "hit"})
+    _resp = jsonify({
         "version":         VERSION,
         "node_id":         WALLET.node_id,
         "solana_address":  RECEIVE_ADDRESS,
@@ -22434,6 +22769,11 @@ def dash_api():
         # genérico satisfeito.
         "base_bootstrap_done": _base_settles() > 0,
     })
+    try:
+        _dc["body"], _dc["ts"] = _resp.get_data(), time.time()
+    except Exception:
+        pass
+    return _resp
 
 # ============================================================================
 # 16. TELEGRAM BOT (com comandos adicionais)
@@ -23652,7 +23992,7 @@ def _start_background_once():
     threading.Thread(target=autopilot_report_loop, daemon=True).start()
     threading.Thread(target=llm_watchdog_loop, daemon=True).start()
     threading.Thread(target=acp_railway_seller_loop, daemon=True).start()
-    threading.Thread(target=_ml_boot_warm, daemon=True).start()  # v48.17.15: mata WORKER TIMEOUT de boot
+    threading.Thread(target=_ml_boot_warm, daemon=True).start()  # v48.18.1-MERGE: mata WORKER TIMEOUT de boot
     log.info("✅ Autopilot: loops de background ativos neste worker")
 
 def run_server():
@@ -29981,12 +30321,11 @@ app.add_url_rule("/api/v1/best", "api_v1_best",
                  paid_endpoint("/api/v1/best")(_api_v1_best_handler))
 log.info("🧭 /api/v1/best registrado ($0.01) — concierge semântico do catálogo")
 
-# v48.17.15-DEMANDA — radar 7d flagrou: /mcp/sse (6req/5ip; transporte MCP
-# legado procurando este nó), /keys.json (6/3; key-discovery estilo A2A) e
-# /auth/login (6/3; probe genérico de login). Em vez de 404, todos recebem o
-# concierge pago do catálogo ($0.01) — que apresenta tudo o que o nó faz e
-# como pagar. NOTA DE SEGURANÇA: /vendor/composer/installed.json (5/5 no
-# radar) é scanner de vulnerabilidade PHP — NUNCA servir; fica 404 para sempre.
+# v48.18.1-MERGE (da 48.17.15) — radar 7d: /mcp/sse (6req/5ip; transporte MCP
+# legado), /keys.json (6/3) e /auth/login (6/3; ambos majoritariamente scanners
+# de credencial — o radar v48.18.0 agora os filtra do relatório, mas o 402 aqui
+# converte o probe em vitrine para quem for agente de verdade). NUNCA servir
+# /vendor/composer/installed.json: scanner de vulnerabilidade PHP, fica 404.
 for _alias in ("/mcp/sse", "/keys.json", "/auth/login"):
     if _alias not in app.view_functions and not any(r.rule == _alias for r in app.url_map.iter_rules()):
         app.add_url_rule(
@@ -30022,9 +30361,9 @@ log.info("🤖 /agent-call REALCALL: roteador semântico que EXECUTA o endpoint 
          "eleito do próprio catálogo (cap = preço pago; estorno automático)")
 
 
-VERSION = "48.17.14-REALCALL"  # v48.17.14-REALCALL: /agent-call CONSERTADO DE VERDADE — de "busca o agent-card de um peer que não existe" para ROTEADOR SEMÂNTICO QUE EXECUTA: ?task= em linguagem natural → busca local (MiniLM ONNX + rerank cross-encoder, fallback palavra-chave) sobre o catálogo ELEGÍVEL (handler real + _sellable_now + gates de IA/provedor) dentro do TETO ANTI-ARBITRAGEM (get_dynamic_price do alvo ≤ o preço pago na chamada) → handler executado in-process na mesma request (parâmetros extras ?symbol=/?wallet= fluem direto) → envelope com resultado real + recibo de roteamento + alternativas. Qualquer não-entrega (sem match, match fraco <0.28 no cosseno puro, match premium acima do teto, alvo indisponível, exceção, corpo de erro, status ≥400) cai no caminho v48.10.2: estorno automático em crédito — nunca cobrar sem entregar. ?endpoint=/nome pula o roteamento (execução direta validada); ?target= preserva o caminho A2A externo para quando houver peer. Preço volta a $0.10 (saía do _V32_REPRICE) para o universo roteável cobrir os produtos que agentes mais recompram (wallet-scan, token-intel, sanctions…). Descrição/tags/OpenAPI/param-hints reescritos para o produto real. | base: v48.17.13-SHELFSYNC
+VERSION = "48.18.0-REGISTRY"  # v48.17.14-REALCALL: /agent-call CONSERTADO DE VERDADE — de "busca o agent-card de um peer que não existe" para ROTEADOR SEMÂNTICO QUE EXECUTA: ?task= em linguagem natural → busca local (MiniLM ONNX + rerank cross-encoder, fallback palavra-chave) sobre o catálogo ELEGÍVEL (handler real + _sellable_now + gates de IA/provedor) dentro do TETO ANTI-ARBITRAGEM (get_dynamic_price do alvo ≤ o preço pago na chamada) → handler executado in-process na mesma request (parâmetros extras ?symbol=/?wallet= fluem direto) → envelope com resultado real + recibo de roteamento + alternativas. Qualquer não-entrega (sem match, match fraco <0.28 no cosseno puro, match premium acima do teto, alvo indisponível, exceção, corpo de erro, status ≥400) cai no caminho v48.10.2: estorno automático em crédito — nunca cobrar sem entregar. ?endpoint=/nome pula o roteamento (execução direta validada); ?target= preserva o caminho A2A externo para quando houver peer. Preço volta a $0.10 (saía do _V32_REPRICE) para o universo roteável cobrir os produtos que agentes mais recompram (wallet-scan, token-intel, sanctions…). Descrição/tags/OpenAPI/param-hints reescritos para o produto real. | base: v48.17.13-SHELFSYNC
 
-VERSION = "48.17.15-WARMBOOT"  # v48.17.15-WARMBOOT: embeddings/reranker aquecidos em thread no boot de cada worker + _discover_embed não-bloqueante (mata WORKER TIMEOUT de boot); aliases de demanda /mcp/sse, /keys.json, /auth/login → /api/v1/best; textos de chains incluem Polygon (blurb x402scan vinha do meta description)
+VERSION = "48.18.1-MERGE"  # v48.18.1-MERGE: 48.18.0-REGISTRY (Claude: painel orgânico, radar anti-scanner, cache /live/api+/dash, /br-cnpj /br-cep /classify /summarize) + 48.17.15-WARMBOOT (Kimi: _discover_embed não-bloqueante + warmer de embeddings/reranker no boot — mata WORKER TIMEOUT; aliases /mcp/sse /keys.json /auth/login; textos de chains com Polygon — corrige o blurb do x402scan). Base deployada: 48.17.14-REALCALL.
 
 
 if __name__ == "__main__":
@@ -30035,3 +30374,6 @@ else:
     # em um único worker; ver _start_background_once).
     if os.environ.get("AUTOPILOT", "1") != "0":
         _start_background_once()
+
+# v48.18.0-REGISTRY: (1) dashboard: manchete e conversão passam a ser ORGÂNICAS (o bruto incl. operador fica rotulado) | (2) radar de demanda ignora scanners de credencial (/vendor/composer, /keys.json, /auth/login, /wallet.json) | (3) /live/api e /dash/api/stats com cache TTL (670-1000 ms por chamada no log do Railway) | (4) novos /br-cnpj /br-cep (BrasilAPI, sem LLM) e /classify /summarize (mesmo gateway do /extract) | base: v48.17.14-REALCALL
+# v48.18.1-MERGE: merge auditado de dois patches sobre a 48.17.14 — ver nexus_omega_v48_18_1.md
