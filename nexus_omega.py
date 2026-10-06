@@ -5913,6 +5913,8 @@ def _recommended_next(current: str, payer: str, limit: int = 2) -> list:
     for ep in BASE_PRICES:
         if ep in bought or ep in skip:
             continue
+        if not _sellable_now(ep):   # v48.17.13: nunca recomendar o invendável
+            continue
         shared = len(cur_tags & set(ENDPOINT_TAGS.get(ep, [])))
         scored.append((shared, -get_dynamic_price(ep), ep))
     scored.sort(key=lambda t: (-t[0], t[1]))
@@ -8378,6 +8380,22 @@ def _sellability_block(path):
     except Exception:
         pass
     return None
+
+
+def _sellable_now(path: str) -> bool:
+    """v48.17.13-SHELFSYNC — um endpoint invendável NÃO pode aparecer na
+    vitrine de máquinas. Caso real (06/10): o 503 honesto do /agent-call
+    (v48.17.11) protegeu o comprador, mas o endpoint SEGUIA anunciado como
+    pago no openapi/manifesto/get-pricing — o x402lint probeou, não achou o
+    402 e marcou FAIL P6 price-integrity (A 93/100, única falha), o x402scan
+    pulou o registro ("no valid x402 response") e o x402-list degradou o
+    badge. Consistência total agora: invendável = fora do catálogo de
+    máquinas (volta sozinho quando a dependência voltar). Default True —
+    qualquer erro na checagem NUNCA tira um endpoint sadio da vitrine."""
+    try:
+        return _sellability_block(path) is None
+    except Exception:
+        return True
 
 
 def _reactive_402(path, ip):
@@ -11064,16 +11082,16 @@ def get_pricing():
             "free":  {"endpoints": ["/ip", "/sample", "/losbeto-alpha-score", "/launch-risk-preview",
                                     "/receipts", "/credits-status"],
                       "price": "grátis", "limit": "rate-limited"},
-            "discovery": {"endpoints": [e for e, p in BASE_PRICES.items() if p <= 0.03], "price_range": "$0.01-0.03"},
-            "core":      {"endpoints": [e for e, p in BASE_PRICES.items() if 0.03 < p <= 0.12], "price_range": "$0.04-0.12"},
-            "pro":       {"endpoints": [e for e, p in BASE_PRICES.items() if 0.12 < p <= 0.35], "price_range": "$0.15-0.35"},
-            "flagship":  {"endpoints": [e for e, p in BASE_PRICES.items() if 0.35 < p <= 1.00 and e not in CREDIT_PLANS],
+            "discovery": {"endpoints": [e for e, p in BASE_PRICES.items() if p <= 0.03 and _sellable_now(e)], "price_range": "$0.01-0.03"},
+            "core":      {"endpoints": [e for e, p in BASE_PRICES.items() if 0.03 < p <= 0.12 and _sellable_now(e)], "price_range": "$0.04-0.12"},
+            "pro":       {"endpoints": [e for e, p in BASE_PRICES.items() if 0.12 < p <= 0.35 and _sellable_now(e)], "price_range": "$0.15-0.35"},
+            "flagship":  {"endpoints": [e for e, p in BASE_PRICES.items() if 0.35 < p <= 1.00 and e not in CREDIT_PLANS and _sellable_now(e)],
                           "price_range": "$0.49-1.00"},
             "credits":   {"endpoints": list(CREDIT_PLANS), "price_range": "$0.99-99.99",
                           "note": "One on-chain transaction, then N calls via the X-API-Key header — no per-request settlement"},
         },
         "featured":  FEATURED_ENDPOINTS,
-        "endpoints": {ep: {"price_usdc": get_dynamic_price(ep), "desc": ENDPOINT_DESC.get(ep, ""), "env_key": _price_env_key(ep)} for ep, p in BASE_PRICES.items()},
+        "endpoints": {ep: {"price_usdc": get_dynamic_price(ep), "desc": ENDPOINT_DESC.get(ep, ""), "env_key": _price_env_key(ep)} for ep, p in BASE_PRICES.items() if _sellable_now(ep)},
         "pay_with":  "USDC-SPL via x402 (Solana) ou USDC via x402 (Base)",
         "discovery": f"{base}/.well-known/x402.json",
         "tasks":     f"{base}/tasks.json",
@@ -11093,6 +11111,8 @@ def api_for_you():
     for ep in BASE_PRICES:
         if ep == fav or ep.startswith(("/subscribe", "/day-pass", "/week-pass",
                                        "/buy-credits", "/starter", "/enterprise")):
+            continue
+        if not _sellable_now(ep):   # v48.17.13: não recomendar o invendável
             continue
         shared = len(fav_tags & set(ENDPOINT_TAGS.get(ep, []))) if fav_tags else 0
         recs.append((shared, -get_dynamic_price(ep), ep))
@@ -11442,6 +11462,8 @@ def bazaar_manifest():
     base = _public_base()
     resources = []
     for p, price in BASE_PRICES.items():
+        if not _sellable_now(p):   # v48.17.13: invendável fora do bazaar.json
+            continue
         dyn_price = get_dynamic_price(p)
         payment_opts = [{
             "chain":  f"solana:{SOL_GENESIS}",
@@ -12411,7 +12433,7 @@ def _render_clean_landing() -> str:
     fb = FEEDBACK_GITHUB or (os.environ.get("CONTACT_EMAIL", "") or "")
     html = (CLEAN_LANDING
             .replace("__BASE__", base)
-            .replace("__N__", str(len(BASE_PRICES)))
+            .replace("__N__", str(sum(1 for _p in BASE_PRICES if _sellable_now(_p))))
             .replace("__P_MIN__", _cheapest_call_label())
             .replace("__CHAINS__", _chains_text())
             .replace("__NCHAINS__", str(len(_chains_list())))
@@ -13004,6 +13026,8 @@ def manifest_x402():
 
     for p in BASE_PRICES:
         if p in MIXED_METHOD:
+            continue
+        if not _sellable_now(p):   # v48.17.13: invendável não entra no manifesto
             continue
         try:
             r = _resource(p)
@@ -19885,6 +19909,10 @@ def _build_openapi():
 
     # Endpoints pagos (mantêm security: [{"x402": []}])
     for p in BASE_PRICES:
+        # v48.17.13-SHELFSYNC: invendável (503 honesto) não é anunciado como
+        # pago — era o FAIL P6 do x402lint quando o /agent-call 503ava.
+        if not _sellable_now(p):
+            continue
         # v48.9.27-PRICESYNC: era BASE_PRICES[p] — IGNORAVA os PRICE_OVERRIDES
         # de env (Railway PRICE_*) que o 402 efetivamente cobra. Resultado:
         # openapi dizia /fear-greed=$0.003 enquanto o desafio cobrava $0.010
@@ -29695,6 +29723,8 @@ log.info("🧭 /api/v1/best registrado ($0.01) — concierge semântico do catá
 
 VERSION = "48.17.11-SELLABLE"  # v48.17.11-SELLABLE: /agent-call deixava de entregar SEM deixar de cobrar ("no peers available" → 502 charged:true no passe Algorand 05/out, chamada 37/91). Novo gate _sellability_block ANTES do 402: dependência estrutural vazia (rede A2A com zero peers ativos) → 503 grátis charged:false + Retry-After + nota honesta, logado como refused_unsellable; o endpoint volta a vender sozinho quando um peer estiver ativo (GET /peers), sem redeploy. Refund automático v48.10.2 segue como cinto-e-suspensório para a corrida peer-sai-entre-402-e-settle. | base: v48.17.10-FUNNEL
 VERSION = "48.17.12-BESTBACK"  # v48.17.12-BESTBACK: /api/v1/best ressuscitado como concierge semântico pago ($0.01) — rota morta no x402-list (404) volta viva e melhor; textos de chains da landing e do /pay viram dinâmicos (__CHAINS__ conforme flags X402_*). | base: v48.17.11-SELLABLE
+
+VERSION = "48.17.13-SHELFSYNC"  # v48.17.13-SHELFSYNC: VITRINE CONSISTENTE — o 503 honesto do /agent-call (48.17.11) protegeu o comprador mas o endpoint seguia ANUNCIADO como pago: x402lint marcou FAIL P6 price-integrity (A 93/100, única falha do scan 06/10), x402scan pulou o registro ("no valid x402 response"), x402-list degradou o badge. Novo _sellable_now(): invendável some do manifesto x402/.well-known/slim, openapi, bazaar.json, get-pricing, /api/for-you e do recommended_next — e VOLTA sozinho quando um peer A2A estiver ativo, sem redeploy. __N__ da landing conta só os vendáveis. WARN P7 (2 payTos) é intencional: multi-chain exige 1 payTo por chain. | base: v48.17.12-BESTBACK
 
 if __name__ == "__main__":
     cli()
