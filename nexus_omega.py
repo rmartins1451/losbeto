@@ -20035,6 +20035,112 @@ def claim_pix_activate():
     except Exception as e:
         return f"error: {str(e)[:200]}", 500
 
+# ── v48.18.5-ONECLICK: registro ERC-8004 guiado, servido pelo proprio no ──────
+# A pagina conecta a carteira do OPERADOR (Phantom/MetaMask, rede Base) e chama
+# register(agentURI) no Identity Registry. NENHUMA chave passa pelo servidor:
+# a assinatura acontece inteira na carteira, no browser do operador.
+_ERC8004_REGISTRY = "0x8004A169FB4a3325136EB29fA0ceB6D2e539a432"  # Base mainnet
+# Arquivo de registro registration-v1 (name/services/x402Support) como data URI
+# auto-contida — imutavel, nao depende de nenhum endpoint estar no ar.
+_ERC8004_AGENT_URI = ("data:application/json;base64,eyJ0eXBlIjoiaHR0cHM6Ly9laXBzLmV0aGVyZXVtLm9yZy9FSVBTL2VpcC04MDA0I3JlZ2lzdHJhdGlvbi12MSIsIm5hbWUiOiJMb3NiZXRvIiwiZGVzY3JpcHRpb24iOiJBdXRvbm9tb3VzIHg0MDIgbWVyY2hhbnQgbm9kZTogMTAwKyBwYWlkIEFQSSBlbmRwb2ludHMgKEdFVCwgVVNEQywgJDAuMDAxLSQwLjEwKSBjb3ZlcmluZyBjcnlwdG8gbWFya2V0IGRhdGEgKGZlYXIgJiBncmVlZCwgUHl0aCBwcmljZXMsIHdoYWxlIGRvc3NpZXJzLCBsYXVuY2ggcmlzayksIEFJL0xMTSBqb2JzIChzdW1tYXJpemUsIGNsYXNzaWZ5LCB0cmFuc2xhdGUsIGRlZXAtdGhpbmspLCBCcmF6aWwgZGF0YSAoQ05QSiwgQ0VQLCBlcXVpdHksIGRvYykgYW5kIHV0aWxpdHkgc21va2UgdGVzdHMuIFBheXMgeDQwMiBvbiBCYXNlLCBTb2xhbmEsIEFsZ29yYW5kIGFuZCBQb2x5Z29uLiBDaGVhcGVzdCBsaXZlIGNhbGw6IC9waW5nNDAyIGF0ICQwLjAwMS4gT25lIGZyZWUgY2FsbCBhdCAvd2VsY29tZS4gQ2F0YWxvZyBtYXAgYXQgL2FnZW50LW1hcmtldC4gT3BlbkFQSSBhdCAvb3BlbmFwaS5qc29uLiIsImltYWdlIjoiaHR0cHM6Ly9hcGkubG9zYmV0by54eXovaWNvbi5wbmciLCJzZXJ2aWNlcyI6W3sibmFtZSI6IndlYiIsImVuZHBvaW50IjoiaHR0cHM6Ly9hcGkubG9zYmV0by54eXovIn0seyJuYW1lIjoiQTJBIiwiZW5kcG9pbnQiOiJodHRwczovL2FwaS5sb3NiZXRvLnh5ei8ud2VsbC1rbm93bi9hZ2VudC1jYXJkLmpzb24iLCJ2ZXJzaW9uIjoiMC4zLjAifSx7Im5hbWUiOiJNQ1AiLCJlbmRwb2ludCI6Imh0dHBzOi8vYXBpLmxvc2JldG8ueHl6L21jcCIsInZlcnNpb24iOiIyMDI1LTA2LTE4In1dLCJ4NDAyU3VwcG9ydCI6dHJ1ZSwiYWN0aXZlIjp0cnVlLCJyZWdpc3RyYXRpb25zIjpbeyJhZ2VudFJlZ2lzdHJ5IjoiZWlwMTU1Ojg0NTM6MHg4MDA0QTE2OUZCNGEzMzI1MTM2RUIyOWZBMGNlQjZEMmU1MzlhNDMyIn1dfQ==")
+_ERC8004_PAGE = """<!doctype html>
+<html lang="pt-BR"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>ERC-8004 · registro em 1 clique — Losbeto</title>
+<style>
+body{font-family:system-ui,'Segoe UI',Arial,sans-serif;max-width:760px;margin:36px auto;padding:0 16px;color:#14161a;line-height:1.5}
+h1{font-size:1.45rem;margin:0 0 8px}code{background:#f0f2f5;padding:1px 5px;border-radius:4px;font-size:.85em;word-break:break-all}
+button{font-size:1rem;padding:12px 18px;border:0;border-radius:10px;margin:6px 8px 6px 0;cursor:pointer;background:#0052ff;color:#fff;font-weight:600}
+button:disabled{background:#c4ccd8;cursor:not-allowed}
+#out{background:#0e1420;color:#9fe8a9;padding:14px;border-radius:10px;white-space:pre-wrap;word-break:break-all;min-height:120px;font-size:.86rem}
+.box{border:1px solid #e2e6ec;border-radius:12px;padding:14px 16px;margin:14px 0;background:#fafbfc}
+</style></head>
+<body>
+<h1>🪪 Registro ERC-8004 — um clique e o Losbeto entra no índice global de agentes</h1>
+<div class="box">
+<b>O que isto faz:</b> chama <code>register(string agentURI)</code> no Identity Registry da Base mainnet
+(<code>__REG8004__</code>). O <b>agentURI</b> (arquivo de registro com nome, serviços web/A2A/MCP e
+<code>x402Support: true</code>) já vem preenchido. Indexadores como o <b>8004scan.io</b>
+(~550 mil agentes) passam a listar o Losbeto automaticamente.<br>
+<b>Segurança:</b> a assinatura acontece na SUA carteira, no SEU browser — esta página não envia
+nenhuma chave ao servidor. Custo: alguns centavos de gas (ETH na Base).
+</div>
+<div class="box">
+<b>Passo a passo:</b>
+<ol style="margin:8px 0 0">
+<li>Tenha a carteira <b>Phantom</b> (ou MetaMask) no browser, com alguns centavos de ETH na rede <b>Base</b>.</li>
+<li>Clique em <b>1 · Conectar carteira</b> e autorize. Se a rede não for Base, a página oferece a troca.</li>
+<li>Clique em <b>2 · Registrar agente</b> e confirme na carteira.</li>
+<li>Guarde o <b>agentId</b> exibido — é o número do Losbeto no índice global (depois dá para publicar
+o <code>/.well-known/agent-registration.json</code> com ele para verificação de domínio).</li>
+</ol>
+</div>
+<button id="btnConn">1 · Conectar carteira</button>
+<button id="btnReg" disabled>2 · Registrar agente (Base)</button>
+<pre id="out">aguardando…</pre>
+<p><small>Depois de registrado, consulte o agente em <a href="https://www.8004scan.io">8004scan.io</a>
+e a transação em <a href="https://basescan.org">basescan.org</a>.</small></p>
+<script src="https://cdn.jsdelivr.net/npm/ethers@6.13.4/dist/ethers.umd.min.js"></script>
+<script>
+const REG = "__REG8004__";
+const AGENT_URI = "__AGENTURI__";
+const ABI = ["function register(string agentURI) returns (uint256)"];
+const BASE_CHAIN = "0x2105"; // 8453
+const out = document.getElementById("out");
+let signer = null;
+function log(s){ out.textContent += s + "\\n"; }
+document.getElementById("btnConn").onclick = async () => {
+  try {
+    if (!window.ethereum) { log("ERRO: nenhuma carteira encontrada no browser (instale Phantom ou MetaMask)."); return; }
+    const provider = new ethers.BrowserProvider(window.ethereum);
+    await provider.send("eth_requestAccounts", []);
+    const net = await provider.getNetwork();
+    if (net.chainId !== 8453n) {
+      log("rede atual nao e Base — solicitando troca…");
+      try {
+        await window.ethereum.request({ method: "wallet_switchEthereumChain", params: [{ chainId: BASE_CHAIN }] });
+      } catch (sw) {
+        await window.ethereum.request({ method: "wallet_addEthereumChain", params: [{ chainId: BASE_CHAIN,
+          chainName: "Base", nativeCurrency: { name: "Ether", symbol: "ETH", decimals: 18 },
+          rpcUrls: ["https://mainnet.base.org"], blockExplorerUrls: ["https://basescan.org"] }] });
+      }
+    }
+    signer = await provider.getSigner();
+    log("carteira conectada: " + (await signer.getAddress()));
+    document.getElementById("btnReg").disabled = false;
+    log("pronto — clique em '2 · Registrar agente'.");
+  } catch (e) { log("ERRO: " + ((e && e.message) || e)); }
+};
+document.getElementById("btnReg").onclick = async () => {
+  try {
+    const c = new ethers.Contract(REG, ABI, signer);
+    log("enviando register() — confirme na carteira…");
+    const tx = await c.register(AGENT_URI);
+    log("tx enviada: " + tx.hash);
+    log("https://basescan.org/tx/" + tx.hash);
+    log("aguardando confirmacao…");
+    const rc = await tx.wait();
+    let agentId = null;
+    for (const lg of rc.logs) {
+      if (lg.address.toLowerCase() === REG.toLowerCase() && lg.topics.length === 4 &&
+          lg.topics[1] === "0x0000000000000000000000000000000000000000000000000000000000000000") {
+        agentId = BigInt(lg.topics[3]).toString(); break;
+      }
+    }
+    log("REGISTRADO ✓  agentId: " + (agentId !== null ? agentId : "(veja o tokenId nos logs da tx)"));
+    log("proximo passo: conferir o agente em https://www.8004scan.io");
+  } catch (e) { log("ERRO: " + ((e && e.message) || e)); }
+};
+</script></body></html>"""
+
+@app.route("/erc8004")
+def erc8004_page():
+    """Guia interativo de registro ERC-8004: conecta a carteira do operador e
+    chama register(agentURI) na Base. Zero chaves no servidor."""
+    return Response(_ERC8004_PAGE.replace("__REG8004__", _ERC8004_REGISTRY)
+                                 .replace("__AGENTURI__", _ERC8004_AGENT_URI),
+                    mimetype="text/html; charset=utf-8")
+
 @app.route("/chat/poll")
 def chat_poll():
     """A página busca as respostas do operador."""
@@ -30700,7 +30806,7 @@ VERSION = "48.18.0-REGISTRY"  # v48.17.14-REALCALL: /agent-call CONSERTADO DE VE
 VERSION = "48.18.1-MERGE"  # v48.18.1-MERGE: 48.18.0-REGISTRY (Claude: painel orgânico, radar anti-scanner, cache /live/api+/dash, /br-cnpj /br-cep /classify /summarize) + 48.17.15-WARMBOOT (Kimi: _discover_embed não-bloqueante + warmer de embeddings/reranker no boot — mata WORKER TIMEOUT; aliases /mcp/sse /keys.json /auth/login; textos de chains com Polygon — corrige o blurb do x402scan). Base deployada: 48.17.14-REALCALL.
 VERSION = "48.18.2-HOTFIX"  # v48.18.2-HOTFIX: fix CRITICO — o loop de registro da 48.18.0 usava `_ai` como variavel de desempacotamento do tuple e SOBRESCREVIA a funcao global _ai() (~l.9292) ao fim do import (ficava _ai=True); os 16 endpoints premium que chamam _ai()/_ai_required() 500avam com "'bool' object is not callable" (traceback real: analise l.3734 -> _ai_required l.9311). Renomeado p/ _uses_ai + assert callable(_ai) + del dos nomes do loop. | base: v48.18.1-MERGE
 VERSION = "48.18.3-PAYGUARD"  # v48.18.3-PAYGUARD: /pay nunca mais vende endpoint sem parametro obrigatorio — querystring da pagina segue para a chamada paga (carteira EIP-3009, Solana, cartao manual E o QR mobile) e, sem querystring, cartao pre-preenchido de ENDPOINT_REQUIRED_PARAMS bloqueia a assinatura com campo vazio. Mata o estorno pos-settle 400 do /br-doc (2x em 07/out, mesmo comprador).
-VERSION = "48.18.4-VITRINE"  # v48.18.4-VITRINE: (1) PIX CLAIM LOOP — form inline no cartao Pix + /api/claim-pix + ativacao 1-clique via Telegram (HMAC c/ TG_TOKEN) + status polling (mata o beco sem saida: pagou Pix e nada acontecia, teste real 07/out); (2) /ping402 $0.001 — hello-world do x402, iman de pagadores unicos p/ o ranking do Bazaar (lideres tem 500-700 unicos; nos tinhamos 1); (3) ENDPOINT_PARAM_HINTS completo p/ 11 endpoints que caiam no fallback format-only (agente nao montava a chamada).
+VERSION = "48.18.5-ONECLICK"  # v48.18.5-ONECLICK: /erc8004 — pagina guiada servida pelo proprio no que conecta a carteira do operador (Phantom/MetaMask, rede Base, com troca automatica de rede) e chama register(agentURI) no Identity Registry 0x8004A169...a432; agentURI registration-v1 (x402Support:true, web/A2A/MCP) embutido como data URI imutavel; agentId lido do evento Transfer do recibo. ZERO chaves no servidor — assinatura 100% na carteira. Entra o no no indice global de ~550k agentes (8004scan.io) com 2 cliques. | base: v48.18.4-VITRINE
 
 
 if __name__ == "__main__":
