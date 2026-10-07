@@ -6265,6 +6265,24 @@ ENDPOINT_REQUIRED_PARAMS = {
     "/agent-call": {"task": "fear and greed index"},
 }
 
+# v48.18.4-VITRINE: endpoints com parâmetro FUNCIONAL que ainda caíam no
+# fallback {"format": "json"} — o Bazaar indexava um schema que não ensina o
+# agente a montar a chamada (CDP: "sem schemas explícitos, agentes descobrem
+# mas não conseguem chamar"). Exemplos = defaults reais dos handlers (200 ok).
+ENDPOINT_PARAM_HINTS.update({
+    "/weather":           {"city": "Tokyo"},
+    "/pyth-price":        {"symbol": "SOL"},
+    "/thesis-engine":     {"symbol": "SOL"},
+    "/whale-dossier":     {"symbol": "SOL"},
+    "/deep-think":        {"topic": "BTC outlook 30 days"},
+    "/geo-alpha":         {"market": "BR"},
+    "/trust-hash":        {"endpoint": "/fear-greed"},
+    "/launch-risk":       {"token": "SOL"},
+    "/launch-sniper":     {"token": "SOL"},
+    "/portfolio-copilot": {"wallet": "GEhr9HCFTRDjanMg435frSgCVwVZYpNoPrEkmNBnFHFE"},
+    "/starter-pack":      {"wallet": "GEhr9HCFTRDjanMg435frSgCVwVZYpNoPrEkmNBnFHFE"},
+})
+
 _PARAM_DESC = {
     "pair": "Currency pair, e.g. EUR/USD, GBP/USD, USD/JPY",
     "symbol": "Asset ticker, e.g. AAPL, TSLA, BTC, GOLD",
@@ -9288,6 +9306,45 @@ ENDPOINT_HANDLERS = {
     "/forex-arbitrage": Brain.forex_arbitrage,
     "/global-macro":    Brain.global_macro,
 }
+
+# v48.18.4-VITRINE: /ping402 — a chamada paga MAIS BARATA do nó ($0.001).
+# Análise do CDP Bazaar (07/out/2026): os líderes de ranking têm 500-700
+# PAGADORES ÚNICOS/30d num endpoint de $0.001-0.003 que todo agente usa para
+# testar o loop de pagamento (OneSource block-number: 777 chamadas/666
+# pagadores). O ranking do Bazaar = relevância × volume × PAGADORES ÚNICOS ×
+# completude de metadata — e os nossos 95 recursos tinham uniquePayers=1 (só
+# a carteira do operador). /ping402 é o nosso "hello world" de pipeline: o
+# agente valida 402→assinatura→facilitator→settle→entrega contra um merchant
+# real pelo menor preço possível, e de quebra recebe o mapa do catálogo.
+def _h_ping402():
+    import hashlib as _hl
+    ts = int(time.time())
+    payload = {"node": WALLET.node_id, "ts": ts, "version": VERSION,
+               "chains": ["eip155:8453", "solana", "algorand", "eip155:137"]}
+    return {"pong": True,
+            "you_paid": "$0.001 — the cheapest live call on this node",
+            "purpose": "x402 payment-loop smoke test against a real merchant: "
+                       "402 challenge, signature, facilitator settle, delivery. "
+                       "If this came back, your client is wired correctly.",
+            "receipt": {"algorithm": "SHA-256",
+                        "hash": _hl.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest(),
+                        "payload": payload},
+            "node_alive": True, "version": VERSION, "ts": ts,
+            "next": {"one_free_call": f"{_public_base()}/welcome",
+                     "catalog_map": f"{_public_base()}/agent-market",
+                     "cheapest_data_call": f"{_public_base()}/llm"},
+            "provider": "Losbeto", "upstream_calls": 0}
+
+ENDPOINT_HANDLERS["/ping402"] = _h_ping402
+BASE_PRICES["/ping402"] = float(os.environ.get("PRICE_PING402", "0.001"))
+ENDPOINT_DESC["/ping402"] = (
+    "x402 hello-world: the cheapest live call on this node ($0.001), built for "
+    "agents to smoke-test the full payment loop — 402 challenge, wallet "
+    "signature, facilitator settlement, JSON delivery — against a real "
+    "merchant. Returns a signed liveness receipt, the node version and a map "
+    "to the free trial and the full catalog. Zero upstream calls.")
+ENDPOINT_TAGS["/ping402"] = ["Utility", "SmokeTest", "Trust", "ZeroUpstream"]
+ENDPOINT_PARAM_HINTS["/ping402"] = {"format": "json"}
 
 for _path, _handler in ENDPOINT_HANDLERS.items():
     _rule_name = _path.strip("/").replace("-", "_")
@@ -19834,6 +19891,150 @@ def chat_send():
                             "A human operator also sees every message and can "
                             "join this same thread. Poll /chat/poll?sid=<sid>."})
 
+# ---------------------------------------------------------------------------
+# v48.18.4-VITRINE: PIX CLAIM LOOP — o comprador Pix deixava o dinheiro num
+# beco sem saída: pagava o QR e a página só dizia "mande o comprovante no
+# /chat/send" (sem confirmação, sem status, sem entrega — teste real do
+# operador em 07/out: pagou R$4,92 e nada aconteceu). Agora o cartão Pix tem
+# formulário inline: o comprador registra o pagamento, recebe um claim-id
+# (segredo de entrega), o operador recebe Telegram com link de ativação de
+# 1 clique (HMAC assinado com o TG_TOKEN — sem env nova) e o comprador vê a
+# api_key no próprio status do claim. Sem webhook de PSP: a verificação do
+# Pix continua humana (app do banco), mas o caminho é fechado ponta a ponta.
+_PIX_RL: dict = {}
+
+def _pix_db():
+    c = sqlite3.connect(str(DB_PATH), timeout=10)
+    c.execute("""CREATE TABLE IF NOT EXISTS pix_claims(
+        id TEXT PRIMARY KEY, endpoint TEXT, amount_brl REAL, payer TEXT,
+        ref TEXT, status TEXT, api_key TEXT, plan TEXT,
+        created_ts INTEGER, activated_ts INTEGER, ip TEXT)""")
+    return c
+
+def _pix_sig(cid: str) -> str:
+    import hmac as _hm, hashlib as _hl
+    return _hm.new(TG_TOKEN.encode(), f"pix-activate:{cid}".encode(),
+                   _hl.sha256).hexdigest()[:24]
+
+@app.route("/api/claim-pix", methods=["GET", "POST"])
+def claim_pix():
+    if request.method == "GET":
+        cid = (request.args.get("id") or "").strip()[:40]
+        if not re.fullmatch(r"[A-Za-z0-9_-]{16,40}", cid or ""):
+            return jsonify({"error": "invalid_claim_id"}), 400
+        try:
+            c = _pix_db()
+            row = c.execute("SELECT endpoint,amount_brl,status,api_key,plan,"
+                            "created_ts,activated_ts FROM pix_claims WHERE id=?",
+                            (cid,)).fetchone()
+            c.close()
+        except Exception as e:
+            return jsonify({"error": "db", "reason": str(e)[:120]}), 500
+        if not row:
+            return jsonify({"error": "not_found"}), 404
+        ep, brl, status, key, plan, cts, ats = row
+        out = {"claim": cid, "endpoint": ep, "amount_brl": brl, "status": status,
+               "created_ts": cts}
+        if status == "activated":
+            out.update({"activated_ts": ats, "api_key": key, "plan": plan,
+                        "how_to_use": {"header": f"X-API-Key: {key}",
+                                       "example": f"curl -H 'X-API-Key: {key}' "
+                                                  f"{_public_base()}/fear-greed"}})
+        else:
+            out["note"] = ("Payment registered. The operator verifies it in the "
+                           "bank app and activates with one tap — keep this URL "
+                           "and poll it; your X-API-Key appears here.")
+        return jsonify(out)
+
+    # POST — comprador registra o pagamento
+    ip = (request.headers.get("X-Forwarded-For", request.remote_addr) or "").split(",")[0].strip()
+    now = int(time.time())
+    last = _PIX_RL.get(ip, 0)
+    if now - last < 60:
+        return jsonify({"error": "rate_limited", "retry_in_s": 60 - (now - last)}), 429
+    _PIX_RL[ip] = now
+    try:
+        body = request.get_json(silent=True) or {}
+    except Exception:
+        body = {}
+    ep = "/" + (body.get("endpoint") or "").strip().lstrip("/")[:64]
+    if ep not in BASE_PRICES:
+        return jsonify({"error": "unknown_endpoint"}), 400
+    payer = (body.get("payer") or "").strip()[:80]
+    ref = (body.get("ref") or "").strip()[:120]
+    try:
+        brl = round(float(body.get("amount_brl") or 0), 2)
+    except Exception:
+        brl = 0.0
+    cid = "px" + secrets.token_urlsafe(14)
+    try:
+        c = _pix_db()
+        c.execute("INSERT INTO pix_claims VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                  (cid, ep, brl, payer, ref, "pending", None, None, now, None, ip))
+        c.commit(); c.close()
+    except Exception as e:
+        return jsonify({"error": "db", "reason": str(e)[:120]}), 500
+    act_url = (f"{_public_base()}/api/claim-pix-activate?id={cid}&sig={_pix_sig(cid)}"
+               if TG_TOKEN else "")
+    _notify_telegram(
+        f"💰 PIX CLAIM {cid}\n"
+        f"Endpoint: {ep} · R${brl:.2f}\n"
+        f"Pagador: {(payer or '?')[:60]}\nRef: {(ref or '-')[:90]}\n"
+        + (f"✅ Ativar (1 clique, após conferir no banco): {act_url}" if act_url
+           else "⚠ TELEGRAM_BOT_TOKEN ausente — ativação manual no ledger."))
+    return jsonify({"claim": cid, "status": "pending",
+                    "status_url": f"{_public_base()}/api/claim-pix?id={cid}",
+                    "note": "Registered. Poll status_url — your X-API-Key appears "
+                            "there as soon as the operator confirms the Pix."})
+
+@app.route("/api/claim-pix-activate")
+def claim_pix_activate():
+    cid = (request.args.get("id") or "").strip()[:40]
+    sig = (request.args.get("sig") or "").strip()[:40]
+    if not (TG_TOKEN and cid and sig):
+        return "disabled", 403
+    import hmac as _hm
+    if not _hm.compare_digest(sig, _pix_sig(cid)):
+        return "bad signature", 403
+    try:
+        c = _pix_db()
+        row = c.execute("SELECT endpoint,payer,status,api_key FROM pix_claims WHERE id=?",
+                        (cid,)).fetchone()
+        if not row:
+            c.close(); return "unknown claim", 404
+        ep, payer, status, key = row
+        if status == "activated" and key:
+            c.close()
+            return (f"<h3>✅ Já ativado</h3><p>claim {cid} · key <code>{key}</code> "
+                    f"— o comprador já vê isso no status.</p>")
+        if ep in CREDIT_PLANS:
+            plan = CREDIT_PLANS[ep]
+            tx_sig = "pix:" + cid
+            existing = LEDGER.api_key_by_tx(tx_sig)
+            if existing:
+                key = existing["key"]
+            else:
+                key = "lsk_" + secrets.token_urlsafe(24)
+                LEDGER.api_key_create(key, f"pix:{(payer or 'unknown')[:40]}",
+                                      plan["plan"], plan["balance_usd"],
+                                      plan["ttl_days"] * 86400, tx_sig)
+            c.execute("UPDATE pix_claims SET status='activated', api_key=?, plan=?,"
+                      " activated_ts=? WHERE id=?",
+                      (key, plan["plan"], int(time.time()), cid))
+            c.commit(); c.close()
+            _notify_telegram(f"✅ Pix claim {cid} ativado — plano {plan['plan']} entregue.")
+            return (f"<h3>✅ Ativado</h3><p>claim {cid} → plano <b>{plan['plan']}</b>. "
+                    f"O comprador já vê a api_key no status do claim — nada mais a fazer.</p>")
+        c.execute("UPDATE pix_claims SET status='activated', activated_ts=? WHERE id=?",
+                  (int(time.time()), cid))
+        c.commit(); c.close()
+        _notify_telegram(f"⚠ Pix claim {cid} ({ep}) NÃO é plano de créditos — "
+                         f"entregar o produto manualmente (endpoint avulso).")
+        return (f"<h3>✅ Marcado</h3><p>{ep} não é plano de créditos — entrega "
+                f"manual registrada no Telegram.</p>")
+    except Exception as e:
+        return f"error: {str(e)[:200]}", 500
+
 @app.route("/chat/poll")
 def chat_poll():
     """A página busca as respostas do operador."""
@@ -29471,12 +29672,51 @@ _PAY_PIX_CARD = """
        onerror="this.style.display='none'">
   <pre id="pixEmv" style="margin-top:8px">__PIX_EMV__</pre>
   <span class="copy" onclick="navigator.clipboard.writeText(document.getElementById('pixEmv').innerText)">copy Pix code</span>
-  <p style="font-size:12.5px;color:var(--dim);margin:10px 0 0">
-    Manual activation, human in the loop: pay, then send the receipt at
-    <a href="/chat/send">/chat/send</a> and the plan is activated shortly after.
-    On Binance? Scan this QR with the Binance app to pay with crypto (Binance Pay → Pix).
+  <p style="font-size:12.5px;color:var(--dim);margin:10px 0 6px">
+    Paid? Register it here — the operator confirms the Pix in the bank app and
+    activates with one tap; your key appears right on this page. On Binance?
+    Scan this QR with the Binance app to pay with crypto (Binance Pay → Pix).
     For instant machine checkout, use USDC on Base above.</p>
+  <div id="pixClaimBox">
+    <input id="pixPayer" placeholder="your name (optional)" style="width:100%;padding:8px 10px;border-radius:8px;border:1px solid var(--line);background:var(--bg);color:var(--fg);font-size:13px;margin:4px 0">
+    <input id="pixRef" placeholder="receipt ref / E2E txid (optional)" style="width:100%;padding:8px 10px;border-radius:8px;border:1px solid var(--line);background:var(--bg);color:var(--fg);font-size:13px;margin:4px 0">
+    <button id="btnPixClaim" style="margin-top:6px">I paid — register my Pix</button>
+    <div id="pixClaimStatus" class="status" style="margin-top:8px"></div>
+  </div>
 </div>
+<script>
+(function(){
+  var btn = document.getElementById('btnPixClaim');
+  if (!btn) return;
+  var st = document.getElementById('pixClaimStatus');
+  var poll = null;
+  function say(m, c){ st.textContent = m; st.className = 'status' + (c ? ' ' + c : ''); }
+  btn.addEventListener('click', function(){
+    btn.disabled = true;
+    say('Registering…');
+    fetch('/api/claim-pix', {method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({endpoint: location.pathname.replace(/^\/pay/, ''),
+        amount_brl: '__PIX_BRL__'.replace(',', '.'),
+        payer: document.getElementById('pixPayer').value,
+        ref: document.getElementById('pixRef').value})})
+    .then(function(r){ return r.json().then(function(j){ return {ok:r.ok, j:j}; }); })
+    .then(function(res){
+      if (!res.ok){ say(res.j.error === 'rate_limited' ? 'Too many tries — wait a minute.' : ('Error: ' + (res.j.error || 'unknown')), 'err'); btn.disabled = false; return; }
+      say('Registered ✓ claim ' + res.j.claim + ' — the operator confirms the Pix in the bank app and activates with one tap. This page updates automatically.', 'ok');
+      poll = setInterval(function(){
+        fetch(res.j.status_url).then(function(r){ return r.json(); }).then(function(j){
+          if (j.status === 'activated' && j.api_key){
+            clearInterval(poll);
+            st.innerHTML = '<b>Activated ✓</b> — your X-API-Key:<br><code style="word-break:break-all">' + j.api_key + '</code>'
+              + '<br><span style="color:var(--dim);font-size:12px">Use as header <code>X-API-Key</code> on any endpoint. Save it — it is only shown here.</span>';
+          }
+        }).catch(function(){});
+      }, 7000);
+    })
+    .catch(function(){ say('Network error — retry.', 'err'); btn.disabled = false; });
+  });
+})();
+</script>
 """
 
 
@@ -30460,6 +30700,7 @@ VERSION = "48.18.0-REGISTRY"  # v48.17.14-REALCALL: /agent-call CONSERTADO DE VE
 VERSION = "48.18.1-MERGE"  # v48.18.1-MERGE: 48.18.0-REGISTRY (Claude: painel orgânico, radar anti-scanner, cache /live/api+/dash, /br-cnpj /br-cep /classify /summarize) + 48.17.15-WARMBOOT (Kimi: _discover_embed não-bloqueante + warmer de embeddings/reranker no boot — mata WORKER TIMEOUT; aliases /mcp/sse /keys.json /auth/login; textos de chains com Polygon — corrige o blurb do x402scan). Base deployada: 48.17.14-REALCALL.
 VERSION = "48.18.2-HOTFIX"  # v48.18.2-HOTFIX: fix CRITICO — o loop de registro da 48.18.0 usava `_ai` como variavel de desempacotamento do tuple e SOBRESCREVIA a funcao global _ai() (~l.9292) ao fim do import (ficava _ai=True); os 16 endpoints premium que chamam _ai()/_ai_required() 500avam com "'bool' object is not callable" (traceback real: analise l.3734 -> _ai_required l.9311). Renomeado p/ _uses_ai + assert callable(_ai) + del dos nomes do loop. | base: v48.18.1-MERGE
 VERSION = "48.18.3-PAYGUARD"  # v48.18.3-PAYGUARD: /pay nunca mais vende endpoint sem parametro obrigatorio — querystring da pagina segue para a chamada paga (carteira EIP-3009, Solana, cartao manual E o QR mobile) e, sem querystring, cartao pre-preenchido de ENDPOINT_REQUIRED_PARAMS bloqueia a assinatura com campo vazio. Mata o estorno pos-settle 400 do /br-doc (2x em 07/out, mesmo comprador).
+VERSION = "48.18.4-VITRINE"  # v48.18.4-VITRINE: (1) PIX CLAIM LOOP — form inline no cartao Pix + /api/claim-pix + ativacao 1-clique via Telegram (HMAC c/ TG_TOKEN) + status polling (mata o beco sem saida: pagou Pix e nada acontecia, teste real 07/out); (2) /ping402 $0.001 — hello-world do x402, iman de pagadores unicos p/ o ranking do Bazaar (lideres tem 500-700 unicos; nos tinhamos 1); (3) ENDPOINT_PARAM_HINTS completo p/ 11 endpoints que caiam no fallback format-only (agente nao montava a chamada).
 
 
 if __name__ == "__main__":
