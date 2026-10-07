@@ -6246,6 +6246,25 @@ ENDPOINT_PARAM_HINTS = {
     "/portfolio-stress":  {"positions": '[{"asset":"BTC","qty":1.5}]'},
 }
 
+# v48.18.3-PAYGUARD: parâmetros OBRIGATÓRIOS por endpoint. O checkout /pay
+# renderiza um cartão com estes campos PRÉ-PREENCHIDOS (exemplo funcional) e
+# o JS bloqueia a assinatura se algum obrigatório estiver vazio. Antes desta
+# versão, o caminho de carteira (EIP-3009/Solana) chamava o endpoint SEM
+# querystring: /br-doc respondia 400 DEPOIS do settle e o comprador recebia
+# estorno em crédito em vez do dado — aconteceu 2x em 07/out com o mesmo
+# comprador (dinheiro devolvido, venda perdida). Pré-preenchido, pagar sem
+# editar devolve 200 com o dado-exemplo — nunca estorno.
+ENDPOINT_REQUIRED_PARAMS = {
+    "/br-doc":     {"doc": "00.000.000/0001-91"},
+    "/br-cep":     {"cep": "01310100"},
+    "/br-cnpj":    {"cnpj": "00.000.000/0001-91"},
+    "/classify":   {"text": "My card was charged twice",
+                    "labels": "billing,shipping,technical,other"},
+    "/summarize":  {"text": "The central bank held the policy rate at 15 percent "
+                            "for the third meeting in a row"},
+    "/agent-call": {"task": "fear and greed index"},
+}
+
 _PARAM_DESC = {
     "pair": "Currency pair, e.g. EUR/USD, GBP/USD, USD/JPY",
     "symbol": "Asset ticker, e.g. AAPL, TSLA, BTC, GOLD",
@@ -28860,6 +28879,8 @@ pre{background:#0d0f13;border:1px solid var(--line);border-radius:8px;
 
 __RAILS_BANNER__
 
+__PARAM_CARD__
+
 <div class="card" id="cardInjected" style="display:none">
   <div id="warnBox" class="status err" style="margin:0 0 12px"></div>
   <div id="walletPick" style="display:none;margin:0 0 12px"></div>
@@ -28947,6 +28968,33 @@ async function ensureFresh(notify){
 const ENDPOINT_URL = "__ENDPOINT_URL__";
 const PAGE_URL = "__PAGE_URL__";
 const IS_CREDIT = __IS_CREDIT__;
+  const PARAM_FIELDS = __PARAM_FIELDS_JSON__;
+  // v48.18.3-PAYGUARD: a chamada paga SEMPRE leva os parametros — da URL da
+  // pagina ou do cartao pre-preenchido. O botao nao dispara com campo
+  // obrigatorio vazio (o endpoint cobraria e devolveria 400 + estorno).
+  function qsFromInputs(){
+    const out = [];
+    for (const k of (PARAM_FIELDS || [])){
+      const el = document.getElementById('pp_' + k);
+      const v = el ? el.value.trim() : '';
+      if (v) out.push(encodeURIComponent(k) + '=' + encodeURIComponent(v));
+    }
+    return out.length ? '?' + out.join('&') : '';
+  }
+  function endpointWithParams(){
+    if (ENDPOINT_URL.indexOf('?') >= 0) return ENDPOINT_URL;
+    return ENDPOINT_URL + qsFromInputs();
+  }
+  function requiredFilled(){
+    if (ENDPOINT_URL.indexOf('?') >= 0) return true;
+    for (const k of (PARAM_FIELDS || [])){
+      const el = document.getElementById('pp_' + k);
+      if (el && el.dataset.req === '1' && !el.value.trim()) return false;
+    }
+    return true;
+  }
+  const PAYGATE_MSG = 'Fill the required parameters above before paying — '
+    + 'the endpoint rejects empty ones AFTER the payment (auto-refund, but the call is lost).';
 const statusEl = document.getElementById('status');
 const statusMEl = document.getElementById('statusM');
 const resultEl = document.getElementById('result');
@@ -29159,6 +29207,7 @@ async function paySolana(){
   const st = document.getElementById('statusSol');
   const setS = (m, c) => { st.textContent = m; st.className = 'status' + (c ? ' ' + c : ''); };
   btnS.disabled = true;
+  if (!requiredFilled()){ setS(PAYGATE_MSG, 'err'); btnS.disabled = false; return; }
   if (!(await ensureFresh(setS))) return;   // v48.16.5: aba velha nunca mais assina
   try{
     setS('Loading Solana runtime…');
@@ -29256,7 +29305,7 @@ async function paySolana(){
       network: SOL_ACCEPT.network, payload: { transaction: b64tx },
       accepted: SOL_ACCEPT }));
     setS('Signature captured. Settling payment and fetching your data…');
-    const resp = await fetch(ENDPOINT_URL, { headers: { 'X-PAYMENT': header, 'Accept': 'application/json' } });
+    const resp = await fetch(endpointWithParams(), { headers: { 'X-PAYMENT': header, 'Accept': 'application/json' } });
     const body = await resp.json().catch(() => ({}));
     if(!resp.ok){
       const r0 = String(body.reason || body.error || resp.status);
@@ -29304,7 +29353,7 @@ async function claimTransfer(){
   btn.disabled = true;
   setC('Verifying the transfer on-chain…');
   try{
-    const ep = location.pathname.replace(/^\/pay/, '') + location.search;
+    const ep = location.pathname.replace(/^\/pay/, '') + (location.search || qsFromInputs());
     const r = await fetch('/api/claim-transfer', { method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ endpoint: ep, tx: tx }) });
@@ -29346,6 +29395,7 @@ async function payAndFetch(){
   const w = evmProvider();
   if(!w){ renderWalletPicker(); return; }
   btn.disabled = true;
+  if (!requiredFilled()){ setStatus(PAYGATE_MSG, 'err'); btn.disabled = false; return; }
   if (!(await ensureFresh(setStatus))) return;   // v48.16.5: aba velha nunca mais assina
   try{
     setStatus('Requesting wallet connection…');
@@ -29376,7 +29426,7 @@ async function payAndFetch(){
       payload:{signature,authorization},accepted:ACCEPT};
     const header = btoa(JSON.stringify(paymentPayload));
     setStatus('Signature captured. Settling payment and fetching your data…');
-    const resp = await fetch(ENDPOINT_URL,{headers:{'X-PAYMENT':header,'Accept':'application/json'}});
+    const resp = await fetch(endpointWithParams(),{headers:{'X-PAYMENT':header,'Accept':'application/json'}});
     const body = await resp.json().catch(()=>({}));
     if(!resp.ok){
       setStatus('Payment not accepted: '+(body.reason||body.error||resp.status)+
@@ -29479,7 +29529,43 @@ def _pay_bridge_handler(raw_endpoint):
                          "hint": "This node's Base chain is not configured."}), 503
     price = get_dynamic_price(ep)
     desc = (ENDPOINT_DESC.get(ep, "") or "").replace('"', "&quot;")[:220]
-    page_url = f"{_public_base()}/pay{ep}"  # v48.5.0: deep link + QR
+    # v48.18.3-PAYGUARD: a querystring da PRÓPRIA página (/pay/<ep>?doc=...)
+    # segue para a chamada paga e para o QR mobile — allowlist de caracteres
+    # (sem aspas, barra invertida ou <>) para não quebrar a string JS nem
+    # virar HTML injection.
+    qs = re.sub(r"[^A-Za-z0-9._~!$&()*+,;=:@%/?-]", "",
+                request.query_string.decode("utf-8", "ignore"))[:600]
+    endpoint_url = f"{_public_base()}{ep}" + (f"?{qs}" if qs else "")
+    page_url = f"{_public_base()}/pay{ep}" + (f"?{qs}" if qs else "")  # v48.5.0: deep link + QR
+    # v48.18.3-PAYGUARD: cartão de parâmetros pré-preenchidos (obrigatórios
+    # de ENDPOINT_REQUIRED_PARAMS + hints opcionais de ENDPOINT_PARAM_HINTS).
+    # Só aparece quando a URL da página ainda não traz querystring.
+    from html import escape as _esc
+    param_card, param_fields = "", []
+    if not qs:
+        merged = dict(ENDPOINT_PARAM_HINTS.get(ep) or {})
+        merged.update(ENDPOINT_REQUIRED_PARAMS.get(ep) or {})
+        rows = []
+        for k, ex in merged.items():
+            req = k in (ENDPOINT_REQUIRED_PARAMS.get(ep) or {})
+            param_fields.append(k)
+            rows.append(
+                f'<label style="display:block;margin:8px 0 2px;font-size:13px;'
+                f'color:var(--dim)">{_esc(k)}{" *" if req else ""}</label>'
+                f'<input id="pp_{_esc(k)}" data-req="{1 if req else 0}" '
+                f'value="{_esc(str(ex), quote=True)}" style="width:100%;'
+                f'padding:9px 11px;border-radius:10px;border:1px solid var(--line);'
+                f'background:var(--bg);color:var(--fg);font-size:14px">')
+        if rows:
+            param_card = (
+                '<div class="card"><p style="margin:0 0 2px;font-size:14px">'
+                '<b>Parameters</b> '
+                + ('— <span style="color:var(--err)">* required</span>: the endpoint '
+                   'rejects empty ones AFTER charging (auto-refund, but a lost call). '
+                   'Pre-filled with a working example — edit to your data.'
+                   if any(k in (ENDPOINT_REQUIRED_PARAMS.get(ep) or {}) for k in merged)
+                   else '— optional, pre-filled with an example. Edit if you like.')
+                + '</p>' + "".join(rows) + '</div>')
     # v48.9.6: cartão Pix (somente planos/bundles — ver PIX_MIN_USD). Se a
     # PTAX falhar, o cartão simplesmente não aparece (checkout cripto intacto).
     pix_card = ""
@@ -29522,8 +29608,10 @@ def _pay_bridge_handler(raw_endpoint):
             .replace("__RAILS_BANNER__", rails_banner)
             .replace("__PIX_CARD__", pix_card)
             .replace("__ENDPOINT__", ep)
-            .replace("__ENDPOINT_URL__", f"{_public_base()}{ep}")
+            .replace("__ENDPOINT_URL__", endpoint_url)
             .replace("__PAGE_URL__", page_url)
+            .replace("__PARAM_CARD__", param_card)
+            .replace("__PARAM_FIELDS_JSON__", json.dumps(param_fields))
             .replace("__PRICE__", f"{price:.4f}")
             .replace("__DESC__", desc)
             .replace("__ACCEPT_JSON__", json.dumps(base_accept))
@@ -30371,6 +30459,7 @@ VERSION = "48.18.0-REGISTRY"  # v48.17.14-REALCALL: /agent-call CONSERTADO DE VE
 
 VERSION = "48.18.1-MERGE"  # v48.18.1-MERGE: 48.18.0-REGISTRY (Claude: painel orgânico, radar anti-scanner, cache /live/api+/dash, /br-cnpj /br-cep /classify /summarize) + 48.17.15-WARMBOOT (Kimi: _discover_embed não-bloqueante + warmer de embeddings/reranker no boot — mata WORKER TIMEOUT; aliases /mcp/sse /keys.json /auth/login; textos de chains com Polygon — corrige o blurb do x402scan). Base deployada: 48.17.14-REALCALL.
 VERSION = "48.18.2-HOTFIX"  # v48.18.2-HOTFIX: fix CRITICO — o loop de registro da 48.18.0 usava `_ai` como variavel de desempacotamento do tuple e SOBRESCREVIA a funcao global _ai() (~l.9292) ao fim do import (ficava _ai=True); os 16 endpoints premium que chamam _ai()/_ai_required() 500avam com "'bool' object is not callable" (traceback real: analise l.3734 -> _ai_required l.9311). Renomeado p/ _uses_ai + assert callable(_ai) + del dos nomes do loop. | base: v48.18.1-MERGE
+VERSION = "48.18.3-PAYGUARD"  # v48.18.3-PAYGUARD: /pay nunca mais vende endpoint sem parametro obrigatorio — querystring da pagina segue para a chamada paga (carteira EIP-3009, Solana, cartao manual E o QR mobile) e, sem querystring, cartao pre-preenchido de ENDPOINT_REQUIRED_PARAMS bloqueia a assinatura com campo vazio. Mata o estorno pos-settle 400 do /br-doc (2x em 07/out, mesmo comprador).
 
 
 if __name__ == "__main__":
