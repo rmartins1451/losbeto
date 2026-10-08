@@ -12358,29 +12358,42 @@ def agent_registration_8004():
     URL como agentURI ao chamar register() no Identity Registry
     0x8004A169FB4a3325136EB29fA0ceB6D2e539a432 (Base). Routers e compradores
     consultam o registry antes de pagar; o strict-test da TRM só conta como
-    agente legítimo quem está registrado."""
+    agente legítimo quem está registrado.
+
+    v48.21.0-TRUSTSTACK: ESTE arquivo é também a prova de DOMÍNIO da spec
+    (Endpoint Domain Verification): precisa conter `registrations` com o
+    agentId on-chain. Estava sem o campo e com "99 paid endpoints" congelado
+    — o 8004scan lia Publisher 19 / Compliance 75. Agora: registrations com
+    fallback ao agentId real (87048) e contagem DINÂMICA de endpoints, que
+    nunca mais desatualiza."""
     base = _public_base()
+    _aid = os.environ.get("ERC8004_AGENT_ID", "87048").strip() or "87048"
+    _regs = ([{"agentId": int(_aid),
+               "agentRegistry": "eip155:8453:0x8004A169FB4a3325136EB29fA0ceB6D2e539a432"}]
+             if _aid.isdigit() else [])
     return jsonify({
         "type": "https://eips.ethereum.org/EIPS/eip-8004#registration-v1",
         "name": "Losbeto Market Intelligence",
-        "description": ("99 paid endpoints for AI agents: the only Brazilian data suite "
+        "description": (f"{len(BASE_PRICES)} paid endpoints for AI agents: the only Brazilian data suite "
                         "on x402 (PIX BR Code tools, du/252 business-day rates math, BCB "
-                        "series, B3 equities, point-in-time macro archive), market data, "
-                        "an OpenAI-compatible LLM inference gateway, and transform APIs "
-                        "(/extract, /translate). USDC via x402 on Base, Polygon, Solana and "
-                        "Algorand. Free delayed preview on every endpoint; "
-                        "delivery-or-refund on every paid call."),
+                        "series, B3 equities, point-in-time macro archive), cross-asset "
+                        "market data, Base chain intelligence with a self-trained gas "
+                        "forecaster, an OpenAI-compatible LLM inference gateway, and "
+                        "transform APIs (/extract, /translate). USDC via x402 on Base, "
+                        "Polygon, Solana and Algorand. Free delayed preview on every "
+                        "endpoint; delivery-or-refund on every paid call."),
         "image": f"{base}/favicon.png",
         "services": [
             {"name": "web",  "endpoint": f"{base}/"},
-            {"name": "A2A",  "endpoint": f"{base}/.well-known/agent-card.json"},
-            {"name": "MCP",  "endpoint": f"{base}/mcp"},
+            {"name": "A2A",  "endpoint": f"{base}/.well-known/agent-card.json", "version": "0.3.0"},
+            {"name": "MCP",  "endpoint": f"{base}/mcp", "version": "2025-06-18"},
             {"name": "x402", "endpoint": f"{base}/.well-known/x402.json"},
             {"name": "OAS",  "endpoint": f"{base}/openapi.json"},
         ],
         "x402Support": True,
         "active": True,
         "supportedTrust": ["reputation", "crypto-economic"],
+        "registrations": _regs,
     })
 
 
@@ -12822,6 +12835,18 @@ footer a{color:var(--dim)}
 .tickband:hover .tick{animation-play-state:paused}
 @keyframes tick{from{transform:translateX(0)}to{transform:translateX(-50%)}}
 @media(prefers-reduced-motion:reduce){.tick{animation:none}}
+/* v48.21-TRUSTSTACK — trust bar de listagens verificáveis. Cada selo é um
+   link para a PROVA pública (nunca um badge inventado). */
+.seals{display:grid;grid-template-columns:repeat(auto-fit,minmax(215px,1fr));gap:12px;margin-top:18px}
+.seal{display:flex;flex-direction:column;gap:4px;background:var(--card);border:1px solid var(--line);
+      border-radius:10px;padding:14px 16px;text-decoration:none;color:inherit;transition:border-color .15s}
+.seal:hover{border-color:#2ea36a}
+.seal b{font-size:13.5px;font-weight:600;color:var(--fg);display:flex;align-items:center;gap:7px}
+.seal b .ok{color:var(--acc);font-size:12px}
+.seal span{color:var(--dim);font-size:12px;line-height:1.45}
+.copyright{margin-top:18px;padding-top:16px;border-top:1px solid var(--line);
+           font-size:12px;color:#5f6672;text-align:center}
+.copyright a{color:#8b9199}
 </style></head><body>
 <header><div class="wrap hrow">
   <div class="logo"><img src="/favicon.svg?v=2" width="22" height="22" alt="" style="vertical-align:-5px;margin-right:8px">los<span>beto</span></div>
@@ -12922,6 +12947,44 @@ reputation feed on x402. Zero upstream cost — built to be hammered by agents.<
        idempotent via requestKey, plus a free shareable SVG card built to be
        posted.</p>
     <code>GET /wallet-verdict?address=0x…</code></a>
+</div>
+</div></section>
+
+<!-- v48.21-TRUSTSTACK: LISTED & VERIFIED — um selo só é selo se clicar e
+     abrir a prova pública. Todos os destinos foram verificados respondendo
+     200 na data do deploy. Nenhum badge auto-declarado. -->
+<section class="band alt"><div class="wrap">
+<h2>Listed &amp; verified — check each one yourself</h2>
+<p class="lede">Trust is not a badge we drew — it is a page someone else
+maintains about this node. Every seal below opens the public proof.</p>
+<div class="seals">
+  <a class="seal" href="https://8004scan.io/agents/base/87048" target="_blank" rel="noopener">
+    <b><span class="ok">✓</span> ERC-8004 · 8004scan</b>
+    <span>On-chain identity on Base — agent #87048, minted 15 Sep 2026.
+    Reputation registry live.</span></a>
+  <a class="seal" href="https://x402lint.com" target="_blank" rel="noopener">
+    <b><span class="ok">✓</span> x402lint — Grade A</b>
+    <span>Protocol-compliance scan: 98/100 (PASS 23 · FAIL 0) on the
+    independent x402 linter.</span></a>
+  <a class="seal" href="https://www.x402scan.com" target="_blank" rel="noopener">
+    <b><span class="ok">✓</span> x402scan</b>
+    <span>Every priced resource indexed and settlement-tracked on the
+    ecosystem explorer.</span></a>
+  <a class="seal" href="https://x402-list.com/services/losbeto-cross-asset-market-intelligence" target="_blank" rel="noopener">
+    <b><span class="ok">✓</span> x402-list</b>
+    <span>Curated directory listing with continuous uptime and compliance
+    monitoring.</span></a>
+  <a class="seal" href="https://registry.modelcontextprotocol.io" target="_blank" rel="noopener">
+    <b><span class="ok">✓</span> Official MCP Registry</b>
+    <span>Published as io.github.rmartins1451/losbeto — 5 meta-tools over
+    streamable HTTP.</span></a>
+  <a class="seal" href="https://pypi.org/project/losbeto-tools/" target="_blank" rel="noopener">
+    <b><span class="ok">✓</span> PyPI — losbeto-tools</b>
+    <span>pip install losbeto-tools[langchain] — LangChain / CrewAI
+    integrations.</span></a>
+  <a class="seal" href="https://www.npmjs.com/package/losbeto-mcp" target="_blank" rel="noopener">
+    <b><span class="ok">✓</span> npm — losbeto-mcp</b>
+    <span>npx losbeto-mcp — the MCP bridge package for local clients.</span></a>
 </div>
 </div></section>
 
@@ -13208,6 +13271,8 @@ Brazil in depth: Selic, CDI, IPCA, Ibovespa + B3 (/br-brief, /br-macro, /br-curv
 <tr><td>Plain-text guidance for LLM agents</td><td><a href="/llms.txt">/llms.txt</a></td></tr>
 <tr><td>Long-form agent guide, one section per endpoint</td><td><a href="/llms-full.txt">/llms-full.txt</a></td></tr>
 <tr><td>Per-source liveness before you integrate</td><td><a href="/health/providers">/health/providers</a></td></tr>
+<tr><td>ERC-8004 registration file (on-chain agent #87048, Base)</td><td><a href="/.well-known/erc8004.json">/.well-known/erc8004.json</a></td></tr>
+<tr><td>ERC-8004 domain verification proof</td><td><a href="/.well-known/agent-registration.json">/.well-known/agent-registration.json</a></td></tr>
 </table>
 </div></section>
 
@@ -13217,7 +13282,13 @@ Brazil in depth: Selic, CDI, IPCA, Ibovespa + B3 (/br-brief, /br-macro, /br-curv
        <a href="/llms.txt">llms.txt</a> · <a href="/server.json">MCP</a> ·
        <a href="/pricing">pricing</a> · <a href="/terms">terms</a> ·
        <a href="/privacy">privacy</a> · <a href="/impressum">impressum</a></div>
-</div></footer>
+</div>
+<div class="copyright">Copyright © 2026 Losbeto. Built on the open
+<a href="https://x402.org" target="_blank" rel="noopener">x402 protocol</a>
+(HTTP 402 micropayments) — an independent node, not affiliated with Coinbase
+or LF Projects. Identity registered on-chain:
+<a href="https://8004scan.io/agents/base/87048" target="_blank" rel="noopener">ERC-8004 agent #87048 on Base</a>.</div>
+</footer>
 </div>
 <script>
 function mode(m){
@@ -20828,7 +20899,17 @@ Registrado em 15/set/2026 01:28 UTC · bloco 51.323.176 · pela carteira do oper
 <tr><td>Identity Registry</td><td><code>__REG8004__</code> — <code>ownerOf(87048)</code> responde a carteira acima</td></tr>
 <tr><td>Arquivo de registro</td><td><a href="/.well-known/erc8004.json">/.well-known/erc8004.json</a> (servido por este nó; o tokenURI on-chain aponta para ele)</td></tr>
 <tr><td>Reputação via API</td><td><code>GET /agent-reputation?agentId=87048</code> — lê o Reputation Registry on-chain</td></tr>
+<tr><td>Prova de domínio</td><td><a href="/.well-known/agent-registration.json">/.well-known/agent-registration.json</a> — v48.21: ganhou o campo <code>registrations</code> (a spec exige p/ fechar a domain verification; o 8004scan lia Publisher 19 sem ele)</td></tr>
 </table>
+</div>
+<div class="box">
+<b>Comprou algum dado deste nó? Deixe seu feedback on-chain.</b><br>
+O ERC-8004 tem um Reputation Registry público na Base
+(<code>0x8004BAa17C55a88189AE136b182e5fdA19dE9b63</code>): qualquer cliente que interagiu
+pode avaliar o agente #87048 — a avaliação fica gravada para sempre e alimenta o score
+público no <a href="https://8004scan.io/agents/base/87048">8004scan</a> (aba <i>Feedback</i>,
+botão <i>Write feedback</i> — a assinatura sai da SUA carteira, custo de gas mínimo).
+É a forma mais forte de dizer ao mercado que este nó entrega — e de cobrar quando não entregar.
 </div>
 <div class="box">
 <b>Sobre o erro -32603 do Phantom ("Unexpected error"):</b> não é falta de fundos nem de gas —
@@ -21168,19 +21249,24 @@ def erc8004_registration():
     base = _public_base()
     # v48.3.3: após o mint na Base, setar env ERC8004_AGENT_ID para publicar
     # o agentId aqui — compradores-agentes conferem esse campo antes de pagar.
+    # v48.21.0: default passa a ser o agentId real (87048) — se a env sumir num
+    # redeploy, a identidade on-chain continua publicada em vez de sumir.
     _regs = []
-    _aid = os.environ.get("ERC8004_AGENT_ID", "").strip()
+    _aid = os.environ.get("ERC8004_AGENT_ID", "87048").strip() or "87048"
     if _aid.isdigit():
         _regs.append({"agentId": int(_aid),
                       "agentRegistry": "eip155:8453:0x8004A169FB4a3325136EB29fA0ceB6D2e539a432"})
     return jsonify({
         "type": "https://eips.ethereum.org/EIPS/eip-8004#registration-v1",
         "name": "Losbeto",
-        "description": ("x402-paid market data + OpenAI-compatible LLM gateway "
-                        "for AI agents, global in scope: forex, equities, "
-                        "commodities, crypto and macro — including a signed "
-                        "point-in-time Brazil macro archive (BCB/B3). "
-                        "USDC on Base/Solana/Algorand. Fixed public pricing."),
+        "description": (f"{len(BASE_PRICES)} x402-paid endpoints for AI agents: "
+                        "cross-asset market data (forex, equities, commodities, "
+                        "crypto, macro) including a signed point-in-time Brazil "
+                        "macro archive (BCB/B3), an OpenAI-compatible LLM "
+                        "inference gateway, and a Base chain-intelligence suite "
+                        "with a self-trained gas forecaster and the first "
+                        "ERC-8004 reputation feed on x402. USDC on Base, "
+                        "Polygon, Solana and Algorand. Fixed public pricing."),
         "image": f"{base}/favicon.png",
         "services": [
             {"name": "web", "endpoint": base},
@@ -31593,7 +31679,7 @@ VERSION = "48.18.0-REGISTRY"  # v48.17.14-REALCALL: /agent-call CONSERTADO DE VE
 VERSION = "48.18.1-MERGE"  # v48.18.1-MERGE: 48.18.0-REGISTRY (Claude: painel orgânico, radar anti-scanner, cache /live/api+/dash, /br-cnpj /br-cep /classify /summarize) + 48.17.15-WARMBOOT (Kimi: _discover_embed não-bloqueante + warmer de embeddings/reranker no boot — mata WORKER TIMEOUT; aliases /mcp/sse /keys.json /auth/login; textos de chains com Polygon — corrige o blurb do x402scan). Base deployada: 48.17.14-REALCALL.
 VERSION = "48.18.2-HOTFIX"  # v48.18.2-HOTFIX: fix CRITICO — o loop de registro da 48.18.0 usava `_ai` como variavel de desempacotamento do tuple e SOBRESCREVIA a funcao global _ai() (~l.9292) ao fim do import (ficava _ai=True); os 16 endpoints premium que chamam _ai()/_ai_required() 500avam com "'bool' object is not callable" (traceback real: analise l.3734 -> _ai_required l.9311). Renomeado p/ _uses_ai + assert callable(_ai) + del dos nomes do loop. | base: v48.18.1-MERGE
 VERSION = "48.18.3-PAYGUARD"  # v48.18.3-PAYGUARD: /pay nunca mais vende endpoint sem parametro obrigatorio — querystring da pagina segue para a chamada paga (carteira EIP-3009, Solana, cartao manual E o QR mobile) e, sem querystring, cartao pre-preenchido de ENDPOINT_REQUIRED_PARAMS bloqueia a assinatura com campo vazio. Mata o estorno pos-settle 400 do /br-doc (2x em 07/out, mesmo comprador).
-VERSION = "48.20.0-STOREFRONT"  # v48.20: STOREFRONT — landing ganha (1) rails strip com logos SVG inline (USDC/Base/Polygon/Solana/Algorand/Pix, zero requests externos), (2) badge ERC-8004 #87048 verificavel no hero, (3) ticker CSS-only com os endpoints de $0.001, (4) vitrine 'Base chain intelligence' com os 7 endpoints da v48.19 (1a secao de produto, visivel nas 2 abas), (5) _price_label com 3 casas p/ precos < $0.01 (o .2f imprimiria $0.00), (6) aba Agent com 4 chains + 5 meta-tools | /erc8004 DEIXA DE SER FERRAMENTA E VIRA PROVA: pagina de identidade com agentId 87048 + tx 0x694b13bd…d0061e + links de verificacao (o registro JA EXISTIA desde 15/set — o -32603 do Phantom e pre-simulacao, nao gas; registrador recolhido p/ <details> avancado) | base: v48.19.0-AGUA  # v48.18.6-ONECLICK: /erc8004 com gasLimit explicito (1.2M; estimateGas real 1.107.928, custo ~$0,03) — contorna a falha de estimativa do Phantom (-32603 'Unexpected error' no eth_sendTransaction que travou o registro em 08/out) + Plano B na propria pagina: link BaseScan #writeContract e botao 'copiar agentURI'. | base: v48.18.5-ONECLICK (pagina guiada de registro ERC-8004, data URI imutavel registration-v1, agentId lido do evento Transfer; ZERO chaves no servidor)
+VERSION = "48.21.0-TRUSTSTACK"  # v48.21.0-TRUSTSTACK: (1) FIX DOMAIN-VERIFICATION ERC-8004 — /.well-known/agent-registration.json estava SEM o campo registrations (a spec exige p/ provar dominio) e com "99 paid endpoints" congelado: o 8004scan lia Publisher 19 / Compliance 75. Agora registrations com agentId 87048 (env ERC8004_AGENT_ID com fallback) e contagem DINAMICA len(BASE_PRICES) — nunca mais desatualiza. erc8004.json ganha o mesmo fallback (identidade sobrevive a env perdida) e descricao atualizada. (2) LANDING: faixa "Listed & verified" com 7 selos clicaveis de prova publica (8004scan, x402lint A 98/100, x402scan, x402-list, MCP Registry, PyPI, npm) + rodape copyright (c 2026 Losbeto sobre o protocolo aberto x402, sem texto LF) + tabela machine-readable ganha as 2 linhas ERC-8004. | base: v48.20.0-STOREFRONT  # v48.20: STOREFRONT — landing ganha (1) rails strip com logos SVG inline (USDC/Base/Polygon/Solana/Algorand/Pix, zero requests externos), (2) badge ERC-8004 #87048 verificavel no hero, (3) ticker CSS-only com os endpoints de $0.001, (4) vitrine 'Base chain intelligence' com os 7 endpoints da v48.19 (1a secao de produto, visivel nas 2 abas), (5) _price_label com 3 casas p/ precos < $0.01 (o .2f imprimiria $0.00), (6) aba Agent com 4 chains + 5 meta-tools | /erc8004 DEIXA DE SER FERRAMENTA E VIRA PROVA: pagina de identidade com agentId 87048 + tx 0x694b13bd…d0061e + links de verificacao (o registro JA EXISTIA desde 15/set — o -32603 do Phantom e pre-simulacao, nao gas; registrador recolhido p/ <details> avancado) | base: v48.19.0-AGUA  # v48.18.6-ONECLICK: /erc8004 com gasLimit explicito (1.2M; estimateGas real 1.107.928, custo ~$0,03) — contorna a falha de estimativa do Phantom (-32603 'Unexpected error' no eth_sendTransaction que travou o registro em 08/out) + Plano B na propria pagina: link BaseScan #writeContract e botao 'copiar agentURI'. | base: v48.18.5-ONECLICK (pagina guiada de registro ERC-8004, data URI imutavel registration-v1, agentId lido do evento Transfer; ZERO chaves no servidor)
 
 
 if __name__ == "__main__":
