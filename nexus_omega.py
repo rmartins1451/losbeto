@@ -20035,7 +20035,7 @@ def claim_pix_activate():
     except Exception as e:
         return f"error: {str(e)[:200]}", 500
 
-# ── v48.18.5-ONECLICK: registro ERC-8004 guiado, servido pelo proprio no ──────
+# ── v48.18.6-ONECLICK: registro ERC-8004 guiado, servido pelo proprio no ──────
 # A pagina conecta a carteira do OPERADOR (Phantom/MetaMask, rede Base) e chama
 # register(agentURI) no Identity Registry. NENHUMA chave passa pelo servidor:
 # a assinatura acontece inteira na carteira, no browser do operador.
@@ -20080,6 +20080,14 @@ o <code>/.well-known/agent-registration.json</code> com ele para verificação d
 <pre id="out">aguardando…</pre>
 <p><small>Depois de registrado, consulte o agente em <a href="https://www.8004scan.io">8004scan.io</a>
 e a transação em <a href="https://basescan.org">basescan.org</a>.</small></p>
+<details style="margin-top:10px"><summary><b>Plano B</b> — se a carteira der erro (ex.: -32603), registre pelo BaseScan</summary>
+<ol style="margin:8px 0 0">
+<li>Abra o <a href="https://basescan.org/address/__REG8004__#writeContract">contrato no BaseScan</a> (aba <b>Contract → Write Contract</b>).</li>
+<li>Clique em <b>Connect to Web3</b> e conecte a MESMA carteira (rede Base).</li>
+<li>No metodo <b>register</b>, cole o agentURI: <button id="btnCopy" type="button">copiar agentURI</button> <span id="cpok"></span></li>
+<li>Clique em <b>Write</b> e confirme na carteira. O agentId e o tokenId do evento <b>Transfer</b> da transacao (aba Logs no BaseScan).</li>
+</ol>
+</details>
 <script src="https://cdn.jsdelivr.net/npm/ethers@6.13.4/dist/ethers.umd.min.js"></script>
 <script>
 const REG = "__REG8004__";
@@ -20115,7 +20123,9 @@ document.getElementById("btnReg").onclick = async () => {
   try {
     const c = new ethers.Contract(REG, ABI, signer);
     log("enviando register() — confirme na carteira…");
-    const tx = await c.register(AGENT_URI);
+    // v48.18.6: gasLimit explicito — contorna a falha de estimativa do Phantom
+    // (-32603 "Unexpected error" no eth_sendTransaction). estimateGas real ≈ 1.107.928.
+    const tx = await c.register(AGENT_URI, { gasLimit: 1200000 });
     log("tx enviada: " + tx.hash);
     log("https://basescan.org/tx/" + tx.hash);
     log("aguardando confirmacao…");
@@ -20129,7 +20139,14 @@ document.getElementById("btnReg").onclick = async () => {
     }
     log("REGISTRADO ✓  agentId: " + (agentId !== null ? agentId : "(veja o tokenId nos logs da tx)"));
     log("proximo passo: conferir o agente em https://www.8004scan.io");
-  } catch (e) { log("ERRO: " + ((e && e.message) || e)); }
+  } catch (e) { log("ERRO: " + ((e && e.message) || e));
+    log("se o erro persistir (ex.: -32603), use o PLANO B logo abaixo dos botoes: registrar pelo BaseScan.");
+  }
+};
+document.getElementById("btnCopy").onclick = async () => {
+  try { await navigator.clipboard.writeText(AGENT_URI);
+        document.getElementById("cpok").textContent = "copiado ✓"; }
+  catch (e) { prompt("Copie o agentURI:", AGENT_URI); }
 };
 </script></body></html>"""
 
@@ -30806,7 +30823,7 @@ VERSION = "48.18.0-REGISTRY"  # v48.17.14-REALCALL: /agent-call CONSERTADO DE VE
 VERSION = "48.18.1-MERGE"  # v48.18.1-MERGE: 48.18.0-REGISTRY (Claude: painel orgânico, radar anti-scanner, cache /live/api+/dash, /br-cnpj /br-cep /classify /summarize) + 48.17.15-WARMBOOT (Kimi: _discover_embed não-bloqueante + warmer de embeddings/reranker no boot — mata WORKER TIMEOUT; aliases /mcp/sse /keys.json /auth/login; textos de chains com Polygon — corrige o blurb do x402scan). Base deployada: 48.17.14-REALCALL.
 VERSION = "48.18.2-HOTFIX"  # v48.18.2-HOTFIX: fix CRITICO — o loop de registro da 48.18.0 usava `_ai` como variavel de desempacotamento do tuple e SOBRESCREVIA a funcao global _ai() (~l.9292) ao fim do import (ficava _ai=True); os 16 endpoints premium que chamam _ai()/_ai_required() 500avam com "'bool' object is not callable" (traceback real: analise l.3734 -> _ai_required l.9311). Renomeado p/ _uses_ai + assert callable(_ai) + del dos nomes do loop. | base: v48.18.1-MERGE
 VERSION = "48.18.3-PAYGUARD"  # v48.18.3-PAYGUARD: /pay nunca mais vende endpoint sem parametro obrigatorio — querystring da pagina segue para a chamada paga (carteira EIP-3009, Solana, cartao manual E o QR mobile) e, sem querystring, cartao pre-preenchido de ENDPOINT_REQUIRED_PARAMS bloqueia a assinatura com campo vazio. Mata o estorno pos-settle 400 do /br-doc (2x em 07/out, mesmo comprador).
-VERSION = "48.18.5-ONECLICK"  # v48.18.5-ONECLICK: /erc8004 — pagina guiada servida pelo proprio no que conecta a carteira do operador (Phantom/MetaMask, rede Base, com troca automatica de rede) e chama register(agentURI) no Identity Registry 0x8004A169...a432; agentURI registration-v1 (x402Support:true, web/A2A/MCP) embutido como data URI imutavel; agentId lido do evento Transfer do recibo. ZERO chaves no servidor — assinatura 100% na carteira. Entra o no no indice global de ~550k agentes (8004scan.io) com 2 cliques. | base: v48.18.4-VITRINE
+VERSION = "48.18.6-ONECLICK"  # v48.18.6-ONECLICK: /erc8004 com gasLimit explicito (1.2M; estimateGas real 1.107.928, custo ~$0,03) — contorna a falha de estimativa do Phantom (-32603 'Unexpected error' no eth_sendTransaction que travou o registro em 08/out) + Plano B na propria pagina: link BaseScan #writeContract e botao 'copiar agentURI'. | base: v48.18.5-ONECLICK (pagina guiada de registro ERC-8004, data URI imutavel registration-v1, agentId lido do evento Transfer; ZERO chaves no servidor)
 
 
 if __name__ == "__main__":
