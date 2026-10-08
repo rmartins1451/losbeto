@@ -12801,6 +12801,27 @@ td:last-child{text-align:right;font:13px var(--mono);color:var(--acc)}
 footer{border-top:1px solid var(--line);margin-top:64px;padding:26px 0 48px;color:var(--dim);font-size:13px}
 footer a{color:var(--dim)}
 .hide{display:none}
+/* v48.20-STOREFRONT — payment rails, badge ERC-8004, ticker e vitrine chain.
+   Preenche as faixas escuras com sinais de confiança (logos SVG inline — zero
+   requests externos) e coloca os endpoints de $0.001 logo na dobra. */
+.pill8004{display:inline-flex;align-items:center;gap:8px;margin:2px 0 4px;padding:7px 14px;
+          border:1px solid #1f6f43;background:#0d1f14;color:#4ade80;border-radius:999px;
+          font-size:12.5px;text-decoration:none;font-weight:500}
+.pill8004:hover{border-color:#2ea36a;color:#6ee7a0}
+.rails{display:flex;align-items:center;gap:26px;flex-wrap:wrap;margin-top:30px;
+       padding-top:22px;border-top:1px solid var(--line)}
+.rails .rl{display:flex;align-items:center;gap:8px;color:var(--dim);font-size:13px}
+.rails svg{width:20px;height:20px;display:block}
+.rails .acc-lbl{color:var(--dim);font-size:11px;text-transform:uppercase;letter-spacing:.09em}
+.tickband{width:100vw;margin-left:calc(50% - 50vw);border-top:1px solid var(--line);
+          background:#0c0e11;overflow:hidden;padding:9px 0}
+.tick{display:flex;gap:38px;width:max-content;animation:tick 48s linear infinite;
+      font:12.5px var(--mono);color:#6b7280;white-space:nowrap}
+.tick b{color:#9fd8ab;font-weight:600}
+.tick .sep{color:#2a2f36}
+.tickband:hover .tick{animation-play-state:paused}
+@keyframes tick{from{transform:translateX(0)}to{transform:translateX(-50%)}}
+@media(prefers-reduced-motion:reduce){.tick{animation:none}}
 </style></head><body>
 <header><div class="wrap hrow">
   <div class="logo"><img src="/favicon.svg?v=2" width="22" height="22" alt="" style="vertical-align:-5px;margin-right:8px">los<span>beto</span></div>
@@ -12822,6 +12843,7 @@ footer a{color:var(--dim)}
 macro and B3 equities, US equities, forex,
 commodities, global macro and crypto. No API keys, no accounts — your agent
 settles a few cents in USDC per request and gets clean JSON back.</p>
+<a class="pill8004" href="https://8004scan.io/agents/base/87048">✓&nbsp; ERC-8004 registered on-chain · agent #87048 on Base&nbsp;↗</a>
 <div class="cta">
   <a class="p" href="/try">Try free — 6 live samples</a>
   <a class="s" href="/pricing">Pricing &amp; subscriptions</a>
@@ -12835,6 +12857,71 @@ settles a few cents in USDC per request and gets clean JSON back.</p>
   <div class="stat"><b>0</b><span>accounts to create</span></div>
   <div class="stat"><b>Free</b><span>sample on every endpoint</span></div>
   <div class="stat"><b><a href="/welcome" style="color:inherit">1st call free</a></b><span>real-time, no wallet · /welcome</span></div>
+</div>
+<div class="rails">
+  <span class="acc-lbl">We accept</span>
+  <span class="rl"><svg viewBox="0 0 24 24" aria-label="USDC"><circle cx="12" cy="12" r="11" fill="#2775CA"/><path d="M8 4.8a9 9 0 0 0 0 14.4M16 4.8a9 9 0 0 1 0 14.4" stroke="#fff" stroke-width="1.5" fill="none" stroke-linecap="round"/><text x="12" y="16" font-size="10.5" font-weight="700" fill="#fff" text-anchor="middle" font-family="Arial,sans-serif">$</text></svg>USDC</span>
+  <span class="rl"><svg viewBox="0 0 24 24" aria-label="Base"><circle cx="12" cy="12" r="11" fill="#0052FF"/><path d="M12 5a7 7 0 1 0 7 7h-4.5v-2H19A7 7 0 0 0 12 5z" fill="#fff"/></svg>Base</span>
+  <span class="rl"><svg viewBox="0 0 24 24" aria-label="Polygon"><path d="M12 1.5l9 5.2v10.6l-9 5.2-9-5.2V6.7z" fill="#8247E5"/><path d="M15.7 9.1l-3.7-2.1-3.7 2.1v4.3l3.7 2.1 3.7-2.1z" fill="#fff" opacity=".95"/></svg>Polygon</span>
+  <span class="rl"><svg viewBox="0 0 24 24" aria-label="Solana"><defs><linearGradient id="solg" x1="0" y1="1" x2="1" y2="0"><stop offset="0" stop-color="#9945FF"/><stop offset="1" stop-color="#14F195"/></linearGradient></defs><path d="M5.2 6.4L7.8 3.8h11l-2.6 2.6z" fill="url(#solg)"/><path d="M18.8 11.1l-2.6-2.6h-11l2.6 2.6z" fill="url(#solg)"/><path d="M5.2 15.8l2.6-2.6h11l-2.6 2.6z" fill="url(#solg)"/></svg>Solana</span>
+  <span class="rl"><svg viewBox="0 0 24 24" aria-label="Algorand"><path d="M13.8 3h-3.6L4 21h2.9l1.6-4.6h6.9l1.6 4.6h3zM9.5 14.2L12 7.5l2.5 6.7z" fill="#e8eaed"/></svg>Algorand</span>
+  <span class="rl"><svg viewBox="0 0 24 24" aria-label="Pix"><rect x="5.1" y="5.1" width="13.8" height="13.8" rx="3.4" transform="rotate(45 12 12)" fill="#32BCAD"/><circle cx="12" cy="12" r="2.5" fill="#0a0b0d"/></svg>Pix</span>
+</div>
+</div></section>
+<div class="tickband"><div class="tick">
+<span>/chain-block <b>__P_CBLOCK__</b></span><span class="sep">·</span><span>/gas-price <b>__P_CGAS__</b> + ML forecast</span><span class="sep">·</span><span>/chain-ens <b>__P_CENS__</b></span><span class="sep">·</span><span>/chain-tx <b>__P_CTX__</b></span><span class="sep">·</span><span>/chain-balance <b>__P_CBAL__</b></span><span class="sep">·</span><span>/agent-reputation <b>__P_AREP__</b> · ERC-8004</span><span class="sep">·</span><span>/wallet-verdict <b>__P_WV__</b> + shareable card</span><span class="sep">·</span><span>free sample on every endpoint — /try · /welcome · ?preview=1</span><span class="sep">·</span>
+<span>/chain-block <b>__P_CBLOCK__</b></span><span class="sep">·</span><span>/gas-price <b>__P_CGAS__</b> + ML forecast</span><span class="sep">·</span><span>/chain-ens <b>__P_CENS__</b></span><span class="sep">·</span><span>/chain-tx <b>__P_CTX__</b></span><span class="sep">·</span><span>/chain-balance <b>__P_CBAL__</b></span><span class="sep">·</span><span>/agent-reputation <b>__P_AREP__</b> · ERC-8004</span><span class="sep">·</span><span>/wallet-verdict <b>__P_WV__</b> + shareable card</span><span class="sep">·</span><span>free sample on every endpoint — /try · /welcome · ?preview=1</span><span class="sep">·</span>
+</div></div>
+
+<!-- v48.20: CHAIN INTELLIGENCE — a "água" que o mercado x402 compra em volume
+     (leituras de chain $0.001-0.005), com a camada que o líder não tem:
+     forecast ML, classe de carteira, ENS, explainer LLM e reputação ERC-8004.
+     Visível nas DUAS abas (human/agent) — fora do #human de propósito. -->
+<section class="band alt"><div class="wrap">
+<h2>New — Base chain intelligence, priced for loops</h2>
+<p class="lede">Raw chain data at commodity prices, with the layer the raw-RPC
+sellers don't have: a self-trained gas forecaster, wallet classification,
+ENS resolution, LLM transaction explanations and the first ERC-8004
+reputation feed on x402. Zero upstream cost — built to be hammered by agents.</p>
+<div class="grid">
+  <a class="card" href="/chain-block?preview=1"><span class="p">__P_CBLOCK__</span>
+    <h3>Chain Block</h3>
+    <p>Latest Base block — number, age in seconds, gas-used % and base fee.
+       The two-second heartbeat of the chain.</p>
+    <code>GET /chain-block</code></a>
+  <a class="card" href="/gas-price?preview=1"><span class="p">__P_CGAS__</span>
+    <h3>Gas Price + ML Forecast <em>new</em></h3>
+    <p>Gas now plus a Holt double-exponential forecast ~10 min ahead — trained
+       by every paid call. Answers <i>send_now</i> or <i>wait_~10min_cheaper</i>
+       with a confidence score.</p>
+    <code>GET /gas-price</code></a>
+  <a class="card" href="/chain-balance?preview=1"><span class="p">__P_CBAL__</span>
+    <h3>Chain Balance</h3>
+    <p>ETH + ERC-20 balances (USDC/WETH/cbBTC or your token list), nonce and a
+       wallet-class heuristic — whale, degen, diversified, retail, newcomer.</p>
+    <code>GET /chain-balance?address=0x…</code></a>
+  <a class="card" href="/chain-ens?name=vitalik.eth&amp;preview=1"><span class="p">__P_CENS__</span>
+    <h3>Chain ENS</h3>
+    <p>ENS forward and reverse resolution on Ethereum mainnet — embedded
+       keccak/namehash, zero external dependencies.</p>
+    <code>GET /chain-ens?name=vitalik.eth</code></a>
+  <a class="card" href="/chain-tx?preview=1"><span class="p">__P_CTX__</span>
+    <h3>Chain Tx</h3>
+    <p>Status, confirmations, value, fee and logs for any Base transaction —
+       add <code>&amp;explain=1</code> for an LLM plain-English explanation.</p>
+    <code>GET /chain-tx?hash=0x…</code></a>
+  <a class="card" href="/agent-reputation?preview=1"><span class="p">__P_AREP__</span>
+    <h3>Agent Reputation <em>ERC-8004</em></h3>
+    <p>On-chain identity and aggregated feedback from the ERC-8004 Reputation
+       Registry, for any registered agent — the first x402 endpoint serving
+       the standard. This node is agent #87048.</p>
+    <code>GET /agent-reputation?agentId=87048</code></a>
+  <a class="card" href="/wallet-verdict?preview=1"><span class="p">__P_WV__</span>
+    <h3>Wallet Verdict <em>viral</em></h3>
+    <p>A graded verdict on any wallet — WHALE to GHOST — with an LLM roast,
+       idempotent via requestKey, plus a free shareable SVG card built to be
+       posted.</p>
+    <code>GET /wallet-verdict?address=0x…</code></a>
 </div>
 </div></section>
 
@@ -13038,7 +13125,7 @@ GET __BASE__/.well-known/ucp
 GET __BASE__/openapi.json
 GET __BASE__/llms.txt
 
-<span class="c"># MCP streamable http — 69 tools, no install</span>
+<span class="c"># MCP streamable http — 5 meta-tools covering the full catalog, no install</span>
 POST __BASE__/mcp
 {"jsonrpc":"2.0","id":1,"method":"tools/list"}
 
@@ -13055,8 +13142,8 @@ GET __BASE__/oracle-consensus
 <span class="c"># 3 wallet signs a gasless USDC transfer and retries</span>
 <span class="c"># 4 facilitator settles on Base or Solana; JSON returned</span>
 
-Networks: eip155:8453 (Base, Coinbase CDP) · solana (PayAI)
-Asset:    USDC · Prices: $0.003 – $0.50
+Networks: eip155:8453 (Base) · eip155:137 (Polygon) · solana · algorand
+Asset:    USDC · Prices: $0.001 – $0.50
 <span class="c"># also answers MPP "Payment" challenges (IETF draft-httpauth-payment)
 # and is discoverable via Google UCP at /.well-known/ucp</span></pre>
 
@@ -13365,7 +13452,14 @@ def _render_clean_landing() -> str:
             .replace("__CHAINS__", _chains_text())
             .replace("__NCHAINS__", str(len(_chains_list())))
             .replace("__FEEDBACK__", fb))
-    for tag, ep in (("__P_WEATHER__", "/weather"),
+    for tag, ep in (("__P_CBLOCK__", "/chain-block"),
+                    ("__P_CGAS__", "/gas-price"),
+                    ("__P_CBAL__", "/chain-balance"),
+                    ("__P_CENS__", "/chain-ens"),
+                    ("__P_CTX__", "/chain-tx"),
+                    ("__P_AREP__", "/agent-reputation"),
+                    ("__P_WV__", "/wallet-verdict"),
+                    ("__P_WEATHER__", "/weather"),
                     ("__P_ORACLE__", "/oracle-consensus"),
                     ("__P_SENT__", "/sentiment-consensus"),
                     ("__P_TOKINTEL__", "/token-intel"),
@@ -13380,8 +13474,19 @@ def _render_clean_landing() -> str:
                     ("__P_BRIEF_BR__", "/br-brief"),
                     ("__P_CURVE__", "/br-curve"),
                     ("__P_BREQ__", "/br-equity")):
-        html = html.replace(tag, f"${get_dynamic_price(ep):.2f}")
+        html = html.replace(tag, _price_label(ep))
     return html
+
+
+def _price_label(ep: str) -> str:
+    """v48.20: label de preco do card — 3 casas abaixo de $0.01 (a vitrine
+    nova vive em $0.001-0.002; o .2f antigo imprimiria '$0.00')."""
+    try:
+        p = get_dynamic_price(ep)
+        return f"${p:.3f}" if p < 0.01 else f"${p:.2f}"
+    except Exception:
+        return "$0.001"
+
 
 @app.route("/")
 def root():
@@ -20691,7 +20796,7 @@ _ERC8004_AGENT_URI = ("data:application/json;base64,eyJ0eXBlIjoiaHR0cHM6Ly9laXBz
 _ERC8004_PAGE = """<!doctype html>
 <html lang="pt-BR"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>ERC-8004 · registro em 1 clique — Losbeto</title>
+<title>ERC-8004 · Losbeto é o agente #87048 — identidade on-chain</title>
 <style>
 body{font-family:system-ui,'Segoe UI',Arial,sans-serif;max-width:760px;margin:36px auto;padding:0 16px;color:#14161a;line-height:1.5}
 h1{font-size:1.45rem;margin:0 0 8px}code{background:#f0f2f5;padding:1px 5px;border-radius:4px;font-size:.85em;word-break:break-all}
@@ -20699,39 +20804,61 @@ button{font-size:1rem;padding:12px 18px;border:0;border-radius:10px;margin:6px 8
 button:disabled{background:#c4ccd8;cursor:not-allowed}
 #out{background:#0e1420;color:#9fe8a9;padding:14px;border-radius:10px;white-space:pre-wrap;word-break:break-all;min-height:120px;font-size:.86rem}
 .box{border:1px solid #e2e6ec;border-radius:12px;padding:14px 16px;margin:14px 0;background:#fafbfc}
+.done{border:1px solid #b7e4c7;background:#f0fff4;border-radius:12px;padding:18px 20px;margin:14px 0}
+.done .aid{font:700 2rem/1.1 ui-monospace,Menlo,monospace;color:#106c2f;letter-spacing:-.02em}
+.done b.ok{color:#106c2f}
+table{border-collapse:collapse;width:100%;font-size:.92rem}
+td{padding:7px 0;border-bottom:1px solid #e8ebef;vertical-align:top}
+td:first-child{color:#5b6470;width:130px}
+a{color:#0052ff}
 </style></head>
 <body>
-<h1>🪪 Registro ERC-8004 — um clique e o Losbeto entra no índice global de agentes</h1>
-<div class="box">
-<b>O que isto faz:</b> chama <code>register(string agentURI)</code> no Identity Registry da Base mainnet
-(<code>__REG8004__</code>). O <b>agentURI</b> (arquivo de registro com nome, serviços web/A2A/MCP e
-<code>x402Support: true</code>) já vem preenchido. Indexadores como o <b>8004scan.io</b>
-(~550 mil agentes) passam a listar o Losbeto automaticamente.<br>
-<b>Segurança:</b> a assinatura acontece na SUA carteira, no SEU browser — esta página não envia
-nenhuma chave ao servidor. Custo: alguns centavos de gas (ETH na Base).
+<h1>🪪 ERC-8004 — identidade on-chain do Losbeto</h1>
+<div class="done">
+<b class="ok">✓ REGISTRADO na Base mainnet</b> — o Losbeto já é um agente on-chain no índice global ERC-8004.<br>
+<div class="aid">agentId 87048</div>
+Registrado em 15/set/2026 01:28 UTC · bloco 51.323.176 · pela carteira do operador
+<code>0xE82218ad28777a7A2b9dA9182557519B9Af11581</code>
 </div>
 <div class="box">
-<b>Passo a passo:</b>
+<b>Verifique você mesmo (não confie, verifique):</b>
+<table>
+<tr><td>Índice global</td><td><a href="https://8004scan.io/agents/base/87048">8004scan.io/agents/base/87048</a></td></tr>
+<tr><td>Transação do registro</td><td><a href="https://basescan.org/tx/0x694b13bd5dbe6a373272b4beebc10d434ebed396e335338ba9fc5e5ba5d0061e">0x694b13bd…d0061e</a> (evento Transfer: mint do agentId 87048)</td></tr>
+<tr><td>Identity Registry</td><td><code>__REG8004__</code> — <code>ownerOf(87048)</code> responde a carteira acima</td></tr>
+<tr><td>Arquivo de registro</td><td><a href="/.well-known/erc8004.json">/.well-known/erc8004.json</a> (servido por este nó; o tokenURI on-chain aponta para ele)</td></tr>
+<tr><td>Reputação via API</td><td><code>GET /agent-reputation?agentId=87048</code> — lê o Reputation Registry on-chain</td></tr>
+</table>
+</div>
+<div class="box">
+<b>Sobre o erro -32603 do Phantom ("Unexpected error"):</b> não é falta de fundos nem de gas —
+a pré-simulação proprietária do Phantom aborta a transação antes do popup de confirmação.
+Aconteceu em todas as tentativas (com e sem gasLimit explícito). <b>E foi sorte:</b> o registro
+já existia desde 15/set — uma segunda chamada teria criado um agente <i>duplicado</i>.
+Se um dia for necessário registrar outro agente, o caminho confiável é o Plano B (BaseScan) ali embaixo.
+</div>
+<details style="margin-top:10px"><summary><b>Avançado</b> — registrar <u>outro</u> agente (o Losbeto já está registrado)</summary>
+<div class="box">
+<b>O que isto faz:</b> chama <code>register(string agentURI)</code> no Identity Registry da Base mainnet
+(<code>__REG8004__</code>). A assinatura acontece na SUA carteira, no SEU browser — esta página não envia
+nenhuma chave ao servidor. Custo: alguns centavos de gas (ETH na Base).
 <ol style="margin:8px 0 0">
 <li>Tenha a carteira <b>Phantom</b> (ou MetaMask) no browser, com alguns centavos de ETH na rede <b>Base</b>.</li>
 <li>Clique em <b>1 · Conectar carteira</b> e autorize. Se a rede não for Base, a página oferece a troca.</li>
-<li>Clique em <b>2 · Registrar agente</b> e confirme na carteira.</li>
-<li>Guarde o <b>agentId</b> exibido — é o número do Losbeto no índice global (depois dá para publicar
-o <code>/.well-known/agent-registration.json</code> com ele para verificação de domínio).</li>
+<li>Clique em <b>2 · Registrar agente</b> e confirme na carteira. Se o Phantom abortar com -32603, use o Plano B.</li>
 </ol>
 </div>
 <button id="btnConn">1 · Conectar carteira</button>
 <button id="btnReg" disabled>2 · Registrar agente (Base)</button>
 <pre id="out">aguardando…</pre>
-<p><small>Depois de registrado, consulte o agente em <a href="https://www.8004scan.io">8004scan.io</a>
-e a transação em <a href="https://basescan.org">basescan.org</a>.</small></p>
-<details style="margin-top:10px"><summary><b>Plano B</b> — se a carteira der erro (ex.: -32603), registre pelo BaseScan</summary>
+<details style="margin-top:10px"><summary><b>Plano B</b> — registrar pelo BaseScan (caminho que não depende da simulação do Phantom)</summary>
 <ol style="margin:8px 0 0">
 <li>Abra o <a href="https://basescan.org/address/__REG8004__#writeContract">contrato no BaseScan</a> (aba <b>Contract → Write Contract</b>).</li>
 <li>Clique em <b>Connect to Web3</b> e conecte a MESMA carteira (rede Base).</li>
 <li>No metodo <b>register</b>, cole o agentURI: <button id="btnCopy" type="button">copiar agentURI</button> <span id="cpok"></span></li>
 <li>Clique em <b>Write</b> e confirme na carteira. O agentId e o tokenId do evento <b>Transfer</b> da transacao (aba Logs no BaseScan).</li>
 </ol>
+</details>
 </details>
 <script src="https://cdn.jsdelivr.net/npm/ethers@6.13.4/dist/ethers.umd.min.js"></script>
 <script>
@@ -20768,8 +20895,6 @@ document.getElementById("btnReg").onclick = async () => {
   try {
     const c = new ethers.Contract(REG, ABI, signer);
     log("enviando register() — confirme na carteira…");
-    // v48.18.6: gasLimit explicito — contorna a falha de estimativa do Phantom
-    // (-32603 "Unexpected error" no eth_sendTransaction). estimateGas real ≈ 1.107.928.
     const tx = await c.register(AGENT_URI, { gasLimit: 1200000 });
     log("tx enviada: " + tx.hash);
     log("https://basescan.org/tx/" + tx.hash);
@@ -20785,7 +20910,7 @@ document.getElementById("btnReg").onclick = async () => {
     log("REGISTRADO ✓  agentId: " + (agentId !== null ? agentId : "(veja o tokenId nos logs da tx)"));
     log("proximo passo: conferir o agente em https://www.8004scan.io");
   } catch (e) { log("ERRO: " + ((e && e.message) || e));
-    log("se o erro persistir (ex.: -32603), use o PLANO B logo abaixo dos botoes: registrar pelo BaseScan.");
+    log("se o erro persistir (ex.: -32603), use o PLANO B: registrar pelo BaseScan.");
   }
 };
 document.getElementById("btnCopy").onclick = async () => {
@@ -31468,7 +31593,7 @@ VERSION = "48.18.0-REGISTRY"  # v48.17.14-REALCALL: /agent-call CONSERTADO DE VE
 VERSION = "48.18.1-MERGE"  # v48.18.1-MERGE: 48.18.0-REGISTRY (Claude: painel orgânico, radar anti-scanner, cache /live/api+/dash, /br-cnpj /br-cep /classify /summarize) + 48.17.15-WARMBOOT (Kimi: _discover_embed não-bloqueante + warmer de embeddings/reranker no boot — mata WORKER TIMEOUT; aliases /mcp/sse /keys.json /auth/login; textos de chains com Polygon — corrige o blurb do x402scan). Base deployada: 48.17.14-REALCALL.
 VERSION = "48.18.2-HOTFIX"  # v48.18.2-HOTFIX: fix CRITICO — o loop de registro da 48.18.0 usava `_ai` como variavel de desempacotamento do tuple e SOBRESCREVIA a funcao global _ai() (~l.9292) ao fim do import (ficava _ai=True); os 16 endpoints premium que chamam _ai()/_ai_required() 500avam com "'bool' object is not callable" (traceback real: analise l.3734 -> _ai_required l.9311). Renomeado p/ _uses_ai + assert callable(_ai) + del dos nomes do loop. | base: v48.18.1-MERGE
 VERSION = "48.18.3-PAYGUARD"  # v48.18.3-PAYGUARD: /pay nunca mais vende endpoint sem parametro obrigatorio — querystring da pagina segue para a chamada paga (carteira EIP-3009, Solana, cartao manual E o QR mobile) e, sem querystring, cartao pre-preenchido de ENDPOINT_REQUIRED_PARAMS bloqueia a assinatura com campo vazio. Mata o estorno pos-settle 400 do /br-doc (2x em 07/out, mesmo comprador).
-VERSION = "48.19.0-AGUA"  # v48.19: 7 novos endpoints (5 chain-reads + ERC-8004 reputation + wallet-verdict viral); anterior: 48.18.6-ONECLICK gasLimit+PlanoB no registro ERC-8004  # v48.18.6-ONECLICK: /erc8004 com gasLimit explicito (1.2M; estimateGas real 1.107.928, custo ~$0,03) — contorna a falha de estimativa do Phantom (-32603 'Unexpected error' no eth_sendTransaction que travou o registro em 08/out) + Plano B na propria pagina: link BaseScan #writeContract e botao 'copiar agentURI'. | base: v48.18.5-ONECLICK (pagina guiada de registro ERC-8004, data URI imutavel registration-v1, agentId lido do evento Transfer; ZERO chaves no servidor)
+VERSION = "48.20.0-STOREFRONT"  # v48.20: STOREFRONT — landing ganha (1) rails strip com logos SVG inline (USDC/Base/Polygon/Solana/Algorand/Pix, zero requests externos), (2) badge ERC-8004 #87048 verificavel no hero, (3) ticker CSS-only com os endpoints de $0.001, (4) vitrine 'Base chain intelligence' com os 7 endpoints da v48.19 (1a secao de produto, visivel nas 2 abas), (5) _price_label com 3 casas p/ precos < $0.01 (o .2f imprimiria $0.00), (6) aba Agent com 4 chains + 5 meta-tools | /erc8004 DEIXA DE SER FERRAMENTA E VIRA PROVA: pagina de identidade com agentId 87048 + tx 0x694b13bd…d0061e + links de verificacao (o registro JA EXISTIA desde 15/set — o -32603 do Phantom e pre-simulacao, nao gas; registrador recolhido p/ <details> avancado) | base: v48.19.0-AGUA  # v48.18.6-ONECLICK: /erc8004 com gasLimit explicito (1.2M; estimateGas real 1.107.928, custo ~$0,03) — contorna a falha de estimativa do Phantom (-32603 'Unexpected error' no eth_sendTransaction que travou o registro em 08/out) + Plano B na propria pagina: link BaseScan #writeContract e botao 'copiar agentURI'. | base: v48.18.5-ONECLICK (pagina guiada de registro ERC-8004, data URI imutavel registration-v1, agentId lido do evento Transfer; ZERO chaves no servidor)
 
 
 if __name__ == "__main__":
