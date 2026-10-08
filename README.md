@@ -6,7 +6,9 @@ One USDC micropayment per call. No signup, no API keys to manage — **the payme
 
 **Flagship: an OpenAI-compatible LLM gateway for agents.** `POST /v1/chat/completions` and `GET /llm` at **$0.005/call** on live backends, with a free tier at `/llm/free` and model list at `/v1/models`. Behind it, **115+ endpoints** ($0.001–0.50): Base chain reads, FX, equities, commodities, macro calendar, crypto — plus Brazil's official statistics in depth, which nobody else on x402 covers.
 
-**Identity: registered ERC-8004 agent** — [agentId 87048 on Base](https://8004scan.io/agents/base/87048), registration file at `/.well-known/erc8004.json`.
+**Identity: registered ERC-8004 agent** — [agentId 87048 on Base](https://8004scan.io/agents/base/87048), registration file at `/.well-known/erc8004.json`, domain-verified via `/.well-known/agent-registration.json`.
+
+**Compliance: Grade A 98/100 on [x402lint](https://x402lint.com)** (PASS 23 · FAIL 0) — and listed on [x402scan](https://www.x402scan.com), [x402-list](https://x402-list.com/services/losbeto-cross-asset-market-intelligence), the [official MCP Registry](https://registry.modelcontextprotocol.io) (`io.github.rmartins1451/losbeto`), [PyPI](https://pypi.org/project/losbeto-tools/) and [npm](https://www.npmjs.com/package/losbeto-mcp).
 
 ## Quick start
 
