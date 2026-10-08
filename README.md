@@ -4,7 +4,9 @@
 
 One USDC micropayment per call. No signup, no API keys to manage — **the payment is the auth**. USDC on Base, Solana or Algorand.
 
-**Flagship: an OpenAI-compatible LLM gateway for agents.** `POST /v1/chat/completions` and `GET /llm` at **$0.005/call** on live backends, with a free tier at `/llm/free` and model list at `/v1/models`. Behind it, **95+ market-data endpoints** ($0.003–0.05): FX, equities, commodities, macro calendar, crypto — plus Brazil's official statistics in depth, which nobody else on x402 covers.
+**Flagship: an OpenAI-compatible LLM gateway for agents.** `POST /v1/chat/completions` and `GET /llm` at **$0.005/call** on live backends, with a free tier at `/llm/free` and model list at `/v1/models`. Behind it, **115+ endpoints** ($0.001–0.50): Base chain reads, FX, equities, commodities, macro calendar, crypto — plus Brazil's official statistics in depth, which nobody else on x402 covers.
+
+**Identity: registered ERC-8004 agent** — [agentId 87048 on Base](https://8004scan.io/agents/base/87048), registration file at `/.well-known/erc8004.json`.
 
 ## Quick start
 
@@ -54,6 +56,25 @@ As an MCP server (Claude Desktop, Cursor, Claude Code):
 ```
 
 Get a credit key with one on-chain payment: `POST https://api.losbeto.xyz/buy-credits`.
+
+## Base chain reads — priced for loops ($0.001–0.002)
+
+Raw chain data with an intelligence layer on top. Zero upstream cost (public RPC with short-cache and failover), so these are built to be hammered by agent loops:
+
+| Endpoint | Price | What you get |
+|---|---|---|
+| `/chain-block` | $0.001 | Latest Base block: number, age, gas-used %, base fee |
+| `/gas-price` | $0.001 | Gas now **+ ML forecast ~10 min ahead** (self-fed Holt double exponential smoothing — every paid call trains the model). Answers `send_now` or `wait_~10min_cheaper` with confidence |
+| `/chain-balance?address=` | $0.002 | ETH + ERC-20 balances (USDC/WETH/cbBTC default, up to 20 via `tokens=`), nonce, and a **wallet-class heuristic** (whale / degen / diversified / retail / newcomer) |
+| `/chain-ens?name=` or `?address=` | $0.002 | ENS forward **and** reverse resolution (Ethereum mainnet) — embedded keccak/namehash, zero dependencies |
+| `/chain-tx?hash=` | $0.002 | Status, confirmations, value, fee, logs, explorer link. Add `&explain=1` for an **LLM plain-English explanation** of the transaction |
+
+## Agent-native: ERC-8004 reputation and wallet verdicts
+
+| Endpoint | Price | What you get |
+|---|---|---|
+| `/agent-reputation?agentId=&clients=` | $0.010 | On-chain ERC-8004 identity (owner, tokenURI) plus aggregated feedback from the Reputation Registry (`getSummary`), for **any** registered agent. First x402 endpoint serving the ERC-8004 standard |
+| `/wallet-verdict?address=` | $0.020 | A graded verdict on any Base wallet (WHALE / STEADY / DEGEN / NEWCOMER / GHOST) with an **LLM-written roast**, idempotent via `requestKey`, plus a free shareable SVG card at `/wallet-verdict/card.svg?address=` — built to be posted |
 
 ## Plans — one payment, N calls (no settlement latency)
 
@@ -107,7 +128,7 @@ Verifiable from outside: `GET /zero-upstream.json` declares which routes never t
 - `GET /receipts` — every settlement, public
 - `GET /.well-known/honest-revenue.json` — signed; separates **organic** (wallets the operator doesn't control) from **operator-test** and **self-sweep**
 - `GET /scorecard.json` — 24h availability, p50/p95 latency, traffic mix, signed
-- `GET /.well-known/erc8004.json` — ERC-8004 registration file (trustless agent identity)
+- `GET /.well-known/erc8004.json` — ERC-8004 registration file; live on-chain as [agentId 87048](https://8004scan.io/agents/base/87048)
 
 ## Verify anything, offline
 
@@ -135,7 +156,7 @@ export BUYER_WALLETS=...              # your own test-buyer wallets, comma separ
 gunicorn --workers 2 --threads 8 --preload --bind 0.0.0.0:$PORT nexus_omega:app
 ```
 
-Useful env vars: `AI_WARMER=1`, `LLM_DAILY_GLOBAL_CAP`, `LLM_DAILY_KEY_CAP`, `PIT_INTERVAL_S`, `ALGO_ANCHOR_MNEMONIC`, `X402LIST_TOKEN`.
+Useful env vars: `AI_WARMER=1`, `LLM_DAILY_GLOBAL_CAP`, `LLM_DAILY_KEY_CAP`, `PIT_INTERVAL_S`, `ALGO_ANCHOR_MNEMONIC`, `X402LIST_TOKEN`, `EVM_RPC_URLS`, `ETH_RPC_URLS`, `PRICE_CHAIN_BLOCK` … `PRICE_WALLET_VERDICT` (per-endpoint price overrides).
 
 ## Contact
 
