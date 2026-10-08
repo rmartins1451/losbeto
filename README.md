@@ -4,7 +4,7 @@
 
 One USDC micropayment per call. No signup, no API keys to manage — **the payment is the auth**. USDC on Base, Solana or Algorand.
 
-**Flagship: an OpenAI-compatible LLM gateway for agents.** `POST /v1/chat/completions` and `GET /llm` at **$0.005/call** on live backends, with a free tier at `/llm/free` and model list at `/v1/models`. Behind it, **115+ endpoints** ($0.001–0.50): Base chain reads, FX, equities, commodities, macro calendar, crypto — plus Brazil's official statistics in depth, which nobody else on x402 covers.
+**Flagship: an OpenAI-compatible LLM gateway for agents.** `POST /v1/chat/completions` and `GET /llm` at **$0.005/call** on live backends, with a free tier at `/llm/free` and model list at `/v1/models`. Behind it, **116 endpoints** ($0.001–0.50): Base chain reads, FX, equities, commodities, macro calendar, crypto — plus Brazil's official statistics in depth, which nobody else on x402 covers.
 
 **Identity: registered ERC-8004 agent** — [agentId 87048 on Base](https://8004scan.io/agents/base/87048), registration file at `/.well-known/erc8004.json`, domain-verified via `/.well-known/agent-registration.json`.
 
