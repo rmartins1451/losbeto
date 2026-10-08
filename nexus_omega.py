@@ -9346,6 +9346,651 @@ ENDPOINT_DESC["/ping402"] = (
 ENDPOINT_TAGS["/ping402"] = ["Utility", "SmokeTest", "Trust", "ZeroUpstream"]
 ENDPOINT_PARAM_HINTS["/ping402"] = {"format": "json"}
 
+# ============================================================================
+# v48.19.0-AGUA — 7 endpoints de dados de chain + inteligencia embutida.
+# Tese (teardown CDP 08/out/2026): o volume real do x402 esta em leituras
+# basicas de blockchain ($0.001-0.005; lider com 460-700 pagadores unicos/30d
+# POR endpoint) e o Losbeto nao tinha NENHUMA. Estes endpoints copiam a
+# demanda provada e somam o que o lider nao tem: classe da carteira
+# (heuristica), forecast de gas (mini-Holt auto-alimentado), explicacao LLM
+# (bandit groq/gemini) e reputacao ERC-8004 on-chain (padrao lancado ha
+# semanas — primeiro-mover no x402). Upstream = RPC publico ($0) com cache
+# curto + failover → margem ~100%. Zero deps novas: keccak-256 embutido.
+# ============================================================================
+import json as _json4819  # defensivo: ja importado no topo do arquivo
+import requests as _requests4819  # defensivo: idem (linha ~774)
+try:
+    requests  # noqa: F821
+except NameError:  # pragma: no cover
+    requests = _requests4819  # noqa: F821
+try:
+    json  # noqa: F821
+except NameError:  # pragma: no cover
+    json = _json4819  # noqa: F821
+
+_KK_RC = [0x0000000000000001, 0x0000000000008082, 0x800000000000808A, 0x8000000080008000,
+          0x000000000000808B, 0x0000000080000001, 0x8000000080008081, 0x8000000000008009,
+          0x000000000000008A, 0x0000000000000088, 0x0000000080008009, 0x000000008000000A,
+          0x000000008000808B, 0x800000000000008B, 0x8000000000008089, 0x8000000000008003,
+          0x8000000000008002, 0x8000000000000080, 0x000000000000800A, 0x800000008000000A,
+          0x8000000080008081, 0x8000000000008080, 0x0000000080000001, 0x8000000080008008]
+_KK_ROT = [[0, 36, 3, 41, 18], [1, 44, 10, 45, 2], [62, 6, 43, 15, 61],
+           [28, 55, 25, 21, 56], [27, 20, 39, 8, 14]]
+_KK_M64 = (1 << 64) - 1
+
+def _kk_f(st):
+    for rc in _KK_RC:
+        C = [st[x] ^ st[x + 5] ^ st[x + 10] ^ st[x + 15] ^ st[x + 20] for x in range(5)]
+        D = [C[(x - 1) % 5] ^ (((C[(x + 1) % 5] << 1) | (C[(x + 1) % 5] >> 63)) & _KK_M64)
+             for x in range(5)]
+        for x in range(5):
+            for y in range(5):
+                st[x + 5 * y] ^= D[x]
+        B = [0] * 25
+        for x in range(5):
+            for y in range(5):
+                r = _KK_ROT[x][y]
+                v = st[x + 5 * y]
+                B[y + 5 * ((2 * x + 3 * y) % 5)] = (((v << r) | (v >> (64 - r))) & _KK_M64) if r else v
+        for x in range(5):
+            for y in range(5):
+                st[x + 5 * y] = B[x + 5 * y] ^ ((~B[(x + 1) % 5 + 5 * y]) & B[(x + 2) % 5 + 5 * y])
+        st[0] ^= rc
+
+def _keccak256(data: bytes) -> bytes:
+    rate, st = 136, [0] * 25
+    padded = bytearray(data); padded.append(0x01)
+    while len(padded) % rate != 0:
+        padded.append(0x00)
+    padded[-1] |= 0x80
+    for off in range(0, len(padded), rate):
+        for i in range(rate // 8):
+            st[i] ^= int.from_bytes(padded[off + i * 8: off + i * 8 + 8], "little")
+        _kk_f(st)
+    out = b""
+    while len(out) < 32:
+        for i in range(rate // 8):
+            out += st[i].to_bytes(8, "little")
+        if len(out) >= 32:
+            break
+        _kk_f(st)
+    return out[:32]
+
+def _sel4(sig: str) -> str:
+    return "0x" + _keccak256(sig.encode())[:4].hex()
+
+def _namehash(name: str) -> bytes:
+    node = b"\x00" * 32
+    if name:
+        for label in reversed(name.strip().lower().split(".")):
+            node = _keccak256(node + _keccak256(label.encode()))
+    return node
+
+# ── RPC com failover + cache curto ──────────────────────────────────────────
+_EVM_RPCS = [u.strip() for u in os.environ.get(
+    "EVM_RPC_URLS", "https://mainnet.base.org,https://base-rpc.publicnode.com").split(",") if u.strip()]
+_ETH_RPCS = [u.strip() for u in os.environ.get(
+    "ETH_RPC_URLS", "https://ethereum-rpc.publicnode.com,https://eth.drpc.org").split(",") if u.strip()]
+_CHAIN_CACHE: dict = {}
+
+def _evm_rpc(method: str, params: list, ttl: float = 20.0, rpcs=None, upstream=[0]):
+    """JSON-RPC read-only com cache curto e failover. None = tudo indisponivel."""
+    key = method + "|" + json.dumps(params, sort_keys=True)
+    hit = _CHAIN_CACHE.get(key)
+    if hit and (time.time() - hit[0]) < ttl:
+        return hit[1]
+    for url in (rpcs or _EVM_RPCS):
+        try:
+            r = requests.post(url, json={"jsonrpc": "2.0", "id": 1,
+                                         "method": method, "params": params}, timeout=8)
+            j = r.json()
+            if "result" in j:
+                upstream[0] += 1
+                _CHAIN_CACHE[key] = (time.time(), j["result"])
+                if len(_CHAIN_CACHE) > 3000:
+                    _CHAIN_CACHE.clear()
+                return j["result"]
+        except Exception as e:
+            log.warning(f"evm_rpc {method} via {url}: {e}")
+    return None
+
+def _hx(v, default=0):
+    try:
+        return int(v, 16)
+    except Exception:
+        return default
+
+def _is_addr(a) -> bool:
+    return isinstance(a, str) and len(a) == 42 and a.startswith("0x") and all(
+        c in "0123456789abcdefABCDEF" for c in a[2:])
+
+def _enc_u256(n: int) -> str:
+    return int(n).to_bytes(32, "big").hex()
+
+def _enc_addr(a: str) -> str:
+    return "000000000000000000000000" + a.lower().replace("0x", "")
+
+def _abi_dec_str(raw: bytes) -> str:
+    try:
+        ln = int.from_bytes(raw[32:64], "big")
+        return raw[64:64 + ln].decode("utf-8", "replace")
+    except Exception:
+        return ""
+
+# ── /chain-block ────────────────────────────────────────────────────────────
+def _h_chain_block():
+    up = [0]
+    bn = _evm_rpc("eth_blockNumber", [], ttl=10, upstream=up)
+    if bn is None:
+        return {"error": "upstream_unavailable", "upstream_calls": 0,
+                    "provider": "Losbeto/Chain", "version": VERSION, "ts": int(time.time())}
+    blk = _evm_rpc("eth_getBlockByNumber", [bn, False], ttl=10, upstream=up) or {}
+    ts_blk = _hx(blk.get("timestamp"))
+    gl, gu = _hx(blk.get("gasLimit")), _hx(blk.get("gasUsed"))
+    return {"network": "base", "chain_id": 8453,
+            "block_number": _hx(bn),
+            "block_timestamp": ts_blk, "block_age_seconds": max(0, int(time.time()) - ts_blk),
+            "gas_used_pct": round(100.0 * gu / gl, 2) if gl else None,
+            "base_fee_gwei": round(_hx(blk.get("baseFeePerGas")) / 1e9, 6) if blk.get("baseFeePerGas") else None,
+            "source": "base rpc", "upstream_calls": up[0],
+            "provider": "Losbeto/Chain", "version": VERSION, "ts": int(time.time())}
+
+# ── /gas-price — com forecast ML auto-alimentado ────────────────────────────
+_GAS_FILE = str(HOME_DIR / "gas_series.json")
+
+def _gas_series_append(gwei: float) -> list:
+    """Cada chamada paga alimenta a serie — o modelo melhora com o proprio uso."""
+    series = []
+    try:
+        series = json.loads(open(_GAS_FILE).read())
+    except Exception:
+        pass
+    now = time.time()
+    if not series or (now - series[-1][0]) >= 15:
+        series.append([now, gwei])
+        series = series[-4000:]
+        try:
+            open(_GAS_FILE, "w").write(json.dumps(series))
+        except Exception:
+            pass
+    return series
+
+def _holt_forecast(series, alpha=0.4, beta=0.1, h=20):
+    """Double exponential smoothing inline — ~10 min a frente com amostras de 30s."""
+    if len(series) < 8:
+        return None
+    vals = [p[1] for p in series]
+    level, trend = vals[0], vals[1] - vals[0]
+    for v in vals[1:]:
+        prev = level
+        level = alpha * v + (1 - alpha) * (level + trend)
+        trend = beta * (level - prev) + (1 - beta) * trend
+    return level + h * trend
+
+def _h_gas_price():
+    up = [0]
+    gp = _evm_rpc("eth_gasPrice", [], ttl=15, upstream=up)
+    if gp is None:
+        return {"error": "upstream_unavailable", "upstream_calls": 0,
+                    "provider": "Losbeto/Chain", "version": VERSION, "ts": int(time.time())}
+    now_gwei = _hx(gp) / 1e9
+    series = _gas_series_append(now_gwei)
+    fc = _holt_forecast(series)
+    out = {"network": "base", "chain_id": 8453,
+           "gas_price_gwei": round(now_gwei, 6),
+           "samples_collected": len(series),
+           "source": "base rpc + self-fed Holt forecaster", "upstream_calls": up[0],
+           "provider": "Losbeto/Chain", "version": VERSION, "ts": int(time.time())}
+    if fc is not None:
+        out["ml_forecast"] = {
+            "model": "Holt double exponential smoothing (self-fed by paid calls)",
+            "horizon": "~10 min",
+            "forecast_gwei": round(max(0.0, fc), 6),
+            "recommendation": "send_now" if fc >= now_gwei * 0.98 else "wait_~10min_cheaper",
+            "confidence": min(0.95, 0.5 + len(series) / 4000.0)}
+    else:
+        out["ml_forecast"] = {"model": "warming_up", "need_samples": 8, "have": len(series)}
+    return out
+
+# ── /chain-balance — ETH + ERC20 batch + classe da carteira ─────────────────
+_CHAIN_DEFAULT_TOKENS = {
+    "USDC": "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
+    "WETH": "0x4200000000000000000000000000000000000006",
+    "cbBTC": "0xcbB7C0000aB88B473b1f5aFd9ef808440eed33Bf"}
+
+def _erc20_meta(tok: str, owner: str, up) -> dict:
+    """balanceOf+decimals+symbol de um token; saldo None se falhar."""
+    out = {"contract": tok}
+    bal = _evm_rpc("eth_call", [{"to": tok, "data": "0x70a08231" + _enc_addr(owner)}, "latest"],
+                   ttl=30, upstream=up)
+    if bal in (None, "0x"):
+        out["balance_raw"] = None
+        return out
+    out["balance_raw"] = str(_hx(bal))
+    dec = _evm_rpc("eth_call", [{"to": tok, "data": _sel4("decimals()")}, "latest"], ttl=3600, upstream=up)
+    out["decimals"] = _hx(dec, 18) if dec not in (None, "0x") else 18
+    sym = _evm_rpc("eth_call", [{"to": tok, "data": _sel4("symbol()")}, "latest"], ttl=3600, upstream=up)
+    if sym not in (None, "0x"):
+        s = _abi_dec_str(bytes.fromhex(sym[2:]))
+        if s:
+            out["symbol"] = s
+    try:
+        out["balance"] = round(int(out["balance_raw"]) / (10 ** out["decimals"]), 6)
+    except Exception:
+        pass
+    return out
+
+def _wallet_class(eth_bal: float, nonce: int, tokens_with_balance: int) -> str:
+    """Heuristica de carteira — a camada que o lider (RPC cru) nao tem."""
+    if nonce == 0 and eth_bal < 0.0001:
+        return "ghost-or-fresh"
+    if eth_bal >= 10:
+        return "whale"
+    if nonce >= 200 and eth_bal < 0.05:
+        return "high-frequency/degen"
+    if tokens_with_balance >= 3:
+        return "diversified-active"
+    if nonce >= 20:
+        return "established-retail"
+    return "newcomer"
+
+def _h_chain_balance():
+    up = [0]
+    addr = (request.args.get("address") or "").strip()
+    if not _is_addr(addr):
+        return {"error": "param 'address' required: 0x + 40 hex chars",
+                    "example": f"{_public_base()}/chain-balance?address=0xd8dA6BF26964aF9E7eEd9e03E53415D37aA96045",
+                    "upstream_calls": 0, "provider": "Losbeto/Chain", "version": VERSION,
+                    "ts": int(time.time())}
+    eth_raw = _evm_rpc("eth_getBalance", [addr, "latest"], ttl=20, upstream=up)
+    if eth_raw is None:
+        return {"error": "upstream_unavailable", "upstream_calls": 0,
+                    "provider": "Losbeto/Chain", "version": VERSION, "ts": int(time.time())}
+    nonce = _hx(_evm_rpc("eth_getTransactionCount", [addr, "latest"], ttl=20, upstream=up) or "0x0")
+    eth_bal = _hx(eth_raw) / 1e18
+    toks = [t.strip() for t in (request.args.get("tokens") or "").split(",") if _is_addr(t.strip())][:20]
+    if not toks:
+        toks = list(_CHAIN_DEFAULT_TOKENS.values())
+    held = []
+    for t in toks:
+        meta = _erc20_meta(t, addr, up)
+        if meta.get("balance_raw") and int(meta["balance_raw"]) > 0:
+            held.append(meta)
+    out = {"network": "base", "chain_id": 8453, "address": addr,
+           "eth_balance": round(eth_bal, 8), "tx_count_nonce": nonce,
+           "tokens_with_balance": held,
+           "wallet_class": _wallet_class(eth_bal, nonce, len(held)),
+           "source": "base rpc", "upstream_calls": up[0],
+           "provider": "Losbeto/Chain", "version": VERSION, "ts": int(time.time())}
+    ens = _ens_reverse(addr, up)
+    if ens:
+        out["ens_name"] = ens
+    return out
+
+# ── ENS (Ethereum mainnet) — forward + reverse, keccak embutido ─────────────
+_ENS_REGISTRY = "0x00000000000C2E074eC69A0dFb2997BA6C7d2e1e"
+
+def _ens_resolver(node_hex: str, up) -> str:
+    r = _evm_rpc("eth_call", [{"to": _ENS_REGISTRY, "data": "0x0178b8bf" + node_hex}, "latest"],
+                 ttl=300, rpcs=_ETH_RPCS, upstream=up)
+    if r in (None, "0x") or _hx(r) == 0:
+        return ""
+    return "0x" + r[-40:]
+
+def _ens_forward(name: str, up) -> str:
+    node = _namehash(name).hex()
+    res = _ens_resolver(node, up)
+    if not res:
+        return ""
+    a = _evm_rpc("eth_call", [{"to": res, "data": "0x3b3b57de" + node}, "latest"],
+                 ttl=300, rpcs=_ETH_RPCS, upstream=up)
+    if a in (None, "0x") or _hx(a) == 0:
+        return ""
+    return "0x" + a[-40:]
+
+def _ens_reverse(addr: str, up) -> str:
+    node = _namehash(addr.lower()[2:] + ".addr.reverse").hex()
+    res = _ens_resolver(node, up)
+    if not res:
+        return ""
+    n = _evm_rpc("eth_call", [{"to": res, "data": _sel4("name(bytes32)") + node}, "latest"],
+                 ttl=300, rpcs=_ETH_RPCS, upstream=up)
+    if n in (None, "0x"):
+        return ""
+    return _abi_dec_str(bytes.fromhex(n[2:]))
+
+def _h_chain_ens():
+    up = [0]
+    name = (request.args.get("name") or "").strip().lower()
+    addr = (request.args.get("address") or "").strip()
+    if not name and not _is_addr(addr):
+        return {"error": "param 'name' (ex.: vitalik.eth) or 'address' (0x…) required",
+                    "example": f"{_public_base()}/chain-ens?name=vitalik.eth",
+                    "upstream_calls": 0, "provider": "Losbeto/Chain", "version": VERSION,
+                    "ts": int(time.time())}
+    out = {"source": "ENS registry on ethereum mainnet", "upstream_calls": 0,
+           "provider": "Losbeto/Chain", "version": VERSION, "ts": int(time.time())}
+    if name:
+        node = _namehash(name).hex()
+        out["name"] = name
+        out["node"] = "0x" + node
+        out["resolved_address"] = _ens_forward(name, up) or None
+        own = _evm_rpc("eth_call", [{"to": _ENS_REGISTRY, "data": "0x02571be3" + node}, "latest"],
+                       ttl=300, rpcs=_ETH_RPCS, upstream=up)
+        if own not in (None, "0x") and _hx(own) != 0:
+            out["owner"] = "0x" + own[-40:]
+    else:
+        out["address"] = addr
+        out["reverse_name"] = _ens_reverse(addr, up) or None
+    out["upstream_calls"] = up[0]
+    return out
+
+# ── /chain-tx — receipt + explicacao LLM opcional ───────────────────────────
+def _h_chain_tx():
+    up = [0]
+    h = (request.args.get("hash") or "").strip()
+    if not (len(h) == 66 and h.startswith("0x")):
+        return {"error": "param 'hash' required: 0x + 64 hex chars",
+                    "example": f"{_public_base()}/chain-tx?hash=0x…&explain=1",
+                    "upstream_calls": 0, "provider": "Losbeto/Chain", "version": VERSION,
+                    "ts": int(time.time())}
+    rc = _evm_rpc("eth_getTransactionReceipt", [h], ttl=120, upstream=up)
+    if rc in (None, "0x") or not isinstance(rc, dict):
+        return {"network": "base", "hash": h, "found": False,
+                    "note": "not found or still pending on Base",
+                    "upstream_calls": up[0], "provider": "Losbeto/Chain",
+                    "version": VERSION, "ts": int(time.time())}
+    tx = _evm_rpc("eth_getTransactionByHash", [h], ttl=120, upstream=up) or {}
+    bn = _evm_rpc("eth_blockNumber", [], ttl=10, upstream=up)
+    blk_no = _hx(rc.get("blockNumber"))
+    conf = max(0, _hx(bn) - blk_no) if bn else None
+    gas_used = _hx(rc.get("gasUsed"))
+    eff = _hx(rc.get("effectiveGasPrice"))
+    status_ok = rc.get("status") == "0x1"
+    out = {"network": "base", "chain_id": 8453, "hash": h, "found": True,
+           "status": "success" if status_ok else "reverted",
+           "block_number": blk_no, "confirmations": conf,
+           "from": tx.get("from"), "to": tx.get("to") or "(contract creation)",
+           "value_eth": round(_hx(tx.get("value")) / 1e18, 8),
+           "gas_used": gas_used, "tx_fee_eth": round(gas_used * eff / 1e18, 10),
+           "logs_emitted": len(rc.get("logs") or []),
+           "explorer": f"https://basescan.org/tx/{h}",
+           "source": "base rpc", "upstream_calls": up[0],
+           "provider": "Losbeto/Chain", "version": VERSION, "ts": int(time.time())}
+    if request.args.get("explain") == "1":
+        prompt = (f"Explain this Base transaction in exactly 2 short plain-English sentences for "
+                      f"a non-expert. Facts: status={out['status']}, from={out['from']}, "
+                      f"to={out['to']}, value={out['value_eth']} ETH, fee={out['tx_fee_eth']} ETH, "
+                      f"logs={out['logs_emitted']}, confirmations={conf}. No preamble.")
+        txt = ""
+        try:
+            txt = LLM.ask(prompt, max_tokens=120, temperature=0.3)
+        except Exception:
+            pass
+        out["plain_english"] = txt.strip() or (
+            f"This transaction {'completed successfully' if status_ok else 'was reverted'} on Base "
+                f"with {conf} confirmations. It moved {out['value_eth']} ETH and paid "
+                f"{out['tx_fee_eth']} ETH in fees.")
+        out["explainer"] = "llm-bandit" if txt.strip() else "deterministic-fallback"
+    return out
+
+# ── /agent-reputation — ERC-8004 on-chain (primeiro-mover x402) ─────────────
+_8004_ID = "0x8004A169FB4a3325136EB29fA0ceB6D2e539a432"    # Identity (Base)
+_8004_REP = "0x8004BAa17C55a88189AE136b182e5fdA19dE9b63"   # Reputation (Base)
+_LOSBETO_AGENT_ID = 87048
+
+def _h_agent_reputation():
+    up = [0]
+    try:
+        aid = int(request.args.get("agentId") or _LOSBETO_AGENT_ID)
+    except Exception:
+        aid = _LOSBETO_AGENT_ID
+    owner = _evm_rpc("eth_call", [{"to": _8004_ID, "data": _sel4("ownerOf(uint256)") + _enc_u256(aid)},
+                                  "latest"], ttl=300, upstream=up)
+    if owner in (None, "0x") or _hx(owner) == 0:
+        return {"error": "agent not found on ERC-8004 Identity Registry (Base)",
+                    "agentId": aid, "registry": f"eip155:8453:{_8004_ID}",
+                    "upstream_calls": up[0], "provider": "Losbeto/Chain8004",
+                    "version": VERSION, "ts": int(time.time())}
+    uri_raw = _evm_rpc("eth_call", [{"to": _8004_ID, "data": _sel4("tokenURI(uint256)") + _enc_u256(aid)},
+                                    "latest"], ttl=300, upstream=up)
+    out = {"agentId": aid, "registry": f"eip155:8453:{_8004_ID}",
+           "owner": "0x" + owner[-40:],
+           "agent_uri": _abi_dec_str(bytes.fromhex(uri_raw[2:])) if uri_raw not in (None, "0x") else None,
+           "scan": f"https://8004scan.io/agents/base/{aid}",
+           "provider": "Losbeto/Chain8004", "version": VERSION, "ts": int(time.time())}
+    clients = [c.strip() for c in (request.args.get("clients") or "").split(",") if _is_addr(c.strip())][:25]
+    if clients:
+        arr = _enc_u256(len(clients)) + "".join(_enc_addr(c) for c in clients)
+        empty = _enc_u256(0)
+        head = (_enc_u256(aid) + _enc_u256(0x80)
+                + _enc_u256(0x80 + len(arr) // 2) + _enc_u256(0x80 + len(arr) // 2 + len(empty) // 2))
+        data = _sel4("getSummary(uint256,address[],string,string)") + head + arr + empty + empty
+        s = _evm_rpc("eth_call", [{"to": _8004_REP, "data": data}, "latest"], ttl=120, upstream=up)
+        if s not in (None, "0x") and len(s) >= 2 + 192:
+            raw = bytes.fromhex(s[2:])
+            cnt = int.from_bytes(raw[0:32], "big")
+            val = int.from_bytes(raw[32:64], "big", signed=True)
+            dec = int.from_bytes(raw[64:96], "big")
+            out["reputation"] = {"feedback_count": cnt,
+                                 "summary_value": val / (10 ** dec) if dec else val,
+                                 "clients_counted": len(clients),
+                                 "registry": f"eip155:8453:{_8004_REP}"}
+    else:
+        out["reputation"] = {"note": "pass &clients=0x…,0x… to aggregate on-chain feedback "
+                                         "(getSummary on the ERC-8004 Reputation Registry)",
+                             "registry": f"eip155:8453:{_8004_REP}"}
+    out["losbeto_own"] = {"agentId": _LOSBETO_AGENT_ID,
+                          "scan": f"https://8004scan.io/agents/base/{_LOSBETO_AGENT_ID}"}
+    out["upstream_calls"] = up[0]
+    return out
+
+# ── /wallet-verdict — o endpoint viral (veredito + roast + card OG) ─────────
+# Mecanica provada pelo lider AX1 (385K calls / 4.749 pagadores unicos/30d no
+# CDP): veredito + roast curto + card compartilhavel + requestKey idempotente.
+# O nosso julga CARTEIRAS — todo agente EVM tem uma; o TAM e maior que tokens.
+_VERDICT_FILE = str(HOME_DIR / "verdict_cache.json")
+_VERDICTS = {
+    "WHALE": ["Moves size and probably front-runs your thesis.",
+              "Deep pockets, calm hands. The market notices.",
+              "This wallet doesn't chase candles; candles chase it."],
+    "STEADY": ["Balanced, patient, boringly competent. Compliment.",
+               "A grown-up wallet in a casino of teenagers.",
+               "Survives cycles by not being clever at the wrong time."],
+    "NEWCOMER": ["Fresh address, clean slate — write a good story.",
+                 "Just landed onchain. Welcome; gas is cheap today.",
+                 "Every whale started as this exact wallet."],
+    "DEGEN": ["High frequency, thin balance, pure adrenaline.",
+              "Trades first, reads docs never.",
+              "This wallet treats slippage as a personality trait."],
+    "GHOST": ["No ETH, no history — a wallet-shaped shadow.",
+              "Freshly minted and already silent.",
+              "The onchain equivalent of an unopened book."]}
+
+def _verdict_grade(eth_bal: float, nonce: int, held: int) -> str:
+    if nonce == 0 and eth_bal < 0.0001:
+        return "GHOST"
+    if eth_bal >= 10:
+        return "WHALE"
+    if nonce >= 200 and eth_bal < 0.05:
+        return "DEGEN"
+    if nonce >= 20 or held >= 2:
+        return "STEADY"
+    return "NEWCOMER"
+
+def _verdict_fallback_roast(addr: str, grade: str) -> str:
+    return _VERDICTS[grade][int(addr[2:10], 16) % 3]
+
+def _verdict_cache_get(key: str):
+    try:
+        cache = json.loads(open(_VERDICT_FILE).read())
+        hit = cache.get(key)
+        if hit and (time.time() - hit["ts"]) < 86400:
+            return hit["data"]
+    except Exception:
+        pass
+    return None
+
+def _verdict_cache_put(key: str, data: dict) -> None:
+    try:
+        cache = json.loads(open(_VERDICT_FILE).read())
+    except Exception:
+        cache = {}
+    cache[key] = {"ts": time.time(), "data": data}
+    if len(cache) > 500:
+        cache = dict(sorted(cache.items(), key=lambda kv: -kv[1]["ts"])[:500])
+    try:
+        open(_VERDICT_FILE, "w").write(json.dumps(cache))
+    except Exception:
+        pass
+
+def _wallet_facts(addr: str, up) -> dict:
+    eth_raw = _evm_rpc("eth_getBalance", [addr, "latest"], ttl=30, upstream=up)
+    nonce = _hx(_evm_rpc("eth_getTransactionCount", [addr, "latest"], ttl=30, upstream=up) or "0x0")
+    eth_bal = _hx(eth_raw or "0x0") / 1e18
+    held = 0
+    for t in _CHAIN_DEFAULT_TOKENS.values():
+        m = _erc20_meta(t, addr, up)
+        if m.get("balance_raw") and int(m["balance_raw"]) > 0:
+            held += 1
+    return {"eth_balance": round(eth_bal, 8), "nonce": nonce, "tokens_held": held}
+
+def _h_wallet_verdict():
+    up = [0]
+    addr = (request.args.get("address") or "").strip()
+    if not _is_addr(addr):
+        return {"error": "param 'address' required: 0x + 40 hex chars",
+                    "example": f"{_public_base()}/wallet-verdict?address=0xd8dA6BF26964aF9E7eEd9e03E53415D37aA96045",
+                    "upstream_calls": 0, "provider": "Losbeto/Verdict", "version": VERSION,
+                    "ts": int(time.time())}
+    rkey = (request.args.get("requestKey") or "").strip()[:128]
+    ck = addr.lower() + "|" + rkey if rkey else ""
+    if ck:
+        hit = _verdict_cache_get(ck)
+        if hit:
+            hit = dict(hit)
+            hit["idempotent_replay"] = True
+            return hit
+    facts = _wallet_facts(addr, up)
+    grade = _verdict_grade(facts["eth_balance"], facts["nonce"], facts["tokens_held"])
+    prompt = (f"Write a witty one-sentence roast (max 200 chars) for an EVM wallet graded "
+              f"{grade}. Facts: {facts['eth_balance']} ETH on Base, nonce {facts['nonce']}, "
+              f"{facts['tokens_held']} major tokens held. Tone: trading-desk humor, no slurs, "
+              f"no advice. Output the roast only.")
+    roast = ""
+    try:
+        roast = LLM.ask(prompt, max_tokens=140, temperature=0.9, cache=False)
+    except Exception:
+        pass
+    roast = (roast or "").strip().strip('"') or _verdict_fallback_roast(addr, grade)
+    out = {"network": "base", "address": addr, "grade": grade,
+           "one_liner": f"{grade} wallet on Base",
+           "roast": roast,
+           "facts": facts,
+           "roast_source": "llm-bandit" if roast != _verdict_fallback_roast(addr, grade) else "deterministic",
+           "share_card_svg": f"{_public_base()}/wallet-verdict/card.svg?address={addr}",
+           "disclaimer": "Entertainment only. Not financial advice.",
+           "upstream_calls": up[0], "provider": "Losbeto/Verdict",
+           "version": VERSION, "ts": int(time.time())}
+    if ck:
+        slim = dict(out)
+        _verdict_cache_put(ck, slim)
+    return out
+
+@app.route("/wallet-verdict/card.svg")
+def wallet_verdict_card():
+    """Card OG 1200x630 GRATIS — a peca viral: todo veredito linka de volta."""
+    import html as _html
+    addr = (request.args.get("address") or "").strip()
+    if not _is_addr(addr):
+        return Response("bad address", status=400, mimetype="text/plain")
+    up = [0]
+    facts = _wallet_facts(addr, up)
+    grade = _verdict_grade(facts["eth_balance"], facts["nonce"], facts["tokens_held"])
+    roast = _html.escape(_verdict_fallback_roast(addr, grade))
+    short = addr[:8] + "…" + addr[-6:]
+    colors = {"WHALE": "#22c55e", "STEADY": "#3b82f6", "NEWCOMER": "#a78bfa",
+              "DEGEN": "#f59e0b", "GHOST": "#64748b"}
+    c = colors.get(grade, "#3b82f6")
+    svg = (f'<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="630">'
+           f'<rect width="1200" height="630" fill="#0b1020"/>'
+           f'<rect x="40" y="40" width="1120" height="550" rx="24" fill="#111a33" stroke="{c}" stroke-width="4"/>'
+           f'<text x="90" y="150" font-family="monospace" font-size="40" fill="#94a3b8">WALLET VERDICT · Base</text>'
+           f'<text x="90" y="250" font-family="monospace" font-size="64" fill="{c}" font-weight="bold">{grade}</text>'
+           f'<text x="90" y="330" font-family="monospace" font-size="34" fill="#e2e8f0">{short}</text>'
+           f'<text x="90" y="400" font-family="monospace" font-size="28" fill="#cbd5e1">{roast[:70]}</text>'
+           f'<text x="90" y="450" font-family="monospace" font-size="28" fill="#cbd5e1">{roast[70:140]}</text>'
+           f'<text x="90" y="545" font-family="monospace" font-size="24" fill="#64748b">'
+           f'verify yours → api.losbeto.xyz/wallet-verdict</text></svg>')
+    return Response(svg, mimetype="image/svg+xml",
+                    headers={"Cache-Control": "public, max-age=300"})
+
+# ── registro central — entra no despacho pago padrao (402 + preview + ML) ───
+_AGUA_META = {
+    "/chain-block": (0.001,
+        "Current Base block number, timestamp, age and gas usage — the cheapest real "
+        "chain read on this node. The 'hello world' of live chain data.",
+        ["ChainData", "Utility", "ZeroUpstream"],
+        {}),
+    "/gas-price": (0.001,
+        "Current Base gas price PLUS an ML forecast ~10 minutes ahead (Holt "
+        "double-exponential smoothing self-fed by every paid call) with a "
+        "send-now/wait recommendation. The model improves with usage.",
+        ["ChainData", "Utility", "MLForecast", "ZeroUpstream"],
+        {}),
+    "/chain-balance": (0.002,
+        "Native ETH balance + ERC-20 balances (batched eth_call, up to 20 tokens; "
+        "defaults to USDC/WETH/cbBTC) for any address on Base, plus tx-count nonce, "
+        "a heuristic wallet_class (ghost/newcomer/steady/degen/whale) and reverse "
+        "ENS when set. OneSource-level data, with the intelligence layer they lack.",
+        ["ChainData", "Crypto", "Wallet", "Intelligence"],
+        {"address": "0xd8dA6BF26964aF9E7eEd9e03E53415D37aA96045",
+         "tokens": "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913 (CSV, optional, up to 20)"}),
+    "/chain-ens": (0.002,
+        "ENS resolution done on-chain: forward (name → address, with owner) or "
+        "reverse (address → primary name) via the ENS registry on Ethereum "
+        "mainnet. Keccak-256 namehash computed in-process — zero trusted third "
+        "parties beyond public RPCs.",
+        ["ChainData", "Utility", "Identity"],
+        {"name": "vitalik.eth", "address": "0xd8dA6BF26964aF9E7eEd9e03E53415D37aA96045 (reverse)"}),
+    "/chain-tx": (0.002,
+        "Transaction receipt on Base: status, confirmations, gas used, fee paid, "
+        "logs count, explorer link — plus optional plain-English explanation "
+        "(explain=1) written by the node's LLM bandit (deterministic fallback).",
+        ["ChainData", "Utility", "LLM"],
+        {"hash": "0x… (64 hex)", "explain": "1 for a plain-English explanation"}),
+    "/agent-reputation": (0.010,
+        "On-chain trust for AI agents (ERC-8004, weeks-old standard): identity "
+        "(owner, agentURI) plus reputation aggregation (getSummary) over caller-"
+        "supplied client addresses on the Base registries. First x402 endpoint "
+        "of its kind. Defaults to this node's own agentId 87048 as a live demo.",
+        ["ChainData", "Trust", "ERC8004", "AgentIntel"],
+        {"agentId": "87048", "clients": "0x…,0x… (optional, up to 25)"}),
+    "/wallet-verdict": (0.020,
+        "A shareable verdict for any EVM wallet on Base: grade (GHOST/NEWCOMER/"
+        "STEADY/DEGEN/WHALE), a one-line roast written by the node's LLM "
+        "(deterministic fallback), the facts behind the grade, and a free OG "
+        "card SVG to share. Pass requestKey for idempotent replays (24h). "
+        "Entertainment, not financial advice.",
+        ["ChainData", "Entertainment", "Viral", "LLM"],
+        {"address": "0xd8dA6BF26964aF9E7eEd9e03E53415D37aA96045",
+         "requestKey": "any-string-for-idempotency (optional)"}),
+}
+for _p, (_price, _desc, _tags, _hints) in _AGUA_META.items():
+    BASE_PRICES[_p] = float(os.environ.get(
+        "PRICE_" + _p.strip("/").replace("-", "_").upper(), str(_price)))
+    ENDPOINT_DESC[_p] = _desc
+    ENDPOINT_TAGS[_p] = _tags
+    ENDPOINT_PARAM_HINTS[_p] = _hints
+ENDPOINT_HANDLERS["/chain-block"] = _h_chain_block
+ENDPOINT_HANDLERS["/gas-price"] = _h_gas_price
+ENDPOINT_HANDLERS["/chain-balance"] = _h_chain_balance
+ENDPOINT_HANDLERS["/chain-ens"] = _h_chain_ens
+ENDPOINT_HANDLERS["/chain-tx"] = _h_chain_tx
+ENDPOINT_HANDLERS["/agent-reputation"] = _h_agent_reputation
+ENDPOINT_HANDLERS["/wallet-verdict"] = _h_wallet_verdict
+
+
 for _path, _handler in ENDPOINT_HANDLERS.items():
     _rule_name = _path.strip("/").replace("-", "_")
     app.add_url_rule(_path, _rule_name, paid_endpoint(_path)(_handler))
@@ -30823,7 +31468,7 @@ VERSION = "48.18.0-REGISTRY"  # v48.17.14-REALCALL: /agent-call CONSERTADO DE VE
 VERSION = "48.18.1-MERGE"  # v48.18.1-MERGE: 48.18.0-REGISTRY (Claude: painel orgânico, radar anti-scanner, cache /live/api+/dash, /br-cnpj /br-cep /classify /summarize) + 48.17.15-WARMBOOT (Kimi: _discover_embed não-bloqueante + warmer de embeddings/reranker no boot — mata WORKER TIMEOUT; aliases /mcp/sse /keys.json /auth/login; textos de chains com Polygon — corrige o blurb do x402scan). Base deployada: 48.17.14-REALCALL.
 VERSION = "48.18.2-HOTFIX"  # v48.18.2-HOTFIX: fix CRITICO — o loop de registro da 48.18.0 usava `_ai` como variavel de desempacotamento do tuple e SOBRESCREVIA a funcao global _ai() (~l.9292) ao fim do import (ficava _ai=True); os 16 endpoints premium que chamam _ai()/_ai_required() 500avam com "'bool' object is not callable" (traceback real: analise l.3734 -> _ai_required l.9311). Renomeado p/ _uses_ai + assert callable(_ai) + del dos nomes do loop. | base: v48.18.1-MERGE
 VERSION = "48.18.3-PAYGUARD"  # v48.18.3-PAYGUARD: /pay nunca mais vende endpoint sem parametro obrigatorio — querystring da pagina segue para a chamada paga (carteira EIP-3009, Solana, cartao manual E o QR mobile) e, sem querystring, cartao pre-preenchido de ENDPOINT_REQUIRED_PARAMS bloqueia a assinatura com campo vazio. Mata o estorno pos-settle 400 do /br-doc (2x em 07/out, mesmo comprador).
-VERSION = "48.18.6-ONECLICK"  # v48.18.6-ONECLICK: /erc8004 com gasLimit explicito (1.2M; estimateGas real 1.107.928, custo ~$0,03) — contorna a falha de estimativa do Phantom (-32603 'Unexpected error' no eth_sendTransaction que travou o registro em 08/out) + Plano B na propria pagina: link BaseScan #writeContract e botao 'copiar agentURI'. | base: v48.18.5-ONECLICK (pagina guiada de registro ERC-8004, data URI imutavel registration-v1, agentId lido do evento Transfer; ZERO chaves no servidor)
+VERSION = "48.19.0-AGUA"  # v48.19: 7 novos endpoints (5 chain-reads + ERC-8004 reputation + wallet-verdict viral); anterior: 48.18.6-ONECLICK gasLimit+PlanoB no registro ERC-8004  # v48.18.6-ONECLICK: /erc8004 com gasLimit explicito (1.2M; estimateGas real 1.107.928, custo ~$0,03) — contorna a falha de estimativa do Phantom (-32603 'Unexpected error' no eth_sendTransaction que travou o registro em 08/out) + Plano B na propria pagina: link BaseScan #writeContract e botao 'copiar agentURI'. | base: v48.18.5-ONECLICK (pagina guiada de registro ERC-8004, data URI imutavel registration-v1, agentId lido do evento Transfer; ZERO chaves no servidor)
 
 
 if __name__ == "__main__":
