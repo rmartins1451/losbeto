@@ -12962,7 +12962,7 @@ maintains about this node. Every seal below opens the public proof.</p>
     <b><span class="ok">✓</span> ERC-8004 · 8004scan</b>
     <span>On-chain identity on Base — agent #87048, minted 15 Sep 2026.
     Reputation registry live.</span></a>
-  <a class="seal" href="https://x402lint.com" target="_blank" rel="noopener">
+  <a class="seal" href="https://x402lint.dev/o/api.losbeto.xyz" target="_blank" rel="noopener">
     <b><span class="ok">✓</span> x402lint — Grade A</b>
     <span>Protocol-compliance scan: 98/100 (PASS 23 · FAIL 0) on the
     independent x402 linter.</span></a>
@@ -14791,11 +14791,49 @@ def mcp_streamable():
     if request.method == "DELETE":
         return ("", 204)                     # encerra "sessão" (stateless aqui)
     if request.method == "GET":
-        # Sem canal SSE server->client: a spec permite responder 405 aqui.
-        r = app.response_class(json.dumps({"jsonrpc": "2.0", "error": {
-            "code": -32000, "message": "SSE stream not supported; use POST"}}),
-            status=405, mimetype="application/json")
-        r.headers["Allow"] = "POST, DELETE, OPTIONS"
+        # v48.22.0-MCPHEALTH: health checkers (8004scan marcava este serviço
+        # UNHEALTHY com "HTTP 405", Health 66.7/degraded) e humanos fazem GET
+        # bare, sem Accept de stream. A spec MCP permite 405 para GET de SSE —
+        # mas só para quem PEDIU stream. Quem pediu event-stream segue com 405
+        # spec-true; todo o resto recebe 200 com o descriptor do servidor
+        # (prova de vida + instrução de uso), o que também dá ao scanner as
+        # "capabilities" que ele dizia não encontrar.
+        _acc = (request.headers.get("Accept") or "")
+        if "text/event-stream" in _acc:
+            r = app.response_class(json.dumps({"jsonrpc": "2.0", "error": {
+                "code": -32000, "message": "SSE stream not supported; use POST"}}),
+                status=405, mimetype="application/json")
+            r.headers["Allow"] = "POST, DELETE, OPTIONS"
+            return r
+        base = _public_base()
+        r = jsonify({
+            "name": "losbeto",
+            "title": "Losbeto — LLM gateway + market data for AI agents (x402)",
+            "version": VERSION,
+            "status": "ok",
+            "transport": "streamable-http — POST JSON-RPC 2.0 to this URL",
+            "protocolVersion": "2025-06-18",
+            "capabilities": {"tools": {"listChanged": False}},
+            "tools": [
+                {"name": "search_market_data", "price": "free",
+                 "description": "Plain-language semantic search over the full endpoint catalog"},
+                {"name": "get_market_data", "price": "from $0.001",
+                 "description": "Fetch any endpoint — delayed sample free, live at its x402 price"},
+                {"name": "market_snapshot", "price": "bundled",
+                 "description": "One call for a whole area: brazil, global or crypto"},
+                {"name": "list_categories", "price": "free",
+                 "description": "Every category with endpoint count and cheapest price"},
+                {"name": "account_status", "price": "free",
+                 "description": "Subscription/credit status for this connection"},
+            ],
+            "usage": {"initialize": "POST {'jsonrpc':'2.0','id':1,'method':'initialize','params':{'protocolVersion':'2025-06-18','capabilities':{},'clientInfo':{'name':'probe','version':'0'}}}",
+                      "list_tools": "POST {'jsonrpc':'2.0','id':2,'method':'tools/list'}"},
+            "server_card": f"{base}/mcp/server-card",
+            "manifest": f"{base}/.well-known/mcp.json",
+            "docs": f"{base}/llms.txt",
+            "ts": int(time.time()),
+        })
+        r.headers["Cache-Control"] = "public, max-age=300"
         return r
     try:
         body = request.get_json(force=True, silent=True)
@@ -31679,7 +31717,7 @@ VERSION = "48.18.0-REGISTRY"  # v48.17.14-REALCALL: /agent-call CONSERTADO DE VE
 VERSION = "48.18.1-MERGE"  # v48.18.1-MERGE: 48.18.0-REGISTRY (Claude: painel orgânico, radar anti-scanner, cache /live/api+/dash, /br-cnpj /br-cep /classify /summarize) + 48.17.15-WARMBOOT (Kimi: _discover_embed não-bloqueante + warmer de embeddings/reranker no boot — mata WORKER TIMEOUT; aliases /mcp/sse /keys.json /auth/login; textos de chains com Polygon — corrige o blurb do x402scan). Base deployada: 48.17.14-REALCALL.
 VERSION = "48.18.2-HOTFIX"  # v48.18.2-HOTFIX: fix CRITICO — o loop de registro da 48.18.0 usava `_ai` como variavel de desempacotamento do tuple e SOBRESCREVIA a funcao global _ai() (~l.9292) ao fim do import (ficava _ai=True); os 16 endpoints premium que chamam _ai()/_ai_required() 500avam com "'bool' object is not callable" (traceback real: analise l.3734 -> _ai_required l.9311). Renomeado p/ _uses_ai + assert callable(_ai) + del dos nomes do loop. | base: v48.18.1-MERGE
 VERSION = "48.18.3-PAYGUARD"  # v48.18.3-PAYGUARD: /pay nunca mais vende endpoint sem parametro obrigatorio — querystring da pagina segue para a chamada paga (carteira EIP-3009, Solana, cartao manual E o QR mobile) e, sem querystring, cartao pre-preenchido de ENDPOINT_REQUIRED_PARAMS bloqueia a assinatura com campo vazio. Mata o estorno pos-settle 400 do /br-doc (2x em 07/out, mesmo comprador).
-VERSION = "48.21.0-TRUSTSTACK"  # v48.21.0-TRUSTSTACK: (1) FIX DOMAIN-VERIFICATION ERC-8004 — /.well-known/agent-registration.json estava SEM o campo registrations (a spec exige p/ provar dominio) e com "99 paid endpoints" congelado: o 8004scan lia Publisher 19 / Compliance 75. Agora registrations com agentId 87048 (env ERC8004_AGENT_ID com fallback) e contagem DINAMICA len(BASE_PRICES) — nunca mais desatualiza. erc8004.json ganha o mesmo fallback (identidade sobrevive a env perdida) e descricao atualizada. (2) LANDING: faixa "Listed & verified" com 7 selos clicaveis de prova publica (8004scan, x402lint A 98/100, x402scan, x402-list, MCP Registry, PyPI, npm) + rodape copyright (c 2026 Losbeto sobre o protocolo aberto x402, sem texto LF) + tabela machine-readable ganha as 2 linhas ERC-8004. | base: v48.20.0-STOREFRONT  # v48.20: STOREFRONT — landing ganha (1) rails strip com logos SVG inline (USDC/Base/Polygon/Solana/Algorand/Pix, zero requests externos), (2) badge ERC-8004 #87048 verificavel no hero, (3) ticker CSS-only com os endpoints de $0.001, (4) vitrine 'Base chain intelligence' com os 7 endpoints da v48.19 (1a secao de produto, visivel nas 2 abas), (5) _price_label com 3 casas p/ precos < $0.01 (o .2f imprimiria $0.00), (6) aba Agent com 4 chains + 5 meta-tools | /erc8004 DEIXA DE SER FERRAMENTA E VIRA PROVA: pagina de identidade com agentId 87048 + tx 0x694b13bd…d0061e + links de verificacao (o registro JA EXISTIA desde 15/set — o -32603 do Phantom e pre-simulacao, nao gas; registrador recolhido p/ <details> avancado) | base: v48.19.0-AGUA  # v48.18.6-ONECLICK: /erc8004 com gasLimit explicito (1.2M; estimateGas real 1.107.928, custo ~$0,03) — contorna a falha de estimativa do Phantom (-32603 'Unexpected error' no eth_sendTransaction que travou o registro em 08/out) + Plano B na propria pagina: link BaseScan #writeContract e botao 'copiar agentURI'. | base: v48.18.5-ONECLICK (pagina guiada de registro ERC-8004, data URI imutavel registration-v1, agentId lido do evento Transfer; ZERO chaves no servidor)
+VERSION = "48.22.0-MCPHEALTH"  # v48.22.0-MCPHEALTH: (1) GET /mcp deixa de responder 405 para quem NAO pediu SSE — o 8004scan marcava o servico MCP UNHEALTHY (Health 66.7, status degraded). Agora: Accept com text/event-stream segue 405 spec-true; GET bare recebe 200 com descriptor vivo do servidor (nome/versao/5 meta-tools/instrucao de initialize) — que tambem entrega as "capabilities" que o scanner dizia faltar. (2) Selo x402lint da landing aponta p/ o relatorio publico direto (x402lint.dev/o/api.losbeto.xyz, A 98/100 re-scan pago 08/out 15:32 UTC). | base: v48.21.0-TRUSTSTACK  # v48.21.0-TRUSTSTACK: (1) FIX DOMAIN-VERIFICATION ERC-8004 — /.well-known/agent-registration.json estava SEM o campo registrations (a spec exige p/ provar dominio) e com "99 paid endpoints" congelado: o 8004scan lia Publisher 19 / Compliance 75. Agora registrations com agentId 87048 (env ERC8004_AGENT_ID com fallback) e contagem DINAMICA len(BASE_PRICES) — nunca mais desatualiza. erc8004.json ganha o mesmo fallback (identidade sobrevive a env perdida) e descricao atualizada. (2) LANDING: faixa "Listed & verified" com 7 selos clicaveis de prova publica (8004scan, x402lint A 98/100, x402scan, x402-list, MCP Registry, PyPI, npm) + rodape copyright (c 2026 Losbeto sobre o protocolo aberto x402, sem texto LF) + tabela machine-readable ganha as 2 linhas ERC-8004. | base: v48.20.0-STOREFRONT  # v48.20: STOREFRONT — landing ganha (1) rails strip com logos SVG inline (USDC/Base/Polygon/Solana/Algorand/Pix, zero requests externos), (2) badge ERC-8004 #87048 verificavel no hero, (3) ticker CSS-only com os endpoints de $0.001, (4) vitrine 'Base chain intelligence' com os 7 endpoints da v48.19 (1a secao de produto, visivel nas 2 abas), (5) _price_label com 3 casas p/ precos < $0.01 (o .2f imprimiria $0.00), (6) aba Agent com 4 chains + 5 meta-tools | /erc8004 DEIXA DE SER FERRAMENTA E VIRA PROVA: pagina de identidade com agentId 87048 + tx 0x694b13bd…d0061e + links de verificacao (o registro JA EXISTIA desde 15/set — o -32603 do Phantom e pre-simulacao, nao gas; registrador recolhido p/ <details> avancado) | base: v48.19.0-AGUA  # v48.18.6-ONECLICK: /erc8004 com gasLimit explicito (1.2M; estimateGas real 1.107.928, custo ~$0,03) — contorna a falha de estimativa do Phantom (-32603 'Unexpected error' no eth_sendTransaction que travou o registro em 08/out) + Plano B na propria pagina: link BaseScan #writeContract e botao 'copiar agentURI'. | base: v48.18.5-ONECLICK (pagina guiada de registro ERC-8004, data URI imutavel registration-v1, agentId lido do evento Transfer; ZERO chaves no servidor)
 
 
 if __name__ == "__main__":
