@@ -25291,7 +25291,7 @@ def _start_background_once():
                          name="v4824-prune").start()
         threading.Thread(target=x402_watch_loop, daemon=True,
                          name="v4824-watch").start()
-        threading.Thread(target=ofac_refresh_loop, daemon=True,
+        threading.Thread(target=ofac_payer_refresh_loop, daemon=True,
                          name="v4825-ofac").start()
     except Exception as _e:
         log.warning(f"v48.23 loops extras: {_e}")
@@ -29641,7 +29641,7 @@ Usage: send header <code>X-API-Key: lsk_...</code> on any paid endpoint —
 calls then cost from your balance instead of on-chain each time.</p>
 </body></html>"""
 
-def _esc(s) -> str:
+def _esc_html(s) -> str:
     return str(s).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 @app.route("/account")
@@ -29654,7 +29654,7 @@ def account_page():
             row = LEDGER.api_key_get(key)
         except Exception as e:
             row = None
-            body = f'<div class="card">Lookup error: {_esc(e)[:120]}</div>'
+            body = f'<div class="card">Lookup error: {_esc_html(e)[:120]}</div>'
         if key and not row:
             body = '<div class="card">Unknown key.</div>'
         elif row:
@@ -29666,7 +29666,7 @@ def account_page():
                      if exp_ts else "—")
             status = "&#9888; expired — top up to reactivate" if expired else "&#9989; active"
             body = (f'<div class="card"><h2>{status}</h2>'
-                    f'<p>Plan: <b>{_esc(row.get("plan", "prepaid"))}</b></p>'
+                    f'<p>Plan: <b>{_esc_html(row.get("plan", "prepaid"))}</b></p>'
                     f'<p>Balance: <b>{bal_s}</b></p>'
                     f'<p>Calls used: <b>{row.get("calls_used", 0)}</b></p>'
                     f'<p>Expires: {exp_s}</p></div>')
@@ -29762,9 +29762,9 @@ log.info(f"👁 v48.24-PROBEHARVEST: /x402-watch (${BASE_PRICES.get('/x402-watch
 # set/2026) — este nó é o primeiro do ecossistema com triagem SDN embutida.
 # ============================================================================
 
-_OFAC_FILE = HOME_DIR / "ofac_addresses.json"
-_OFAC_CACHE = {"ts": 0.0, "addrs": set()}
-_OFAC_URLS = (
+_OFAC_PAYER_FILE = HOME_DIR / "ofac_addresses.json"
+_OFAC_PAYER_CACHE = {"ts": 0.0, "addrs": set()}
+_OFAC_PAYER_URLS = (
     "https://raw.githubusercontent.com/0xB10C/ofac-sanctioned-digital-"
     "currency-addresses/lists/sanctioned_addresses_ETH.json",
     "https://raw.githubusercontent.com/0xB10C/ofac-sanctioned-digital-"
@@ -29775,22 +29775,22 @@ _OFAC_URLS = (
     "currency-addresses/lists/sanctioned_addresses_USDT.json",
 )
 
-def _ofac_load_disk() -> set:
+def _ofac_payer_load_disk() -> set:
     try:
-        if _OFAC_FILE.exists():
-            d = json.loads(_OFAC_FILE.read_text())
+        if _OFAC_PAYER_FILE.exists():
+            d = json.loads(_OFAC_PAYER_FILE.read_text())
             return {str(a).lower() for a in d.get("addrs", [])}
     except Exception:
         pass
     return set()
 
-def _ofac_refresh() -> int:
+def _ofac_payer_refresh() -> int:
     """Baixa as listas SDN de cripto (0xB10C, atualizadas toda madrugada UTC
     a partir do sdn_advanced.xml do Tesouro dos EUA). Falha NUNCA derruba o
     cache antigo — lista velha é melhor que lista nenhuma."""
     addrs = set()
     ok = 0
-    for u in _OFAC_URLS:
+    for u in _OFAC_PAYER_URLS:
         try:
             r = requests.get(u, timeout=12)
             if r.status_code == 200:
@@ -29799,39 +29799,39 @@ def _ofac_refresh() -> int:
         except Exception as e:
             log.debug(f"ofac fetch {u[-40:]}: {e}")
     if ok and addrs:
-        _OFAC_CACHE.update({"ts": time.time(), "addrs": addrs})
+        _OFAC_PAYER_CACHE.update({"ts": time.time(), "addrs": addrs})
         try:
-            _OFAC_FILE.write_text(json.dumps(
-                {"ts": _OFAC_CACHE["ts"], "addrs": sorted(addrs)}))
+            _OFAC_PAYER_FILE.write_text(json.dumps(
+                {"ts": _OFAC_PAYER_CACHE["ts"], "addrs": sorted(addrs)}))
         except Exception:
             pass
         log.info(f"🛡 OFAC: {len(addrs)} endereços sancionados carregados "
-                 f"({ok}/{len(_OFAC_URLS)} fontes)")
-    elif not _OFAC_CACHE["addrs"]:
-        disk = _ofac_load_disk()
+                 f"({ok}/{len(_OFAC_PAYER_URLS)} fontes)")
+    elif not _OFAC_PAYER_CACHE["addrs"]:
+        disk = _ofac_payer_load_disk()
         if disk:
-            _OFAC_CACHE.update({"ts": _OFAC_FILE.stat().st_mtime, "addrs": disk})
+            _OFAC_PAYER_CACHE.update({"ts": _OFAC_PAYER_FILE.stat().st_mtime, "addrs": disk})
             log.info(f"🛡 OFAC: cache de disco ({len(disk)} endereços)")
-    return len(_OFAC_CACHE["addrs"])
+    return len(_OFAC_PAYER_CACHE["addrs"])
 
 def _payer_hit_ofac(addr: str) -> bool:
     a = (addr or "").strip().lower()
     if not a:
         return False
-    if not _OFAC_CACHE["addrs"]:
-        d = _ofac_load_disk()
+    if not _OFAC_PAYER_CACHE["addrs"]:
+        d = _ofac_payer_load_disk()
         if d:
-            _OFAC_CACHE["addrs"] = d
-    return a in _OFAC_CACHE["addrs"]
+            _OFAC_PAYER_CACHE["addrs"] = d
+    return a in _OFAC_PAYER_CACHE["addrs"]
 
-def ofac_refresh_loop():
+def ofac_payer_refresh_loop():
     """Refresh diário da lista SDN — só no dono do flock."""
     time.sleep(60)
-    _ofac_refresh()
+    _ofac_payer_refresh()
     while True:
         time.sleep(24 * 3600)
         try:
-            _ofac_refresh()
+            _ofac_payer_refresh()
         except Exception as e:
             log.warning(f"ofac_refresh_loop: {e}")
 
@@ -29873,9 +29873,9 @@ def admin_storage():
                                  "SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
     except Exception as e:
         out["tables_error"] = str(e)[:120]
-    out["ofac"] = {"cached_addrs": len(_OFAC_CACHE["addrs"]),
-                   "cache_age_h": round((time.time() - _OFAC_CACHE["ts"]) / 3600, 1)
-                                  if _OFAC_CACHE["ts"] else None}
+    out["ofac"] = {"cached_addrs": len(_OFAC_PAYER_CACHE["addrs"]),
+                   "cache_age_h": round((time.time() - _OFAC_PAYER_CACHE["ts"]) / 3600, 1)
+                                  if _OFAC_PAYER_CACHE["ts"] else None}
     return jsonify(out)
 
 log.info(f"🛡 v48.25.0-GLOBAL: Pix rail OFF (PIX_RAIL=1 reativa) · OFAC payer "
@@ -32360,6 +32360,7 @@ VERSION = "48.18.3-PAYGUARD"  # v48.18.3-PAYGUARD: /pay nunca mais vende endpoin
 VERSION = "48.23.0-FORKSAFE"  # v48.23.0-FORKSAFE: BOOT SEM THREADS NO IMPORT — com --preload, ~25 threads nasciam no ARBITER (loops bg, v27, radar, PIT, warmers) e o fork herdava locks travados de threads inexistentes: 2 de 4 workers congelavam ~30s apos cada deploy e morriam em WORKER TIMEOUT 120s (00:03/00:18 de 09/out). Agora: (1) import 100% livre de threads; (2) post_fork_boot() novo — chamado pelo hook post_fork do gunicorn (gerado pelo start.sh v48.23) + fallback na 1a request (@app.before_request); (3) _start_background_once retorna o DONO do flock e absorve os loops v27 (cdp-seed, discovery-ping) e o radar demand_autofulfill (antes soltos no import, sem guard); (4) _v27_start_background vira banner-only com flag; (5) _ml_boot_warm volta a ser PER-WORKER com stagger 2-8s (a docstring sempre pediu isso, mas o flock fazia so 1 worker aquecer). Deploy junto com start.sh v48.23.0-FORKSAFE. | base: v48.22.0-MCPHEALTH  # v48.22.0-MCPHEALTH: (1) GET /mcp deixa de responder 405 para quem NAO pediu SSE — o 8004scan marcava o servico MCP UNHEALTHY (Health 66.7, status degraded). Agora: Accept com text/event-stream segue 405 spec-true; GET bare recebe 200 com descriptor vivo do servidor (nome/versao/5 meta-tools/instrucao de initialize) — que tambem entrega as "capabilities" que o scanner dizia faltar. (2) Selo x402lint da landing aponta p/ o relatorio publico direto (x402lint.dev/o/api.losbeto.xyz, A 98/100 re-scan pago 08/out 15:32 UTC). | base: v48.21.0-TRUSTSTACK  # v48.21.0-TRUSTSTACK: (1) FIX DOMAIN-VERIFICATION ERC-8004 — /.well-known/agent-registration.json estava SEM o campo registrations (a spec exige p/ provar dominio) e com "99 paid endpoints" congelado: o 8004scan lia Publisher 19 / Compliance 75. Agora registrations com agentId 87048 (env ERC8004_AGENT_ID com fallback) e contagem DINAMICA len(BASE_PRICES) — nunca mais desatualiza. erc8004.json ganha o mesmo fallback (identidade sobrevive a env perdida) e descricao atualizada. (2) LANDING: faixa "Listed & verified" com 7 selos clicaveis de prova publica (8004scan, x402lint A 98/100, x402scan, x402-list, MCP Registry, PyPI, npm) + rodape copyright (c 2026 Losbeto sobre o protocolo aberto x402, sem texto LF) + tabela machine-readable ganha as 2 linhas ERC-8004. | base: v48.20.0-STOREFRONT  # v48.20: STOREFRONT — landing ganha (1) rails strip com logos SVG inline (USDC/Base/Polygon/Solana/Algorand/Pix, zero requests externos), (2) badge ERC-8004 #87048 verificavel no hero, (3) ticker CSS-only com os endpoints de $0.001, (4) vitrine 'Base chain intelligence' com os 7 endpoints da v48.19 (1a secao de produto, visivel nas 2 abas), (5) _price_label com 3 casas p/ precos < $0.01 (o .2f imprimiria $0.00), (6) aba Agent com 4 chains + 5 meta-tools | /erc8004 DEIXA DE SER FERRAMENTA E VIRA PROVA: pagina de identidade com agentId 87048 + tx 0x694b13bd…d0061e + links de verificacao (o registro JA EXISTIA desde 15/set — o -32603 do Phantom e pre-simulacao, nao gas; registrador recolhido p/ <details> avancado) | base: v48.19.0-AGUA  # v48.18.6-ONECLICK: /erc8004 com gasLimit explicito (1.2M; estimateGas real 1.107.928, custo ~$0,03) — contorna a falha de estimativa do Phantom (-32603 'Unexpected error' no eth_sendTransaction que travou o registro em 08/out) + Plano B na propria pagina: link BaseScan #writeContract e botao 'copiar agentURI'. | base: v48.18.5-ONECLICK (pagina guiada de registro ERC-8004, data URI imutavel registration-v1, agentId lido do evento Transfer; ZERO chaves no servidor)
 VERSION = "48.24.0-PROBEHARVEST"  # v48.24.0-PROBEHARVEST: trafego de maquina vira produto — /x402-watch (watch 30d em endpoint x402 alheio, $0.05, webhook em mudanca de estado/preco), /account (portal do pagante sem senha: a lsk_ E a credencial), /.well-known/demand-teaser.json (amostra gratis 1h que anuncia o /ecosystem-pulse), preview pay-ready (pay_link + quickstart em TODA amostra; avaliador 50+/dia recebe OFERTA, nunca bloqueio — veredito v44.3.0), ledger_prune_loop (probes/challenges >8d fora, 6h/6h — tabela emagrece ~270MB/mes sem perder metrica) | base: v48.23.0-FORKSAFE
 VERSION = "48.25.0-GLOBAL"  # v48.25.0-GLOBAL: des-regionalizacao — rail Pix DESLIGADO por padrao (PIX_RAIL=1 reativa; agentes pagam USDC; o email do recebedor saiu do codigo), concierge BR sem oferta Pix, chip Pix fora da landing. Compliance: triagem OFAC do pagador ANTES do settle (listas 0xB10C/SDN, refresh 24h, cache /data; hit EVM = 402 sem settle; hit pos-settle nos demais rails = alerta Telegram) — resposta a designacao da rede A7 (OFAC 01/out/2026). Storage: prune + wal_checkpoint(TRUNCATE) e VACUUM semanal com guarda de disco (resolve o alerta de 88% do volume Railway — DELETE sem VACUUM nao devolve espaco). Radar: scanners de credencial (.npmrc, aws-exports, runtime-config, index.js) rotulados como ruido, nao "produto novo". Novo: /api/admin/storage (DASH_TOKEN). | base: v48.24.0-PROBEHARVEST
+VERSION = "48.25.1-HOTFIX"  # v48.25.1-HOTFIX: colisao de nome — meu _OFAC_CACHE (triagem de pagador) sobrescreveu o _OFAC_CACHE["text"] pre-existente do /sanctions (KeyError text, HTTP 500 pos-settle; estorno automatico pegou). Renomeados: _OFAC_PAYER_CACHE/_FILE/_URLS, _ofac_payer_refresh(+_loop). E _esc -> _esc_html (html.escape local do /pay vencia por ordem). Sem mudanca de comportamento. | base: v48.25.0-GLOBAL
 
 
 if __name__ == "__main__":
