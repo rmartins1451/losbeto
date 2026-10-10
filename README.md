@@ -4,7 +4,7 @@
 
 One USDC micropayment per call. No signup, no API keys to manage — **the payment is the auth**. USDC on Base, Solana or Algorand.
 
-**Flagship: an OpenAI-compatible LLM gateway for agents.** `POST /v1/chat/completions` and `GET /llm` at **$0.005/call** on live backends, with a free tier at `/llm/free` and model list at `/v1/models`. Behind it, **116 endpoints** ($0.001–0.50): Base chain reads, FX, equities, commodities, macro calendar, crypto — plus Brazil's official statistics in depth, which nobody else on x402 covers.
+**Flagship: an OpenAI-compatible LLM gateway for agents.** `POST /v1/chat/completions` and `GET /llm` at **$0.005/call** on live backends, with a free tier at `/llm/free` and model list at `/v1/models`. Behind it, **117 endpoints** ($0.001–0.50): Base chain reads, FX, equities, commodities, macro calendar, crypto — plus Brazil's official statistics in depth, which nobody else on x402 covers.
 
 **Identity: registered ERC-8004 agent** — [agentId 87048 on Base](https://8004scan.io/agents/base/87048), registration file at `/.well-known/erc8004.json`, domain-verified via `/.well-known/agent-registration.json`.
 
@@ -27,7 +27,7 @@ curl "https://api.losbeto.xyz/br-asof?series=ipca_12m_pct&date=2026-08-05"
 # -> HTTP 402 with the payment challenge; pay and repeat
 ```
 
-With an x402 client:
+With an x402 client (EVM):
 
 ```js
 import { wrapFetchWithPayment } from "x402-fetch";
@@ -37,10 +37,27 @@ const r = await fetchWithPay("https://api.losbeto.xyz/llm?q=market%20outlook");
 console.log(await r.json());
 ```
 
+### Pay from Solana (or Algorand)
+
+The 402 challenge lists every network we accept — read it once, then pay on the chain you prefer:
+
+```bash
+curl -i "https://api.losbeto.xyz/pyth-price?symbol=SOL"
+# HTTP 402 — the body carries one accepts[] entry per network:
+#   { "network": "base",   "scheme": "exact", "amount": ..., "payTo": "0xd5Ba9711..." }
+#   { "network": "solana", "scheme": "exact", "amount": ..., "payTo": "GEhr9HCFTR..." }
+```
+
+1. Pick the `accepts[]` entry matching your chain — same price on all of them.
+2. Build the payment exactly as the `exact` scheme requires. Any x402 client with SVM support handles this for you; on Solana the payload is your partially-signed USDC transfer transaction, which the facilitator broadcasts and settles (it also pays the network fee — you only sign).
+3. Re-send the same request with the signed payload in the `X-PAYMENT` header. The response arrives on that same request — no polling, no webhook.
+
+Algorand follows the identical pattern (USDC, scheme `exact`) — it is the rail our own indexers use for full-catalog round-trips. Settlements from every chain appear publicly in `GET /receipts`, and `GET /agents.json` lists the live payment networks machine-readably.
+
 From npm:
 
 ```bash
-npm i -g losbeto-llm   # CLI + client for the LLM gateway (set LOSBETO_EVM_KEY)
+npm i -g losbeto-llm   # CLI + client for the LLM gateway (EVM: set LOSBETO_EVM_KEY — Solana/Algorand above)
 npm i losbeto-mcp      # MCP server package
 ```
 

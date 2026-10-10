@@ -772,6 +772,7 @@ import socket as _socket
 _socket.setdefaulttimeout(25)
 
 import requests
+import netrc  # v48.25.2: pré-import na largada (single-thread, preload) — evita stall no import-lock quando uma request chama requests.get() pela 1ª vez enquanto threads de fundo importam (WORKER TIMEOUT pid 100, 10/out/2026)
 import base58
 from nacl.signing import SigningKey, VerifyKey
 from nacl.exceptions import BadSignatureError
@@ -2099,15 +2100,25 @@ class FacilitatorClient:
 
     def get_svm_fee_payer(self) -> Optional[str]:
         """Consulta /supported no facilitador e extrai o signer (feePayer) para redes solana:*.
-        Resultado é cacheado no processo — evita bater no facilitador a cada 402 emitido."""
+        v48.25.2: cache em memória (1h) + disco (24h, sobrevive a respawn de worker) —
+        o 402 nunca mais depende de o /supported responder na hora (WORKER TIMEOUT pid 100, 10/out/2026)."""
         cached = getattr(self, "_svm_fee_payer_cache", None)
         cached_at = getattr(self, "_svm_fee_payer_cache_at", 0)
         if cached and (time.time() - cached_at) < 3600:
             return cached
+        disk_fp = None
+        try:
+            fp_file = HOME_DIR / "svm_fee_payer.json"
+            if fp_file.exists():
+                d = json.loads(fp_file.read_text())
+                if d.get("fee_payer") and (time.time() - float(d.get("ts", 0))) < 86400:
+                    disk_fp = d["fee_payer"]
+        except Exception:
+            disk_fp = None
         try:
             r = requests.get(f"{self.url}/supported", timeout=10)
             if not r.ok:
-                return cached
+                return cached or disk_fp
             data = r.json() if r.text else {}
             signers = data.get("signers", {}) or {}
             fee_payer = None
@@ -2118,10 +2129,17 @@ class FacilitatorClient:
             if fee_payer:
                 self._svm_fee_payer_cache = fee_payer
                 self._svm_fee_payer_cache_at = time.time()
+                try:
+                    fp_file = HOME_DIR / "svm_fee_payer.json"
+                    tmp = fp_file.with_suffix(".tmp")
+                    tmp.write_text(json.dumps({"fee_payer": fee_payer, "ts": time.time()}))
+                    tmp.replace(fp_file)
+                except Exception:
+                    pass
                 return fee_payer
         except Exception as e:
             log.warning(f"⚠️ Falha ao buscar feePayer do facilitador: {e}")
-        return cached
+        return cached or disk_fp
 
 FACILITATOR = FacilitatorClient(FACILITATOR_URL) if USE_FACILITATOR else None
 
@@ -29878,8 +29896,7 @@ def admin_storage():
                                   if _OFAC_PAYER_CACHE["ts"] else None}
     return jsonify(out)
 
-log.info(f"🛡 v48.25.0-GLOBAL: Pix rail OFF (PIX_RAIL=1 reativa) · OFAC payer "
-         "screening pré/pós-settle · VACUUM semanal guardado · /api/admin/storage")
+log.info(f"🛡 v48.25.2-FEEPAYER: netrc pré-import + feePayer disco 24h (anti WORKER TIMEOUT) · Pix rail OFF · OFAC pré/pós-settle · VACUUM semanal · /api/admin/storage")
 
 
 # ============================================================================
@@ -32360,7 +32377,7 @@ VERSION = "48.18.3-PAYGUARD"  # v48.18.3-PAYGUARD: /pay nunca mais vende endpoin
 VERSION = "48.23.0-FORKSAFE"  # v48.23.0-FORKSAFE: BOOT SEM THREADS NO IMPORT — com --preload, ~25 threads nasciam no ARBITER (loops bg, v27, radar, PIT, warmers) e o fork herdava locks travados de threads inexistentes: 2 de 4 workers congelavam ~30s apos cada deploy e morriam em WORKER TIMEOUT 120s (00:03/00:18 de 09/out). Agora: (1) import 100% livre de threads; (2) post_fork_boot() novo — chamado pelo hook post_fork do gunicorn (gerado pelo start.sh v48.23) + fallback na 1a request (@app.before_request); (3) _start_background_once retorna o DONO do flock e absorve os loops v27 (cdp-seed, discovery-ping) e o radar demand_autofulfill (antes soltos no import, sem guard); (4) _v27_start_background vira banner-only com flag; (5) _ml_boot_warm volta a ser PER-WORKER com stagger 2-8s (a docstring sempre pediu isso, mas o flock fazia so 1 worker aquecer). Deploy junto com start.sh v48.23.0-FORKSAFE. | base: v48.22.0-MCPHEALTH  # v48.22.0-MCPHEALTH: (1) GET /mcp deixa de responder 405 para quem NAO pediu SSE — o 8004scan marcava o servico MCP UNHEALTHY (Health 66.7, status degraded). Agora: Accept com text/event-stream segue 405 spec-true; GET bare recebe 200 com descriptor vivo do servidor (nome/versao/5 meta-tools/instrucao de initialize) — que tambem entrega as "capabilities" que o scanner dizia faltar. (2) Selo x402lint da landing aponta p/ o relatorio publico direto (x402lint.dev/o/api.losbeto.xyz, A 98/100 re-scan pago 08/out 15:32 UTC). | base: v48.21.0-TRUSTSTACK  # v48.21.0-TRUSTSTACK: (1) FIX DOMAIN-VERIFICATION ERC-8004 — /.well-known/agent-registration.json estava SEM o campo registrations (a spec exige p/ provar dominio) e com "99 paid endpoints" congelado: o 8004scan lia Publisher 19 / Compliance 75. Agora registrations com agentId 87048 (env ERC8004_AGENT_ID com fallback) e contagem DINAMICA len(BASE_PRICES) — nunca mais desatualiza. erc8004.json ganha o mesmo fallback (identidade sobrevive a env perdida) e descricao atualizada. (2) LANDING: faixa "Listed & verified" com 7 selos clicaveis de prova publica (8004scan, x402lint A 98/100, x402scan, x402-list, MCP Registry, PyPI, npm) + rodape copyright (c 2026 Losbeto sobre o protocolo aberto x402, sem texto LF) + tabela machine-readable ganha as 2 linhas ERC-8004. | base: v48.20.0-STOREFRONT  # v48.20: STOREFRONT — landing ganha (1) rails strip com logos SVG inline (USDC/Base/Polygon/Solana/Algorand/Pix, zero requests externos), (2) badge ERC-8004 #87048 verificavel no hero, (3) ticker CSS-only com os endpoints de $0.001, (4) vitrine 'Base chain intelligence' com os 7 endpoints da v48.19 (1a secao de produto, visivel nas 2 abas), (5) _price_label com 3 casas p/ precos < $0.01 (o .2f imprimiria $0.00), (6) aba Agent com 4 chains + 5 meta-tools | /erc8004 DEIXA DE SER FERRAMENTA E VIRA PROVA: pagina de identidade com agentId 87048 + tx 0x694b13bd…d0061e + links de verificacao (o registro JA EXISTIA desde 15/set — o -32603 do Phantom e pre-simulacao, nao gas; registrador recolhido p/ <details> avancado) | base: v48.19.0-AGUA  # v48.18.6-ONECLICK: /erc8004 com gasLimit explicito (1.2M; estimateGas real 1.107.928, custo ~$0,03) — contorna a falha de estimativa do Phantom (-32603 'Unexpected error' no eth_sendTransaction que travou o registro em 08/out) + Plano B na propria pagina: link BaseScan #writeContract e botao 'copiar agentURI'. | base: v48.18.5-ONECLICK (pagina guiada de registro ERC-8004, data URI imutavel registration-v1, agentId lido do evento Transfer; ZERO chaves no servidor)
 VERSION = "48.24.0-PROBEHARVEST"  # v48.24.0-PROBEHARVEST: trafego de maquina vira produto — /x402-watch (watch 30d em endpoint x402 alheio, $0.05, webhook em mudanca de estado/preco), /account (portal do pagante sem senha: a lsk_ E a credencial), /.well-known/demand-teaser.json (amostra gratis 1h que anuncia o /ecosystem-pulse), preview pay-ready (pay_link + quickstart em TODA amostra; avaliador 50+/dia recebe OFERTA, nunca bloqueio — veredito v44.3.0), ledger_prune_loop (probes/challenges >8d fora, 6h/6h — tabela emagrece ~270MB/mes sem perder metrica) | base: v48.23.0-FORKSAFE
 VERSION = "48.25.0-GLOBAL"  # v48.25.0-GLOBAL: des-regionalizacao — rail Pix DESLIGADO por padrao (PIX_RAIL=1 reativa; agentes pagam USDC; o email do recebedor saiu do codigo), concierge BR sem oferta Pix, chip Pix fora da landing. Compliance: triagem OFAC do pagador ANTES do settle (listas 0xB10C/SDN, refresh 24h, cache /data; hit EVM = 402 sem settle; hit pos-settle nos demais rails = alerta Telegram) — resposta a designacao da rede A7 (OFAC 01/out/2026). Storage: prune + wal_checkpoint(TRUNCATE) e VACUUM semanal com guarda de disco (resolve o alerta de 88% do volume Railway — DELETE sem VACUUM nao devolve espaco). Radar: scanners de credencial (.npmrc, aws-exports, runtime-config, index.js) rotulados como ruido, nao "produto novo". Novo: /api/admin/storage (DASH_TOKEN). | base: v48.24.0-PROBEHARVEST
-VERSION = "48.25.1-HOTFIX"  # v48.25.1-HOTFIX: colisao de nome — meu _OFAC_CACHE (triagem de pagador) sobrescreveu o _OFAC_CACHE["text"] pre-existente do /sanctions (KeyError text, HTTP 500 pos-settle; estorno automatico pegou). Renomeados: _OFAC_PAYER_CACHE/_FILE/_URLS, _ofac_payer_refresh(+_loop). E _esc -> _esc_html (html.escape local do /pay vencia por ordem). Sem mudanca de comportamento. | base: v48.25.0-GLOBAL
+VERSION = "48.25.2-FEEPAYER"  # v48.25.2: import netrc na largada + feePayer Solana com cache em disco (24h) — mata o WORKER TIMEOUT de 10/out (pid 100, stall no import-lock em get_svm_fee_payer)
 
 
 if __name__ == "__main__":
