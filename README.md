@@ -124,7 +124,7 @@ This node has been recording Brazilian official statistics as they were publishe
 | `/br-pit-proof` | free | Merkle roots, signer key, coverage window, verification recipe |
 | `/br-asof?series=&date=` | $0.09 | The value as known on that date — vintage, not revised |
 | `/br-revisions?series=` | $0.19 | First print → every correction, with size and observation timestamp |
-| `/br-archive?day=` | $0.05 | Signed daily snapshot: BCB macro + Ibovespa close |
+| `/br-archive?day=` | $0.09 | Signed daily snapshot: BCB macro + Ibovespa close |
 | `/br-brief` | $0.50 | Daily Brazil macro + equity brief, in English |
 
 Series tracked: `selic_meta_pct, cdi_daily_pct, ipca_12m_pct, igpm_month_pct, usd_brl_ptax, eur_brl`.
@@ -135,10 +135,10 @@ Pure computation over Brazilian specifications — no external API in the reques
 
 | Endpoint | Price | What you get |
 |---|---|---|
-| `/br-pix-parse?code=` | $0.004 | Decode and CRC16-verify a PIX BR Code (EMV-MPM) |
-| `/br-pix-code?key=&name=&city=` | $0.004 | Generate a valid static PIX BR Code, self-checked by re-parsing |
-| `/br-bizdays?from=&to=` | $0.004 | Bank business days on the ANBIMA 252 convention |
-| `/br-doc?doc=` | $0.004 | CNPJ/CPF modulo-11 check-digit validation |
+| `/br-pix-parse?code=` | $0.010 | Decode and CRC16-verify a PIX BR Code (EMV-MPM) |
+| `/br-pix-code?key=&name=&city=` | $0.010 | Generate a valid static PIX BR Code, self-checked by re-parsing |
+| `/br-bizdays?from=&to=` | $0.010 | Bank business days on the ANBIMA 252 convention |
+| `/br-doc?doc=` | $0.010 | CNPJ/CPF modulo-11 check-digit validation |
 
 Verifiable from outside: `GET /zero-upstream.json` declares which routes never touch the network.
 
