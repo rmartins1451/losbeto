@@ -121,7 +121,7 @@
 from __future__ import annotations
 
 import os, sys, json, time, base64, hashlib, threading, sqlite3, hmac
-import socket, struct, secrets, subprocess, signal, logging, traceback, random
+import socket, struct, secrets, subprocess, signal, logging, traceback, random, shutil
 import urllib.request, urllib.error, urllib.parse, re, math
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
@@ -7749,6 +7749,29 @@ def _verify_payment(endpoint: str, payment_header: str):
         # motivo REAL da tentativa correta (eip155) no 402 devolvido.
         if isinstance(pdata.get("accepted"), dict) and pdata["accepted"].get("network"):
             network = pdata["accepted"]["network"]
+        # v48.25.0-GLOBAL: triagem OFAC do pagador ANTES de qualquer settle —
+        # pagador sancionado recebe 402 de volta e o dinheiro nunca entra.
+        # (rede A7 designada pela OFAC em 01/out/2026; FinCEN propôs regra
+        # cobrindo crypto. Nosso payTo é depósito de exchange — fundo manchado
+        # é risco operacional real, não teoria.)
+        try:
+            _cand = {payer or ""}
+            _pl2 = pdata.get("payload")
+            if isinstance(_pl2, dict):
+                _au2 = _pl2.get("authorization")
+                if isinstance(_au2, dict) and _au2.get("from"):
+                    _cand.add(str(_au2["from"]))
+            if any(_payer_hit_ofac(a) for a in _cand if a):
+                log.warning(f"⛔ OFAC hit PRÉ-settle em {endpoint}: "
+                            f"{sorted(_cand)} — settle recusado")
+                try:
+                    _notify_telegram(f"⛔ OFAC: pagador sancionado tentou "
+                                     f"{endpoint} — settle RECUSADO: {sorted(_cand)}")
+                except Exception:
+                    pass
+                return False, "sanctioned-payer", {}
+        except Exception:
+            pass
     except Exception:
         tx_sig = payment_header.strip()
 
@@ -8003,6 +8026,20 @@ def _verify_payment(endpoint: str, payment_header: str):
             # EIP-3009: payload.payload.authorization.from; Algorand: remetente
             # do grupo de pagamento). Sem isto o ledger gravava payer vazio e
             # a receita saía sem atribuição.
+            # v48.25.0-GLOBAL: pós-settle — se o pagador real (revelado só no
+            # SettleResponse, ex.: Solana patrocinado) constar na lista OFAC,
+            # o dinheiro JÁ entrou: servir normalmente, mas alertar o operador
+            # na hora (decisão de compliance é humana: reportar/congelar via
+            # exchange de destino).
+            if real_payer:
+                try:
+                    if _payer_hit_ofac(real_payer):
+                        log.warning(f"⛔ OFAC hit PÓS-settle: {real_payer} em {endpoint}")
+                        _notify_telegram(f"⛔ OFAC pós-settle: {real_payer} pagou "
+                                         f"{endpoint} (tx {settle_tx}) — FUNDO JÁ RECEBIDO. "
+                                         "Avaliar report/freeze no destino.")
+                except Exception:
+                    pass
             if not real_payer and isinstance(payload, dict):
                 _pl = payload.get("payload")
                 _pl = _pl if isinstance(_pl, dict) else {}
@@ -12890,8 +12927,7 @@ settles a few cents in USDC per request and gets clean JSON back.</p>
   <span class="rl"><svg viewBox="0 0 24 24" aria-label="Polygon"><path d="M12 1.5l9 5.2v10.6l-9 5.2-9-5.2V6.7z" fill="#8247E5"/><path d="M15.7 9.1l-3.7-2.1-3.7 2.1v4.3l3.7 2.1 3.7-2.1z" fill="#fff" opacity=".95"/></svg>Polygon</span>
   <span class="rl"><svg viewBox="0 0 24 24" aria-label="Solana"><defs><linearGradient id="solg" x1="0" y1="1" x2="1" y2="0"><stop offset="0" stop-color="#9945FF"/><stop offset="1" stop-color="#14F195"/></linearGradient></defs><path d="M5.2 6.4L7.8 3.8h11l-2.6 2.6z" fill="url(#solg)"/><path d="M18.8 11.1l-2.6-2.6h-11l2.6 2.6z" fill="url(#solg)"/><path d="M5.2 15.8l2.6-2.6h11l-2.6 2.6z" fill="url(#solg)"/></svg>Solana</span>
   <span class="rl"><svg viewBox="0 0 24 24" aria-label="Algorand"><path d="M13.8 3h-3.6L4 21h2.9l1.6-4.6h6.9l1.6 4.6h3zM9.5 14.2L12 7.5l2.5 6.7z" fill="#e8eaed"/></svg>Algorand</span>
-  <span class="rl"><svg viewBox="0 0 24 24" aria-label="Pix"><rect x="5.1" y="5.1" width="13.8" height="13.8" rx="3.4" transform="rotate(45 12 12)" fill="#32BCAD"/><circle cx="12" cy="12" r="2.5" fill="#0a0b0d"/></svg>Pix</span>
-</div>
+  </div>
 </div></section>
 <div class="tickband"><div class="tick">
 <span>/chain-block <b>__P_CBLOCK__</b></span><span class="sep">·</span><span>/gas-price <b>__P_CGAS__</b> + ML forecast</span><span class="sep">·</span><span>/chain-ens <b>__P_CENS__</b></span><span class="sep">·</span><span>/chain-tx <b>__P_CTX__</b></span><span class="sep">·</span><span>/chain-balance <b>__P_CBAL__</b></span><span class="sep">·</span><span>/agent-reputation <b>__P_AREP__</b> · ERC-8004</span><span class="sep">·</span><span>/wallet-verdict <b>__P_WV__</b> + shareable card</span><span class="sep">·</span><span>free sample on every endpoint — /try · /welcome · ?preview=1</span><span class="sep">·</span>
@@ -16874,6 +16910,10 @@ _SCAN_NOISE = re.compile(
     r"secrets?\.|config\.(json|yml|yaml)|actuator|/api/v1/(pods|namespaces)|"
     r"\.well-known/(acme|security)|favicon|robots|sitemap|apple-touch|"
     r"\.map$|\.asp|cgi-bin|xmlrpc|\.svn|docker|kube|"
+    # v48.25.0: leva vista no radar em 10/out — sondas de credencial de
+    # ecossistema JS/Node classificadas como "produto novo": não são demanda.
+    r"\.npmrc|\.yarnrc|\.pnpm|aws-exports|runtime-config|env-config|"
+    r"config/config\.js|/index\.js$|_zz_|wallet\.json|keys\.json|"
     # v48.4.0: observado no radar de demanda classificando sonda de segredo
     # como "produto novo" (/env, /config/master.key, /appsettings.json) —
     # são scanners de vazamento de credenciais, não cliente em potencial.
@@ -20497,7 +20537,7 @@ def _chat_facts() -> str:
         f"{n} paid endpoints, US$0.003–0.50/call. Cheapest: {cheap_s}. "
         f"Payment: x402 protocol, USDC on Base (eip155:8453) or Solana — the payment IS the auth; "
         f"no accounts, no API keys, no signup. Humans can also pay via browser checkout ({base}/pay/<endpoint>) "
-        f"or Pix (Brazil). Free evaluation: /try, ?preview=1 on any endpoint, /welcome (1 free call), "
+        f"Free evaluation: /try, ?preview=1 on any endpoint, /welcome (1 free call), "
         f"/llm/free (5 free LLM calls/day/IP). "
         f"Credit plans (public, fixed): {plans_s}; day-pass $2.99 unlimited 24h, week-pass $9.99. "
         f"Trust: 4,000+ on-chain settlements, public receipts at /receipts, grade A on x402lint.dev, "
@@ -20657,16 +20697,15 @@ def _chat_greet_message(ip: str, ua: str) -> dict:
         if visto:
             msg = (f"Olá de novo! 🤖 Vi que você avaliou o {visto} — custa só "
                    f"${BASE_PRICES[visto]:.3f} (menos de um centavo de dólar) e o checkout "
-                   f"leva 10 segundos: {base}/pay{visto} — aceita **Pix** (R$ pela PTAX) "
-                   f"ou USDC. Quer que eu mostre o que ele devolve antes de pagar?")
+                   f"leva 10 segundos: {base}/pay{visto} — em USDC na Base, direto da "
+                   f"carteira. Quer que eu mostre o que ele devolve antes de pagar?")
             chips = ["Quero o link de pagamento", f"O que o {visto} retorna?", "Ver planos com bônus"]
         else:
-            msg = (f"Olá! Sou a IA do Losbeto 🤖 Você está no Brasil, então já adianto: "
-                   f"aceitamos **Pix** (R$ pela PTAX) e USDC. São {n} endpoints de dados para "
-                   f"agentes de IA — inclusive a única suíte brasileira do x402 (Pix BR Code, "
-                   f"du/252, B3) — a partir de $0,003, sem cadastro. Posso te mostrar o mais "
-                   f"popular ou um teste grátis agora.")
-            chips = ["Quero testar grátis", "Como pago com Pix?", "Ver planos a partir de $0,10"]
+            msg = (f"Olá! Sou a IA do Losbeto 🤖 São {n} endpoints de dados para "
+                   f"agentes de IA, pagamento por chamada em USDC (Base · Solana · "
+                   f"Algorand · Polygon), sem cadastro — a partir de $0,003. "
+                   f"Posso te mostrar o mais popular ou um teste grátis agora.")
+            chips = ["Quero testar grátis", "Como pago em USDC?", "Ver planos a partir de $0,10"]
     else:
         if visto:
             msg = (f"Welcome back 🤖 You evaluated {visto} last time — it's "
@@ -20777,6 +20816,9 @@ def _pix_sig(cid: str) -> str:
 
 @app.route("/api/claim-pix", methods=["GET", "POST"])
 def claim_pix():
+    if not PIX_RAIL:
+        return jsonify({"error": "pix_rail_off",
+                        "note": "Pix checkout retired — USDC/x402 only."}), 410
     if request.method == "GET":
         cid = (request.args.get("id") or "").strip()[:40]
         if not re.fullmatch(r"[A-Za-z0-9_-]{16,40}", cid or ""):
@@ -25249,6 +25291,8 @@ def _start_background_once():
                          name="v4824-prune").start()
         threading.Thread(target=x402_watch_loop, daemon=True,
                          name="v4824-watch").start()
+        threading.Thread(target=ofac_refresh_loop, daemon=True,
+                         name="v4825-ofac").start()
     except Exception as _e:
         log.warning(f"v48.23 loops extras: {_e}")
     log.info("✅ Autopilot: loops de background ativos neste worker")
@@ -29534,7 +29578,10 @@ def _preview_payready(path: str, ip: str) -> dict:
 def ledger_prune_loop():
     """Apaga probes/challenges402 com >8 dias a cada 6h. Previews, settles e
     vendas NUNCA são podados. O 'probes 24h' do dashboard e o '~64k probes/
-    day' do /ecosystem-pulse vivem da janela recente — continuam exatos."""
+    day' do /ecosystem-pulse vivem da janela recente — continuam exatos.
+    v48.25.0: DELETE não devolve espaço ao volume (Railway alertou 88%) —
+    depois da poda, wal_checkpoint(TRUNCATE) e, 1x/semana, VACUUM com guarda:
+    só roda se houver 2.3x o tamanho do DB livre (VACUUM reescreve o arquivo)."""
     time.sleep(300)
     while True:
         try:
@@ -29544,8 +29591,29 @@ def ledger_prune_loop():
                                 "(kind='probe' OR kind='challenge402' OR kind='')",
                                 (cutoff,))
                 n = cur.rowcount if cur.rowcount is not None else 0
+                c.execute("PRAGMA wal_checkpoint(TRUNCATE)")
             if n:
                 log.info(f"🧹 ledger_prune: {n} probes/challenges >8d removidos")
+            # VACUUM semanal, com guarda de espaço (Railway Hobby = 5GB de volume)
+            try:
+                stamp = HOME_DIR / ".last_vacuum"
+                last = float(stamp.read_text().strip()) if stamp.exists() else 0.0
+                db_size = DB_PATH.stat().st_size if DB_PATH.exists() else 0
+                free = shutil.disk_usage(str(HOME_DIR)).free
+                if time.time() - last > 7 * 86400 and db_size > 50_000_000 \
+                        and free > db_size * 2.3:
+                    t0 = time.time()
+                    with LEDGER.lock, LEDGER._conn() as c:
+                        c.execute("VACUUM")
+                    stamp.write_text(str(time.time()))
+                    new_size = DB_PATH.stat().st_size
+                    log.info(f"🧹 VACUUM semanal: {db_size/1e6:.0f}MB → "
+                             f"{new_size/1e6:.0f}MB em {time.time()-t0:.0f}s")
+                elif time.time() - last > 7 * 86400 and db_size > 50_000_000:
+                    log.warning(f"🧹 VACUUM adiado — disco livre {free/1e9:.2f}GB "
+                                f"< 2.3x DB {db_size/1e9:.2f}GB")
+            except Exception as e:
+                log.warning(f"ledger_prune vacuum: {e}")
         except Exception as e:
             log.warning(f"ledger_prune_loop: {e}")
         time.sleep(6 * 3600)
@@ -29686,6 +29754,132 @@ except Exception as _e:
 
 log.info(f"👁 v48.24-PROBEHARVEST: /x402-watch (${BASE_PRICES.get('/x402-watch', 0):.3f}), "
          "/account, demand-teaser, preview pay-ready, ledger prune ativos")
+
+
+# ============================================================================
+# v48.25.0-GLOBAL (parte 2) — compliance de pagador (OFAC) + observabilidade
+# de storage. "Agentic commerce will need agentic compliance" (TRM Labs,
+# set/2026) — este nó é o primeiro do ecossistema com triagem SDN embutida.
+# ============================================================================
+
+_OFAC_FILE = HOME_DIR / "ofac_addresses.json"
+_OFAC_CACHE = {"ts": 0.0, "addrs": set()}
+_OFAC_URLS = (
+    "https://raw.githubusercontent.com/0xB10C/ofac-sanctioned-digital-"
+    "currency-addresses/lists/sanctioned_addresses_ETH.json",
+    "https://raw.githubusercontent.com/0xB10C/ofac-sanctioned-digital-"
+    "currency-addresses/lists/sanctioned_addresses_SOL.json",
+    "https://raw.githubusercontent.com/0xB10C/ofac-sanctioned-digital-"
+    "currency-addresses/lists/sanctioned_addresses_USDC.json",
+    "https://raw.githubusercontent.com/0xB10C/ofac-sanctioned-digital-"
+    "currency-addresses/lists/sanctioned_addresses_USDT.json",
+)
+
+def _ofac_load_disk() -> set:
+    try:
+        if _OFAC_FILE.exists():
+            d = json.loads(_OFAC_FILE.read_text())
+            return {str(a).lower() for a in d.get("addrs", [])}
+    except Exception:
+        pass
+    return set()
+
+def _ofac_refresh() -> int:
+    """Baixa as listas SDN de cripto (0xB10C, atualizadas toda madrugada UTC
+    a partir do sdn_advanced.xml do Tesouro dos EUA). Falha NUNCA derruba o
+    cache antigo — lista velha é melhor que lista nenhuma."""
+    addrs = set()
+    ok = 0
+    for u in _OFAC_URLS:
+        try:
+            r = requests.get(u, timeout=12)
+            if r.status_code == 200:
+                addrs.update(str(a).strip().lower() for a in r.json() if a)
+                ok += 1
+        except Exception as e:
+            log.debug(f"ofac fetch {u[-40:]}: {e}")
+    if ok and addrs:
+        _OFAC_CACHE.update({"ts": time.time(), "addrs": addrs})
+        try:
+            _OFAC_FILE.write_text(json.dumps(
+                {"ts": _OFAC_CACHE["ts"], "addrs": sorted(addrs)}))
+        except Exception:
+            pass
+        log.info(f"🛡 OFAC: {len(addrs)} endereços sancionados carregados "
+                 f"({ok}/{len(_OFAC_URLS)} fontes)")
+    elif not _OFAC_CACHE["addrs"]:
+        disk = _ofac_load_disk()
+        if disk:
+            _OFAC_CACHE.update({"ts": _OFAC_FILE.stat().st_mtime, "addrs": disk})
+            log.info(f"🛡 OFAC: cache de disco ({len(disk)} endereços)")
+    return len(_OFAC_CACHE["addrs"])
+
+def _payer_hit_ofac(addr: str) -> bool:
+    a = (addr or "").strip().lower()
+    if not a:
+        return False
+    if not _OFAC_CACHE["addrs"]:
+        d = _ofac_load_disk()
+        if d:
+            _OFAC_CACHE["addrs"] = d
+    return a in _OFAC_CACHE["addrs"]
+
+def ofac_refresh_loop():
+    """Refresh diário da lista SDN — só no dono do flock."""
+    time.sleep(60)
+    _ofac_refresh()
+    while True:
+        time.sleep(24 * 3600)
+        try:
+            _ofac_refresh()
+        except Exception as e:
+            log.warning(f"ofac_refresh_loop: {e}")
+
+@app.route("/api/admin/storage")
+def admin_storage():
+    """Forense do volume /data — o alerta de 88% do Railway se responde aqui.
+    Protegido pelo token do operador (mesmo padrão do /intel)."""
+    tok = (request.args.get("token", "") or
+           request.headers.get("X-Dash-Token", "")).strip()
+    if not tok or not hmac.compare_digest(tok, DASH_TOKEN):
+        return jsonify({"error": "operator token required"}), 401
+    out = {"data_dir": str(HOME_DIR), "ts": int(time.time())}
+    try:
+        du = shutil.disk_usage(str(HOME_DIR))
+        out["disk"] = {"total_gb": round(du.total / 1e9, 2),
+                       "used_gb": round(du.used / 1e9, 2),
+                       "free_gb": round(du.free / 1e9, 2),
+                       "used_pct": round(du.used / du.total * 100, 1)}
+    except Exception as e:
+        out["disk_error"] = str(e)[:120]
+    try:
+        files = []
+        for p in HOME_DIR.rglob("*"):
+            try:
+                if p.is_file():
+                    files.append((p.stat().st_size, str(p.relative_to(HOME_DIR))))
+            except Exception:
+                pass
+        files.sort(reverse=True)
+        out["top_files"] = [{"mb": round(s / 1e6, 1), "file": f}
+                            for s, f in files[:20]]
+        out["total_files_mb"] = round(sum(s for s, _ in files) / 1e6, 1)
+    except Exception as e:
+        out["files_error"] = str(e)[:120]
+    try:
+        with LEDGER._conn() as c:
+            out["tables"] = {t: c.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0]
+                             for (t,) in c.execute(
+                                 "SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
+    except Exception as e:
+        out["tables_error"] = str(e)[:120]
+    out["ofac"] = {"cached_addrs": len(_OFAC_CACHE["addrs"]),
+                   "cache_age_h": round((time.time() - _OFAC_CACHE["ts"]) / 3600, 1)
+                                  if _OFAC_CACHE["ts"] else None}
+    return jsonify(out)
+
+log.info(f"🛡 v48.25.0-GLOBAL: Pix rail OFF (PIX_RAIL=1 reativa) · OFAC payer "
+         "screening pré/pós-settle · VACUUM semanal guardado · /api/admin/storage")
 
 
 # ============================================================================
@@ -30779,8 +30973,8 @@ async function preflightWallet(from){
       const need = Number(BigInt(ACCEPT.amount))/1e6;
       if(bal < need){
         warns.push('USDC balance on Base: '+bal.toFixed(4)+' — this payment needs '+need.toFixed(4)+'. '+
-          'Top up first: card via Coinbase Onramp (pay.coinbase.com), or buy on Binance with Pix and '+
-          'withdraw choosing the BASE network. A short balance reverts on-chain.');
+          'Top up first: card via Coinbase Onramp (pay.coinbase.com), or buy USDC on any '+
+          'exchange and withdraw choosing the BASE network. A short balance reverts on-chain.');
       }
     }
   }catch(e){}
@@ -31117,9 +31311,13 @@ btn.addEventListener('click', payAndFetch);
 # pagar o QR com CRIPTO via Binance Pay→Pix (mai/2025) — recebemos BRL no banco.
 # Per-call de centavos NÃO ganha Pix (R$0,02 não cabe no rail); para esses o
 # caminho instantâneo continua sendo USDC/x402 acima.
-PIX_RECEIVER_KEY  = os.environ.get("PIX_RECEIVER_KEY",  "roberto.martins622@gmail.com")
-PIX_RECEIVER_NAME = os.environ.get("PIX_RECEIVER_NAME", "ROBERTO MARTINS")
-PIX_RECEIVER_CITY = os.environ.get("PIX_RECEIVER_CITY", "PORTO ALEGRE")
+# v48.25.0-GLOBAL: rail Pix DESLIGADO por padrão — comércio de máquinas é
+# USDC/x402; o comprador humano brasileiro nunca converteu aqui. PIX_RAIL=1
+# reativa. Os dados do recebedor saíram do código (só via env, se reativar).
+PIX_RAIL          = os.environ.get("PIX_RAIL", "0") == "1"
+PIX_RECEIVER_KEY  = os.environ.get("PIX_RECEIVER_KEY",  "")
+PIX_RECEIVER_NAME = os.environ.get("PIX_RECEIVER_NAME", "")
+PIX_RECEIVER_CITY = os.environ.get("PIX_RECEIVER_CITY", "")
 PIX_MIN_USD       = float(os.environ.get("PIX_MIN_USD", "0.99"))
 
 _PAY_PIX_CARD = """
@@ -31268,7 +31466,7 @@ def _pay_bridge_handler(raw_endpoint):
     # v48.9.6: cartão Pix (somente planos/bundles — ver PIX_MIN_USD). Se a
     # PTAX falhar, o cartão simplesmente não aparece (checkout cripto intacto).
     pix_card = ""
-    if price >= PIX_MIN_USD:
+    if PIX_RAIL and price >= PIX_MIN_USD:
         try:
             ptax = (_bcb_last(1) or {}).get("value")
             brl = round(price * float(ptax), 2) if ptax else None
@@ -32161,6 +32359,7 @@ VERSION = "48.18.2-HOTFIX"  # v48.18.2-HOTFIX: fix CRITICO — o loop de registr
 VERSION = "48.18.3-PAYGUARD"  # v48.18.3-PAYGUARD: /pay nunca mais vende endpoint sem parametro obrigatorio — querystring da pagina segue para a chamada paga (carteira EIP-3009, Solana, cartao manual E o QR mobile) e, sem querystring, cartao pre-preenchido de ENDPOINT_REQUIRED_PARAMS bloqueia a assinatura com campo vazio. Mata o estorno pos-settle 400 do /br-doc (2x em 07/out, mesmo comprador).
 VERSION = "48.23.0-FORKSAFE"  # v48.23.0-FORKSAFE: BOOT SEM THREADS NO IMPORT — com --preload, ~25 threads nasciam no ARBITER (loops bg, v27, radar, PIT, warmers) e o fork herdava locks travados de threads inexistentes: 2 de 4 workers congelavam ~30s apos cada deploy e morriam em WORKER TIMEOUT 120s (00:03/00:18 de 09/out). Agora: (1) import 100% livre de threads; (2) post_fork_boot() novo — chamado pelo hook post_fork do gunicorn (gerado pelo start.sh v48.23) + fallback na 1a request (@app.before_request); (3) _start_background_once retorna o DONO do flock e absorve os loops v27 (cdp-seed, discovery-ping) e o radar demand_autofulfill (antes soltos no import, sem guard); (4) _v27_start_background vira banner-only com flag; (5) _ml_boot_warm volta a ser PER-WORKER com stagger 2-8s (a docstring sempre pediu isso, mas o flock fazia so 1 worker aquecer). Deploy junto com start.sh v48.23.0-FORKSAFE. | base: v48.22.0-MCPHEALTH  # v48.22.0-MCPHEALTH: (1) GET /mcp deixa de responder 405 para quem NAO pediu SSE — o 8004scan marcava o servico MCP UNHEALTHY (Health 66.7, status degraded). Agora: Accept com text/event-stream segue 405 spec-true; GET bare recebe 200 com descriptor vivo do servidor (nome/versao/5 meta-tools/instrucao de initialize) — que tambem entrega as "capabilities" que o scanner dizia faltar. (2) Selo x402lint da landing aponta p/ o relatorio publico direto (x402lint.dev/o/api.losbeto.xyz, A 98/100 re-scan pago 08/out 15:32 UTC). | base: v48.21.0-TRUSTSTACK  # v48.21.0-TRUSTSTACK: (1) FIX DOMAIN-VERIFICATION ERC-8004 — /.well-known/agent-registration.json estava SEM o campo registrations (a spec exige p/ provar dominio) e com "99 paid endpoints" congelado: o 8004scan lia Publisher 19 / Compliance 75. Agora registrations com agentId 87048 (env ERC8004_AGENT_ID com fallback) e contagem DINAMICA len(BASE_PRICES) — nunca mais desatualiza. erc8004.json ganha o mesmo fallback (identidade sobrevive a env perdida) e descricao atualizada. (2) LANDING: faixa "Listed & verified" com 7 selos clicaveis de prova publica (8004scan, x402lint A 98/100, x402scan, x402-list, MCP Registry, PyPI, npm) + rodape copyright (c 2026 Losbeto sobre o protocolo aberto x402, sem texto LF) + tabela machine-readable ganha as 2 linhas ERC-8004. | base: v48.20.0-STOREFRONT  # v48.20: STOREFRONT — landing ganha (1) rails strip com logos SVG inline (USDC/Base/Polygon/Solana/Algorand/Pix, zero requests externos), (2) badge ERC-8004 #87048 verificavel no hero, (3) ticker CSS-only com os endpoints de $0.001, (4) vitrine 'Base chain intelligence' com os 7 endpoints da v48.19 (1a secao de produto, visivel nas 2 abas), (5) _price_label com 3 casas p/ precos < $0.01 (o .2f imprimiria $0.00), (6) aba Agent com 4 chains + 5 meta-tools | /erc8004 DEIXA DE SER FERRAMENTA E VIRA PROVA: pagina de identidade com agentId 87048 + tx 0x694b13bd…d0061e + links de verificacao (o registro JA EXISTIA desde 15/set — o -32603 do Phantom e pre-simulacao, nao gas; registrador recolhido p/ <details> avancado) | base: v48.19.0-AGUA  # v48.18.6-ONECLICK: /erc8004 com gasLimit explicito (1.2M; estimateGas real 1.107.928, custo ~$0,03) — contorna a falha de estimativa do Phantom (-32603 'Unexpected error' no eth_sendTransaction que travou o registro em 08/out) + Plano B na propria pagina: link BaseScan #writeContract e botao 'copiar agentURI'. | base: v48.18.5-ONECLICK (pagina guiada de registro ERC-8004, data URI imutavel registration-v1, agentId lido do evento Transfer; ZERO chaves no servidor)
 VERSION = "48.24.0-PROBEHARVEST"  # v48.24.0-PROBEHARVEST: trafego de maquina vira produto — /x402-watch (watch 30d em endpoint x402 alheio, $0.05, webhook em mudanca de estado/preco), /account (portal do pagante sem senha: a lsk_ E a credencial), /.well-known/demand-teaser.json (amostra gratis 1h que anuncia o /ecosystem-pulse), preview pay-ready (pay_link + quickstart em TODA amostra; avaliador 50+/dia recebe OFERTA, nunca bloqueio — veredito v44.3.0), ledger_prune_loop (probes/challenges >8d fora, 6h/6h — tabela emagrece ~270MB/mes sem perder metrica) | base: v48.23.0-FORKSAFE
+VERSION = "48.25.0-GLOBAL"  # v48.25.0-GLOBAL: des-regionalizacao — rail Pix DESLIGADO por padrao (PIX_RAIL=1 reativa; agentes pagam USDC; o email do recebedor saiu do codigo), concierge BR sem oferta Pix, chip Pix fora da landing. Compliance: triagem OFAC do pagador ANTES do settle (listas 0xB10C/SDN, refresh 24h, cache /data; hit EVM = 402 sem settle; hit pos-settle nos demais rails = alerta Telegram) — resposta a designacao da rede A7 (OFAC 01/out/2026). Storage: prune + wal_checkpoint(TRUNCATE) e VACUUM semanal com guarda de disco (resolve o alerta de 88% do volume Railway — DELETE sem VACUUM nao devolve espaco). Radar: scanners de credencial (.npmrc, aws-exports, runtime-config, index.js) rotulados como ruido, nao "produto novo". Novo: /api/admin/storage (DASH_TOKEN). | base: v48.24.0-PROBEHARVEST
 
 
 if __name__ == "__main__":
