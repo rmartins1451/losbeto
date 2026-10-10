@@ -8740,7 +8740,7 @@ def paid_endpoint(path):
                         "fresh_version": {"endpoint": path,
                             "price_usd": f"{get_dynamic_price(path):.3f}",
                             "how": "same URL without preview=1, pay via x402"},
-                        "note": "Delayed sample (Bloomberg model). Pay for real-time."})
+                        "note": "Delayed sample (Bloomberg model). Pay for real-time.", "pay_ready": _preview_payready(path, ip)})
                 # v24.5: NUNCA devolver "warming_up" para um avaliador — era a
                 # própria fricção que o preview existe para matar. Se não há
                 # cache, gera agora (sem pagamento), serve e guarda.
@@ -8784,7 +8784,7 @@ def paid_endpoint(path):
                             "fresh_version": {"endpoint": path,
                                 "price_usd": f"{get_dynamic_price(path):.3f}",
                                 "how": "same URL without preview=1, pay via x402"},
-                            "note": "Free sample generated on demand. Pay for real-time."})
+                            "note": "Free sample generated on demand. Pay for real-time.", "pay_ready": _preview_payready(path, ip)})
                 except Exception as e:
                     log.debug(f"preview on-demand {path}: {e}")
                 return jsonify({"preview": True, "status": "warming_up",
@@ -25245,6 +25245,10 @@ def _start_background_once():
                          name="v27-discovery-ping").start()
         threading.Thread(target=demand_autofulfill_loop, daemon=True,
                          name="v4795-radar").start()
+        threading.Thread(target=ledger_prune_loop, daemon=True,
+                         name="v4824-prune").start()
+        threading.Thread(target=x402_watch_loop, daemon=True,
+                         name="v4824-watch").start()
     except Exception as _e:
         log.warning(f"v48.23 loops extras: {_e}")
     log.info("✅ Autopilot: loops de background ativos neste worker")
@@ -29315,6 +29319,376 @@ log.info(f"🇧🇷 v47: {len(_V47_PRODUCTS)} primitivos brasileiros registrados
 
 
 # ============================================================================
+# v48.24.0-PROBEHARVEST — o tráfego de máquina vira produto e o funil vira
+# receita. Seis componentes:
+# 1) /x402-watch (pago $0.05): watch de 30 dias em QUALQUER endpoint x402 —
+#    mede agora (up/down, latência, 402, preço) e re-checa a cada 30 min;
+#    mudança de estado ou de preço dispara POST no webhook do comprador.
+#    Cliente-alvo: outros vendedores x402 vigiando a própria vitrine.
+# 2) /x402-watch-status (grátis): pull de estado pela capability URL.
+# 3) /account (grátis): portal do pagante SEM SENHA — a api_key lsk_ É a
+#    credencial (modelo OpenAI). Saldo/plano/uso/validade + top-up. Senha
+#    seria anti-padrão para comércio de máquinas e superfície de ataque.
+# 4) /.well-known/demand-teaser.json (grátis): top-3 da demanda de máquina
+#    (cache 1h) — a amostra que anuncia o /ecosystem-pulse pago. Probes já
+#    gravados são colhidos aqui em vez de apodrecer no SQLite.
+# 5) Preview pay-ready: toda amostra grátis carrega pay_link + quickstart;
+#    avaliador pesado (50+ previews/dia no MESMO endpoint) recebe oferta de
+#    créditos — NUNCA bloqueio. Veredito v44.3.0 é lei: o A/B provou que
+#    paywall de preview mata o funil (5 avaliadores/24h).
+# 6) ledger_prune_loop: probes/challenges com >8 dias são apagados (6h/6h).
+#    61k probes/dia inchavam a tabela; previews e vendas são eternos e o
+#    dashboard não perde nada (janelas dele são 24h/7d).
+# ============================================================================
+
+_WATCH_MAX = 300
+
+def _watch_db(c):
+    c.execute("""CREATE TABLE IF NOT EXISTS watches(
+        id TEXT PRIMARY KEY, url TEXT, webhook TEXT, buyer TEXT,
+        created INTEGER, expires INTEGER, last_status INTEGER,
+        last_price TEXT, last_check INTEGER, alerts INTEGER DEFAULT 0)""")
+
+def _watch_url_ok(url: str) -> bool:
+    """Guard SSRF: só http/https público — nada de localhost/RFC1918/metadata."""
+    try:
+        from urllib.parse import urlparse
+        u = urlparse(url)
+        if u.scheme not in ("http", "https"):
+            return False
+        h = (u.hostname or "").lower()
+        if not h or h == "localhost":
+            return False
+        if re.match(r"^(127\.|10\.|192\.168\.|169\.254\.|172\.(1[6-9]|2[0-9]|3[01])\.|0\.)", h):
+            return False
+        if h.endswith((".internal", ".local", ".localhost")):
+            return False
+        return True
+    except Exception:
+        return False
+
+def _watch_measure(url: str) -> dict:
+    t0 = time.time()
+    try:
+        r = requests.get(url, timeout=8, allow_redirects=True,
+                         headers={"User-Agent": "losbeto-x402-watch/1.0 (+https://api.losbeto.xyz)"})
+        lat = int((time.time() - t0) * 1000)
+        price = None
+        if r.status_code == 402:
+            try:
+                j = r.json()
+                acc = j.get("accepts") or []
+                if acc and isinstance(acc, list):
+                    amt = acc[0].get("maxAmountRequired") or acc[0].get("amount")
+                    if amt:
+                        price = f"{int(amt) / 1e6:.4f}"
+            except Exception:
+                pass
+        return {"up": r.status_code < 500, "http": r.status_code,
+                "latency_ms": lat, "is_x402": r.status_code == 402,
+                "price_usdc": price}
+    except Exception as e:
+        return {"up": False, "http": 0,
+                "latency_ms": int((time.time() - t0) * 1000),
+                "is_x402": False, "price_usdc": None, "error": str(e)[:140]}
+
+def _watch_status_payload(wid: str):
+    try:
+        with LEDGER._conn() as c:
+            _watch_db(c)
+            r = c.execute("SELECT url,created,expires,last_status,last_price,"
+                          "last_check,alerts FROM watches WHERE id=?",
+                          (wid,)).fetchone()
+    except Exception as e:
+        return {"error": f"watch db: {e}"}, 500
+    if not r:
+        return {"error": "unknown watch_id"}, 404
+    return {"watch_id": wid, "url": r[0], "created": r[1], "expires": r[2],
+            "last_http": r[3], "last_price_usdc": r[4] or None,
+            "last_check": r[5], "alerts_sent": r[6],
+            "days_left": max(0, round((r[2] - time.time()) / 86400, 1))}, 200
+
+@app.route("/x402-watch-status")
+def x402_watch_status():
+    wid = (request.args.get("id") or "").strip()
+    if not wid:
+        return jsonify({"error": "pass ?id=w_..."}), 400
+    payload, code = _watch_status_payload(wid)
+    return jsonify(payload), code
+
+def _h_x402_watch():
+    url = (request.args.get("url") or "").strip()
+    if not url or not _watch_url_ok(url):
+        return {"error": "pass ?url=https://... (public http/https). Optional: "
+                         "&webhook=https://... for state/price change alerts."}
+    webhook = (request.args.get("webhook") or "").strip()
+    if webhook and not _watch_url_ok(webhook):
+        return {"error": "webhook must be a public http/https URL"}
+    m = _watch_measure(url)
+    # v48.24: em modo preview (amostra grátis gerada pelo paid_endpoint),
+    # entrega SÓ a medição — o watch de 30 dias exige pagamento.
+    if request.args.get("preview"):
+        return {"preview_demo": True, "measured_now": m,
+                "note": ("Free sample = one measurement. The paid product "
+                         "pins a 30-day watch: re-checks every 30 min, "
+                         "webhook alerts on state/price change.")}
+    wid = "w_" + secrets.token_urlsafe(9)
+    now = int(time.time())
+    try:
+        with LEDGER.lock, LEDGER._conn() as c:
+            _watch_db(c)
+            n = c.execute("SELECT COUNT(*) FROM watches WHERE expires>?",
+                          (now,)).fetchone()[0]
+            if n >= _WATCH_MAX:
+                return {"error": "watch capacity reached — try again later",
+                        "measured_now": m}
+            c.execute("INSERT INTO watches VALUES(?,?,?,?,?,?,?,?,?,0)",
+                      (wid, url, webhook, "", now, now + 30 * 86400,
+                       m.get("http"), str(m.get("price_usdc") or ""), now))
+    except Exception as e:
+        return {"error": f"watch register: {e}", "measured_now": m}
+    return {"watch_id": wid, "url": url, "measured_now": m,
+            "watch": {"days": 30, "interval_min": 30,
+                      "alerts": ("webhook POST on up/down or price change"
+                                 if webhook else
+                                 "pull-only: use the status_url below (free)"),
+                      "status_url": f"{_public_base()}/x402-watch-status?id={wid}"},
+            "version": VERSION}
+
+def x402_watch_loop():
+    """v48.24: re-checa alvos a cada 30 min; mudança de estado/preço dispara
+    o webhook do comprador. Roda só no dono do flock (1 processo)."""
+    time.sleep(120)
+    while True:
+        try:
+            now = int(time.time())
+            with LEDGER.lock, LEDGER._conn() as c:
+                _watch_db(c)
+                rows = c.execute("SELECT id,url,webhook,last_status,last_price "
+                                 "FROM watches WHERE expires>?", (now,)).fetchall()
+                c.execute("DELETE FROM watches WHERE expires<?",
+                          (now - 7 * 86400,))
+            for wid, url, webhook, st0, pr0 in rows:
+                try:
+                    m = _watch_measure(url)
+                    changed = ((m["up"] != (st0 is not None and st0 < 500))
+                               or (str(m.get("price_usdc") or "") != (pr0 or "")))
+                    with LEDGER.lock, LEDGER._conn() as c:
+                        c.execute("UPDATE watches SET last_status=?,last_price=?,"
+                                  "last_check=?,alerts=alerts+? WHERE id=?",
+                                  (m["http"], str(m.get("price_usdc") or ""),
+                                   now, 1 if changed else 0, wid))
+                    if changed:
+                        log.info(f"👁 x402-watch {wid}: {url[:70]} → http {m['http']} "
+                                 f"${m.get('price_usdc')}")
+                        if webhook:
+                            try:
+                                requests.post(webhook, timeout=6, json={
+                                    "watch_id": wid, "url": url, "now": m,
+                                    "ts": now, "by": "losbeto /x402-watch"})
+                            except Exception:
+                                pass
+                except Exception as e:
+                    log.debug(f"watch {wid}: {e}")
+                time.sleep(2)
+        except Exception as e:
+            log.warning(f"x402_watch_loop: {e}")
+        time.sleep(1800)
+
+# ── 5) preview pay-ready + nudge de avaliador pesado ────────────────────────
+def _preview_freq_24h(ip: str, path: str) -> int:
+    try:
+        with LEDGER._conn() as c:
+            return c.execute(
+                "SELECT COUNT(*) FROM requests WHERE ts>? AND kind='preview' "
+                "AND ip=? AND endpoint=?",
+                (int(time.time()) - 86400, ip, path)).fetchone()[0]
+    except Exception:
+        return 0
+
+def _preview_payready(path: str, ip: str) -> dict:
+    """Bloco anexado a TODA resposta de preview: a amostra grátis agora
+    aponta para o pagamento (1 clique) e, para avaliador pesado, oferece
+    créditos — sem NUNCA bloquear (veredito do A/B da v44.3.0)."""
+    base = _public_base()
+    out = {"pay_link": f"{base}/pay{path}",
+           "agent_quickstart": (f"1) GET {base}{path} → 402 com preço e "
+                                f"instruções; 2) pague e repita com o header "
+                                f"X-PAYMENT; 3) resposta fresca em ~1s."),
+           "buy_credits": f"{base}/buy-credits"}
+    try:
+        n = _preview_freq_24h(ip, path)
+        if n >= 50:
+            out["frequent_evaluator"] = {
+                "samples_today": n,
+                "note": (f"You sampled this endpoint {n} times in 24h. Heavy "
+                         "evaluators save with prepaid credits: one on-chain "
+                         "tx, then ~1ms calls via the X-API-Key header."),
+                "get_key": f"{base}/register",
+                "top_up": f"{base}/buy-credits"}
+    except Exception:
+        pass
+    return out
+
+# ── 6) poda do ledger: probes/challenges velhos fora, métricas intactas ─────
+def ledger_prune_loop():
+    """Apaga probes/challenges402 com >8 dias a cada 6h. Previews, settles e
+    vendas NUNCA são podados. O 'probes 24h' do dashboard e o '~64k probes/
+    day' do /ecosystem-pulse vivem da janela recente — continuam exatos."""
+    time.sleep(300)
+    while True:
+        try:
+            cutoff = int(time.time()) - 8 * 86400
+            with LEDGER.lock, LEDGER._conn() as c:
+                cur = c.execute("DELETE FROM requests WHERE ts<? AND "
+                                "(kind='probe' OR kind='challenge402' OR kind='')",
+                                (cutoff,))
+                n = cur.rowcount if cur.rowcount is not None else 0
+            if n:
+                log.info(f"🧹 ledger_prune: {n} probes/challenges >8d removidos")
+        except Exception as e:
+            log.warning(f"ledger_prune_loop: {e}")
+        time.sleep(6 * 3600)
+
+# ── 3) /account — portal do pagante sem senha ───────────────────────────────
+_ACCOUNT_PAGE = """<!doctype html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Losbeto — Account</title>
+<style>body{font-family:system-ui,sans-serif;background:#0b0e14;color:#e6e9ef;max-width:640px;margin:40px auto;padding:0 16px}
+.card{background:#151a23;border:1px solid #232a36;border-radius:12px;padding:20px;margin:14px 0}
+code{background:#0b0e14;padding:2px 6px;border-radius:6px}
+input{width:100%;padding:10px;border-radius:8px;border:1px solid #2a3342;background:#0b0e14;color:#e6e9ef;box-sizing:border-box}
+button{margin-top:10px;padding:10px 16px;border-radius:8px;border:0;background:#2f6fed;color:#fff;cursor:pointer}
+a{color:#6ea8fe}.small{color:#8b95a5;font-size:13px}</style></head><body>
+<h1>Losbeto Account</h1>
+<p class="small">No passwords. Your <code>lsk_</code> API key IS the credential
+(the same model as OpenAI keys). Whoever holds it, spends it — never share it.</p>
+<form method="get" action="/account">
+<input name="key" placeholder="lsk_..." value="__KEY__">
+<button type="submit">Open my account</button></form>
+__BODY__
+<p class="small">Top up: <a href="/buy-credits">/buy-credits</a> ·
+New key: <a href="/register">/register</a> ·
+Usage: send header <code>X-API-Key: lsk_...</code> on any paid endpoint —
+calls then cost from your balance instead of on-chain each time.</p>
+</body></html>"""
+
+def _esc(s) -> str:
+    return str(s).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+@app.route("/account")
+def account_page():
+    key = (request.args.get("key") or "").strip()
+    body = ""
+    safe_key = key if re.fullmatch(r"[A-Za-z0-9_\-]{0,80}", key or "") else ""
+    if key:
+        try:
+            row = LEDGER.api_key_get(key)
+        except Exception as e:
+            row = None
+            body = f'<div class="card">Lookup error: {_esc(e)[:120]}</div>'
+        if key and not row:
+            body = '<div class="card">Unknown key.</div>'
+        elif row:
+            bal = row.get("balance_usd")
+            bal_s = "unlimited" if (bal is None or bal < 0) else f"${bal:.4f}"
+            exp_ts = row.get("expires") or 0
+            expired = bool(exp_ts and int(time.time()) > exp_ts)
+            exp_s = (time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime(exp_ts))
+                     if exp_ts else "—")
+            status = "&#9888; expired — top up to reactivate" if expired else "&#9989; active"
+            body = (f'<div class="card"><h2>{status}</h2>'
+                    f'<p>Plan: <b>{_esc(row.get("plan", "prepaid"))}</b></p>'
+                    f'<p>Balance: <b>{bal_s}</b></p>'
+                    f'<p>Calls used: <b>{row.get("calls_used", 0)}</b></p>'
+                    f'<p>Expires: {exp_s}</p></div>')
+    page = _ACCOUNT_PAGE.replace("__KEY__", safe_key).replace("__BODY__", body)
+    return app.response_class(page, mimetype="text/html")
+
+# ── 4) demand-teaser — a amostra grátis que vende o /ecosystem-pulse ────────
+_TEASER_CACHE = {"ts": 0, "data": None}
+
+@app.route("/.well-known/demand-teaser.json")
+def demand_teaser():
+    now = time.time()
+    if _TEASER_CACHE["data"] and now - _TEASER_CACHE["ts"] < 3600:
+        return jsonify(_TEASER_CACHE["data"])
+    base = _public_base()
+    data = {"teaser": True, "generated": int(now),
+            "note": ("Free hourly sample of this node's machine-demand "
+                     "intelligence: what 60k+ probes/day are actually asking "
+                     "for. The full feed — top-25 endpoints, 7-day trends, "
+                     "agent-IP counts, demand clusters — is the paid "
+                     "endpoint below."),
+            "full_feed": {"endpoint": f"{base}/ecosystem-pulse",
+                          "price_usdc": "0.0500", "via": "x402"},
+            "version": VERSION}
+    try:
+        with LEDGER._conn() as c:
+            d1 = int(now) - 86400
+            d7 = int(now) - 7 * 86400
+            top = c.execute("SELECT endpoint, COUNT(*) n FROM requests "
+                            "WHERE ts>? AND kind IN ('probe','preview') "
+                            "GROUP BY endpoint ORDER BY n DESC LIMIT 3",
+                            (d1,)).fetchall()
+            par = c.execute("SELECT endpoint, params, COUNT(*) n FROM requests "
+                            "WHERE ts>? AND params<>'' "
+                            "GROUP BY endpoint, params ORDER BY n DESC LIMIT 3",
+                            (d7,)).fetchall()
+            tot = c.execute("SELECT COUNT(*) FROM requests WHERE ts>?",
+                            (d1,)).fetchone()[0]
+        data["most_probed_24h"] = [{"endpoint": e, "probes": n} for e, n in top]
+        data["most_requested_params_7d"] = [
+            {"endpoint": e, "params": (p or "")[:60], "requests": n}
+            for e, p, n in par]
+        data["total_requests_24h"] = tot
+    except Exception as e:
+        data["partial"] = str(e)[:80]
+    _TEASER_CACHE.update({"ts": now, "data": data})
+    return jsonify(data)
+
+# ── 1) registro do produto /x402-watch (padrão _V47_PRODUCTS) ───────────────
+ENDPOINT_REQUIRED_PARAMS["/x402-watch"] = {"url": "https://api.example.com/endpoint"}
+
+_V4824_PRODUCTS = {
+    "/x402-watch": (_h_x402_watch, 0.050,
+        "30-day watch on ANY x402 endpoint — yours or a competitor's. We "
+        "measure it immediately (up/down, latency, HTTP status, correct 402 "
+        "shape, current USDC price) and then re-check every 30 minutes for "
+        "30 days. State flips and price changes fire a JSON POST to your "
+        "?webhook=; pull current state anytime, free, via the returned "
+        "watch_id capability URL. Built for x402 sellers monitoring their "
+        "own storefronts and for agents watching a paid dependency before "
+        "routing money to it. First-party measurement from a live x402 "
+        "node that fields 60k+ machine probes/day.",
+        ["Analytics", "Monitoring", "x402", "Sellers", "Webhook"],
+        {"url": "https://api.example.com/endpoint",
+         "webhook": "https://agent.example/hook"}),
+}
+
+for _path, (_fn, _price, _desc, _tags, _hint) in _V4824_PRODUCTS.items():
+    BASE_PRICES[_path] = float(os.environ.get(
+        "PRICE_" + _path.strip("/").replace("-", "_").upper(), _price))
+    ENDPOINT_DESC[_path] = _desc
+    ENDPOINT_TAGS[_path] = _tags
+    ENDPOINT_PARAM_HINTS[_path] = _hint
+    ENDPOINT_HANDLERS[_path] = _fn
+    app.add_url_rule(_path, "v4824" + _path.replace("/", "_").replace("-", "_"),
+                     paid_endpoint(_path)(_fn))
+
+try:
+    for _p in reversed(list(_V4824_PRODUCTS)):
+        if _p in FEATURED_ENDPOINTS:
+            FEATURED_ENDPOINTS.remove(_p)
+        FEATURED_ENDPOINTS.insert(0, _p)
+except Exception as _e:
+    log.warning(f"v48.24 featured: {_e}")
+
+log.info(f"👁 v48.24-PROBEHARVEST: /x402-watch (${BASE_PRICES.get('/x402-watch', 0):.3f}), "
+         "/account, demand-teaser, preview pay-ready, ledger prune ativos")
+
+
+# ============================================================================
 # BLOCO P — A LATÊNCIA É UM PRODUTO, E AGORA É DECLARÁVEL
 # ============================================================================
 #
@@ -31786,6 +32160,7 @@ VERSION = "48.18.1-MERGE"  # v48.18.1-MERGE: 48.18.0-REGISTRY (Claude: painel or
 VERSION = "48.18.2-HOTFIX"  # v48.18.2-HOTFIX: fix CRITICO — o loop de registro da 48.18.0 usava `_ai` como variavel de desempacotamento do tuple e SOBRESCREVIA a funcao global _ai() (~l.9292) ao fim do import (ficava _ai=True); os 16 endpoints premium que chamam _ai()/_ai_required() 500avam com "'bool' object is not callable" (traceback real: analise l.3734 -> _ai_required l.9311). Renomeado p/ _uses_ai + assert callable(_ai) + del dos nomes do loop. | base: v48.18.1-MERGE
 VERSION = "48.18.3-PAYGUARD"  # v48.18.3-PAYGUARD: /pay nunca mais vende endpoint sem parametro obrigatorio — querystring da pagina segue para a chamada paga (carteira EIP-3009, Solana, cartao manual E o QR mobile) e, sem querystring, cartao pre-preenchido de ENDPOINT_REQUIRED_PARAMS bloqueia a assinatura com campo vazio. Mata o estorno pos-settle 400 do /br-doc (2x em 07/out, mesmo comprador).
 VERSION = "48.23.0-FORKSAFE"  # v48.23.0-FORKSAFE: BOOT SEM THREADS NO IMPORT — com --preload, ~25 threads nasciam no ARBITER (loops bg, v27, radar, PIT, warmers) e o fork herdava locks travados de threads inexistentes: 2 de 4 workers congelavam ~30s apos cada deploy e morriam em WORKER TIMEOUT 120s (00:03/00:18 de 09/out). Agora: (1) import 100% livre de threads; (2) post_fork_boot() novo — chamado pelo hook post_fork do gunicorn (gerado pelo start.sh v48.23) + fallback na 1a request (@app.before_request); (3) _start_background_once retorna o DONO do flock e absorve os loops v27 (cdp-seed, discovery-ping) e o radar demand_autofulfill (antes soltos no import, sem guard); (4) _v27_start_background vira banner-only com flag; (5) _ml_boot_warm volta a ser PER-WORKER com stagger 2-8s (a docstring sempre pediu isso, mas o flock fazia so 1 worker aquecer). Deploy junto com start.sh v48.23.0-FORKSAFE. | base: v48.22.0-MCPHEALTH  # v48.22.0-MCPHEALTH: (1) GET /mcp deixa de responder 405 para quem NAO pediu SSE — o 8004scan marcava o servico MCP UNHEALTHY (Health 66.7, status degraded). Agora: Accept com text/event-stream segue 405 spec-true; GET bare recebe 200 com descriptor vivo do servidor (nome/versao/5 meta-tools/instrucao de initialize) — que tambem entrega as "capabilities" que o scanner dizia faltar. (2) Selo x402lint da landing aponta p/ o relatorio publico direto (x402lint.dev/o/api.losbeto.xyz, A 98/100 re-scan pago 08/out 15:32 UTC). | base: v48.21.0-TRUSTSTACK  # v48.21.0-TRUSTSTACK: (1) FIX DOMAIN-VERIFICATION ERC-8004 — /.well-known/agent-registration.json estava SEM o campo registrations (a spec exige p/ provar dominio) e com "99 paid endpoints" congelado: o 8004scan lia Publisher 19 / Compliance 75. Agora registrations com agentId 87048 (env ERC8004_AGENT_ID com fallback) e contagem DINAMICA len(BASE_PRICES) — nunca mais desatualiza. erc8004.json ganha o mesmo fallback (identidade sobrevive a env perdida) e descricao atualizada. (2) LANDING: faixa "Listed & verified" com 7 selos clicaveis de prova publica (8004scan, x402lint A 98/100, x402scan, x402-list, MCP Registry, PyPI, npm) + rodape copyright (c 2026 Losbeto sobre o protocolo aberto x402, sem texto LF) + tabela machine-readable ganha as 2 linhas ERC-8004. | base: v48.20.0-STOREFRONT  # v48.20: STOREFRONT — landing ganha (1) rails strip com logos SVG inline (USDC/Base/Polygon/Solana/Algorand/Pix, zero requests externos), (2) badge ERC-8004 #87048 verificavel no hero, (3) ticker CSS-only com os endpoints de $0.001, (4) vitrine 'Base chain intelligence' com os 7 endpoints da v48.19 (1a secao de produto, visivel nas 2 abas), (5) _price_label com 3 casas p/ precos < $0.01 (o .2f imprimiria $0.00), (6) aba Agent com 4 chains + 5 meta-tools | /erc8004 DEIXA DE SER FERRAMENTA E VIRA PROVA: pagina de identidade com agentId 87048 + tx 0x694b13bd…d0061e + links de verificacao (o registro JA EXISTIA desde 15/set — o -32603 do Phantom e pre-simulacao, nao gas; registrador recolhido p/ <details> avancado) | base: v48.19.0-AGUA  # v48.18.6-ONECLICK: /erc8004 com gasLimit explicito (1.2M; estimateGas real 1.107.928, custo ~$0,03) — contorna a falha de estimativa do Phantom (-32603 'Unexpected error' no eth_sendTransaction que travou o registro em 08/out) + Plano B na propria pagina: link BaseScan #writeContract e botao 'copiar agentURI'. | base: v48.18.5-ONECLICK (pagina guiada de registro ERC-8004, data URI imutavel registration-v1, agentId lido do evento Transfer; ZERO chaves no servidor)
+VERSION = "48.24.0-PROBEHARVEST"  # v48.24.0-PROBEHARVEST: trafego de maquina vira produto — /x402-watch (watch 30d em endpoint x402 alheio, $0.05, webhook em mudanca de estado/preco), /account (portal do pagante sem senha: a lsk_ E a credencial), /.well-known/demand-teaser.json (amostra gratis 1h que anuncia o /ecosystem-pulse), preview pay-ready (pay_link + quickstart em TODA amostra; avaliador 50+/dia recebe OFERTA, nunca bloqueio — veredito v44.3.0), ledger_prune_loop (probes/challenges >8d fora, 6h/6h — tabela emagrece ~270MB/mes sem perder metrica) | base: v48.23.0-FORKSAFE
 
 
 if __name__ == "__main__":
