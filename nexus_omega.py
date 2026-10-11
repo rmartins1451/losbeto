@@ -6283,6 +6283,24 @@ ENDPOINT_REQUIRED_PARAMS = {
     "/agent-call": {"task": "fear and greed index"},
 }
 
+# v48.26.0-PREFLIGHT: paridade /pay ↔ API — o checkout pré-preenche (e o JS
+# bloqueia vazio) os mesmos obrigatórios que o preflight pré-402 agora valida
+# de graça. Todos os exemplos são FUNCIONAIS (pagou sem editar → 200): o BR
+# Code abaixo é o mesmo que os indexadores usam mensalmente com sucesso.
+ENDPOINT_REQUIRED_PARAMS.update({
+    "/chain-tx":       {"hash": "0x694b13bd5dbe6a373272b4beebc10d434ebed396e335338ba9fc5e5ba5d0061e"},
+    "/chain-balance":  {"address": "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045"},
+    "/wallet-verdict": {"address": "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045"},
+    "/chain-ens":      {"name": "vitalik.eth"},
+    "/br-asof":        {"series": "selic_meta_pct", "date": "2026-08-05"},
+    "/br-pix-parse":   {"code": ("00020101021226370014br.gov.bcb.pix0115"
+                                 "pix@losbeto.xyz52040000530398654040.105802BR"
+                                 "5907LOSBETO6012PORTO ALEGRE62110507INDEXAR"
+                                 "630462C0")},
+    "/br-pix-code":    {"key": "pix@losbeto.xyz", "name": "LOSBETO",
+                        "city": "PORTO ALEGRE", "amount": "0.10"},
+})
+
 # v48.18.4-VITRINE: endpoints com parâmetro FUNCIONAL que ainda caíam no
 # fallback {"format": "json"} — o Bazaar indexava um schema que não ensina o
 # agente a montar a chamada (CDP: "sem schemas explícitos, agentes descobrem
@@ -8462,28 +8480,117 @@ _PARAM_RULES = {
     },
 }
 
+# v48.26.0-PREFLIGHT — parâmetro obrigatório AUSENTE é erro do CLIENTE:
+# 400 didático e GRATUITO antes de qualquer 402, nunca erro pago pós-settle.
+# A classe "pagou → handler 400 → estorno em crédito" nasceu aqui — prova em
+# produção: /chain-tx sem ?hash= pago 3× em 10/out ($0.006 estornado em
+# crédito; o checkout /pay já era coberto pelo PAYGUARD v48.18.3, a API crua
+# não). Cada entrada é uma lista de GRUPOS any-of: o grupo passa quando PELO
+# MENOS um alias vem presente e válido (regex, ou simplesmente não-vazio);
+# TODOS os grupos precisam passar. Só entram endpoints SEM default
+# inteligente — quem tem default (padrão v21.11, ex.: /wallet-scan usa a
+# carteira do pagador) segue servindo o exemplo. POST/JSON-body (/classify,
+# /summarize) ficam fora de propósito: request.args é vazio neles.
+_PARAM_REQUIRED = {
+    "/chain-tx": [[("hash", r"^0x[0-9a-fA-F]{64}$",
+                    "0x694b13bd5dbe6a373272b4beebc10d434ebed396e335338ba9fc5e5ba5d0061e")]],
+    "/chain-balance": [[("address", r"^0x[0-9a-fA-F]{40}$",
+                         "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045")]],
+    "/wallet-verdict": [[("address", r"^0x[0-9a-fA-F]{40}$",
+                          "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045")]],
+    "/chain-ens": [[("name", r"^[A-Za-z0-9]([A-Za-z0-9._-]*\.[A-Za-z]{2,})$",
+                     "vitalik.eth"),
+                    ("address", r"^0x[0-9a-fA-F]{40}$",
+                     "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045")]],
+    "/br-doc": [[("doc", r"^[0-9./-]{11,18}$", "00.000.000/0001-91"),
+                 ("value", r"^[0-9./-]{11,18}$", "00.000.000/0001-91")]],
+    "/br-cnpj": [[("cnpj", r"^[0-9./-]{14,18}$", "00.000.000/0001-91"),
+                  ("doc", r"^[0-9./-]{14,18}$", "00.000.000/0001-91")]],
+    "/br-cep": [[("cep", r"^[0-9][0-9-]{7,8}$", "01310100")]],
+    "/br-pix-parse": [[("code", r"^00020[12]",
+                        "00020101021226370014br.gov.bcb.pix0115pix@losbeto.xyz"
+                        "52040000530398654040.105802BR5907LOSBETO6012PORTO ALEGRE"
+                        "62110507INDEXAR630462C0"),
+                       ("brcode", r"^00020[12]",
+                        "00020101021226370014br.gov.bcb.pix0115pix@losbeto.xyz"
+                        "52040000530398654040.105802BR5907LOSBETO6012PORTO ALEGRE"
+                        "62110507INDEXAR630462C0")]],
+    "/br-pix-code": [[("key", None, "pix@losbeto.xyz")]],
+    "/br-asof": [[("date", r"^\d{4}-\d{2}-\d{2}$", "2026-08-05"),
+                  ("asof", r"^\d{4}-\d{2}-\d{2}$", "2026-08-05")]],
+    "/x402-watch": [[("url", r"^https?://", "https://api.example.com/endpoint")]],
+    "/agent-call": [[("task", None, "fear and greed index"),
+                     ("skill", None, "fear and greed index"),
+                     ("endpoint", r"^/?[a-z0-9][a-z0-9/-]*$", "/fear-greed"),
+                     ("target", None, "https://peer.example.com")]],
+}
+
 def _preflight_param_check(path: str):
     """Roda ANTES de qualquer 402 ou verificação de pagamento."""
-    rule = _PARAM_RULES.get(path)
-    if not rule:
-        return None
-    raw = request.args.get(rule["param"])
-    if raw is None or raw == "":
-        return None                      # ausente → handler aplica o default
-    if re.match(rule["pattern"], raw.strip().upper()):
-        return None
     base = _public_base()
-    return ({"error": "invalid_param",
-             "param": rule["param"],
-             "received": raw[:32],
-             "valid_examples": rule["examples"],
-             "how_to_call": f"GET {base}{path}?{rule['param']}={rule['examples'][0]}",
-             "free_preview": f"{base}{path}?preview=1",
-             "charged": False,
-             "note": ("No payment challenge was issued. Fix the parameter and "
-                      f"retry — this call costs ${get_dynamic_price(path):.3f} "
-                      "once the parameter is valid."),
-             "ts": int(time.time())}, 400)
+    rule = _PARAM_RULES.get(path)
+    if rule:
+        raw = request.args.get(rule["param"])
+        # ausente → handler aplica o default; presente → valida o formato
+        if not (raw is None or raw == ""):
+            if not re.match(rule["pattern"], raw.strip().upper()):
+                return ({"error": "invalid_param",
+                         "param": rule["param"],
+                         "received": raw[:32],
+                         "valid_examples": rule["examples"],
+                         "how_to_call": f"GET {base}{path}?{rule['param']}={rule['examples'][0]}",
+                         "free_preview": f"{base}{path}?preview=1",
+                         "charged": False,
+                         "note": ("No payment challenge was issued. Fix the parameter and "
+                                  f"retry — this call costs ${get_dynamic_price(path):.3f} "
+                                  "once the parameter is valid."),
+                         "ts": int(time.time())}, 400)
+    # v48.26.0-PREFLIGHT: obrigatórios ausentes/malformados → 400 grátis.
+    groups = _PARAM_REQUIRED.get(path)
+    if not groups:
+        return None
+    for group in groups:
+        seen_invalid = None
+        ok = False
+        for name, pat, ex in group:
+            raw = request.args.get(name)
+            if raw is None or raw.strip() == "":
+                continue
+            val = raw.strip()
+            if pat is None or re.match(pat, val):
+                ok = True
+                break
+            if seen_invalid is None:
+                seen_invalid = (name, val, ex)
+        if ok:
+            continue
+        if seen_invalid:
+            name, val, ex = seen_invalid
+            return ({"error": "invalid_param",
+                     "param": name,
+                     "received": val[:48],
+                     "valid_examples": [ex],
+                     "how_to_call": f"GET {base}{path}?{name}={ex}",
+                     "free_preview": f"{base}{path}?preview=1",
+                     "charged": False,
+                     "note": ("No payment challenge was issued. Fix the parameter and "
+                              f"retry — this call costs ${get_dynamic_price(path):.3f} "
+                              "once the parameter is valid."),
+                     "ts": int(time.time())}, 400)
+        names = [g[0] for g in group]
+        return ({"error": "missing_param",
+                 "params": names,
+                 "any_of": len(names) > 1,
+                 "valid_examples": {g[0]: g[2] for g in group if g[2]},
+                 "how_to_call": f"GET {base}{path}?{names[0]}={group[0][2]}",
+                 "free_preview": f"{base}{path}?preview=1",
+                 "charged": False,
+                 "note": ("No payment challenge was issued — this endpoint requires "
+                          "the parameter(s) above (one per group). Add it and the "
+                          f"402 challenge comes next (${get_dynamic_price(path):.3f}). "
+                          "You were not charged."),
+                 "ts": int(time.time())}, 400)
+    return None
 
 
 def _preflight_unavailable(path: str):
@@ -16990,6 +17097,12 @@ _SCAN_NOISE = re.compile(
     # dependência vulnerável, chave vazada e formulário de login, não cliente.
     r"(^|/)vendor/|composer\.(json|lock)$|installed\.json$|node_modules|"
     r"(^|/)(keys?|keystore|mnemonic|seed|wallet)s?\.json$|"
+    # v48.26.0: radar de 10-11/out — sondas de credencial de toolchains
+    # devops/IA (.s3cfg, .boto, .amplifyrc, .claude/settings.local.json) e
+    # asset de framework JS (/user/umi.min.js, 6 IPs/7d) classificados como
+    # "produto novo". Nenhum produto real deste nó termina em .min.js nem
+    # vive em diretório de configuração de ferramenta.
+    r"\.s3cfg$|\.boto$|\.amplifyrc$|(^|/)\.claude(/|$)|(^|/)[^/]*\.min\.js$|"
     r"(^|/)auth/(login|signin|register|token)$|package(-lock)?\.json$)", re.I)
 
 def _is_scan_noise(path: str) -> bool:
@@ -17240,6 +17353,33 @@ def _ml_if_load():
             log.warning(f"🧠 ML anomalias load: {e}")
 
 
+def _ml_hour_house_only(hour_epoch: int = 0) -> bool:
+    """v48.26.0: True quando TODO pagador identificado da hora fechada é
+    carteira da casa. Usa a MESMA definição de 'casa' do classify_payer
+    (_self_pay_wallets + pagadores de varredura de catálogo), para a rodada
+    mensal dos indexadores parar de acordar o operador — caso real: 10/out
+    22h, 210 vendas / $14.35 / 3 pagadores, todos nossos, Telegram disparou
+    como 'buyer'. Hora sem pagador identificado → False (não prova nada)."""
+    try:
+        h = hour_epoch or (int(time.time()) // 3600 - 1) * 3600
+        with LEDGER._conn() as c:
+            rows = [r[0] for r in c.execute(
+                "SELECT DISTINCT payer FROM revenue WHERE ts>=? AND ts<? "
+                "AND payer IS NOT NULL AND payer != ''",
+                (h, h + 3600)).fetchall()]
+        if not rows:
+            return False
+        house = {str(w).lower() for w in _self_pay_wallets()}
+        try:
+            house |= {str(p).lower() for p in _sweep_payers_cached()}
+        except Exception:
+            pass
+        return {str(p).lower() for p in rows if p} <= house
+    except Exception as e:
+        log.debug(f"🧠 ML house-check: {e}")
+        return False
+
+
 def _ml_score_current_hour() -> dict:
     """Pontua a ultima hora COMPLETA; anomalia -> log + arquivo + Telegram (1/6h)."""
     if not _ML_SK:
@@ -17270,6 +17410,12 @@ def _ml_score_current_hour() -> dict:
             # regime novo de trafego. So comportamento de COMPRADOR/receita
             # acorda o operador no Telegram (fim do apito de hora em hora).
             sev = "buyer" if (cur[2] > 0 or cur[3] > 0 or cur[4] > 0) else "volume"
+            # v48.26.0-PREFLIGHT: anomalia em que TODO pagador da hora é da
+            # casa (rodada mensal dos indexadores / teste do operador) vira
+            # 'house' — registrada em log/arquivo, nunca Telegram. Misto
+            # (casa + externo) segue 'buyer' e alerta normal.
+            if sev == "buyer" and _ml_hour_house_only():
+                sev = "house"
             out["severity"] = sev
             hist.append({"ts": int(time.time()), **out})
             _ML_ANOM_FILE.write_text(json.dumps(hist[-50:]))
@@ -29932,7 +30078,7 @@ def admin_storage():
                                   if _OFAC_PAYER_CACHE["ts"] else None}
     return jsonify(out)
 
-log.info(f"🛡 v48.25.3-ATACACHE: sol_dest_ata disco/stale + RPCs vivos · netrc pré-import · feePayer disco 24h · Pix rail OFF · OFAC pré/pós-settle · VACUUM semanal · /api/admin/storage")
+log.info(f"🛡 v48.26.0-PREFLIGHT: preflight pré-402 universal (12 endpoints) · /pay parity · scan-noise devops/IA · anomalia house-aware · sol_dest_ata disco/stale · netrc pré-import · feePayer disco 24h · OFAC pré/pós-settle")
 
 
 # ============================================================================
@@ -32413,7 +32559,7 @@ VERSION = "48.18.3-PAYGUARD"  # v48.18.3-PAYGUARD: /pay nunca mais vende endpoin
 VERSION = "48.23.0-FORKSAFE"  # v48.23.0-FORKSAFE: BOOT SEM THREADS NO IMPORT — com --preload, ~25 threads nasciam no ARBITER (loops bg, v27, radar, PIT, warmers) e o fork herdava locks travados de threads inexistentes: 2 de 4 workers congelavam ~30s apos cada deploy e morriam em WORKER TIMEOUT 120s (00:03/00:18 de 09/out). Agora: (1) import 100% livre de threads; (2) post_fork_boot() novo — chamado pelo hook post_fork do gunicorn (gerado pelo start.sh v48.23) + fallback na 1a request (@app.before_request); (3) _start_background_once retorna o DONO do flock e absorve os loops v27 (cdp-seed, discovery-ping) e o radar demand_autofulfill (antes soltos no import, sem guard); (4) _v27_start_background vira banner-only com flag; (5) _ml_boot_warm volta a ser PER-WORKER com stagger 2-8s (a docstring sempre pediu isso, mas o flock fazia so 1 worker aquecer). Deploy junto com start.sh v48.23.0-FORKSAFE. | base: v48.22.0-MCPHEALTH  # v48.22.0-MCPHEALTH: (1) GET /mcp deixa de responder 405 para quem NAO pediu SSE — o 8004scan marcava o servico MCP UNHEALTHY (Health 66.7, status degraded). Agora: Accept com text/event-stream segue 405 spec-true; GET bare recebe 200 com descriptor vivo do servidor (nome/versao/5 meta-tools/instrucao de initialize) — que tambem entrega as "capabilities" que o scanner dizia faltar. (2) Selo x402lint da landing aponta p/ o relatorio publico direto (x402lint.dev/o/api.losbeto.xyz, A 98/100 re-scan pago 08/out 15:32 UTC). | base: v48.21.0-TRUSTSTACK  # v48.21.0-TRUSTSTACK: (1) FIX DOMAIN-VERIFICATION ERC-8004 — /.well-known/agent-registration.json estava SEM o campo registrations (a spec exige p/ provar dominio) e com "99 paid endpoints" congelado: o 8004scan lia Publisher 19 / Compliance 75. Agora registrations com agentId 87048 (env ERC8004_AGENT_ID com fallback) e contagem DINAMICA len(BASE_PRICES) — nunca mais desatualiza. erc8004.json ganha o mesmo fallback (identidade sobrevive a env perdida) e descricao atualizada. (2) LANDING: faixa "Listed & verified" com 7 selos clicaveis de prova publica (8004scan, x402lint A 98/100, x402scan, x402-list, MCP Registry, PyPI, npm) + rodape copyright (c 2026 Losbeto sobre o protocolo aberto x402, sem texto LF) + tabela machine-readable ganha as 2 linhas ERC-8004. | base: v48.20.0-STOREFRONT  # v48.20: STOREFRONT — landing ganha (1) rails strip com logos SVG inline (USDC/Base/Polygon/Solana/Algorand/Pix, zero requests externos), (2) badge ERC-8004 #87048 verificavel no hero, (3) ticker CSS-only com os endpoints de $0.001, (4) vitrine 'Base chain intelligence' com os 7 endpoints da v48.19 (1a secao de produto, visivel nas 2 abas), (5) _price_label com 3 casas p/ precos < $0.01 (o .2f imprimiria $0.00), (6) aba Agent com 4 chains + 5 meta-tools | /erc8004 DEIXA DE SER FERRAMENTA E VIRA PROVA: pagina de identidade com agentId 87048 + tx 0x694b13bd…d0061e + links de verificacao (o registro JA EXISTIA desde 15/set — o -32603 do Phantom e pre-simulacao, nao gas; registrador recolhido p/ <details> avancado) | base: v48.19.0-AGUA  # v48.18.6-ONECLICK: /erc8004 com gasLimit explicito (1.2M; estimateGas real 1.107.928, custo ~$0,03) — contorna a falha de estimativa do Phantom (-32603 'Unexpected error' no eth_sendTransaction que travou o registro em 08/out) + Plano B na propria pagina: link BaseScan #writeContract e botao 'copiar agentURI'. | base: v48.18.5-ONECLICK (pagina guiada de registro ERC-8004, data URI imutavel registration-v1, agentId lido do evento Transfer; ZERO chaves no servidor)
 VERSION = "48.24.0-PROBEHARVEST"  # v48.24.0-PROBEHARVEST: trafego de maquina vira produto — /x402-watch (watch 30d em endpoint x402 alheio, $0.05, webhook em mudanca de estado/preco), /account (portal do pagante sem senha: a lsk_ E a credencial), /.well-known/demand-teaser.json (amostra gratis 1h que anuncia o /ecosystem-pulse), preview pay-ready (pay_link + quickstart em TODA amostra; avaliador 50+/dia recebe OFERTA, nunca bloqueio — veredito v44.3.0), ledger_prune_loop (probes/challenges >8d fora, 6h/6h — tabela emagrece ~270MB/mes sem perder metrica) | base: v48.23.0-FORKSAFE
 VERSION = "48.25.0-GLOBAL"  # v48.25.0-GLOBAL: des-regionalizacao — rail Pix DESLIGADO por padrao (PIX_RAIL=1 reativa; agentes pagam USDC; o email do recebedor saiu do codigo), concierge BR sem oferta Pix, chip Pix fora da landing. Compliance: triagem OFAC do pagador ANTES do settle (listas 0xB10C/SDN, refresh 24h, cache /data; hit EVM = 402 sem settle; hit pos-settle nos demais rails = alerta Telegram) — resposta a designacao da rede A7 (OFAC 01/out/2026). Storage: prune + wal_checkpoint(TRUNCATE) e VACUUM semanal com guarda de disco (resolve o alerta de 88% do volume Railway — DELETE sem VACUUM nao devolve espaco). Radar: scanners de credencial (.npmrc, aws-exports, runtime-config, index.js) rotulados como ruido, nao "produto novo". Novo: /api/admin/storage (DASH_TOKEN). | base: v48.24.0-PROBEHARVEST
-VERSION = "48.25.3-ATACACHE"  # v48.25.3: sol_dest_ata com cache em disco (stale honesto + stale_age_s) e lista de RPCs vivos (drpc fora, onfinality dentro) — fim do balance:null persistente no health
+VERSION = "48.26.0-PREFLIGHT"  # v48.26.0-PREFLIGHT: (1) preflight pré-402 UNIVERSAL — parâmetro obrigatório ausente/malformado vira 400 didático GRÁTIS antes de qualquer cobrança em 12 endpoints sem default (/chain-tx /chain-balance /wallet-verdict /chain-ens /br-doc /br-cnpj /br-cep /br-pix-parse /br-pix-code /br-asof /x402-watch /agent-call; grupos any-of com aliases doc/value, code/brcode, date/asof, task/skill/endpoint/target) — mata a classe "pagou → 400 → estorno em crédito" na API crua (prova: /chain-tx sem hash pago 3× em 10/out); /pay ganha os mesmos obrigatórios pré-preenchidos funcionais (PAYGUARD parity); POST/JSON-body fora de propósito. (2) _SCAN_NOISE += sondas devops/IA (.s3cfg .boto .amplifyrc .claude) e assets .min.js (/user/umi.min.js) — fim do "produto novo" falso no radar. (3) Anomalia ML house-aware: hora em que TODO pagador é carteira da casa (rodada mensal dos indexadores) vira severidade 'house' — log/arquivo, nunca Telegram. | base: v48.25.3-ATACACHE
 
 
 if __name__ == "__main__":
