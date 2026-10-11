@@ -8525,8 +8525,11 @@ _PARAM_REQUIRED = {
                      ("target", None, "https://peer.example.com")]],
 }
 
-def _preflight_param_check(path: str):
-    """Roda ANTES de qualquer 402 ou verificação de pagamento."""
+def _preflight_param_check(path: str, check_required: bool = False):
+    """Roda ANTES de qualquer 402 ou verificação de pagamento.
+    check_required=True habilita a barreira de obrigatórios ausentes —
+    SÓ usada quando há pagamento x402 anexado e ainda não liquidado
+    (v48.26.1-DISCOVERY)."""
     base = _public_base()
     rule = _PARAM_RULES.get(path)
     if rule:
@@ -8546,6 +8549,16 @@ def _preflight_param_check(path: str):
                                   "once the parameter is valid."),
                          "ts": int(time.time())}, 400)
     # v48.26.0-PREFLIGHT: obrigatórios ausentes/malformados → 400 grátis.
+    # v48.26.1-DISCOVERY: a barreira de obrigatórios NÃO vale para probe nu.
+    # Sem payment header, a ausência de parâmetro cai no 402 normal — é o
+    # contrato de descoberta do ecossistema (Bazaar, 402radar, x402scan
+    # probeiam sem params e esperam o challenge; a 48.26.0 devolvia 400 e
+    # 12 endpoints foram recusados no registro do diretório em 11/out).
+    # Com pagamento x402 anexado (check_required), o 400 grátis sai ANTES do
+    # settle — o dinheiro nem se move, nem precisa de estorno. MPP/JWT/
+    # créditos não passam aqui: já capturados → delivery-or-refund v48.10.2.
+    if not check_required:
+        return None
     groups = _PARAM_REQUIRED.get(path)
     if not groups:
         return None
@@ -9144,7 +9157,11 @@ def paid_endpoint(path):
                 return _r
 
             # v44.0.9: parâmetro inválido → 400 didático e GRATUITO, antes do 402.
-            _pbad = _preflight_param_check(path)
+            # v48.26.1-DISCOVERY: formato inválido vale sempre; AUSÊNCIA de
+            # obrigatório só barra com pagamento x402 anexado e não liquidado
+            # (sig real — nunca "mpp-tempo", que já capturou on-chain).
+            _pbad = _preflight_param_check(
+                path, check_required=bool(sig) and sig != "mpp-tempo")
             if _pbad is not None:
                 LEDGER.log_request(path, False, int((time.time() - t0) * 1000), ip,
                                    kind="param_rejected",
@@ -9164,6 +9181,19 @@ def paid_endpoint(path):
                     try:
                         _fcb = LEDGER.cache_get(f"fcb:{_fcb_tok}", 7 * 86400)
                         if _fcb and int(_fcb.get("n", 0)) > 0:
+                            # v48.26.1: obrigatório faltando → 400 didático
+                            # grátis SEM queimar o bônus (a chamada não seria
+                            # entregue de qualquer forma).
+                            _fcb_bad = _preflight_param_check(path, check_required=True)
+                            if _fcb_bad is not None:
+                                LEDGER.log_request(path, False, int((time.time() - t0) * 1000), ip,
+                                                   kind="param_rejected",
+                                                   ua=request.headers.get("User-Agent", ""),
+                                                   params=_clean_params())
+                                _fb, _fc = _fcb_bad
+                                _fr = jsonify(_fb)
+                                _fr.status_code = _fc
+                                return _fr
                             _r = handler()
                             # fonte morreu entre o gate e o handler → 503 grátis,
                             # crédito NÃO é queimado.
@@ -12493,7 +12523,7 @@ def agents_txt():
         "# Losbeto — machine-readable catalog (text)",
         f"# base: {base}",
         f"# version: {VERSION}",
-        "# payment: x402 (USDC on Base, Polygon, Solana, Algorand) — HTTP 402 challenge per call",
+        "# payment: x402 (USDC on Base, Solana, Algorand) — HTTP 402 challenge per call",
         "# free: ?preview=1 on every endpoint · /try tasting menu · /welcome first realtime call",
         "",
     ]
@@ -12522,7 +12552,7 @@ def mpp_discovery():
         "version": "1.0",
         "provider": "losbeto",
         "description": "Cross-asset market data for AI agents. Settlement via "
-                       "x402 (USDC on Base, Polygon, Solana, Algorand) — HTTP 402 "
+                       "x402 (USDC on Base, Solana, Algorand) — HTTP 402 "
                        "challenge with JSON body per x402 v2.",
         "endpoints": endpoints,
         "payment_methods": ["x402"],
@@ -12578,7 +12608,7 @@ def agent_registration_8004():
                         "market data, Base chain intelligence with a self-trained gas "
                         "forecaster, an OpenAI-compatible LLM inference gateway, and "
                         "transform APIs (/extract, /translate). USDC via x402 on Base, "
-                        "Polygon, Solana and Algorand. Free delayed preview on every "
+                        "Solana and Algorand. Free delayed preview on every "
                         "endpoint; delivery-or-refund on every paid call."),
         "image": f"{base}/favicon.png",
         "services": [
@@ -12733,7 +12763,7 @@ tr:hover td{background:var(--bg2)}
 <div class="hero">
   <div class="badge-live"><span class="pulse"></span>NODE ONLINE — v__V__</div>
   <h1>APIs pagas por AI Agents.<br>Instant. Onchain. Zero setup.</h1>
-  <p class="sub">__EPS__ monetized endpoints over <b>x402</b> — real-time crypto, equities, forex, commodities &amp; macro, anchored by a <b>signed point-in-time Brazilian macro archive</b> (IPCA, Selic, PTAX as originally published, no look-ahead, Ed25519). Pay per call with USDC on <b>Base, Polygon, Solana or Algorand</b>, delivered in <b>&lt;500ms</b>.</p>
+  <p class="sub">__EPS__ monetized endpoints over <b>x402</b> — real-time crypto, equities, forex, commodities &amp; macro, anchored by a <b>signed point-in-time Brazilian macro archive</b> (IPCA, Selic, PTAX as originally published, no look-ahead, Ed25519). Pay per call with USDC on <b>Base, Solana or Algorand</b>, delivered in <b>&lt;500ms</b>.</p>
   <div class="cta">
     <a href="/try" class="btn btn-p">🍽️ Free tasting — 6 endpoints in 1 call →</a>
     <a href="/br-pit-proof" class="btn btn-s">📐 Brazil archive proof (free) — Merkle + Ed25519</a>
@@ -12903,7 +12933,7 @@ def _is_bot(ua: str) -> bool:
 CLEAN_LANDING = r"""<!doctype html><html lang="en"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Losbeto — LLM inference + cross-asset market data for AI agents (x402)</title>
-<meta name="description" content="OpenAI-compatible LLM gateway at $0.005/call — change base_url, pay in USDC. Plus pay-per-call market data: multi-oracle price consensus, sentiment, forex, equities, commodities, Brazil macro (BCB/B3) and crypto. No API keys, no accounts. USDC on Base, Polygon, Solana and Algorand via x402.">
+<meta name="description" content="OpenAI-compatible LLM gateway at $0.005/call — change base_url, pay in USDC. Plus pay-per-call market data: multi-oracle price consensus, sentiment, forex, equities, commodities, Brazil macro (BCB/B3) and crypto. No API keys, no accounts. USDC on Base, Solana and Algorand via x402.">
 <link rel="canonical" href="__BASE__/">
 <meta property="og:type" content="website">
 <meta property="og:title" content="Losbeto — cross-asset market data for AI agents">
@@ -13085,7 +13115,6 @@ settles a few cents in USDC per request and gets clean JSON back.</p>
   <span class="acc-lbl">We accept</span>
   <span class="rl"><svg viewBox="0 0 24 24" aria-label="USDC"><circle cx="12" cy="12" r="11" fill="#2775CA"/><path d="M8 4.8a9 9 0 0 0 0 14.4M16 4.8a9 9 0 0 1 0 14.4" stroke="#fff" stroke-width="1.5" fill="none" stroke-linecap="round"/><text x="12" y="16" font-size="10.5" font-weight="700" fill="#fff" text-anchor="middle" font-family="Arial,sans-serif">$</text></svg>USDC</span>
   <span class="rl"><svg viewBox="0 0 24 24" aria-label="Base"><circle cx="12" cy="12" r="11" fill="#0052FF"/><path d="M12 5a7 7 0 1 0 7 7h-4.5v-2H19A7 7 0 0 0 12 5z" fill="#fff"/></svg>Base</span>
-  <span class="rl"><svg viewBox="0 0 24 24" aria-label="Polygon"><path d="M12 1.5l9 5.2v10.6l-9 5.2-9-5.2V6.7z" fill="#8247E5"/><path d="M15.7 9.1l-3.7-2.1-3.7 2.1v4.3l3.7 2.1 3.7-2.1z" fill="#fff" opacity=".95"/></svg>Polygon</span>
   <span class="rl"><svg viewBox="0 0 24 24" aria-label="Solana"><defs><linearGradient id="solg" x1="0" y1="1" x2="1" y2="0"><stop offset="0" stop-color="#9945FF"/><stop offset="1" stop-color="#14F195"/></linearGradient></defs><path d="M5.2 6.4L7.8 3.8h11l-2.6 2.6z" fill="url(#solg)"/><path d="M18.8 11.1l-2.6-2.6h-11l2.6 2.6z" fill="url(#solg)"/><path d="M5.2 15.8l2.6-2.6h11l-2.6 2.6z" fill="url(#solg)"/></svg>Solana</span>
   <span class="rl"><svg viewBox="0 0 24 24" aria-label="Algorand"><path d="M13.8 3h-3.6L4 21h2.9l1.6-4.6h6.9l1.6 4.6h3zM9.5 14.2L12 7.5l2.5 6.7z" fill="#e8eaed"/></svg>Algorand</span>
   </div>
@@ -13402,7 +13431,7 @@ GET __BASE__/oracle-consensus
 <span class="c"># 3 wallet signs a gasless USDC transfer and retries</span>
 <span class="c"># 4 facilitator settles on Base or Solana; JSON returned</span>
 
-Networks: eip155:8453 (Base) · eip155:137 (Polygon) · solana · algorand
+Networks: eip155:8453 (Base) · solana · algorand
 Asset:    USDC · Prices: $0.001 – $0.50
 <span class="c"># also answers MPP "Payment" challenges (IETF draft-httpauth-payment)
 # and is discoverable via Google UCP at /.well-known/ucp</span></pre>
@@ -15727,7 +15756,7 @@ ENDPOINT_DESC["/v1/chat/completions"] = (
     "OpenAI-compatible chat completions over x402: POST the standard "
     "{model, messages, max_tokens} body and receive a standard chat.completion "
     "response — any OpenAI SDK works by changing only base_url. Payment is the "
-    "x402 challenge (USDC on Base, Polygon, Solana or Algorand), so an agent needs no "
+    "x402 challenge (USDC on Base, Solana or Algorand), so an agent needs no "
     "provider account, no credit card, no API key. Failover chain behind the "
     "door: Groq first for speed, Gemini and paid tiers as backup. v1: no "
     "streaming, tools or vision — declared in every error response.")
@@ -20349,7 +20378,7 @@ def terms_page():
         "effective": "2026-08-04",
         "terms": {
             "what_you_buy": ("Per-call access to market data APIs, paid in USDC via "
-                             "x402 on Base, Polygon, Solana or Algorand, or prepaid credit keys. No "
+                             "x402 on Base, Solana or Algorand, or prepaid credit keys. No "
                              "accounts, no subscriptions unless explicitly purchased."),
             "pricing": ("Prices are quoted in the 402 response before you sign anything. "
                         "You never pay a price you did not see first."),
@@ -20417,7 +20446,7 @@ def privacy_page():
             "what_we_log": ("Caller IP, requested path, user-agent and payment metadata "
                             "(tx hash, network, amount), kept for operations, abuse "
                             "prevention and the public transparency pages (/receipts, /live)."),
-            "on_chain_nature": ("Payments settle on public blockchains (Base, Polygon, Solana, "
+            "on_chain_nature": ("Payments settle on public blockchains (Base, Solana, "
                                 "Algorand). Transaction hashes and wallet addresses are "
                                 "inherently public — that is a property of the networks, "
                                 "not a choice of this node."),
@@ -20903,7 +20932,7 @@ def _chat_greet_message(ip: str, ua: str) -> dict:
         else:
             msg = (f"Olá! Sou a IA do Losbeto 🤖 São {n} endpoints de dados para "
                    f"agentes de IA, pagamento por chamada em USDC (Base · Solana · "
-                   f"Algorand · Polygon), sem cadastro — a partir de $0,003. "
+                   f"Algorand), sem cadastro — a partir de $0,003. "
                    f"Posso te mostrar o mais popular ou um teste grátis agora.")
             chips = ["Quero testar grátis", "Como pago em USDC?", "Ver planos a partir de $0,10"]
     else:
@@ -21546,7 +21575,7 @@ def erc8004_registration():
                         "inference gateway, and a Base chain-intelligence suite "
                         "with a self-trained gas forecaster and the first "
                         "ERC-8004 reputation feed on x402. USDC on Base, "
-                        "Polygon, Solana and Algorand. Fixed public pricing."),
+                        "Solana and Algorand. Fixed public pricing."),
         "image": f"{base}/favicon.png",
         "services": [
             {"name": "web", "endpoint": base},
@@ -22180,7 +22209,7 @@ def llms_txt():
         "Every 402 response also carries an inline `upsell.sample` with real output.",
         "",
         "## FLAGSHIP — LLM GATEWAY (OpenAI-compatible, pay-per-call)",
-        f"POST {base}/v1/chat/completions — any OpenAI SDK works; change only base_url. Flat ${LLM_PROXY_PRICE:.4f}/call, USDC via x402 (Base, Polygon, Solana, Algorand).",
+        f"POST {base}/v1/chat/completions — any OpenAI SDK works; change only base_url. Flat ${LLM_PROXY_PRICE:.4f}/call, USDC via x402 (Base, Solana, Algorand).",
         f"GET  {base}/llm?q=your+prompt — same engine over GET, same price.",
         f"FREE: GET {base}/v1/models (model list) · GET {base}/llm/status (live backend telemetry + beta caps)",
         f"Beta caps: {LLM_DAILY_KEY_CAP} calls/day per key, {LLM_DAILY_GLOBAL_CAP}/day global (free-tier backends, honest limits; paid tiers lift them).",
@@ -30078,7 +30107,7 @@ def admin_storage():
                                   if _OFAC_PAYER_CACHE["ts"] else None}
     return jsonify(out)
 
-log.info(f"🛡 v48.26.0-PREFLIGHT: preflight pré-402 universal (12 endpoints) · /pay parity · scan-noise devops/IA · anomalia house-aware · sol_dest_ata disco/stale · netrc pré-import · feePayer disco 24h · OFAC pré/pós-settle")
+log.info(f"🛡 v48.26.1-DISCOVERY: probe nu sempre vê 402 (registro de diretório destravado) · 400 grátis só pré-settle com pagamento anexado · copy sem Polygon/Arbitrum (gated OFF) · scan-noise devops/IA · anomalia house-aware · sol_dest_ata disco/stale · netrc pré-import")
 
 
 # ============================================================================
@@ -32559,7 +32588,7 @@ VERSION = "48.18.3-PAYGUARD"  # v48.18.3-PAYGUARD: /pay nunca mais vende endpoin
 VERSION = "48.23.0-FORKSAFE"  # v48.23.0-FORKSAFE: BOOT SEM THREADS NO IMPORT — com --preload, ~25 threads nasciam no ARBITER (loops bg, v27, radar, PIT, warmers) e o fork herdava locks travados de threads inexistentes: 2 de 4 workers congelavam ~30s apos cada deploy e morriam em WORKER TIMEOUT 120s (00:03/00:18 de 09/out). Agora: (1) import 100% livre de threads; (2) post_fork_boot() novo — chamado pelo hook post_fork do gunicorn (gerado pelo start.sh v48.23) + fallback na 1a request (@app.before_request); (3) _start_background_once retorna o DONO do flock e absorve os loops v27 (cdp-seed, discovery-ping) e o radar demand_autofulfill (antes soltos no import, sem guard); (4) _v27_start_background vira banner-only com flag; (5) _ml_boot_warm volta a ser PER-WORKER com stagger 2-8s (a docstring sempre pediu isso, mas o flock fazia so 1 worker aquecer). Deploy junto com start.sh v48.23.0-FORKSAFE. | base: v48.22.0-MCPHEALTH  # v48.22.0-MCPHEALTH: (1) GET /mcp deixa de responder 405 para quem NAO pediu SSE — o 8004scan marcava o servico MCP UNHEALTHY (Health 66.7, status degraded). Agora: Accept com text/event-stream segue 405 spec-true; GET bare recebe 200 com descriptor vivo do servidor (nome/versao/5 meta-tools/instrucao de initialize) — que tambem entrega as "capabilities" que o scanner dizia faltar. (2) Selo x402lint da landing aponta p/ o relatorio publico direto (x402lint.dev/o/api.losbeto.xyz, A 98/100 re-scan pago 08/out 15:32 UTC). | base: v48.21.0-TRUSTSTACK  # v48.21.0-TRUSTSTACK: (1) FIX DOMAIN-VERIFICATION ERC-8004 — /.well-known/agent-registration.json estava SEM o campo registrations (a spec exige p/ provar dominio) e com "99 paid endpoints" congelado: o 8004scan lia Publisher 19 / Compliance 75. Agora registrations com agentId 87048 (env ERC8004_AGENT_ID com fallback) e contagem DINAMICA len(BASE_PRICES) — nunca mais desatualiza. erc8004.json ganha o mesmo fallback (identidade sobrevive a env perdida) e descricao atualizada. (2) LANDING: faixa "Listed & verified" com 7 selos clicaveis de prova publica (8004scan, x402lint A 98/100, x402scan, x402-list, MCP Registry, PyPI, npm) + rodape copyright (c 2026 Losbeto sobre o protocolo aberto x402, sem texto LF) + tabela machine-readable ganha as 2 linhas ERC-8004. | base: v48.20.0-STOREFRONT  # v48.20: STOREFRONT — landing ganha (1) rails strip com logos SVG inline (USDC/Base/Polygon/Solana/Algorand/Pix, zero requests externos), (2) badge ERC-8004 #87048 verificavel no hero, (3) ticker CSS-only com os endpoints de $0.001, (4) vitrine 'Base chain intelligence' com os 7 endpoints da v48.19 (1a secao de produto, visivel nas 2 abas), (5) _price_label com 3 casas p/ precos < $0.01 (o .2f imprimiria $0.00), (6) aba Agent com 4 chains + 5 meta-tools | /erc8004 DEIXA DE SER FERRAMENTA E VIRA PROVA: pagina de identidade com agentId 87048 + tx 0x694b13bd…d0061e + links de verificacao (o registro JA EXISTIA desde 15/set — o -32603 do Phantom e pre-simulacao, nao gas; registrador recolhido p/ <details> avancado) | base: v48.19.0-AGUA  # v48.18.6-ONECLICK: /erc8004 com gasLimit explicito (1.2M; estimateGas real 1.107.928, custo ~$0,03) — contorna a falha de estimativa do Phantom (-32603 'Unexpected error' no eth_sendTransaction que travou o registro em 08/out) + Plano B na propria pagina: link BaseScan #writeContract e botao 'copiar agentURI'. | base: v48.18.5-ONECLICK (pagina guiada de registro ERC-8004, data URI imutavel registration-v1, agentId lido do evento Transfer; ZERO chaves no servidor)
 VERSION = "48.24.0-PROBEHARVEST"  # v48.24.0-PROBEHARVEST: trafego de maquina vira produto — /x402-watch (watch 30d em endpoint x402 alheio, $0.05, webhook em mudanca de estado/preco), /account (portal do pagante sem senha: a lsk_ E a credencial), /.well-known/demand-teaser.json (amostra gratis 1h que anuncia o /ecosystem-pulse), preview pay-ready (pay_link + quickstart em TODA amostra; avaliador 50+/dia recebe OFERTA, nunca bloqueio — veredito v44.3.0), ledger_prune_loop (probes/challenges >8d fora, 6h/6h — tabela emagrece ~270MB/mes sem perder metrica) | base: v48.23.0-FORKSAFE
 VERSION = "48.25.0-GLOBAL"  # v48.25.0-GLOBAL: des-regionalizacao — rail Pix DESLIGADO por padrao (PIX_RAIL=1 reativa; agentes pagam USDC; o email do recebedor saiu do codigo), concierge BR sem oferta Pix, chip Pix fora da landing. Compliance: triagem OFAC do pagador ANTES do settle (listas 0xB10C/SDN, refresh 24h, cache /data; hit EVM = 402 sem settle; hit pos-settle nos demais rails = alerta Telegram) — resposta a designacao da rede A7 (OFAC 01/out/2026). Storage: prune + wal_checkpoint(TRUNCATE) e VACUUM semanal com guarda de disco (resolve o alerta de 88% do volume Railway — DELETE sem VACUUM nao devolve espaco). Radar: scanners de credencial (.npmrc, aws-exports, runtime-config, index.js) rotulados como ruido, nao "produto novo". Novo: /api/admin/storage (DASH_TOKEN). | base: v48.24.0-PROBEHARVEST
-VERSION = "48.26.0-PREFLIGHT"  # v48.26.0-PREFLIGHT: (1) preflight pré-402 UNIVERSAL — parâmetro obrigatório ausente/malformado vira 400 didático GRÁTIS antes de qualquer cobrança em 12 endpoints sem default (/chain-tx /chain-balance /wallet-verdict /chain-ens /br-doc /br-cnpj /br-cep /br-pix-parse /br-pix-code /br-asof /x402-watch /agent-call; grupos any-of com aliases doc/value, code/brcode, date/asof, task/skill/endpoint/target) — mata a classe "pagou → 400 → estorno em crédito" na API crua (prova: /chain-tx sem hash pago 3× em 10/out); /pay ganha os mesmos obrigatórios pré-preenchidos funcionais (PAYGUARD parity); POST/JSON-body fora de propósito. (2) _SCAN_NOISE += sondas devops/IA (.s3cfg .boto .amplifyrc .claude) e assets .min.js (/user/umi.min.js) — fim do "produto novo" falso no radar. (3) Anomalia ML house-aware: hora em que TODO pagador é carteira da casa (rodada mensal dos indexadores) vira severidade 'house' — log/arquivo, nunca Telegram. | base: v48.25.3-ATACACHE
+VERSION = "48.26.1-DISCOVERY"  # v48.26.1-DISCOVERY: (1) REGISTRO DE DIRETÓRIO DESTRAVADO — a barreira de obrigatórios da 48.26.0 respondia 400 a PROBE NU (sem payment header) e 12 endpoints foram recusados no registro do diretório em 11/out ("they need to return a 402 payment challenge"). Corrigido: probe nu sempre cai no 402 (contrato de descoberta); o 400 didático grátis de parâmetro ausente só existe quando há pagamento x402 anexado e AINDA NÃO LIQUIDADO (check_required — o dinheiro nem se move; nunca para mpp-tempo/JWT/créditos, já capturados → delivery-or-refund v48.10.2). FCB não queima bônus em chamada malformada. (2) COPY HONESTA: Polygon/Arbitrum saem de TODA a copy pública (landing, meta, llms.txt, agents.json, chat) — os rails existem mas seguem gated OFF por env (X402_POLYGON/X402_ARBITRUM) até a confirmação de depósito na Binance; a copy agora lista só Base, Solana e Algorand. | base: v48.26.0-PREFLIGHT: (1) preflight pré-402 UNIVERSAL — parâmetro obrigatório ausente/malformado vira 400 didático GRÁTIS antes de qualquer cobrança em 12 endpoints sem default (/chain-tx /chain-balance /wallet-verdict /chain-ens /br-doc /br-cnpj /br-cep /br-pix-parse /br-pix-code /br-asof /x402-watch /agent-call; grupos any-of com aliases doc/value, code/brcode, date/asof, task/skill/endpoint/target) — mata a classe "pagou → 400 → estorno em crédito" na API crua (prova: /chain-tx sem hash pago 3× em 10/out); /pay ganha os mesmos obrigatórios pré-preenchidos funcionais (PAYGUARD parity); POST/JSON-body fora de propósito. (2) _SCAN_NOISE += sondas devops/IA (.s3cfg .boto .amplifyrc .claude) e assets .min.js (/user/umi.min.js) — fim do "produto novo" falso no radar. (3) Anomalia ML house-aware: hora em que TODO pagador é carteira da casa (rodada mensal dos indexadores) vira severidade 'house' — log/arquivo, nunca Telegram. | base: v48.25.3-ATACACHE
 
 
 if __name__ == "__main__":
