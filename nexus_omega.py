@@ -994,6 +994,12 @@ def _check_wallet_consistency():
         chains.append("base")
     if ENABLE_ALGO:
         chains.append("algorand")
+    # v48.26.3: o log omitia Polygon/Arbitrum com as flags ON — a omissão já
+    # causou diagnóstico errado ("Polygon fora do ar" com eip155:137 no 402).
+    if X402_POLYGON:
+        chains.append("polygon")
+    if X402_ARBITRUM:
+        chains.append("arbitrum")
     log.info(f"✅ Chains ativas: {', '.join(chains)}")
     if warnings:
         log.warning("="*70)
@@ -12325,7 +12331,10 @@ def api_for_you():
     recs = []
     for ep in BASE_PRICES:
         if ep == fav or ep.startswith(("/subscribe", "/day-pass", "/week-pass",
-                                       "/buy-credits", "/starter", "/enterprise")):
+                                       "/buy-credits", "/starter", "/enterprise",
+                                       "/founding-agent")):
+            # v48.26.3: /founding-agent faltava na lista — é PLANO (bundle de
+            # crédito $49.99), não produto per-call; planos têm vitrine própria.
             continue
         if not _sellable_now(ep):   # v48.17.13: não recomendar o invendável
             continue
@@ -12334,9 +12343,16 @@ def api_for_you():
     recs.sort(key=lambda t: (-t[0], t[1]))
     out = []
     for shared, _p, ep in recs[:4]:
+        # v48.26.3-POLISH: o corte duro [:110] truncava a descrição no MEIO da
+        # palavra ("vali", "B3 b", "ri") e o :.4f exibia "$49.9900"/"$0.5000"
+        # na vitrine. Corte em fronteira de palavra + preço por magnitude.
+        desc = (ENDPOINT_DESC.get(ep, ep) or "").strip()
+        if len(desc) > 110:
+            desc = desc[:110].rsplit(" ", 1)[0].rstrip(" ,;:—-(") + "…"
+        preco = get_dynamic_price(ep)
         out.append({"endpoint": ep, "url": f"{base}{ep}",
-                    "price_usdc": f"{get_dynamic_price(ep):.4f}",
-                    "desc": (ENDPOINT_DESC.get(ep, ep) or "")[:110],
+                    "price_usdc": f"{preco:.2f}" if preco >= 0.01 else f"{preco:.3f}",
+                    "desc": desc,
                     "free_sample": f"{base}{ep}?preview=1"})
     # contexto de pregão (horários UTC): B3 13:00-20:00, NYSE 13:30-20:00,
     # cripto sempre. Sábado/domingo fechado para ações.
@@ -13038,7 +13054,7 @@ body{background:var(--bg);color:var(--fg);font:15px/1.65 -apple-system,BlinkMacS
 #hero{border-top:none;padding:64px 0 52px;
       background:radial-gradient(1200px 400px at 50% -10%,#12161d 0%,var(--bg) 70%)}
 #hero h1{font-size:clamp(30px,4.4vw,50px);line-height:1.08;letter-spacing:-.03em;
-         margin:0 0 16px;max-width:16ch}
+         margin:0 0 16px;max-width:18ch;text-wrap:balance}
 #hero .sub{font-size:17px;color:var(--dim);max-width:60ch;margin:0 0 30px}
 .stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));
        gap:1px;background:var(--line);border:1px solid var(--line);
@@ -13048,6 +13064,12 @@ body{background:var(--bg);color:var(--fg);font:15px/1.65 -apple-system,BlinkMacS
         letter-spacing:-.02em}
 .stat span{display:block;color:var(--dim);font-size:12px;margin-top:6px;
            text-transform:uppercase;letter-spacing:.07em}
+/* v48.26.3-POLISH: stats com texto longo (lista de chains, "1st call free")
+   estavam cortando/quebrando feio nas células de minmax(150px,1fr) com
+   overflow:hidden — modificadores com fonte menor e caixa de marca. */
+.stat span.wide{font-size:10.5px;letter-spacing:.04em;text-transform:none;
+                overflow-wrap:break-word}
+.stat b.sm{font-size:19px;letter-spacing:-.01em}
 .cta{display:flex;gap:12px;flex-wrap:wrap;margin-top:28px}
 .cta a{display:inline-block;padding:11px 20px;border-radius:8px;font-size:14px;
        font-weight:500;text-decoration:none;border:1px solid var(--line)}
@@ -13056,12 +13078,19 @@ body{background:var(--bg);color:var(--fg);font:15px/1.65 -apple-system,BlinkMacS
 .cta a:hover{opacity:.88}
 @media(max-width:880px){#hero{padding:44px 0 36px}.band{padding:40px 0}}
 .grid{display:grid;gap:14px;grid-template-columns:repeat(auto-fit,minmax(272px,1fr));margin:18px 0 6px}
-.gcard{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:16px 18px}
+/* v48.26.3-POLISH: .gcard vira coluna flex — o preço ancora no rodapé e todos
+   os cards da mesma fileira alinham; a tag .bz sai do título e vira eyebrow
+   padronizado no topo de TODO card (antes quebrava inline ou na linha de
+   baixo conforme o comprimento do título). */
+.gcard{background:var(--card);border:1px solid var(--line);border-radius:10px;
+       padding:16px 18px;display:flex;flex-direction:column}
 .gcard h3{font-size:14px;margin:0 0 6px;letter-spacing:-.01em}
-.gcard p{color:var(--dim);font-size:13px;line-height:1.5;margin:0 0 10px}
+.gcard p{color:var(--dim);font-size:13px;line-height:1.5;margin:0 0 10px;flex:1}
 .gcard .px{color:var(--acc);font:600 13px var(--mono)}
-.gcard .bz{display:inline-block;font-size:11px;color:var(--acc2);border:1px solid var(--line);
-        border-radius:4px;padding:1px 7px;margin-left:8px;vertical-align:1px}
+.gcard .gf{display:block}
+.gcard .bz{display:inline-block;align-self:flex-start;font-size:10.5px;color:var(--acc2);
+        border:1px solid var(--line);border-radius:4px;padding:1px 7px;
+        margin:0 0 7px;letter-spacing:.06em;text-transform:uppercase}
 .two{display:grid;gap:26px;grid-template-columns:1fr 1fr;align-items:start}
 @media(max-width:880px){.two{grid-template-columns:1fr}.wrap{padding:0 20px}}
 header{border-bottom:1px solid var(--line);padding:18px 0;position:sticky;top:0;background:rgba(10,11,13,.9);backdrop-filter:blur(8px);z-index:9}
@@ -13135,6 +13164,18 @@ footer a{color:var(--dim)}
 .copyright{margin-top:18px;padding-top:16px;border-top:1px solid var(--line);
            font-size:12px;color:#5f6672;text-align:center}
 .copyright a{color:#8b9199}
+/* v48.26.3-POLISH: (1) links de conteúdo herdavam o azul escuro default do
+   navegador — ilegível no fundo #0a0b0d (tabela Machine-readable discovery).
+   Regra de baixa especificidade: .card/.seal/.pill8004/.cta/nav/footer
+   continuam mandando nos seus. (2) Abas Human/Agent por CLASSE — o toggle
+   antigo apontava para um <div id="human"> VAZIO (resto arqueológico) e o
+   #agent ficava fora do .wrap (full-bleed, H2 cortado). Agora o body carrega
+   o modo e as seções se marcam: .tab-h some no modo agente, .tab-a só nele. */
+section a{color:var(--acc2)}
+section a:hover{color:var(--fg)}
+.tab-a{display:none}
+body.show-agent .tab-h{display:none!important}
+body.show-agent .tab-a{display:block}
 </style></head><body>
 <header><div class="wrap hrow">
   <div class="logo"><img src="/favicon.svg?v=2" width="22" height="22" alt="" style="vertical-align:-5px;margin-right:8px">los<span>beto</span></div>
@@ -13166,10 +13207,10 @@ settles a few cents in USDC per request and gets clean JSON back.</p>
 <div class="stats">
   <div class="stat"><b>__N__</b><span>priced endpoints</span></div>
   <div class="stat"><b>__P_MIN__</b><span>cheapest call</span></div>
-  <div class="stat"><b>__NCHAINS__</b><span>chains · __CHAINS__</span></div>
+  <div class="stat"><b>__NCHAINS__</b><span class="wide">chains · __CHAINS__</span></div>
   <div class="stat"><b>0</b><span>accounts to create</span></div>
   <div class="stat"><b>Free</b><span>sample on every endpoint</span></div>
-  <div class="stat"><b><a href="/welcome" style="color:inherit">1st call free</a></b><span>real-time, no wallet · /welcome</span></div>
+  <div class="stat"><b class="sm"><a href="/welcome" style="color:inherit">1st call free</a></b><span>real-time, no wallet · /welcome</span></div>
 </div>
 <div class="rails">
   <span class="acc-lbl">We accept</span>
@@ -13222,7 +13263,7 @@ reputation feed on x402. Zero upstream cost — built to be hammered by agents.<
        add <code>&amp;explain=1</code> for an LLM plain-English explanation.</p>
     <code>GET /chain-tx?hash=0x…</code></a>
   <a class="card" href="/agent-reputation?preview=1"><span class="p">__P_AREP__</span>
-    <h3>Agent Reputation <em>ERC-8004</em></h3>
+    <h3>Agent Reputation <em>ERC&#8209;8004</em></h3>
     <p>On-chain identity and aggregated feedback from the ERC-8004 Reputation
        Registry, for any registered agent — the first x402 endpoint serving
        the standard. This node is agent #87048.</p>
@@ -13277,16 +13318,18 @@ maintains about this node. Every seal below opens the public proof.</p>
 <!-- v44: PERSONALIZAÇÃO. O perfil do visitante fica no navegador dele
      (localStorage) — a página lembra o que ele explorou e devolve uma vitrine
      sob medida na volta, sem coletar nada no servidor. -->
-<section class="band" id="foryou" style="display:none"><div class="wrap">
+<section class="band tab-h" id="foryou" style="display:none"><div class="wrap">
 <h2 id="fy-title">Picked for you</h2>
 <p class="lede" id="fy-sub"></p>
 <div class="grid" id="fy-grid"></div>
 </div></section>
 
-<div class="wrap">
-<div id="human">
-</div></div>
-<section class="band alt"><div class="wrap"><div id="human">
+<!-- v48.26.3-POLISH: aqui havia um <div class="wrap"><div id="human"></div></div>
+     VAZIO (resto arqueológico) seguido de um SEGUNDO id="human" real — HTML
+     inválido: getElementById('human') só alcançava o vazio e o toggle
+     Human/Agent nunca escondeu nada. Sistema novo por classes (.tab-h/.tab-a
+     + body.show-agent), ids duplicados eliminados. -->
+<section class="band alt tab-h"><div class="wrap">
 <h2 id="top">Brazil — the deepest coverage on x402</h2>
 <p class="lede">Central-bank macro, B3 equities and the real interest rate,
 assembled for an international desk. These four are where most of this node's
@@ -13391,64 +13434,64 @@ Losbeto.payUrl("/forecast", {symbol:"BTC"})   <span class="c">// checkout URL fo
 Losbeto.fetchPaid("/forecast", XPAYMENT, {symbol:"BTC"})  <span class="c">// x402 header in, data out</span></pre>
 
 </div></section>
-<section class="band alt"><div class="wrap">
+<section class="band alt tab-h"><div class="wrap">
 <h2>Only here</h2>
 <p class="lede">Four Brazil products built on point-in-time archives, because they
 need a data pipeline assembled inside Brazil.</p>
 <div class="grid">
-  <div class="gcard"><h3>Brazil agricultural parity<span class="bz">in-depth</span></h3>
+  <div class="gcard"><span class="bz">in-depth</span><h3>Brazil agricultural parity</h3>
     <p>Soybeans, corn and arabica coffee in the Brazilian 60kg bag — official
        BCB series when they publish, CBOT/ICE futures converted at the official
        PTAX when they don't. Provenance declared in every response.</p>
-    <span class="px">__P_AGRO__</span> · <code>/br-agro</code></div>
-  <div class="gcard"><h3>Brazil rate structure<span class="bz">in-depth</span></h3>
+    <div class="gf"><span class="px">__P_AGRO__</span> · <code>/br-agro</code></div></div>
+  <div class="gcard"><span class="bz">in-depth</span><h3>Brazil rate structure</h3>
     <p>Selic, CDI annualised on the 252-day convention, TJLP and IPCA — plus the
        real rate by the Fisher relation and a carry reading.</p>
-    <span class="px">__P_CURVE__</span> · <code>/br-curve</code></div>
-  <div class="gcard"><h3>Brazil macro<span class="bz">in-depth</span></h3>
+    <div class="gf"><span class="px">__P_CURVE__</span> · <code>/br-curve</code></div></div>
+  <div class="gcard"><span class="bz">in-depth</span><h3>Brazil macro</h3>
     <p>Selic, CDI, IPCA, IGP-M and official PTAX assembled from separate BCB
        endpoints with comma decimals, sorted by date not array order.</p>
-    <span class="px">__P_BRMACRO__</span> · <code>/br-macro</code></div>
-  <div class="gcard"><h3>Brazil point-in-time archive<span class="bz">in-depth</span></h3>
+    <div class="gf"><span class="px">__P_BRMACRO__</span> · <code>/br-macro</code></div></div>
+  <div class="gcard"><span class="bz">in-depth</span><h3>Brazil point-in-time archive</h3>
     <p>IPCA, Selic or PTAX <i>as originally published</i> on any past date —
        signed daily vintages with Ed25519 proofs, zero look-ahead. Ask for the
        as-of date, get exactly the number that existed that day.</p>
-    <span class="px">__P_ASOF__</span> · <code>/br-asof</code></div>
+    <div class="gf"><span class="px">__P_ASOF__</span> · <code>/br-asof</code></div></div>
 </div>
 
 </div></section>
-<section class="band deep"><div class="wrap">
+<section class="band deep tab-h"><div class="wrap">
 <h2>Built for machine buyers</h2>
 <p class="lede">Agents don't browse — they run pre-authorized purchase orders
 inside a policy engine: per-call caps, per-merchant allowlists, schema
 validation, uptime requirements. This node is shaped to pass those checks,
 not to impress a human skimming a homepage.</p>
 <div class="grid">
-  <div class="gcard"><h3>Policy-engine ready<span class="bz">verified</span></h3>
+  <div class="gcard"><span class="bz">verified</span><h3>Policy-engine ready</h3>
     <p>Stable JSON schemas with declared methodology, 402 challenges served in
        single-digit milliseconds, ASCII-only headers (RFC 7230), priced in the
        volume sweet spot ($0.003–$0.30), and a hard rule: when a source is
        down the node refuses the sale instead of charging for nothing.</p>
-    <span class="px">machine-first</span> · <code>/health/providers</code></div>
-  <div class="gcard"><h3>Token intelligence<span class="bz">new</span></h3>
+    <div class="gf"><span class="px">machine-first</span> · <code>/health/providers</code></div></div>
+  <div class="gcard"><span class="bz">new</span><h3>Token intelligence</h3>
     <p>Pre-execution screening for any contract or ticker: liquidity, pair age,
        buy/sell flow, deterministic risk flags with declared thresholds
        (honeypot pattern, wash-trading signature) plus an AI verdict.</p>
-    <span class="px">__P_TOKINTEL__</span> · <code>/token-intel</code></div>
-  <div class="gcard"><h3>Wallet intelligence<span class="bz">new</span></h3>
+    <div class="gf"><span class="px">__P_TOKINTEL__</span> · <code>/token-intel</code></div></div>
+  <div class="gcard"><span class="bz">new</span><h3>Wallet intelligence</h3>
     <p>Counterparty enrichment before an agent trusts an address: holdings with
        USD values, concentration, activity and spam exposure on Solana and
        Base, deterministic flags plus an AI-written profile.</p>
-    <span class="px">__P_WALLETSCAN__</span> · <code>/wallet-scan</code></div>
-  <div class="gcard"><h3>A human answers<span class="bz">concierge</span></h3>
+    <div class="gf"><span class="px">__P_WALLETSCAN__</span> · <code>/wallet-scan</code></div></div>
+  <div class="gcard"><span class="bz">concierge</span><h3>A human answers</h3>
     <p>The chat box below is not a bot. Messages land on the operator's
        Telegram and the reply comes back to the same thread — usually within
        the hour. Agents can use it too: POST /chat/send with JSON.</p>
-    <span class="px">free</span> · <code>/chat/send</code></div>
+    <div class="gf"><span class="px">free</span> · <code>/chat/send</code></div></div>
 </div>
 
 </div></section>
-<section class="band"><div class="wrap">
+<section class="band tab-h"><div class="wrap">
 <h2>Honest by default</h2>
 <table>
 <tr><td>First real-time call free, no wallet, no signup</td><td>/welcome</td></tr>
@@ -13460,9 +13503,12 @@ not to impress a human skimming a homepage.</p>
 <tr><td>Operator test purchases labelled on-chain</td><td>/receipts</td></tr>
 <tr><td>If a source is down, premium returns 503 and does not charge</td><td>—</td></tr>
 </table>
-</div>
+</div></section>
 
-<div id="agent" class="hide">
+<!-- v48.26.3-POLISH: o bloco Agent vivia DENTRO da seção Honest mas FORA do
+     .wrap (as 3 seções renderizavam full-bleed, H2 colado na borda esquerda).
+     Agora é seção própria, com .wrap, marcada .tab-a (só no modo Agent). -->
+<section class="band alt tab-a" id="agent"><div class="wrap">
 <h2>Machine surfaces</h2>
 <pre><span class="c"># catalog, priced, paginated</span>
 GET __BASE__/x402-resources
@@ -13501,12 +13547,11 @@ Asset:    USDC · Prices: __P_MIN__ – __P_MAX__
 <pre><span class="c"># tell the operator what your agent needs</span>
 __FEEDBACK__
 <span class="c"># endpoints are added on request</span></pre>
-</div>
+</div></section>
 
 <!-- v39: bloco endereçado ao agente, visível nas DUAS abas. Um LLM que abre
      esta página como HTML precisa de uma instrução literal do que fazer, não
      de marketing. É o padrão que os nodes com tração usam. -->
-</div></section>
 <section class="band deep" id="forbots"><div class="wrap">
 <h2>Landed here as an agent? You can <em>buy this data now</em></h2>
 <p class="lede">No signup, no API key, no account. Send any documented path to
@@ -13580,8 +13625,7 @@ or LF Projects. Identity registered on-chain:
 <script>
 function mode(m){
   var h=m==='h';
-  document.getElementById('human').classList.toggle('hide',!h);
-  document.getElementById('agent').classList.toggle('hide',h);
+  document.body.classList.toggle('show-agent',!h);
   document.getElementById('bh').classList.toggle('on',h);
   document.getElementById('ba').classList.toggle('on',!h);
   try{localStorage.setItem('losbeto_mode',m)}catch(e){}
@@ -13639,9 +13683,9 @@ function mode(m){
       grid.innerHTML=(d.recommendations||[]).map(function(r){
         return '<div class="gcard"><h3>'+r.endpoint.replace('/','')+'</h3>'+
           '<p>'+r.desc+'</p>'+
-          '<span class="px">$'+r.price_usdc+'</span> · '+
+          '<div class="gf"><span class="px">$'+r.price_usdc+'</span> · '+
           '<a href="'+r.free_sample+'" style="color:inherit">free sample</a> · '+
-          '<code>'+r.endpoint+'</code></div>';
+          '<code>'+r.endpoint+'</code></div></div>';
       }).join('');
       strip.style.display='block';
     }).catch(function(){});
@@ -17232,7 +17276,11 @@ _SCAN_NOISE = re.compile(
     # "produto novo". Nenhum produto real deste nó termina em .min.js nem
     # vive em diretório de configuração de ferramenta.
     r"\.s3cfg$|\.boto$|\.amplifyrc$|(^|/)\.claude(/|$)|(^|/)[^/]*\.min\.js$|"
-    r"(^|/)auth/(login|signin|register|token)$|package(-lock)?\.json$)", re.I)
+    r"(^|/)auth/(login|signin|register|token)$|package(-lock)?\.json$|"
+    # v48.26.3: /app.config.js (7 hits/6 IPs em 11/out) — sonda de config Expo/
+    # React Native atrás de chave de API vazada; virou "produto novo" no radar.
+    # O [^/]+ antes de .config.js protege o /config.js REAL deste nó.
+    r"(^|/)[^/]+\.config\.js$)", re.I)
 
 def _is_scan_noise(path: str) -> bool:
     return bool(_SCAN_NOISE.search(path or ""))
@@ -24366,7 +24414,13 @@ def dash_api():
         "signer_address":  WALLET.solana_address,
         "ton_address":     TON_WALLET.address if TON_WALLET else None,
         "base_payto":      BASE_PAYTO_EVM if ENABLE_BASE else None,
-        "chains":          [f"solana:{SOL_GENESIS}"] + ([BASE_CAIP2] if ENABLE_BASE else []),
+        # v48.26.3: o card "Chains" do /dash dizia só "solana · eip155" — a
+        # lista hardcoded nunca ganhou Algorand/Polygon. Derivada das flags.
+        "chains":          ([BASE_CAIP2] if ENABLE_BASE else [])
+                           + [f"solana:{SOL_GENESIS}"]
+                           + ([ALGO_CAIP2] if ENABLE_ALGO else [])
+                           + (["eip155:137"] if X402_POLYGON else [])
+                           + (["eip155:42161"] if X402_ARBITRUM else []),
         "stats":           LEDGER.stats(),
         "revenue_truth":   {"last_24h": revenue_split(86400),
                             "all_time": revenue_split()},
@@ -30207,7 +30261,7 @@ def admin_storage():
                                   if _OFAC_PAYER_CACHE["ts"] else None}
     return jsonify(out)
 
-log.info(f"🛡 v48.26.2-LANDING: copy de chains 100% derivada das flags (18 pontos dinamizados, Polygon/Arbitrum voltam à copy quando flag ON — prova live: X402_POLYGON=1 com eip155:137 no header v2) · badge Polygon condicional na vitrine · Prices __P_MIN__-__P_MAX__ dinâmico · Only here ganha /br-asof PIT · probe nu sempre vê 402 · 400 grátis só pré-settle · anomalia house-aware · scan-noise devops/IA")
+log.info(f"🛡 v48.26.3-POLISH: abas Human/Agent por classes (id duplicado+full-bleed mortos) · vitrine sem corte no meio da palavra e sem $49.9900 · links de conteudo legiveis · h1 balanceado · .bz eyebrow · dash/boot listam as 4 chains por flag · radar filtra app.config.js | base: 48.26.2 (uma-verdade-so de chains) (18 pontos dinamizados, Polygon/Arbitrum voltam à copy quando flag ON — prova live: X402_POLYGON=1 com eip155:137 no header v2) · badge Polygon condicional na vitrine · Prices __P_MIN__-__P_MAX__ dinâmico · Only here ganha /br-asof PIT · probe nu sempre vê 402 · 400 grátis só pré-settle · anomalia house-aware · scan-noise devops/IA")
 
 
 # ============================================================================
@@ -32679,7 +32733,7 @@ VERSION = "48.18.3-PAYGUARD"  # v48.18.3-PAYGUARD: /pay nunca mais vende endpoin
 VERSION = "48.23.0-FORKSAFE"  # v48.23.0-FORKSAFE: BOOT SEM THREADS NO IMPORT — com --preload, ~25 threads nasciam no ARBITER (loops bg, v27, radar, PIT, warmers) e o fork herdava locks travados de threads inexistentes: 2 de 4 workers congelavam ~30s apos cada deploy e morriam em WORKER TIMEOUT 120s (00:03/00:18 de 09/out). Agora: (1) import 100% livre de threads; (2) post_fork_boot() novo — chamado pelo hook post_fork do gunicorn (gerado pelo start.sh v48.23) + fallback na 1a request (@app.before_request); (3) _start_background_once retorna o DONO do flock e absorve os loops v27 (cdp-seed, discovery-ping) e o radar demand_autofulfill (antes soltos no import, sem guard); (4) _v27_start_background vira banner-only com flag; (5) _ml_boot_warm volta a ser PER-WORKER com stagger 2-8s (a docstring sempre pediu isso, mas o flock fazia so 1 worker aquecer). Deploy junto com start.sh v48.23.0-FORKSAFE. | base: v48.22.0-MCPHEALTH  # v48.22.0-MCPHEALTH: (1) GET /mcp deixa de responder 405 para quem NAO pediu SSE — o 8004scan marcava o servico MCP UNHEALTHY (Health 66.7, status degraded). Agora: Accept com text/event-stream segue 405 spec-true; GET bare recebe 200 com descriptor vivo do servidor (nome/versao/5 meta-tools/instrucao de initialize) — que tambem entrega as "capabilities" que o scanner dizia faltar. (2) Selo x402lint da landing aponta p/ o relatorio publico direto (x402lint.dev/o/api.losbeto.xyz, A 98/100 re-scan pago 08/out 15:32 UTC). | base: v48.21.0-TRUSTSTACK  # v48.21.0-TRUSTSTACK: (1) FIX DOMAIN-VERIFICATION ERC-8004 — /.well-known/agent-registration.json estava SEM o campo registrations (a spec exige p/ provar dominio) e com "99 paid endpoints" congelado: o 8004scan lia Publisher 19 / Compliance 75. Agora registrations com agentId 87048 (env ERC8004_AGENT_ID com fallback) e contagem DINAMICA len(BASE_PRICES) — nunca mais desatualiza. erc8004.json ganha o mesmo fallback (identidade sobrevive a env perdida) e descricao atualizada. (2) LANDING: faixa "Listed & verified" com 7 selos clicaveis de prova publica (8004scan, x402lint A 98/100, x402scan, x402-list, MCP Registry, PyPI, npm) + rodape copyright (c 2026 Losbeto sobre o protocolo aberto x402, sem texto LF) + tabela machine-readable ganha as 2 linhas ERC-8004. | base: v48.20.0-STOREFRONT  # v48.20: STOREFRONT — landing ganha (1) rails strip com logos SVG inline (USDC/Base/Polygon/Solana/Algorand/Pix, zero requests externos), (2) badge ERC-8004 #87048 verificavel no hero, (3) ticker CSS-only com os endpoints de $0.001, (4) vitrine 'Base chain intelligence' com os 7 endpoints da v48.19 (1a secao de produto, visivel nas 2 abas), (5) _price_label com 3 casas p/ precos < $0.01 (o .2f imprimiria $0.00), (6) aba Agent com 4 chains + 5 meta-tools | /erc8004 DEIXA DE SER FERRAMENTA E VIRA PROVA: pagina de identidade com agentId 87048 + tx 0x694b13bd…d0061e + links de verificacao (o registro JA EXISTIA desde 15/set — o -32603 do Phantom e pre-simulacao, nao gas; registrador recolhido p/ <details> avancado) | base: v48.19.0-AGUA  # v48.18.6-ONECLICK: /erc8004 com gasLimit explicito (1.2M; estimateGas real 1.107.928, custo ~$0,03) — contorna a falha de estimativa do Phantom (-32603 'Unexpected error' no eth_sendTransaction que travou o registro em 08/out) + Plano B na propria pagina: link BaseScan #writeContract e botao 'copiar agentURI'. | base: v48.18.5-ONECLICK (pagina guiada de registro ERC-8004, data URI imutavel registration-v1, agentId lido do evento Transfer; ZERO chaves no servidor)
 VERSION = "48.24.0-PROBEHARVEST"  # v48.24.0-PROBEHARVEST: trafego de maquina vira produto — /x402-watch (watch 30d em endpoint x402 alheio, $0.05, webhook em mudanca de estado/preco), /account (portal do pagante sem senha: a lsk_ E a credencial), /.well-known/demand-teaser.json (amostra gratis 1h que anuncia o /ecosystem-pulse), preview pay-ready (pay_link + quickstart em TODA amostra; avaliador 50+/dia recebe OFERTA, nunca bloqueio — veredito v44.3.0), ledger_prune_loop (probes/challenges >8d fora, 6h/6h — tabela emagrece ~270MB/mes sem perder metrica) | base: v48.23.0-FORKSAFE
 VERSION = "48.25.0-GLOBAL"  # v48.25.0-GLOBAL: des-regionalizacao — rail Pix DESLIGADO por padrao (PIX_RAIL=1 reativa; agentes pagam USDC; o email do recebedor saiu do codigo), concierge BR sem oferta Pix, chip Pix fora da landing. Compliance: triagem OFAC do pagador ANTES do settle (listas 0xB10C/SDN, refresh 24h, cache /data; hit EVM = 402 sem settle; hit pos-settle nos demais rails = alerta Telegram) — resposta a designacao da rede A7 (OFAC 01/out/2026). Storage: prune + wal_checkpoint(TRUNCATE) e VACUUM semanal com guarda de disco (resolve o alerta de 88% do volume Railway — DELETE sem VACUUM nao devolve espaco). Radar: scanners de credencial (.npmrc, aws-exports, runtime-config, index.js) rotulados como ruido, nao "produto novo". Novo: /api/admin/storage (DASH_TOKEN). | base: v48.24.0-PROBEHARVEST
-VERSION = "48.26.2-LANDING"  # v48.26.2-LANDING: REVERSÃO + SISTEMATIZAÇÃO DA COPY DE CHAINS — prova em produção (11/out): X402_POLYGON=1 está ATIVO nas Variables e o header PAYMENT-REQUIRED v2 do 402 live oferece 4 networks (eip155:8453, solana, algorand:wGHE…it8=, eip155:137) — o corpo v1 só mostra base+solana porque _accept_to_v1 devolve None para redes sem nome curto v1 (ficam v2-only no header, por design v48.9.12/v48.11.0). Ou seja: o rail Polygon ESTÁ no ar e a remoção da copy Polygon na 48.26.1 (baseada na minha suposição de flag OFF) INTRODUZIU o desalinhamento que ela queria evitar — hero/footer dinâmicos diziam "4 chains · … + Polygon" enquanto Networks/llms.txt/terms omitem Polygon. Correção definitiva, padrão máquina: (1) UMA VERDADE SÓ — _chains_list/_chains_text movidas p/ junto das flags X402_* (import time) + helpers novos _chains_csv/_chains_or/_chains_and/_chains_md/_chains_networks; 18 pontos de copy pública (landing hero/sub/meta/Payment, llms.txt, llms-full flagship, agents.json, server-card MCP, auth.json, /.well-known/x402 instructions, ENDPOINT_DESC /v1/chat/completions, concierge _INTEGRATE_SYSTEM, /terms what_you_buy+on_chain_nature, discovery description+how, chat PT) passam de texto ESTÁTICO a derivados das mesmas flags dos accepts — ligar/desligar X402_POLYGON/X402_ARBITRUM reescreve o site inteiro sozinho. (2) Badge SVG Polygon volta à strip "We accept" via __RAIL_EXTRA__ — renderizado SÓ com a flag ON (+ badge Arbitrum novo, mesmo gate). (3) Linha "Prices: $0.001 – $0.50" estática vira __P_MIN__ – __P_MAX__ (_priciest_call_label, planos excluídos). (4) "Only here": o 4º card era Multi-oracle consensus contradizendo o lede "Four Brazil products built on point-in-time archives" — vira /br-asof (o arquivo PIT Ed25519, $0.09, que nem aparecia na landing; oracle-consensus segue em Flagships). (5) Passo 4 da seção Payment ("settles on Base or Solana") dinamizado. (6) BUG PRÉ-EXISTENTE achado na auditoria: o rodapé da landing LEGACY (?legacy=1) servia o placeholder "__CHAINS__" CRU desde a v48.11.0 (replace nunca adicionado na rota /) — prova live 11/out: "intelligence node — __CHAINS__ :" no HTML; corrigido. (7) A linha estática "Prices: $0.001 – $0.50" estava ERRADA em produção — o per-call mais caro é /starter-pack $1.00; o __P_MAX__ dinâmico agora diz a verdade ($0.001 – $1.00). (8) _chains_list respeita ENABLE_BASE (sandbox sem payTo EVM não anuncia Base). Arbitrum segue OFF (sem eip155:42161 no 402 live). | base: v48.26.1-DISCOVERY  # v48.26.1-DISCOVERY: (1) REGISTRO DE DIRETÓRIO DESTRAVADO — a barreira de obrigatórios da 48.26.0 respondia 400 a PROBE NU (sem payment header) e 12 endpoints foram recusados no registro do diretório em 11/out ("they need to return a 402 payment challenge"). Corrigido: probe nu sempre cai no 402 (contrato de descoberta); o 400 didático grátis de parâmetro ausente só existe quando há pagamento x402 anexado e AINDA NÃO LIQUIDADO (check_required — o dinheiro nem se move; nunca para mpp-tempo/JWT/créditos, já capturados → delivery-or-refund v48.10.2). FCB não queima bônus em chamada malformada. (2) COPY HONESTA: Polygon/Arbitrum saem de TODA a copy pública (landing, meta, llms.txt, agents.json, chat) — os rails existem mas seguem gated OFF por env (X402_POLYGON/X402_ARBITRUM) até a confirmação de depósito na Binance; a copy agora lista só Base, Solana e Algorand. | base: v48.26.0-PREFLIGHT: (1) preflight pré-402 UNIVERSAL — parâmetro obrigatório ausente/malformado vira 400 didático GRÁTIS antes de qualquer cobrança em 12 endpoints sem default (/chain-tx /chain-balance /wallet-verdict /chain-ens /br-doc /br-cnpj /br-cep /br-pix-parse /br-pix-code /br-asof /x402-watch /agent-call; grupos any-of com aliases doc/value, code/brcode, date/asof, task/skill/endpoint/target) — mata a classe "pagou → 400 → estorno em crédito" na API crua (prova: /chain-tx sem hash pago 3× em 10/out); /pay ganha os mesmos obrigatórios pré-preenchidos funcionais (PAYGUARD parity); POST/JSON-body fora de propósito. (2) _SCAN_NOISE += sondas devops/IA (.s3cfg .boto .amplifyrc .claude) e assets .min.js (/user/umi.min.js) — fim do "produto novo" falso no radar. (3) Anomalia ML house-aware: hora em que TODO pagador é carteira da casa (rodada mensal dos indexadores) vira severidade 'house' — log/arquivo, nunca Telegram. | base: v48.25.3-ATACACHE
+VERSION = "48.26.3-POLISH"  # v48.26.3-POLISH: REVISÃO GERAL VISUAL+ESTRUTURAL (auditoria Chrome do operador, 14 screenshots + renders /dash//live 11/out) — (1) ABAS HUMAN/AGENT CONSERTADAS DE VERDADE: o toggle apontava para um <div id="human"> VAZIO (resto arqueologico) enquanto o #human real abria dentro da secao Brazil e nunca fechava — HTML invalido, getElementById pegava o vazio e o modo Agent so empilhava 3 secoes FULL-BLEED (H2 cortado na borda). Sistema novo por classes: body.show-agent + .tab-h (foryou, Brazil, Only here, Built, Honest) / .tab-a (Machine surfaces, Payment, Missing — agora secao propria COM .wrap); ids duplicados eliminados. (2) VITRINE /api/for-you: descricao cortada no meio da palavra ("vali", "B3 b") vira corte em fronteira de palavra + …; preco :.4f ("$49.9900") vira formato por magnitude (>=$0.01 → 2 casas); /founding-agent (plano $49.99) sai da prateleira per-call — planos tem vitrine propria. (3) CSS: cor global de links de conteudo (section a → --acc2; a tabela Machine-readable discovery estava azul-escuro ilegivel); h1 hero com text-wrap:balance (mata a orfa "time."); stat de chains ganha .wide (cabia "Base + Solana + Algorand + Polygon" cortado no overflow:hidden); "1st call free" com .sm; tags .bz viram eyebrow padronizado no topo dos 8 gcards (antes inline/quebrado conforme o titulo); .gcard flex-column ancora o preco no rodape; "ERC-8004" com hifen nao-quebravel no card. (4) DASH/BOOT honestos: /dash/api/stats chains derivada das flags (era hardcoded solana+base — dizia "solana · eip155" com 4 rails no ar) e o card mostra nomes amigaveis (Base/Solana/Algorand/Polygon); boot "Chains ativas" += polygon/arbitrum por flag (a omissao causou o diagnostico errado de 11/out). (5) _SCAN_NOISE += (^|/)[^/]+\.config\.js$ — /app.config.js (7 hits/6 IPs, sonda Expo) nao vira mais "produto novo"; o /config.js REAL do no segue intacto. Concorrencia (pesquisa 11/out): ScoutScore fev/2026 — 57% do Bazaar fora do ar, 57% dos schemas fantasmas, V2 (PAYMENT-REQUIRED+CAIP-2) em so 16%; este no ja entrega V2 + schema real + 503-honesto = topo do ecossistema, copy mantida. | base: v48.26.2-LANDING  # v48.26.2-LANDING: REVERSÃO + SISTEMATIZAÇÃO DA COPY DE CHAINS — prova em produção (11/out): X402_POLYGON=1 está ATIVO nas Variables e o header PAYMENT-REQUIRED v2 do 402 live oferece 4 networks (eip155:8453, solana, algorand:wGHE…it8=, eip155:137) — o corpo v1 só mostra base+solana porque _accept_to_v1 devolve None para redes sem nome curto v1 (ficam v2-only no header, por design v48.9.12/v48.11.0). Ou seja: o rail Polygon ESTÁ no ar e a remoção da copy Polygon na 48.26.1 (baseada na minha suposição de flag OFF) INTRODUZIU o desalinhamento que ela queria evitar — hero/footer dinâmicos diziam "4 chains · … + Polygon" enquanto Networks/llms.txt/terms omitem Polygon. Correção definitiva, padrão máquina: (1) UMA VERDADE SÓ — _chains_list/_chains_text movidas p/ junto das flags X402_* (import time) + helpers novos _chains_csv/_chains_or/_chains_and/_chains_md/_chains_networks; 18 pontos de copy pública (landing hero/sub/meta/Payment, llms.txt, llms-full flagship, agents.json, server-card MCP, auth.json, /.well-known/x402 instructions, ENDPOINT_DESC /v1/chat/completions, concierge _INTEGRATE_SYSTEM, /terms what_you_buy+on_chain_nature, discovery description+how, chat PT) passam de texto ESTÁTICO a derivados das mesmas flags dos accepts — ligar/desligar X402_POLYGON/X402_ARBITRUM reescreve o site inteiro sozinho. (2) Badge SVG Polygon volta à strip "We accept" via __RAIL_EXTRA__ — renderizado SÓ com a flag ON (+ badge Arbitrum novo, mesmo gate). (3) Linha "Prices: $0.001 – $0.50" estática vira __P_MIN__ – __P_MAX__ (_priciest_call_label, planos excluídos). (4) "Only here": o 4º card era Multi-oracle consensus contradizendo o lede "Four Brazil products built on point-in-time archives" — vira /br-asof (o arquivo PIT Ed25519, $0.09, que nem aparecia na landing; oracle-consensus segue em Flagships). (5) Passo 4 da seção Payment ("settles on Base or Solana") dinamizado. (6) BUG PRÉ-EXISTENTE achado na auditoria: o rodapé da landing LEGACY (?legacy=1) servia o placeholder "__CHAINS__" CRU desde a v48.11.0 (replace nunca adicionado na rota /) — prova live 11/out: "intelligence node — __CHAINS__ :" no HTML; corrigido. (7) A linha estática "Prices: $0.001 – $0.50" estava ERRADA em produção — o per-call mais caro é /starter-pack $1.00; o __P_MAX__ dinâmico agora diz a verdade ($0.001 – $1.00). (8) _chains_list respeita ENABLE_BASE (sandbox sem payTo EVM não anuncia Base). Arbitrum segue OFF (sem eip155:42161 no 402 live). | base: v48.26.1-DISCOVERY  # v48.26.1-DISCOVERY: (1) REGISTRO DE DIRETÓRIO DESTRAVADO — a barreira de obrigatórios da 48.26.0 respondia 400 a PROBE NU (sem payment header) e 12 endpoints foram recusados no registro do diretório em 11/out ("they need to return a 402 payment challenge"). Corrigido: probe nu sempre cai no 402 (contrato de descoberta); o 400 didático grátis de parâmetro ausente só existe quando há pagamento x402 anexado e AINDA NÃO LIQUIDADO (check_required — o dinheiro nem se move; nunca para mpp-tempo/JWT/créditos, já capturados → delivery-or-refund v48.10.2). FCB não queima bônus em chamada malformada. (2) COPY HONESTA: Polygon/Arbitrum saem de TODA a copy pública (landing, meta, llms.txt, agents.json, chat) — os rails existem mas seguem gated OFF por env (X402_POLYGON/X402_ARBITRUM) até a confirmação de depósito na Binance; a copy agora lista só Base, Solana e Algorand. | base: v48.26.0-PREFLIGHT: (1) preflight pré-402 UNIVERSAL — parâmetro obrigatório ausente/malformado vira 400 didático GRÁTIS antes de qualquer cobrança em 12 endpoints sem default (/chain-tx /chain-balance /wallet-verdict /chain-ens /br-doc /br-cnpj /br-cep /br-pix-parse /br-pix-code /br-asof /x402-watch /agent-call; grupos any-of com aliases doc/value, code/brcode, date/asof, task/skill/endpoint/target) — mata a classe "pagou → 400 → estorno em crédito" na API crua (prova: /chain-tx sem hash pago 3× em 10/out); /pay ganha os mesmos obrigatórios pré-preenchidos funcionais (PAYGUARD parity); POST/JSON-body fora de propósito. (2) _SCAN_NOISE += sondas devops/IA (.s3cfg .boto .amplifyrc .claude) e assets .min.js (/user/umi.min.js) — fim do "produto novo" falso no radar. (3) Anomalia ML house-aware: hora em que TODO pagador é carteira da casa (rodada mensal dos indexadores) vira severidade 'house' — log/arquivo, nunca Telegram. | base: v48.25.3-ATACACHE
 
 
 if __name__ == "__main__":
