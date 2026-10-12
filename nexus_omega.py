@@ -33376,3 +33376,909 @@ log.info("📦 v48.27.1-BATCH: /batch registrado — até "
          "atômico por item, falha de item = reembolso automático")
 
 VERSION = "48.27.1-BATCH"  # v48.27.1-BATCH: FIX CRÍTICO do KeyError em _cortex_demand_trend (dict interno plain — quebrava /ml/insights em produção com ledger populado; o teste local passava com ledger vazio) + arquivo renormalizado para LF + /batch: N consultas do catálogo em 1 round-trip via X-API-Key, validação e preço total ANTES de debitar, débito atômico por item, item falho = reembolso automático, budget de tempo com skip-não-cobrado, teto de $0.10/item (BATCH_MAX_ITEM_PRICE) | base: v48.27.0-CORTEX
+
+# ============================================================================
+# v48.28.0-AUTONOMOUS — AUTO-CONSCIÊNCIA OPERACIONAL (control plane vivo)
+#
+# O padrão mais sofisticado de automação em produção hoje: o LLM PROPÕE,
+# a POLÍTICA DETERMINÍSTICA VALIDA, o HUMANO APROVA pelo Telegram — e as
+# mudanças entram em vigor SEM DEPLOY, porque o estado operacional vive em
+# /data (control plane), lido por mtime em todos os workers.
+#
+#   error-watch : reembolsos demais em 1h → endpoint sai da vitrine sozinho
+#                 (503 honesto + fora dos catálogos via _sellable_now) e
+#                 RETOMA sozinho quando a sonda passa (backoff até 6h).
+#   llm-planner : a cada 6h lê o cortex vivo e propõe ações de uma whitelist.
+#                 Ação cujo alvo não está na telemetria real = alucinação =
+#                 descartada. Alias seguro auto-aplica (mesmo padrão do
+#                 radar); preço/pausa/produto novo viram botões no Telegram.
+#   /ops        : ok/no/pause/resume/price — o operador governa por mensagem.
+#   Auditoria   : toda decisão (automática ou humana) vai para ops_audit e
+#                 para /ops/log (DASH_TOKEN); resumo público em /ops/status.
+#
+# Flags: OPS_AGENT=0 desliga o loop · OPS_LLM=0 desliga o planner ·
+#        OPS_PAUSE_MIN_REFUNDS (3) · OPS_CYCLE_S (900) · OPS_LLM_EVERY_S (21600)
+# ============================================================================
+
+OPS_AGENT = os.environ.get("OPS_AGENT", "1") != "0"
+OPS_LLM = os.environ.get("OPS_LLM", "1") != "0"
+OPS_CYCLE_S = int(os.environ.get("OPS_CYCLE_S", "900"))
+OPS_LLM_EVERY_S = int(os.environ.get("OPS_LLM_EVERY_S", "21600"))
+OPS_PAUSE_MIN_REFUNDS = int(os.environ.get("OPS_PAUSE_MIN_REFUNDS", "3"))
+OPS_PAUSE_COOLDOWN_S = int(os.environ.get("OPS_PAUSE_COOLDOWN_S", "1800"))
+OPS_PROPOSAL_TTL_S = int(os.environ.get("OPS_PROPOSAL_TTL_S", "172800"))
+OPS_MAX_ACTIONS = int(os.environ.get("OPS_MAX_ACTIONS", "5"))
+OPS_PRICE_MIN = float(os.environ.get("OPS_PRICE_MIN", "0.005"))
+OPS_PRICE_MAX = float(os.environ.get("OPS_PRICE_MAX", "0.50"))
+OPS_PRICE_STEP = float(os.environ.get("OPS_PRICE_STEP", "0.30"))
+
+_OPS_CONTROL_FILE = HOME_DIR / "ops_control.json"
+_OPS_PROPOSALS_FILE = HOME_DIR / "ops_proposals.json"
+_OPS_PRODUCT_QUEUE = HOME_DIR / "ops_product_queue.json"
+_OPS_CONTROL = {"paused": {}, "mtime": 0.0}
+_OPS_PROPOSALS = {"items": {}, "next_id": 1, "mtime": 0.0}
+_OPS_STATE = {"last_llm": 0.0}
+_OPS_AUDIT_READY = {"ok": False}
+
+
+def _ops_read_json(path, default):
+    try:
+        with open(path) as f:
+            d = json.load(f)
+        return d if isinstance(d, type(default)) else default
+    except Exception:
+        return default
+
+
+def _ops_write_json(path, data):
+    try:
+        tmp = str(path) + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(data, f, ensure_ascii=False, indent=1)
+        os.replace(tmp, path)          # atômico: leitor nunca vê meio-arquivo
+        return True
+    except Exception as e:
+        log.debug(f"ops write {path}: {e}")
+        return False
+
+
+def _ops_control_reload():
+    """Hot-reload por mtime — os 4 workers enxergam pausas sem deploy e sem
+    lock de banco. Custo: 1 os.stat por request pausável (microssegundos)."""
+    global _OPS_CONTROL
+    try:
+        st = os.stat(_OPS_CONTROL_FILE)
+    except Exception:
+        return
+    if st.st_mtime <= _OPS_CONTROL.get("mtime", 0.0):
+        return
+    d = _ops_read_json(_OPS_CONTROL_FILE, {})
+    if isinstance(d, dict) and isinstance(d.get("paused"), dict):
+        _OPS_CONTROL = {"paused": d["paused"], "mtime": st.st_mtime}
+
+
+def _ops_control_save():
+    try:
+        _ops_write_json(_OPS_CONTROL_FILE,
+                        {"paused": _OPS_CONTROL.get("paused", {}),
+                         "version": VERSION,
+                         "ts": int(time.time())})
+        _OPS_CONTROL["mtime"] = os.stat(_OPS_CONTROL_FILE).st_mtime
+    except Exception as e:
+        log.debug(f"ops control save: {e}")
+
+
+def _ops_paused(refresh=True):
+    if refresh:
+        _ops_control_reload()
+    return dict(_OPS_CONTROL.get("paused") or {})
+
+
+def _ops_proposals_reload():
+    global _OPS_PROPOSALS
+    try:
+        st = os.stat(_OPS_PROPOSALS_FILE)
+    except Exception:
+        return
+    if st.st_mtime <= _OPS_PROPOSALS.get("mtime", 0.0):
+        return
+    d = _ops_read_json(_OPS_PROPOSALS_FILE, {})
+    if isinstance(d, dict) and isinstance(d.get("items"), dict):
+        _OPS_PROPOSALS = {"items": d["items"],
+                          "next_id": int(d.get("next_id", 1)),
+                          "mtime": st.st_mtime}
+
+
+def _ops_proposals_save():
+    try:
+        _ops_write_json(_OPS_PROPOSALS_FILE,
+                        {"items": _OPS_PROPOSALS["items"],
+                         "next_id": _OPS_PROPOSALS["next_id"]})
+        _OPS_PROPOSALS["mtime"] = os.stat(_OPS_PROPOSALS_FILE).st_mtime
+    except Exception as e:
+        log.debug(f"ops proposals save: {e}")
+
+
+def _ops_pending():
+    _ops_proposals_reload()
+    return {int(k): v for k, v in _OPS_PROPOSALS["items"].items()
+            if isinstance(v, dict) and v.get("status") == "pending"}
+
+
+# ---------------------------------------------------------------- auditoria --
+def _ops_audit(actor, action, target="", detail=None, status="applied"):
+    """Append-only. Falha de lock NUNCA derruba o chamador — auditoria é
+    importante, mas a loja continuar vendendo é mais."""
+    try:
+        with LEDGER.lock, LEDGER._conn() as c:
+            if not _OPS_AUDIT_READY["ok"]:
+                c.execute("""CREATE TABLE IF NOT EXISTS ops_audit(
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    ts INTEGER, actor TEXT, action TEXT,
+                    target TEXT, detail TEXT, status TEXT)""")
+                c.execute("CREATE INDEX IF NOT EXISTS idx_ops_audit_ts "
+                          "ON ops_audit(ts)")
+                _OPS_AUDIT_READY["ok"] = True
+            c.execute("INSERT INTO ops_audit(ts,actor,action,target,detail,status)"
+                      " VALUES(?,?,?,?,?,?)",
+                      (int(time.time()), str(actor)[:32], str(action)[:40],
+                       str(target)[:80],
+                       json.dumps(detail or {}, ensure_ascii=False)[:600],
+                       str(status)[:16]))
+            c.execute("DELETE FROM ops_audit WHERE ts<?",
+                      (int(time.time()) - 90 * 86400,))
+    except Exception as e:
+        log.debug(f"ops audit: {e}")
+
+
+def _ops_audit_recent(n=10):
+    try:
+        with LEDGER.lock, LEDGER._conn() as c:
+            if not _OPS_AUDIT_READY["ok"]:
+                c.execute("""CREATE TABLE IF NOT EXISTS ops_audit(
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    ts INTEGER, actor TEXT, action TEXT,
+                    target TEXT, detail TEXT, status TEXT)""")
+                _OPS_AUDIT_READY["ok"] = True
+            rows = c.execute(
+                "SELECT ts,actor,action,target,status FROM ops_audit "
+                "ORDER BY id DESC LIMIT ?", (int(n),)).fetchall()
+        return [{"ts": r[0], "actor": r[1], "action": r[2],
+                 "target": r[3], "status": r[4]} for r in rows]
+    except Exception:
+        return []
+
+
+# ------------------------------------------------------------- pausa/retomo --
+def _ops_pause(endpoint, reason, by, refunds_1h=0, cooldown_s=None):
+    cd = int(cooldown_s or OPS_PAUSE_COOLDOWN_S)
+    now = int(time.time())
+    _ops_control_reload()
+    paused = _OPS_CONTROL.setdefault("paused", {})
+    if endpoint in paused:
+        return False, "já pausado"
+    paused[endpoint] = {"ts": now, "reason": str(reason)[:160], "by": by,
+                        "refunds_1h": int(refunds_1h),
+                        "probe_after": now + cd, "backoff_s": cd}
+    _ops_control_save()
+    _ops_audit(by, "pause_endpoint", endpoint,
+               {"reason": str(reason)[:160], "refunds_1h": refunds_1h}, "applied")
+    log.warning(f"⏸ OPS-PAUSE: {endpoint} fora da vitrine ({reason}) — by {by}")
+    return True, "pausado"
+
+
+def _ops_probe(endpoint):
+    """Sonda de retomada: executa o handler real com os parâmetros de exemplo
+    (mesmo executor isolado do /batch). Sucesso = entregou, sem erro sinalizado."""
+    h = ENDPOINT_HANDLERS.get(endpoint)
+    if not h:
+        return False, "sem handler registrado"
+    params = dict(ENDPOINT_PARAM_HINTS.get(endpoint, {}))
+    try:
+        raw = _batch_exec(h, params)
+        status, _data = _batch_unpack(raw)
+        if _is_error_result(raw) or (status and status >= 500):
+            return False, f"status {status}"
+        return True, f"status {status or 200}"
+    except Exception as e:
+        return False, str(e)[:120]
+
+
+def _ops_resume(endpoint, actor, probe=True):
+    _ops_control_reload()
+    if endpoint not in (_OPS_CONTROL.get("paused") or {}):
+        return False, "não está pausado"
+    if probe:
+        ok, msg = _ops_probe(endpoint)
+        if not ok:
+            _ops_audit(actor, "resume_refused", endpoint, {"probe": msg}, "failed")
+            return False, f"sonda falhou: {msg}"
+    _OPS_CONTROL["paused"].pop(endpoint, None)
+    _ops_control_save()
+    _ops_audit(actor, "resume_endpoint", endpoint, {}, "applied")
+    log.warning(f"▶ OPS-RESUME: {endpoint} de volta à vitrine — by {actor}")
+    return True, "retomado"
+
+
+def _ops_resume_sweep():
+    """Pausas com cooldown vencido são sondadas. Falha → backoff x2 (teto 6h)."""
+    now = time.time()
+    for ep, rec in list(_ops_paused().items()):
+        try:
+            if now < float(rec.get("probe_after", 0)):
+                continue
+            ok, msg = _ops_probe(ep)
+            if ok:
+                _ops_resume(ep, "ops-agent", probe=False)
+                _notify_telegram(
+                    f"▶️ *RETOMADA AUTOMÁTICA*\n\n"
+                    f"`{ep}` voltou à vitrine — a sonda entregou "
+                    f"({TelegramBot.esc(msg)}). Pausa durou "
+                    f"{(int(now) - int(rec.get('ts', now))) // 60} min.")
+            else:
+                rec["backoff_s"] = min(int(rec.get("backoff_s",
+                                       OPS_PAUSE_COOLDOWN_S)) * 2, 6 * 3600)
+                rec["probe_after"] = int(now) + rec["backoff_s"]
+                rec["last_probe"] = str(msg)[:120]
+                _OPS_CONTROL["paused"][ep] = rec
+                _ops_control_save()
+                _ops_audit("ops-agent", "resume_probe_failed", ep,
+                           {"probe": str(msg)[:120],
+                            "next_in_s": rec["backoff_s"]}, "failed")
+        except Exception as e:
+            log.debug(f"ops resume sweep {ep}: {e}")
+
+
+# v48.28.0 — o hook de vendabilidade agora consulta o control plane.
+_SELLABILITY_BLOCK_ORIG = _sellability_block
+
+
+def _sellability_block(path):
+    """Pausa do control plane = invendável AGORA: 503 grátis antes do 402 e
+    fora de todos os catálogos de máquinas (via _sellable_now). Retorno é
+    espontâneo quando a sonda passa. O comportamento original é preservado."""
+    try:
+        p = _ops_paused().get(path)
+        if p is not None:
+            return {
+                "status": "unavailable",
+                "error": ("temporarily paused by the node's autonomous ops "
+                          "layer — it refunds nothing because nothing is "
+                          "charged while paused"),
+                "endpoint": path,
+                "paused_at": p.get("ts"),
+                "reason": p.get("reason"),
+                "retry_after_seconds": max(
+                    60, int(float(p.get("probe_after", 0)) - time.time())),
+                "transparency": f"{_public_base()}/ops/status",
+            }
+    except Exception:
+        pass
+    try:
+        return _SELLABILITY_BLOCK_ORIG(path)
+    except Exception:
+        return None
+
+
+# ------------------------------------------------------------- error-watch --
+def _ops_error_watch():
+    """O termômetro de entrega: reembolso = cobramos e NÃO entregamos. Um
+    endpoint que reembolsa mais do que entrega deixa de vender na hora —
+    protege o comprador e o fail-rate nos índices de descoberta."""
+    d = int(time.time()) - 3600
+    try:
+        with LEDGER._conn() as c:
+            refunds = dict(c.execute(
+                "SELECT endpoint, COUNT(*) FROM requests WHERE ts>? "
+                "AND kind='refunded' GROUP BY endpoint", (d,)).fetchall())
+            oks = dict(c.execute(
+                "SELECT endpoint, COUNT(*) FROM requests WHERE ts>? "
+                "AND kind IN ('paid','fcb_bonus') GROUP BY endpoint",
+                (d,)).fetchall())
+    except Exception as e:
+        log.debug(f"ops error-watch query: {e}")
+        return
+    paused = _ops_paused()
+    for ep, n in refunds.items():
+        try:
+            if ep not in BASE_PRICES or ep in paused:
+                continue
+            if int(n) >= OPS_PAUSE_MIN_REFUNDS and int(n) > int(oks.get(ep, 0)):
+                reason = (f"{n} reembolso(s) na última hora vs "
+                          f"{oks.get(ep, 0)} entrega(s) — entrega falhando "
+                          f"após cobrança")
+                applied, _ = _ops_pause(ep, reason, "error-watch",
+                                        refunds_1h=n)
+                if applied and TG_BOT and TG_CHAT:
+                    TG_BOT.send(
+                        TG_CHAT,
+                        f"⏸ *AUTO-PAUSA (error-watch)*\n\n"
+                        f"`{ep}` saiu da vitrine: {TelegramBot.esc(reason)}.\n"
+                        f"Compradores recebem 503 grátis (nada é cobrado) e "
+                        f"o endpoint some dos catálogos. Sonda automática em "
+                        f"{OPS_PAUSE_COOLDOWN_S // 60} min; retoma sozinho se "
+                        f"entregar.",
+                        buttons=[[{"text": "▶ Retomar agora",
+                                   "callback_data": f"/ops resume {ep}"}]])
+        except Exception as e:
+            log.debug(f"ops error-watch {ep}: {e}")
+
+
+# --------------------------------------------------------------- executor ---
+def _ops_target(action):
+    return str(action.get("endpoint") or action.get("path") or "")
+
+
+def _ops_apply(action, actor):
+    """Executa ação JÁ validada pela política. (ok, msg)"""
+    k = action.get("action")
+    if k == "create_alias":
+        path, target = str(action["path"]), str(action["target"])
+        _AUTO_ALIASES[path] = {"target": target, "ts": int(time.time()),
+                               "hits": int(action.get("hits", 0)),
+                               "ips": int(action.get("ips", 0))}
+        _radar_alias_save()
+        return True, f"{path} → {target}"
+    if k == "adjust_price":
+        ep = str(action["endpoint"])
+        np_ = float(action["new_price"])
+        PRICE_OVERRIDES[ep] = round(np_, 4)
+        saved = _ops_read_json(_ML_PRICE_FILE, {})
+        saved[ep] = {"price": round(np_, 4), "ts": int(time.time()),
+                     "by": str(actor)[:24]}
+        _ops_write_json(_ML_PRICE_FILE, saved)
+        return True, f"{ep} agora ${get_dynamic_price(ep):.4f}"
+    if k == "pause_endpoint":
+        return _ops_pause(str(action["endpoint"]),
+                          str(action.get("reason", "decisão ops"))[:160], actor)
+    if k == "resume_endpoint":
+        return _ops_resume(str(action["endpoint"]), actor, probe=True)
+    if k == "queue_product":
+        q = _ops_read_json(_OPS_PRODUCT_QUEUE, [])
+        q.append({"path": str(action["path"]),
+                  "note": str(action.get("reason", ""))[:200],
+                  "ts": int(time.time()), "by": str(actor)[:24]})
+        _ops_write_json(_OPS_PRODUCT_QUEUE, q[-50:])
+        return True, "na fila de produto"
+    if k == "note":
+        return True, "anotado"
+    return False, "ação desconhecida"
+
+
+def _ops_validate(action, candidates):
+    """GUARDRAILS DETERMINÍSTICOS — o LLM não tem poder de execução, só de
+    sugestão. candidates = paths/endpoints REAIS da telemetria que ele recebeu;
+    qualquer ação fora disso é alucinação e morre aqui.
+    Retorna (ok, modo): modo ∈ auto | approval | rejected-reason."""
+    k = action.get("action")
+    if k == "note":
+        txt = str(action.get("text", "")).strip()
+        return (bool(txt), "note") if txt else (False, "nota vazia")
+    if k == "create_alias":
+        path = str(action.get("path", ""))
+        target = str(action.get("target", ""))
+        info = (candidates.get("backlog") or {}).get(path)
+        if info is None:
+            return False, "path fora do backlog real (anti-alucinação)"
+        if not _radar_safe_path(path):
+            return False, "path inseguro"
+        if _route_now_live(path):
+            return False, "rota real já existe"
+        if path in _AUTO_ALIASES:
+            return False, "alias já existe"
+        if len(_AUTO_ALIASES) >= _RADAR_MAX_ALIASES:
+            return False, "limite de aliases"
+        if not _radar_safe_target(target):
+            return False, "alvo não vendável"
+        action["hits"] = info.get("hits", 0)
+        action["ips"] = info.get("ips", 0)
+        return True, "auto"       # mesmo padrão de segurança do radar → aplica
+    if k == "adjust_price":
+        ep = str(action.get("endpoint", ""))
+        if ep not in BASE_PRICES:
+            return False, "endpoint desconhecido"
+        if ep not in (candidates.get("endpoints") or {}):
+            return False, "endpoint fora dos candidatos (anti-alucinação)"
+        try:
+            np_ = float(action.get("new_price"))
+        except Exception:
+            return False, "preço inválido"
+        cur = get_dynamic_price(ep)
+        if not (OPS_PRICE_MIN <= np_ <= OPS_PRICE_MAX):
+            return False, f"fora da faixa ${OPS_PRICE_MIN}–${OPS_PRICE_MAX}"
+        if abs(np_ - cur) / max(cur, 0.0001) > OPS_PRICE_STEP:
+            return False, f"variação maior que {int(OPS_PRICE_STEP * 100)}%"
+        if _price_env_key(ep) in os.environ:
+            return False, "operador fixou este preço por ENV"
+        if abs(np_ - cur) < 0.0005:
+            return False, "sem variação real"
+        action["new_price"] = round(np_, 4)
+        # PRICE_AUTO=1 → o price-advisor já tem trava semanal própria; aqui
+        # o LLM segue a mesma flag. Default: humano aprova.
+        return True, ("auto" if PRICE_AUTO else "approval")
+    if k == "pause_endpoint":
+        ep = str(action.get("endpoint", ""))
+        if ep not in BASE_PRICES:
+            return False, "endpoint desconhecido"
+        if ep in _ops_paused():
+            return False, "já pausado"
+        return True, "approval"   # pausa automática é papel do error-watch
+    if k == "resume_endpoint":
+        ep = str(action.get("endpoint", ""))
+        if ep not in _ops_paused():
+            return False, "não está pausado"
+        return True, "approval"
+    if k == "queue_product":
+        path = str(action.get("path", ""))
+        if path not in (candidates.get("backlog") or {}):
+            return False, "path fora do backlog real"
+        return True, "approval"
+    return False, "ação fora da whitelist"
+
+
+# -------------------------------------------------------------- propostas ---
+def _ops_describe(action):
+    k = action.get("action")
+    why = TelegramBot.esc(str(action.get("reason", ""))[:220])
+    if k == "create_alias":
+        return (f"🍒 Criar alias `{TelegramBot.esc(action.get('path'))}` → "
+                f"`{TelegramBot.esc(action.get('target'))}`\n_{why}_")
+    if k == "adjust_price":
+        ep = str(action.get("endpoint"))
+        cur = get_dynamic_price(ep)
+        return (f"💲 Preço `{TelegramBot.esc(ep)}` ${cur:.4f} → "
+                f"${float(action.get('new_price', 0)):.4f}\n_{why}_")
+    if k == "pause_endpoint":
+        return f"⏸ Pausar `{TelegramBot.esc(action.get('endpoint'))}`\n_{why}_"
+    if k == "resume_endpoint":
+        return f"▶ Retomar `{TelegramBot.esc(action.get('endpoint'))}`\n_{why}_"
+    if k == "queue_product":
+        return (f"➕ Fila de produto: `{TelegramBot.esc(action.get('path'))}`"
+                f"\n_{why}_")
+    return TelegramBot.esc(str(action)[:300])
+
+
+def _ops_propose(action, by):
+    _ops_proposals_reload()
+    pid = int(_OPS_PROPOSALS["next_id"])
+    _OPS_PROPOSALS["next_id"] = pid + 1
+    _OPS_PROPOSALS["items"][str(pid)] = {
+        "action": action, "by": str(by)[:24],
+        "ts": int(time.time()), "status": "pending"}
+    # higiene: guarda só as últimas 60 propostas
+    items = _OPS_PROPOSALS["items"]
+    if len(items) > 60:
+        for old in sorted(items, key=lambda i: items[i].get("ts", 0))[:-60]:
+            items.pop(old, None)
+    _ops_proposals_save()
+    _ops_audit(by, f"propose:{action.get('action')}", _ops_target(action),
+               {"id": pid, "reason": str(action.get("reason", ""))[:200]},
+               "proposed")
+    if TG_BOT and TG_CHAT:
+        TG_BOT.send(
+            TG_CHAT,
+            f"🤖 *PROPOSTA #{pid}* — {TelegramBot.esc(by)}\n\n"
+            f"{_ops_describe(action)}\n\n"
+            f"Expira em {OPS_PROPOSAL_TTL_S // 3600}h.",
+            buttons=[[{"text": "✅ Aplicar", "callback_data": f"/ops ok {pid}"},
+                      {"text": "❌ Recusar", "callback_data": f"/ops no {pid}"}]])
+    return pid
+
+
+def _ops_decide(pid, approve, actor="operator"):
+    _ops_proposals_reload()
+    rec = _OPS_PROPOSALS["items"].get(str(pid))
+    if not rec:
+        return False, f"proposta #{pid} não existe"
+    if rec.get("status") != "pending":
+        return False, f"proposta #{pid} já está {rec.get('status')}"
+    if int(time.time()) - int(rec.get("ts", 0)) > OPS_PROPOSAL_TTL_S:
+        rec["status"] = "expired"
+        _ops_proposals_save()
+        return False, f"proposta #{pid} expirou"
+    if approve:
+        ok, msg = _ops_apply(rec["action"], actor)
+        rec["status"] = "applied" if ok else "failed"
+        rec["result"] = msg
+        _ops_proposals_save()
+        _ops_audit(actor, f"approve:{rec['action'].get('action')}",
+                   _ops_target(rec["action"]),
+                   {"id": pid, "result": str(msg)[:200]},
+                   "applied" if ok else "failed")
+        return ok, (f"✅ #{pid} aplicada: {msg}" if ok
+                    else f"⚠ #{pid} falhou ao aplicar: {msg}")
+    rec["status"] = "rejected"
+    _ops_proposals_save()
+    _ops_audit(actor, f"reject:{rec['action'].get('action')}",
+               _ops_target(rec["action"]), {"id": pid}, "rejected")
+    return True, f"❌ #{pid} recusada."
+
+
+def _ops_proposals_expire():
+    _ops_proposals_reload()
+    now = int(time.time())
+    mudou = False
+    for k, rec in _OPS_PROPOSALS["items"].items():
+        if rec.get("status") == "pending" and now - int(rec.get("ts", 0)) > OPS_PROPOSAL_TTL_S:
+            rec["status"] = "expired"
+            mudou = True
+            _ops_audit("ops-agent", "expire",
+                       _ops_target(rec.get("action") or {}),
+                       {"id": k}, "expired")
+    if mudou:
+        _ops_proposals_save()
+
+
+# ------------------------------------------------------------- llm-planner --
+_BUILD_CORTEX_ORIG = build_cortex
+
+
+def _ops_parse_actions(txt):
+    """JSON tolerante: o LLM às vezes embrulha em prosa/markdown."""
+    if not txt:
+        return []
+    t = txt.strip()
+    if "```" in t:
+        for part in t.split("```"):
+            part = part.strip()
+            if part.startswith("json"):
+                part = part[4:].strip()
+            if part.startswith("{"):
+                t = part
+                break
+    i, j = t.find("{"), t.rfind("}")
+    if i < 0 or j <= i:
+        return []
+    try:
+        d = json.loads(t[i:j + 1])
+        acts = d.get("actions") if isinstance(d, dict) else None
+        return [a for a in (acts or []) if isinstance(a, dict) and a.get("action")]
+    except Exception as e:
+        log.debug(f"ops llm parse: {e}")
+        return []
+
+
+def _ops_llm_planner():
+    """O planejador: lê o cérebro vivo e propõe. NUNCA executa direto — toda
+    ação passa pelo _ops_validate; só alias seguro auto-aplica."""
+    brain = {}
+    try:
+        brain = _BUILD_CORTEX_ORIG() or {}
+    except Exception as e:
+        log.debug(f"ops llm cortex: {e}")
+        return
+    backlog = {}
+    for b in (brain.get("product_backlog") or [])[:8]:
+        p = b.get("requested_path")
+        if p:
+            backlog[p] = {"hits": b.get("hits_7d", 0),
+                          "ips": b.get("distinct_ips", 0),
+                          "closest": b.get("closest_existing")}
+    conv = {}
+    for r in ((brain.get("conversion") or {}).get("by_endpoint") or [])[:10]:
+        ep = r.get("endpoint")
+        if ep in BASE_PRICES:
+            conv[ep] = {"price": r.get("price_usdc"), "signal": r.get("signal"),
+                        "probes": r.get("probes"), "sales": r.get("sales")}
+    paused = _ops_paused()
+    if not backlog and not conv and not paused:
+        return
+    candidates = {"backlog": backlog, "endpoints": conv}
+    state = {"product_backlog": backlog, "conversion": conv,
+             "demand_trend": (brain.get("demand_trend") or [])[:6],
+             "llm_quarantined": (brain.get("llm_routing") or {}).get(
+                 "quarantined_now") or [],
+             "paused_now": {e: p.get("reason") for e, p in paused.items()}}
+    prompt = (
+        "You are the autonomous operations planner of a pay-per-call API node "
+        "(x402 machine commerce; buyers are AI agents). Read the live telemetry "
+        "and propose ONLY actions from this whitelist, as ONE strict JSON object:\n"
+        '{"actions":[\n'
+        ' {"action":"create_alias","path":"<from product_backlog>",'
+        '"target":"<existing endpoint, the close match>","reason":"..."},\n'
+        ' {"action":"adjust_price","endpoint":"<from conversion>",'
+        '"new_price":0.02,"reason":"..."},\n'
+        ' {"action":"pause_endpoint","endpoint":"...","reason":"..."},\n'
+        ' {"action":"resume_endpoint","endpoint":"<from paused_now>","reason":"..."},\n'
+        ' {"action":"queue_product","path":"<backlog item with NO close match>",'
+        '"reason":"what product should exist"},\n'
+        ' {"action":"note","text":"one sharp observation for the operator"}]}\n'
+        "Hard rules: use ONLY paths/endpoints that appear in the telemetry; at "
+        "most 5 actions; create_alias only when the close match is a real "
+        "substitute; new_price within +/-30% of current; high demand + zero "
+        "sales means LOWER the price, not raise; output the JSON and nothing "
+        "else.\nTelemetry: " + json.dumps(state, ensure_ascii=False)[:3500])
+    txt = LLM.ask(prompt, max_tokens=700, temperature=0.2, cache=False)
+    if not txt:
+        log.info("🤖 ops-planner: LLM indisponível neste ciclo")
+        return
+    actions = _ops_parse_actions(txt)
+    if not actions:
+        log.info("🤖 ops-planner: nenhuma ação válida no retorno do LLM")
+        return
+    applied, proposed, notes = 0, 0, []
+    for a in actions[:OPS_MAX_ACTIONS]:
+        try:
+            ok, mode = _ops_validate(a, candidates)
+            tgt = _ops_target(a)
+            if not ok:
+                _ops_audit("llm-planner", str(a.get("action"))[:40], tgt,
+                           {"rejected_by_policy": str(mode)[:120]}, "failed")
+                continue
+            if mode == "auto":
+                ok2, msg = _ops_apply(a, "llm-planner")
+                _ops_audit("llm-planner", a["action"], tgt,
+                           {"reason": str(a.get("reason", ""))[:200],
+                            "result": str(msg)[:200]},
+                           "applied" if ok2 else "failed")
+                if ok2:
+                    applied += 1
+                    _notify_telegram(
+                        f"🤖 *OPS AUTO-APLICADO*\n\n{_ops_describe(a)}\n"
+                        f"Resultado: {TelegramBot.esc(str(msg)[:160])}")
+            elif mode == "approval":
+                if proposed < 3:
+                    _ops_propose(a, "llm-planner")
+                    proposed += 1
+            elif mode == "note":
+                notes.append(str(a.get("text", ""))[:280])
+                _ops_audit("llm-planner", "note", "",
+                           {"text": str(a.get("text", ""))[:280]}, "applied")
+        except Exception as e:
+            log.debug(f"ops llm action: {e}")
+    if notes:
+        _notify_telegram("🤖 *OPS PLANNER — observações*\n\n"
+                         + "\n".join(f"• {TelegramBot.esc(n)}" for n in notes[:3]))
+    log.warning(f"🤖 ops-planner: {applied} auto-aplicadas, "
+                f"{proposed} propostas, {len(notes)} notas")
+
+
+# ----------------------------------------------------------------- Telegram --
+def _ops_tg_status():
+    paused = _ops_paused()
+    pend = _ops_pending()
+    lines = [f"🤖 *OPS — control plane vivo* (v{VERSION})", ""]
+    if paused:
+        lines.append("⏸ *Pausados agora:*")
+        for ep, p in paused.items():
+            mins = (int(time.time()) - int(p.get("ts", 0))) // 60
+            lines.append(f"• `{TelegramBot.esc(ep)}` há {mins}min — "
+                         f"{TelegramBot.esc(str(p.get('reason', ''))[:90])}")
+    else:
+        lines.append("▶ Nenhum endpoint pausado.")
+    lines.append("")
+    if pend:
+        lines.append("⏳ *Propostas pendentes:*")
+        for pid, rec in sorted(pend.items()):
+            a = rec.get("action") or {}
+            age = (int(time.time()) - int(rec.get("ts", 0))) // 3600
+            lines.append(f"• #{pid} ({age}h, {TelegramBot.esc(rec.get('by',''))}): "
+                         f"{TelegramBot.esc(str(a.get('action')))} "
+                         f"`{TelegramBot.esc(_ops_target(a))}`")
+        lines.append("Aprove com `/ops ok N` · recuse com `/ops no N`")
+    else:
+        lines.append("Sem propostas pendentes.")
+    recent = _ops_audit_recent(5)
+    if recent:
+        lines += ["", "🧾 *Últimas decisões:*"]
+        for r in recent:
+            lines.append(f"• {TelegramBot.esc(r['actor'])}/"
+                         f"{TelegramBot.esc(r['action'])} "
+                         f"`{TelegramBot.esc(r['target'])}` → "
+                         f"{TelegramBot.esc(r['status'])}")
+    lines += ["", "Comandos: `/ops pause /x` · `/ops resume /x` · "
+                  "`/ops price /x 0.02` · `/ops ok N` · `/ops no N`"]
+    return "\n".join(lines)
+
+
+def _ops_tg_command(bot, msg, text):
+    chat_id = msg["chat"]["id"]
+    parts = text.strip().split()
+    cmd = parts[1:] if len(parts) > 1 else []
+    if not cmd:
+        bot.send(chat_id, _ops_tg_status())
+        return
+    verb = cmd[0].lower()
+    if verb in ("ok", "yes", "aprovar") and len(cmd) >= 2 and cmd[1].isdigit():
+        ok, msgout = _ops_decide(int(cmd[1]), True)
+        bot.send(chat_id, TelegramBot.esc(msgout))
+        return
+    if verb in ("no", "rej", "recusar") and len(cmd) >= 2 and cmd[1].isdigit():
+        ok, msgout = _ops_decide(int(cmd[1]), False)
+        bot.send(chat_id, TelegramBot.esc(msgout))
+        return
+    if verb == "pause" and len(cmd) >= 2:
+        ep = cmd[1] if cmd[1].startswith("/") else "/" + cmd[1]
+        if ep not in BASE_PRICES:
+            bot.send(chat_id, f"⚠ `{TelegramBot.esc(ep)}` não é endpoint do catálogo.")
+            return
+        reason = " ".join(cmd[2:])[:140] or "pausa manual do operador"
+        ok, m = _ops_pause(ep, reason, "operator")
+        bot.send(chat_id, (f"⏸ `{TelegramBot.esc(ep)}` fora da vitrine." if ok
+                           else f"⚠ {TelegramBot.esc(m)}"))
+        return
+    if verb == "resume" and len(cmd) >= 2:
+        ep = cmd[1] if cmd[1].startswith("/") else "/" + cmd[1]
+        ok, m = _ops_resume(ep, "operator", probe=True)
+        bot.send(chat_id, (f"▶ `{TelegramBot.esc(ep)}` de volta à vitrine "
+                           f"(sonda passou)." if ok
+                           else f"⚠ Retomada recusada: {TelegramBot.esc(m)}"))
+        return
+    if verb == "price" and len(cmd) >= 3:
+        ep = cmd[1] if cmd[1].startswith("/") else "/" + cmd[1]
+        try:
+            np_ = float(cmd[2].replace(",", "."))
+        except Exception:
+            bot.send(chat_id, "⚠ Preço inválido. Ex.: `/ops price /forecast 0.03`")
+            return
+        if ep not in BASE_PRICES:
+            bot.send(chat_id, f"⚠ `{TelegramBot.esc(ep)}` não é endpoint do catálogo.")
+            return
+        if not (OPS_PRICE_MIN <= np_ <= OPS_PRICE_MAX):
+            bot.send(chat_id, f"⚠ Faixa permitida: ${OPS_PRICE_MIN}–${OPS_PRICE_MAX}.")
+            return
+        ok, m = _ops_apply({"action": "adjust_price", "endpoint": ep,
+                            "new_price": round(np_, 4)}, "operator")
+        _ops_audit("operator", "adjust_price", ep,
+                   {"new_price": round(np_, 4), "via": "telegram"},
+                   "applied" if ok else "failed")
+        bot.send(chat_id, (f"💲 {TelegramBot.esc(m)} — já vale no catálogo, "
+                           "sem deploy." if ok else f"⚠ {TelegramBot.esc(m)}"))
+        return
+    bot.send(chat_id,
+             "Comandos `/ops`:\n`/ops` — status\n`/ops ok N` / `/ops no N`\n"
+             "`/ops pause /endpoint [motivo]`\n`/ops resume /endpoint`\n"
+             "`/ops price /endpoint 0.02`")
+
+
+_TG_HANDLE_ORIG = TelegramBot._handle
+
+
+def _tg_handle_with_ops(self, msg):
+    try:
+        text = (msg.get("text") or "").strip()
+    except Exception:
+        text = ""
+    if text.startswith("/ops"):
+        try:
+            _ops_tg_command(self, msg, text)
+        except Exception as e:
+            try:
+                self.send(msg["chat"]["id"],
+                          f"⚠ /ops: {TelegramBot.esc(str(e)[:140])}")
+            except Exception:
+                pass
+        return
+    return _TG_HANDLE_ORIG(self, msg)
+
+
+TelegramBot._handle = _tg_handle_with_ops
+
+
+# --------------------------------------------------------------- HTTP ops ---
+@app.route("/ops/status")
+def ops_status_public():
+    paused = _ops_paused()
+    return jsonify({
+        "node": BRAND_NAME, "version": VERSION,
+        "layer": ("autonomous ops — LLM proposes, deterministic policy "
+                  "validates, operator approves via Telegram; control plane "
+                  "is hot-reloadable from /data, no redeploy needed"),
+        "paused_endpoints": [{"endpoint": e,
+                              "reason": p.get("reason"),
+                              "since": p.get("ts"),
+                              "next_probe_at": p.get("probe_after")}
+                             for e, p in paused.items()],
+        "pending_proposals": len(_ops_pending()),
+        "recent_actions": _ops_audit_recent(8),
+        "flags": {"ops_agent": OPS_AGENT, "ops_llm": OPS_LLM,
+                  "price_auto": PRICE_AUTO},
+        "ts": int(time.time()),
+    })
+
+
+@app.route("/ops/log")
+def ops_log_private():
+    tok = request.headers.get("X-Dash-Token") or request.args.get("token") or ""
+    if not tok or not hmac.compare_digest(str(tok), str(DASH_TOKEN)):
+        return jsonify({"error": "unauthorized",
+                        "hint": "GET /ops/log?token=<DASH_TOKEN>"}), 401
+    pend = _ops_pending()
+    return jsonify({
+        "version": VERSION,
+        "paused": _ops_paused(),
+        "pending_proposals": [
+            {"id": pid, "by": r.get("by"), "ts": r.get("ts"),
+             "action": r.get("action")} for pid, r in sorted(pend.items())],
+        "product_queue": _ops_read_json(_OPS_PRODUCT_QUEUE, []),
+        "audit": _ops_audit_recent(100),
+        "ts": int(time.time()),
+    })
+
+
+# ------------------------------------------- build_cortex ganha bloco ops ---
+def build_cortex():
+    """v48.28.0: /ml/insights passa a publicar o estado operacional autônomo
+    (pausas, propostas, decisões recentes) — assinado como o resto."""
+    brain = dict(_BUILD_CORTEX_ORIG() or {})
+    try:
+        paused = _ops_paused()
+        brain["ops"] = {
+            "layer": ("autonomous ops — LLM proposes, deterministic policy "
+                      "validates, operator approves via Telegram"),
+            "paused_endpoints": [{"endpoint": e, "reason": p.get("reason"),
+                                  "since": p.get("ts")}
+                                 for e, p in paused.items()],
+            "pending_proposals": len(_ops_pending()),
+            "recent_actions": _ops_audit_recent(8),
+            "control_plane": ("hot-reloadable from /data/ops_control.json — "
+                              "changes apply live, no redeploy"),
+        }
+        for k in ("sha256", "signature", "signer"):
+            brain.pop(k, None)
+        blob = json.dumps(brain, sort_keys=True, separators=(",", ":"),
+                          default=str)
+        brain["sha256"] = hashlib.sha256(blob.encode()).hexdigest()
+        brain["signature"] = base64.b64encode(
+            WALLET.sign(f"losbeto-cortex|{brain['sha256']}".encode())).decode()
+        brain["signer"] = WALLET.solana_address
+    except Exception:
+        pass
+    return brain
+
+
+# ------------------------------------------------------------- loop agente --
+def ops_agent_loop():
+    """Ciclo da auto-consciência. Roda SÓ no worker dono do flock (registrado
+    via _start_background_once). Tudo aqui é best-effort: uma exceção em
+    qualquer etapa nunca derruba o loop nem a loja."""
+    time.sleep(240)            # deixa o tráfego e os warmers assentarem
+    while True:
+        t0 = time.time()
+        try:
+            _ops_proposals_expire()
+        except Exception as e:
+            log.debug(f"ops expire: {e}")
+        try:
+            _ops_error_watch()
+        except Exception as e:
+            log.debug(f"ops watch: {e}")
+        try:
+            _ops_resume_sweep()
+        except Exception as e:
+            log.debug(f"ops resume: {e}")
+        try:
+            if OPS_LLM and time.time() - _OPS_STATE["last_llm"] > OPS_LLM_EVERY_S:
+                _OPS_STATE["last_llm"] = time.time()
+                _ops_llm_planner()
+        except Exception as e:
+            log.debug(f"ops llm: {e}")
+        time.sleep(max(60, OPS_CYCLE_S - (time.time() - t0)))
+
+
+_START_BG_ORIG = _start_background_once
+
+
+def _start_background_once():
+    """Mesmo boot de sempre + o ops-agent no worker dono do flock."""
+    owned = _START_BG_ORIG()
+    try:
+        if owned and OPS_AGENT:
+            threading.Thread(target=ops_agent_loop, daemon=True,
+                             name="v4828-ops").start()
+            log.info("🤖 ops-agent ativo neste worker — control plane /data, "
+                     "Telegram /ops, sem deploy para pausar/retomar/reprecificar")
+    except Exception as e:
+        log.warning(f"ops-agent start: {e}")
+    return owned
+
+
+_start_background_once = _start_background_once
+
+log.warning("🤖 v48.28.0-AUTONOMOUS ativo — auto-pausa por reembolso · "
+            "retomada por sonda com backoff · llm-planner 6h (whitelist + "
+            "anti-alucinação) · preço/pausa/produto com botão no Telegram "
+            "(/ops) · control plane em /data sem deploy · auditoria em "
+            "/ops/log e /ops/status")
+
+VERSION = "48.28.0-AUTONOMOUS"  # v48.28.0-AUTONOMOUS: camada de auto-consciencia operacional — error-watch auto-pausa endpoint que reembolsa mais do que entrega (503 honesto + sai dos catalogos via _sellable_now) e retoma sozinho por sonda com backoff ate 6h · llm-planner a cada 6h propoe acoes de whitelist sobre telemetria real (acao fora dos candidatos = alucinacao descartada) — alias seguro auto-aplica, preco/pausa/produto viram botoes no Telegram · /ops ok|no|pause|resume|price governa sem deploy · control plane hot-reload em /data/ops_control.json (padrao mtime, imune a lock de SQLite) · auditoria ops_audit + GET /ops/log (DASH_TOKEN) + /ops/status publico + bloco ops assinado no /ml/insights | base: v48.27.1-BATCH
