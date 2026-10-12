@@ -32938,8 +32938,10 @@ def _cortex_demand_trend(days: int = 14, top: int = 8) -> list:
                 "GROUP BY endpoint, day", (d,)).fetchall()
     except Exception as e:
         return [{"error": str(e)[:80]}]
-    per = defaultdict(dict)
+    per = defaultdict(lambda: defaultdict(int))
     for ep, day, n in rows:
+        # v48.27.1-FIX: o dict interno plain quebrava com KeyError no primeiro
+        # insert — o teste local passava porque o ledger de teste estava vazio.
         per[ep][int(day)] += n
     out = []
     for ep, days_map in per.items():
@@ -33150,3 +33152,227 @@ log.info("🧠 v48.27.0-CORTEX ativo — /ml/insights público e assinado · "
          "upsell anti-operador · /live+/dash unificados · watch anti-exemplo")
 
 VERSION = "48.27.0-CORTEX"  # v48.27.0-CORTEX: /ml/insights assinado (bandit+conversao Wilson+tendencia+backlog ML) · digest Telegram diario (flock, CORTEX_DIGEST=0 off) · quarentena de exploit no bandit LLM (Gemini 9,65s fora da rota sincrona, reabilita sozinho) · scorecard availability conta challenge402 (era 7%, agora ~real) · upsell nunca mais para carteiras do operador (MRVANO recebia 104 tips/dia) · /live redireciona p/ /dash (uma pagina, uma verdade; sem token = telemetria publica) · x402-watch recusa dominios de exemplo (45 watches medindo example.com) · head da landing com rel=alternate/JSON-LD p/ crawlers agneticos | base: v48.26.5-LINTP5
+
+
+# ============================================================================
+# v48.27.1-BATCH — /batch: N consultas do catálogo em UMA round-trip
+#
+# O recurso que Exa e Nansen têm e ninguém do pelotão oferece: agente de
+# orçamento faz UMA compra on-chain (créditos) e executa até 20 chamadas
+# por request, com débito atômico por item e reembolso automático de item
+# que falhar (delivery-or-refund, mesma regra do caminho de créditos).
+#
+# Auth: X-API-Key (créditos). Sem chave → 401 didático com os links de
+# compra (o per-call x402 continua existindo em cada endpoint individual).
+# Teto por item: BATCH_MAX_ITEM_PRICE (default $0.10) — batch é camada de
+# descoberta/volume; produtos premium seguem 1 chamada cada.
+# ============================================================================
+
+BATCH_MAX_CALLS = int(os.environ.get("BATCH_MAX_CALLS", "20"))
+BATCH_ITEM_CAP  = float(os.environ.get("BATCH_MAX_ITEM_PRICE", "0.10"))
+BATCH_BUDGET_S  = float(os.environ.get("BATCH_BUDGET_S", "22"))
+
+
+def _batch_unpack(result):
+    """(status, data) a partir dos 3 formatos históricos de handler."""
+    if isinstance(result, Response):
+        try:
+            data = result.get_json(silent=True)
+        except Exception:
+            data = None
+        if data is None:
+            data = {"raw": result.get_data(as_text=True)[:2000]}
+        return result.status_code, data
+    status = 200
+    data = result
+    if isinstance(result, tuple):
+        data = result[0]
+        if len(result) > 1 and isinstance(result[1], int):
+            status = result[1]
+    if isinstance(data, Response):
+        try:
+            j = data.get_json(silent=True)
+        except Exception:
+            j = None
+        return data.status_code, (j if j is not None
+                                  else {"raw": data.get_data(as_text=True)[:2000]})
+    return status, data
+
+
+def _batch_exec(handler, params: dict):
+    from urllib.parse import urlencode
+    qs = urlencode({str(k): str(v) for k, v in (params or {}).items()})
+    with app.test_request_context(f"/_batch_internal?{qs}"):
+        return handler()
+
+
+def _batch_parse():
+    """POST {"calls":[{"path":"/pyth-price","params":{"symbol":"SOL"}}]}
+    ou GET ?calls=/fear-greed,/pyth-price?symbol=SOL
+    (GET: use POST para chamadas com mais de um parâmetro — o & interno
+    quebraria a query externa)."""
+    calls = []
+    if request.method == "POST":
+        body = request.get_json(silent=True) or {}
+        for item in (body.get("calls") or [])[:BATCH_MAX_CALLS * 2]:
+            if isinstance(item, str):
+                calls.append({"path": item, "params": {}})
+            elif isinstance(item, dict) and item.get("path"):
+                calls.append({"path": str(item["path"]),
+                              "params": item.get("params") or {}})
+    else:
+        raw = (request.args.get("calls") or "").strip()
+        for tok in raw.split(","):
+            tok = tok.strip()
+            if not tok:
+                continue
+            if "?" in tok:
+                p, q = tok.split("?", 1)
+                params = dict(kv.split("=", 1) for kv in q.split("&") if "=" in kv)
+            else:
+                p, params = tok, {}
+            calls.append({"path": p, "params": params})
+    return calls
+
+
+@app.route("/batch", methods=["GET", "POST"])
+def batch_endpoint():
+    base = _public_base()
+    key = (request.headers.get("X-API-Key")
+           or request.headers.get("X-Credit-Token")
+           or request.args.get("api_key", "")).strip()
+    if not key:
+        return jsonify({
+            "error": "batch requires a credit key — one on-chain payment, "
+                     "then N catalog calls per HTTP request with zero "
+                     "settlement latency.",
+            "how": [
+                f"1. Buy credits once (x402): POST {base}/buy-credits-micro "
+                f"($0.10 → $0.11 balance) or POST {base}/buy-credits ($0.99 → $1.25)",
+                "2. Send the key as the X-API-Key header.",
+                '3. POST {"calls":[{"path":"/fear-greed"},'
+                '{"path":"/pyth-price","params":{"symbol":"SOL"}}]}',
+            ],
+            "rules": {
+                "max_calls_per_request": BATCH_MAX_CALLS,
+                "max_item_price_usd": BATCH_ITEM_CAP,
+                "billing": "each item debits its catalog price from the key; "
+                           "a failed item is refunded automatically",
+            },
+            "catalog": f"{base}/get-pricing",
+            "plans": f"{base}/plans",
+        }), 401
+
+    info = LEDGER.api_key_get(key)
+    if not info or (info.get("expires") and int(time.time()) > info["expires"]):
+        return jsonify({"error": "invalid or expired credit key",
+                        "buy": f"{base}/buy-credits-micro",
+                        "plans": f"{base}/plans"}), 401
+
+    calls = _batch_parse()
+    if not calls:
+        return jsonify({
+            "error": "no calls parsed",
+            "post_example": {"calls": [{"path": "/fear-greed"},
+                                       {"path": "/pyth-price",
+                                        "params": {"symbol": "SOL"}}]},
+            "get_example": f"{base}/batch?calls=/fear-greed,/pyth-price?symbol=SOL",
+        }), 400
+    if len(calls) > BATCH_MAX_CALLS:
+        return jsonify({"error": f"max {BATCH_MAX_CALLS} calls per batch",
+                        "received": len(calls)}), 400
+
+    # validação + preço total ANTES de debitar qualquer item
+    items, total = [], 0.0
+    for c in calls:
+        p = c["path"]
+        if p == "/batch":
+            return jsonify({"error": "nested /batch is not allowed"}), 400
+        if p in CREDIT_PLANS:
+            return jsonify({"error": f"{p} is a plan purchase — buy it directly, "
+                                     f"not via batch"}), 400
+        h = ENDPOINT_HANDLERS.get(p)
+        if not h or p not in BASE_PRICES:
+            return jsonify({"error": f"unknown or not sellable: {p}",
+                            "catalog": f"{base}/get-pricing"}), 400
+        price = get_dynamic_price(p)
+        if price > BATCH_ITEM_CAP:
+            return jsonify({
+                "error": f"{p} costs ${price:.4f} — above the batch item cap "
+                         f"(${BATCH_ITEM_CAP:.2f}). Premium endpoints are "
+                         f"one call each; batch covers the volume tier.",
+                "endpoint": p}), 400
+        items.append((p, h, c["params"], price))
+        total += price
+
+    unlimited = info["balance_usd"] is None or info["balance_usd"] < 0
+    if not unlimited and info["balance_usd"] < total:
+        return jsonify({
+            "error": "insufficient_balance — nothing was debited",
+            "needed_usd": round(total, 6),
+            "available_usd": round(info["balance_usd"], 6),
+            "top_up": f"{base}/buy-credits",
+        }), 402
+
+    t0 = time.time()
+    results, charged = [], 0.0
+    for i, (p, h, params, price) in enumerate(items):
+        if time.time() - t0 > BATCH_BUDGET_S:
+            for p2, _, _, _ in items[i:]:
+                results.append({"path": p2, "status": 0, "error":
+                                "skipped — batch time budget reached, not charged"})
+            break
+        used = LEDGER.api_key_use(key, price)
+        if used is None:
+            results.append({"path": p, "status": 402,
+                            "error": "balance exhausted at this item — not charged"})
+            for p2, _, _, _ in items[i + 1:]:
+                results.append({"path": p2, "status": 0,
+                                "error": "skipped — balance exhausted, not charged"})
+            break
+        try:
+            raw = _batch_exec(h, params)
+        except Exception as e:
+            LEDGER.api_key_credit(key, price)
+            results.append({"path": p, "status": 500,
+                            "error": f"handler exception — refunded: {str(e)[:120]}"})
+            continue
+        status, data = _batch_unpack(raw)
+        if _is_error_result(raw) or status >= 500:
+            LEDGER.api_key_credit(key, price)
+            results.append({"path": p, "status": status or 502,
+                            "error": "endpoint did not deliver — refunded",
+                            "detail": data if isinstance(data, dict) else None})
+        else:
+            charged += price
+            results.append({"path": p, "status": status, "price_usd":
+                            round(price, 6), "data": data})
+
+    fin = LEDGER.api_key_get(key) or {}
+    bal = fin.get("balance_usd")
+    try:
+        ip = request.remote_addr or ""
+        LEDGER.log_request("/batch", True, int((time.time() - t0) * 1000), ip,
+                           kind="paid",
+                           ua=request.headers.get("User-Agent", ""),
+                           params=f"items={len(items)}")
+    except Exception:
+        pass
+    return jsonify({
+        "batch": True,
+        "items": len(items),
+        "delivered": sum(1 for r in results if r.get("status") == 200),
+        "charged_usd": round(charged, 6),
+        "credits_remaining": ("unlimited" if bal is None or bal < 0
+                              else round(bal, 6)),
+        "results": results,
+        "ts": int(time.time()),
+        "version": VERSION,
+    })
+
+
+log.info("📦 v48.27.1-BATCH: /batch registrado — até "
+         f"{BATCH_MAX_CALLS} chamadas de catálogo por request, débito "
+         "atômico por item, falha de item = reembolso automático")
+
+VERSION = "48.27.1-BATCH"  # v48.27.1-BATCH: FIX CRÍTICO do KeyError em _cortex_demand_trend (dict interno plain — quebrava /ml/insights em produção com ledger populado; o teste local passava com ledger vazio) + arquivo renormalizado para LF + /batch: N consultas do catálogo em 1 round-trip via X-API-Key, validação e preço total ANTES de debitar, débito atômico por item, item falho = reembolso automático, budget de tempo com skip-não-cobrado, teto de $0.10/item (BATCH_MAX_ITEM_PRICE) | base: v48.27.0-CORTEX
