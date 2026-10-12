@@ -25791,7 +25791,7 @@ def post_fork_boot():
     try:
         def _warm_worker():
             try:
-                time.sleep(2.0 + random.random() * 6.0)  # escalona os workers
+                time.sleep(4.0 + random.random() * 36.0)  # v48.29.0: escalona os workers (janela larga — 4 warms ONNX/sklearn juntos derrubavam 1 worker por WORKER TIMEOUT 120s no boot)
                 _ml_boot_warm()
             except Exception:
                 pass
@@ -34282,3 +34282,282 @@ log.warning("🤖 v48.28.0-AUTONOMOUS ativo — auto-pausa por reembolso · "
             "/ops/log e /ops/status")
 
 VERSION = "48.28.0-AUTONOMOUS"  # v48.28.0-AUTONOMOUS: camada de auto-consciencia operacional — error-watch auto-pausa endpoint que reembolsa mais do que entrega (503 honesto + sai dos catalogos via _sellable_now) e retoma sozinho por sonda com backoff ate 6h · llm-planner a cada 6h propoe acoes de whitelist sobre telemetria real (acao fora dos candidatos = alucinacao descartada) — alias seguro auto-aplica, preco/pausa/produto viram botoes no Telegram · /ops ok|no|pause|resume|price governa sem deploy · control plane hot-reload em /data/ops_control.json (padrao mtime, imune a lock de SQLite) · auditoria ops_audit + GET /ops/log (DASH_TOKEN) + /ops/status publico + bloco ops assinado no /ml/insights | base: v48.27.1-BATCH
+
+# ============================================================================
+# v48.29.0-SALESMIND — A LOJA QUE FECHA A VENDA
+#
+# Objetivo único: converter sondagem em venda e nunca perder a venda por
+# atrito. Cinco peças:
+#
+#   1. Telegram em linguagem natural — "sim", "pode adicionar", "confirmei"
+#      agora APLICAM as propostas pendentes do ops-planner (antes só /ops ok N
+#      funcionava; 3 propostas ficaram penduradas em produção por causa
+#      disso). Keywords PT/EN + classificador de intenção via LLM para
+#      mensagens curtas fora do vocabulário. Reply de visitante passa intacto.
+#   2. /models e /v1/models GRÁTIS — a convenção OpenAI que as máquinas
+#      procuram antes de comprar inference (backlog nº 1 do cortex). Shape
+#      OpenAI + stats AO VIVO do bandit por provedor + caminho de compra.
+#      O menu é grátis; a refeição (/llm) é paga.
+#   3. Captura de demanda well-known: /.well-known/openapi.json → 308 →
+#      /openapi.json · /mcp/.well-known/agent.json → 308 →
+#      /.well-known/agent.json (o radar não pode aliasar .well-known).
+#   4. 402 CLOSER — no desafio de sondador repetido: cheaper_alternatives
+#      (mesma categoria, preço menor, vendável agora) e bundle_offer
+#      (≥3 endpoints sondados em 1h → /batch + créditos). accepts[]/preços
+#      intocados — conformidade x402lint preservada.
+#   5. Boot: stagger do warm ML alargado (4–40s) — fim do WORKER TIMEOUT 120s
+#      por contenção de GIL no deploy.
+# ============================================================================
+
+# ------------------------------------------------ 1. Telegram linguagem natural
+_OPS_YES_WORDS = ("sim", "ok", "pode", "confirma", "confirmo", "confirmei",
+                  "aprova", "aprovo", "aprovado", "yes", "apply", "manda",
+                  "adiciona", "adicionar", "bora", "go", "aceito", "aceita",
+                  "aplica", "aplicar", "faz", "isso", "claro", "vamos")
+_OPS_NO_WORDS = ("não", "nao", "no", "recusa", "rejeita", "rejeitar",
+                 "cancela", "cancelar", "skip", "deixa", "negado", "nope")
+
+
+def _ops_nl_intent(text: str):
+    """'approve' | 'reject' | None. Determinístico por keywords; LLM só como
+    desempate em mensagem curta (custa 1 chamada, rara, só com pendências)."""
+    t = (text or "").strip().lower()
+    if not t or len(t.split()) > 12:
+        return None
+    toks = set(re.findall(r"[a-zà-ÿ]+", t))
+    if toks & set(_OPS_NO_WORDS):
+        return "reject"
+    if toks & set(_OPS_YES_WORDS):
+        return "approve"
+    try:
+        ans = LLM.ask(
+            "You are the intent classifier of an operations bot. The operator "
+            "was shown pending infrastructure proposals with approve/reject "
+            "buttons. Reply with EXACTLY one word: APPROVE, REJECT or OTHER.\n"
+            f"Message: {text[:200]}", max_tokens=8, temperature=0.0,
+            cache=False)
+        ans = (ans or "").strip().upper()
+        if "APPROVE" in ans:
+            return "approve"
+        if "REJECT" in ans:
+            return "reject"
+    except Exception:
+        pass
+    return None
+
+
+def _ops_nl_apply_all(approve: bool) -> list:
+    out = []
+    for pid in sorted(_ops_pending()):
+        ok, msgout = _ops_decide(pid, approve)
+        out.append(f"#{pid} {'✅' if ok else '⚠️'} {msgout}")
+    return out
+
+
+_TG_HANDLE_4828 = TelegramBot._handle   # wrapper da 48.28 (comandos /ops)
+
+
+def _tg_handle_salesmind(self, msg):
+    """Linguagem natural do operador sobre propostas pendentes. Reply de
+    visitante (notificação de chat) NUNCA é interceptado — vai ao handler
+    original como sempre foi."""
+    try:
+        text = (msg.get("text") or "").strip()
+    except Exception:
+        text = ""
+    if (text and not text.startswith("/")
+            and not msg.get("reply_to_message") and _ops_pending()):
+        intent = _ops_nl_intent(text)
+        if intent in ("approve", "reject"):
+            res = _ops_nl_apply_all(intent == "approve")
+            try:
+                self.send(msg["chat"]["id"],
+                          ("🤖 *OPS — decisão registrada*\n\n"
+                           + "\n".join(TelegramBot.esc(r) for r in res))
+                          if res else "🤖 Nenhuma proposta pendente.")
+            except Exception:
+                pass
+            return
+    return _TG_HANDLE_4828(self, msg)
+
+
+TelegramBot._handle = _tg_handle_salesmind
+
+
+# ---------------------------------- 2. /models — o cardápio OpenAI do nó ----
+# Nota: /v1/models JÁ EXISTE no nó (shape {"backends": ...}, do gateway
+# OpenAI-compatible). Aqui nasce o /models puro — o caminho que o backlog
+# mostra as máquinas pedindo (convenção OpenAI clássica).
+@app.route("/models")
+def models_catalog():
+    """Backlog nº 1 das máquinas (convenção OpenAI). Grátis de propósito:
+    quem lista modelos está a UM passo de comprar /llm — cada entrada carrega
+    a prova viva (latência/reward medidos pelo bandit) e o caminho de compra."""
+    try:
+        rep = llm_health_report()
+    except Exception:
+        rep = {}
+    cfg = rep.get("configured") or llm_providers_configured()
+    models_map = rep.get("models") or {}
+    bandit = rep.get("bandit") or {}
+    quar = set((rep.get("quarantined") or {}).keys())
+    data = []
+    for p in cfg:
+        mid = models_map.get(p)
+        if not mid or str(mid).startswith("("):
+            continue
+        st = bandit.get(p) or {}
+        data.append({
+            "id": mid,
+            "object": "model",
+            "created": 0,
+            "owned_by": p,
+            "x_live": {
+                "reward": st.get("reward"),
+                "latency_s": st.get("lat_s"),
+                "calls_ok": st.get("ok"),
+                "calls_fail": st.get("fail"),
+                "quarantined": p in quar,
+            },
+        })
+    base = _public_base()
+    return jsonify({
+        "object": "list",
+        "data": data,
+        "x_losbeto": {
+            "how_to_call": {
+                "endpoint": f"{base}/llm",
+                "price_usdc": f"{get_dynamic_price('/llm'):.4f}",
+                "protocol": "x402 — send X-PAYMENT; no account, no API key",
+                "openai_compatible": ("point your client base_url at this "
+                                      "node; pick a profile with ?profile="),
+                "profiles": sorted(_LLM_PROFILES.keys()),
+                "volume_lane": (f"{base}/batch — one credit key, up to "
+                                f"{BATCH_MAX_CALLS} calls per request"),
+            },
+            "routing": ("epsilon-greedy bandit with adaptive epsilon and "
+                        "exploit-quarantine — the stats above are measured "
+                        "live on production traffic, not marketing copy"),
+            "llms_txt": f"{base}/llms.txt",
+            "catalog": f"{base}/get-pricing",
+        },
+        "ts": int(time.time()),
+        "version": VERSION,
+    })
+
+
+# ------------------------------ 3. captura well-known (backlog real) --------
+@app.route("/.well-known/openapi.json")
+def _wk_openapi_capture():
+    from flask import redirect as _r
+    return _r("/openapi.json", code=308)
+
+
+@app.route("/mcp/.well-known/agent.json")
+def _wk_mcp_agent_capture():
+    from flask import redirect as _r
+    return _r("/.well-known/agent.json", code=308)
+
+
+# ------------------------------------------------- 4. 402 CLOSER ------------
+_REACTIVE_402_ORIG = _reactive_402
+_CLOSER_IP_CACHE = {}
+_CLOSER_MIN_PRICE = float(os.environ.get("CLOSER_MIN_PRICE", "0.10"))
+_CLOSER_MULTI_PROBE = int(os.environ.get("CLOSER_MULTI_PROBE", "3"))
+
+
+def _closer_cheaper(path: str) -> list:
+    """Mesma categoria MCP, mais barato, vendável AGORA. O agente que hesita
+    por preço recebe um caminho para o sim em vez de um não seco."""
+    try:
+        cur = get_dynamic_price(path)
+        if cur < _CLOSER_MIN_PRICE:
+            return []
+        cat = _mcp_category_of(path)
+        out = []
+        for ep in sorted(BASE_PRICES, key=lambda e: get_dynamic_price(e)):
+            if ep == path or ep in CREDIT_PLANS or ep == "/starter-pack":
+                continue
+            p = get_dynamic_price(ep)
+            if p >= cur or p <= 0:
+                continue
+            if _mcp_category_of(ep) != cat:
+                continue
+            if not _sellable_now(ep):
+                continue
+            out.append({"endpoint": ep, "price_usdc": f"{p:.4f}",
+                        "why": f"same category ({cat}), lower price"})
+            if len(out) >= 2:
+                break
+        return out
+    except Exception:
+        return []
+
+
+def _closer_multi_probe(ip: str) -> int:
+    """Quantos endpoints pagos distintos este IP sondou na última hora.
+    Cache 60s por IP — o 402 não pode pagar scan de tabela a cada hit."""
+    now = time.time()
+    hit = _CLOSER_IP_CACHE.get(ip)
+    if hit and now - hit[0] < 60:
+        return hit[1]
+    n = 0
+    try:
+        with LEDGER._conn() as c:
+            n = c.execute(
+                "SELECT COUNT(DISTINCT endpoint) FROM requests WHERE ts>? "
+                "AND ip=? AND kind IN ('probe','challenge402')",
+                (int(now) - 3600, ip)).fetchone()[0]
+    except Exception:
+        pass
+    _CLOSER_IP_CACHE[ip] = (now, n)
+    if len(_CLOSER_IP_CACHE) > 5000:
+        for k in sorted(_CLOSER_IP_CACHE,
+                        key=lambda x: _CLOSER_IP_CACHE[x][0])[:1500]:
+            _CLOSER_IP_CACHE.pop(k, None)
+    return n
+
+
+def _reactive_402(path, ip):
+    """v48.29.0: o desafio de sondador REPETIDO também vende — alternativa
+    mais barata da mesma categoria e, para quem sonda o catálogo inteiro,
+    a oferta de bundle (1 pagamento → N chamadas). Preço e accepts[] do
+    desafio jamais são tocados (P6 price-integrity)."""
+    r = _REACTIVE_402_ORIG(path, ip)
+    try:
+        views, _already = _rladder_state(ip, path)
+        if views >= 2:
+            body = r.get_json(silent=True)
+            if isinstance(body, dict):
+                changed = False
+                alt = _closer_cheaper(path)
+                if alt:
+                    body["cheaper_alternatives"] = alt
+                    changed = True
+                n = _closer_multi_probe(ip)
+                if n >= _CLOSER_MULTI_PROBE:
+                    base = _public_base()
+                    body["bundle_offer"] = {
+                        "you_probed_distinct_endpoints_1h": n,
+                        "pitch": ("one on-chain payment buys a credit key — "
+                                  "then up to 20 catalog calls per request "
+                                  "with zero settlement latency"),
+                        "credits": f"{base}/buy-credits-micro",
+                        "batch": f"{base}/batch",
+                    }
+                    changed = True
+                if changed:
+                    r.set_data(json.dumps(body))
+    except Exception:
+        pass
+    return r
+
+
+log.warning("🏪 v48.29.0-SALESMIND ativo — /models+/v1/models grátis com stats "
+            "vivos do bandit · captura /.well-known/openapi.json e "
+            "/mcp/.well-known/agent.json · 402 closer (alternativa barata + "
+            "oferta de bundle p/ sondador repetido) · Telegram entende "
+            "'sim/pode adicionar' e aplica propostas pendentes · warm "
+            "escalonado 4-40s")
+
+VERSION = "48.29.0-SALESMIND"  # v48.29.0-SALESMIND: venda em cima da sondagem — /models e /v1/models gratis (convenção OpenAI, backlog nº1) com latencia/reward AO VIVO do bandit por provedor + caminho de compra do /llm · captura 308 de /.well-known/openapi.json e /mcp/.well-known/agent.json (demanda real que o radar nao aliasava) · 402 closer: cheaper_alternatives por categoria MCP + bundle_offer /batch para IP que sondou 3+ endpoints em 1h (accepts/precos intocados) · Telegram em linguagem natural aplica/rejeita propostas pendentes (keywords PT/EN + intencao via LLM; reply de visitante intacto) — corrige as 3 propostas que ficaram penduradas em producao · stagger do warm ML 4-40s contra WORKER TIMEOUT no boot | base: v48.28.0-AUTONOMOUS
