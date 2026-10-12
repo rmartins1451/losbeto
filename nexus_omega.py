@@ -121,6 +121,7 @@
 from __future__ import annotations
 
 import os, sys, json, time, base64, hashlib, threading, sqlite3, hmac
+import math  # v48.27-CORTEX: sqrt do score Wilson e do bandit em nível de módulo
 import socket, struct, secrets, subprocess, signal, logging, traceback, random, shutil
 import urllib.request, urllib.error, urllib.parse, re, math
 from datetime import datetime, timezone, timedelta
@@ -3122,6 +3123,34 @@ _LLM_BANDIT_ON = os.environ.get("LLM_BANDIT", "1") != "0"
 _LLM_BANDIT_EPS = float(os.environ.get("LLM_BANDIT_EPSILON", "0.10"))
 _LLM_BANDIT_ALPHA = float(os.environ.get("LLM_BANDIT_ALPHA", "0.15"))
 _LLM_BANDIT_PRIOR = 0.75
+# v48.27-CORTEX: QUARENTENA DE EXPLORAÇÃO. Provedor com evidência suficiente
+# (>= LLM_BANDIT_MIN_PULLS pulls) e recompensa >= DELTA abaixo do líder sai
+# da rota síncrona — o Gemini de 9,65s/reward 0,346 fabricava sozinho o
+# served_p95 de 8s do scorecard em ~2,8% das chamadas. A exploração ε segue
+# podendo testá-lo: se o provedor se recuperar, a recompensa sobe e ele
+# reabilita sozinho. LLM_BANDIT_QUARANTINE=0 restaura o comportamento antigo.
+_LLM_BANDIT_QUAR = os.environ.get("LLM_BANDIT_QUARANTINE", "1") != "0"
+_LLM_BANDIT_QUAR_DELTA = float(os.environ.get("LLM_BANDIT_QUAR_DELTA", "0.30"))
+LLM_BANDIT_MIN_PULLS = int(os.environ.get("LLM_BANDIT_MIN_PULLS", "8"))
+
+
+def _llm_bandit_quarantined() -> list:
+    """Provedores fora da rota síncrona neste instante (diagnóstico /ml)."""
+    try:
+        with _LLM_BANDIT_LOCK:
+            snap = dict(_LLM_BANDIT)
+        if len(snap) < 2:
+            return []
+        def _st(p):
+            s = snap.get(p, {})
+            return (int(s.get("ok", 0)) + int(s.get("fail", 0)),
+                    float(s.get("reward", _LLM_BANDIT_PRIOR)))
+        best = max((_st(p)[1] for p in snap), default=0.0)
+        return sorted(p for p in snap
+                      if _st(p)[0] >= LLM_BANDIT_MIN_PULLS
+                      and _st(p)[1] < best - _LLM_BANDIT_QUAR_DELTA)
+    except Exception:
+        return []
 
 
 def _llm_bandit_eps_eff() -> float:
@@ -3209,8 +3238,20 @@ def _llm_bandit_order(cands: List[str]) -> List[str]:
             return c
         with _LLM_BANDIT_LOCK:
             snap = dict(_LLM_BANDIT)
-        return sorted(cands, key=lambda p: -float(snap.get(p, {}).get(
+        ordered = sorted(cands, key=lambda p: -float(snap.get(p, {}).get(
             "reward", _LLM_BANDIT_PRIOR)))
+        if _LLM_BANDIT_QUAR and len(ordered) > 1:
+            def _st(p):
+                s = snap.get(p, {})
+                return (int(s.get("ok", 0)) + int(s.get("fail", 0)),
+                        float(s.get("reward", _LLM_BANDIT_PRIOR)))
+            best_r = _st(ordered[0])[1]
+            kept = [p for p in ordered
+                    if _st(p)[0] < LLM_BANDIT_MIN_PULLS
+                    or _st(p)[1] >= best_r - _LLM_BANDIT_QUAR_DELTA]
+            if kept:
+                return kept
+        return ordered
     except Exception:
         return cands
 
@@ -6637,8 +6678,15 @@ def _upsell_note(payer: str) -> Optional[dict]:
     2 chamadas, e nunca recomenda para as wallets do operador."""
     if not payer:
         return None
+    # v48.27-CORTEX: usava só OPERATOR_WALLETS — o payTo ALGORAND do próprio
+    # nó (MRVANO…) recebia "savings tip" 104×/dia. _self_pay_wallets cobre
+    # TODOS os endereços declarados do operador (recebedores + compradores).
     try:
-        if (payer or "").lower() in OPERATOR_WALLETS:
+        _own = _self_pay_wallets()
+    except Exception:
+        _own = OPERATOR_WALLETS
+    try:
+        if (payer or "").lower() in _own:
             return None
     except Exception:
         pass
@@ -13038,6 +13086,18 @@ CLEAN_LANDING = r"""<!doctype html><html lang="en"><head>
 <meta name="agent:openapi" content="__BASE__/openapi.json">
 <meta name="agent:mcp" content="__BASE__/mcp">
 <meta name="agent:free-sample" content="__BASE__/try">
+<!-- v48.27-CORTEX: crawlers agênticos e rankers resolvem rel=alternate e
+     JSON-LD antes de parsear o corpo. Todas as rotas abaixo existem e são
+     públicas — cada uma é uma porta de entrada a mais para máquinas. -->
+<link rel="alternate" type="application/json" href="__BASE__/.well-known/x402.json" title="x402 payment manifest">
+<link rel="alternate" type="application/json" href="__BASE__/openapi.json" title="OpenAPI contract">
+<link rel="alternate" type="text/plain" href="__BASE__/llms.txt" title="LLM agent guidance">
+<link rel="alternate" type="application/json" href="__BASE__/agents.json" title="Outcome-based agent flows">
+<link rel="alternate" type="application/json" href="__BASE__/tasks.json" title="Task-oriented index">
+<link rel="alternate" type="application/json" href="__BASE__/ml/insights" title="Live ML internals (bandit, conversion, backlog)">
+<link rel="payment" href="__BASE__/.well-known/x402.json">
+<meta name="agent:ml-internals" content="__BASE__/ml/insights">
+<script type="application/ld+json">{"@context":"https://schema.org","@type":"WebAPI","name":"Losbeto Market Intelligence","url":"__BASE__","description":"Pay-per-call LLM inference and cross-asset market data for AI agents over the x402 protocol.","documentation":"__BASE__/llms.txt","termsOfService":"__BASE__/terms","provider":{"@type":"Organization","name":"Losbeto","url":"__BASE__"}}</script>
 <style>
 :root{--bg:#0a0b0d;--fg:#e8eaed;--dim:#8b9199;--line:#1e2126;--card:#111318;
       --acc:#4ade80;--acc2:#60a5fa;--mono:ui-monospace,'SF Mono',Menlo,monospace}
@@ -21593,8 +21653,10 @@ def live_page():
     número vem do ledger deste nó — nenhum dado simulado. A chuva de glifos
     acelera com atividade REAL: sondagem pesa 1, avaliação 6, liquidação 40.
     Existe porque a transparência já é o nosso diferencial reconhecido; isto
-    a torna visível em movimento, não só num JSON."""
-    return app.response_class(LIVE_HTML, mimetype="text/html")
+    a torna visível em movimento, não só num JSON.
+    v48.27-CORTEX: /live virou REDIRECT para /dash — uma URL canônica, uma
+    fonte de verdade. Duas páginas divergindo era pior que nenhuma."""
+    return redirect("/dash", code=302)
 
 def _live_api_build():
     """Alimenta /live. Público e sem token — expõe apenas agregados que já
@@ -24400,8 +24462,12 @@ def _dash_token_ok(supplied: str) -> bool:
 
 @app.route("/dash")
 def dash():
+    # v48.27-CORTEX: UM painel só. Sem token: a telemetria pública (o antigo
+    # /live — agregados já públicos em /receipts e /health/providers). Com
+    # token: o painel completo do operador. Fim da divergência entre duas
+    # páginas de status.
     if not _dash_token_ok(request.args.get("token", "")):
-        return "Forbidden — pass ?token=...", 403
+        return app.response_class(LIVE_HTML, mimetype="text/html")
     return app.response_class(DASH_HTML.replace("__TOKEN__", DASH_TOKEN).replace("__DASHV__", VERSION),
                               mimetype="text/html")
 
@@ -28105,7 +28171,11 @@ def _latency_stats(window_s: int = 86400) -> dict:
     for ep, ok, ms, kind in rows:
         tot_n += 1
         k = kind or ""
-        if ok or k in ("probe", "param_rejected", "partner"):
+        # v48.27-CORTEX: 'challenge402' é o kind dominante (54k/24h) e NÃO
+        # entrava — o scorecard anunciava availability de 7% para rankers.
+        # Um desafio 402 correto é a definição de endpoint pago DISPONÍVEL.
+        if ok or k in ("probe", "challenge402", "param_rejected", "partner",
+                       "welcome", "fcb_bonus", "refused_unsellable"):
             avail_n += 1
         if k == "probe" and ms and ms > 0:
             probe_ms.append(int(ms))
@@ -29852,11 +29922,28 @@ def x402_watch_status():
     payload, code = _watch_status_payload(wid)
     return jsonify(payload), code
 
+_WATCH_DOC_HOSTS = {"example.com", "example.org", "example.net"}
+
+
 def _h_x402_watch():
     url = (request.args.get("url") or "").strip()
     if not url or not _watch_url_ok(url):
         return {"error": "pass ?url=https://... (public http/https). Optional: "
                          "&webhook=https://... for state/price change alerts."}
+    # v48.27-CORTEX: 45 watches ativos mirando https://api.example.com/endpoint
+    # — gente copiando o exemplo da doc e pagando. O watch rodava 30 dias
+    # medindo um domínio reservado pela RFC 2606. Recusa didática, sem cobrar.
+    try:
+        from urllib.parse import urlparse as _up
+        _h = (_up(url).hostname or "").lower()
+        if _h in _WATCH_DOC_HOSTS or any(_h.endswith("." + d)
+                                         for d in _WATCH_DOC_HOSTS):
+            return {"error": ("That is the documentation example domain "
+                              "(example.com) — pass the real x402 endpoint "
+                              "you want watched."),
+                    "hint": "GET /x402-watch?url=https://host/paid-endpoint"}
+    except Exception:
+        pass
     webhook = (request.args.get("webhook") or "").strip()
     if webhook and not _watch_url_ok(webhook):
         return {"error": "webhook must be a public http/https URL"}
@@ -32757,3 +32844,309 @@ else:
 
 # v48.18.0-REGISTRY: (1) dashboard: manchete e conversão passam a ser ORGÂNICAS (o bruto incl. operador fica rotulado) | (2) radar de demanda ignora scanners de credencial (/vendor/composer, /keys.json, /auth/login, /wallet.json) | (3) /live/api e /dash/api/stats com cache TTL (670-1000 ms por chamada no log do Railway) | (4) novos /br-cnpj /br-cep (BrasilAPI, sem LLM) e /classify /summarize (mesmo gateway do /extract) | base: v48.17.14-REALCALL
 # v48.18.1-MERGE: merge auditado de dois patches sobre a 48.17.14 — ver nexus_omega_v48_18_1.md
+
+
+# ============================================================================
+# v48.27.0-CORTEX — CAMADA DE INTELIGÊNCIA NATIVA
+#
+# Read-only sobre o ledger e os modelos já treinados. Zero dependências
+# novas, zero custo de boot, nenhum caminho de pagamento tocado.
+#
+#   GET /ml/insights — o cérebro do nó num JSON público e assinado:
+#     · roteamento LLM aprendido (bandit) e quarentenas ativas
+#     · conversão por endpoint (sondagem→avaliação→venda) com score Wilson
+#     · tendência de demanda por endpoint (regressão linear, 14d)
+#     · BACKLOG DE PRODUTO: o que as máquinas pediram e não existe (404 real,
+#       ≥3 IPs distintos, ruído de scanner filtrado pelo classificador ML)
+#       mapeado para o endpoint existente mais próximo (busca semântica)
+#     · saúde dos modelos: forecast, anomaly detector, demand classifier
+#   Loop diário (flock de 1 worker): digest Telegram com o que mudou.
+#   CORTEX_DIGEST=0 desliga o digest; o endpoint é sempre público.
+# ============================================================================
+
+CORTEX_TTL = float(os.environ.get("CORTEX_TTL", "120"))
+_CORTEX_CACHE = {"ts": 0.0, "data": None}
+_CORTEX_STATE = os.path.join(os.path.dirname(DB_PATH), "cortex_state.json")
+
+
+def _wilson_lower(s: float, n: float, z: float = 1.96) -> float:
+    """Limite inferior de Wilson — score de conversão honesto com n pequeno.
+    1 venda em 2 sondagens não vale 50%; vale ~9%. É o que impede o ranker
+    interno de supervalorizar endpoint parado."""
+    if n <= 0:
+        return 0.0
+    p = s / n
+    den = 1 + z * z / n
+    centro = p + z * z / (2 * n)
+    margem = z * math.sqrt((p * (1 - p) + z * z / (4 * n)) / n)
+    return max(0.0, (centro - margem) / den)
+
+
+def _cortex_conversion(days: int = 7, limit: int = 15) -> dict:
+    """Funil por endpoint com score Wilson. A mesma consulta do price advisor,
+    exposta de forma estruturada — máquinas avaliam fornecedores por prova de
+    conversão, não por promessa."""
+    now = int(time.time())
+    d = now - days * 86400
+    try:
+        with LEDGER._conn() as c:
+            probes = dict(c.execute(
+                "SELECT endpoint, COUNT(*) FROM requests WHERE ts>? "
+                "AND kind IN ('probe','challenge402') GROUP BY endpoint",
+                (d,)).fetchall())
+            previews = dict(c.execute(
+                "SELECT endpoint, COUNT(*) FROM requests WHERE ts>? "
+                "AND kind='preview' GROUP BY endpoint", (d,)).fetchall())
+            sales = dict(c.execute(
+                "SELECT endpoint, COUNT(*) FROM revenue WHERE ts>? "
+                "GROUP BY endpoint", (d,)).fetchall())
+    except Exception as e:
+        return {"error": str(e)[:80]}
+    rows = []
+    for ep in set(list(probes) + list(previews) + list(sales)):
+        p, pv, s = probes.get(ep, 0), previews.get(ep, 0), sales.get(ep, 0)
+        if p + pv + s < 5:
+            continue
+        rows.append({
+            "endpoint": ep,
+            "probes": p, "previews": pv, "sales": s,
+            "price_usdc": get_dynamic_price(ep),
+            "conversion_score": round(_wilson_lower(s, max(1, p)), 4),
+            "signal": ("high-demand-zero-conversion — candidate for price cut"
+                       if p >= 100 and s == 0 else
+                       "converting" if s >= 3 else "watching"),
+        })
+    rows.sort(key=lambda r: -(r["probes"] + r["sales"] * 50))
+    return {"window_days": days, "by_endpoint": rows[:limit],
+            "note": ("conversion_score = Wilson lower bound of sales/probes. "
+                     "high-demand-zero-conversion = many paying-capable "
+                     "probes, zero settlements — the price or the teaser is "
+                     "the bottleneck, not the demand.")}
+
+
+def _cortex_demand_trend(days: int = 14, top: int = 8) -> list:
+    """Tendência de sondagem por endpoint: inclinação de regressão linear nos
+    contadores diários, normalizada pela média — seta comparável entre
+    endpoints de volumes diferentes. Python puro, ~ms."""
+    now = int(time.time())
+    d = now - days * 86400
+    try:
+        with LEDGER._conn() as c:
+            rows = c.execute(
+                "SELECT endpoint, (ts/86400) AS day, COUNT(*) FROM requests "
+                "WHERE ts>? AND kind IN ('probe','challenge402') "
+                "GROUP BY endpoint, day", (d,)).fetchall()
+    except Exception as e:
+        return [{"error": str(e)[:80]}]
+    per = defaultdict(dict)
+    for ep, day, n in rows:
+        per[ep][int(day)] += n
+    out = []
+    for ep, days_map in per.items():
+        tot = sum(days_map.values())
+        if tot < 20:
+            continue
+        xs = sorted(days_map)
+        x0 = xs[0]
+        X = [x - x0 for x in xs]
+        Y = [days_map[x] for x in xs]
+        n_ = len(X)
+        sx, sy = sum(X), sum(Y)
+        sxx = sum(x * x for x in X)
+        sxy = sum(x * y for x, y in zip(X, Y))
+        den = n_ * sxx - sx * sx
+        slope = (n_ * sxy - sx * sy) / den if den else 0.0
+        mean = sy / n_ if n_ else 0.0
+        rel = slope / mean if mean > 0 else 0.0
+        out.append({"endpoint": ep, "probes_14d": tot,
+                    "trend": ("rising" if rel > 0.08 else
+                              "falling" if rel < -0.08 else "flat"),
+                    "slope_rel_per_day": round(rel, 3)})
+    out.sort(key=lambda r: -r["probes_14d"])
+    return out[:top]
+
+
+def _cortex_backlog(days: int = 7, min_ips: int = 3, limit: int = 12) -> list:
+    """O que as máquinas pediram e NÃO EXISTE — filtrado pelo classificador
+    ML de demanda (scanners de credencial fora) e mapeado para o endpoint
+    existente mais próximo via busca semântica. É o roadmap escrito pelos
+    próprios compradores."""
+    now = int(time.time())
+    d = now - days * 86400
+    try:
+        with LEDGER._conn() as c:
+            rows = c.execute(
+                "SELECT endpoint, COUNT(*) n, COUNT(DISTINCT ip) ips "
+                "FROM requests WHERE ts>? AND kind='notfound' "
+                "GROUP BY endpoint HAVING ips>=? ORDER BY n DESC LIMIT 40",
+                (d, min_ips)).fetchall()
+    except Exception as e:
+        return [{"error": str(e)[:80]}]
+    out = []
+    for path, hits, ips in rows:
+        try:
+            cls = _demand_classify_ml(path)
+            label = (cls or {}).get("kind", "")
+            if "scanner" in str(label).lower():
+                continue
+        except Exception:
+            label = ""
+        try:
+            near = _radar_semantic_target(path)
+        except Exception:
+            near = None
+        out.append({"requested_path": path, "hits_7d": hits,
+                    "distinct_ips": ips,
+                    "closest_existing": near,
+                    "action": ("alias to existing endpoint"
+                               if near else "candidate new endpoint")})
+        if len(out) >= limit:
+            break
+    return out
+
+
+def _cortex_models() -> dict:
+    """Saúde dos modelos locais — lido dos globals já mantidos pelo nó."""
+    m = {}
+    try:
+        m["forecast_symbols_trained"] = len(
+            [s for s in (_FC_FEEDS or {}) if (_FC_DIR / f"{s}.joblib").exists()])
+    except Exception:
+        m["forecast_symbols_trained"] = None
+    try:
+        m["demand_classifier"] = ("trained" if _ML_CLF.get("model") else
+                                  "heuristic-fallback")
+        m["anomaly_detector"] = ("trained" if _ML_IF.get("model") else
+                                 "warming-up")
+    except Exception:
+        pass
+    return m
+
+
+def build_cortex() -> dict:
+    now = time.time()
+    if _CORTEX_CACHE["data"] and now - _CORTEX_CACHE["ts"] < CORTEX_TTL:
+        return _CORTEX_CACHE["data"]
+    base = _public_base()
+    brain = {
+        "node": BRAND_NAME,
+        "url": base,
+        "version": VERSION,
+        "generated_at": datetime.now(timezone.utc).isoformat(
+            timespec="seconds").replace("+00:00", "Z"),
+        "purpose": ("Live ML internals of this node — how it routes LLM "
+                    "calls, which endpoints convert machine demand into "
+                    "sales, what machines asked for that does not exist yet, "
+                    "and which local models are trained. Published so buyers "
+                    "and rankers can verify the intelligence layer instead "
+                    "of trusting marketing copy."),
+        "llm_routing": {
+            "algorithm": "epsilon-greedy bandit, adaptive epsilon, "
+                         "exploit-quarantine (v48.27)",
+            "epsilon_effective": round(_llm_bandit_eps_eff(), 4),
+            "providers": _llm_bandit_stats(),
+            "quarantined_now": (_llm_bandit_quarantined()
+                                if _LLM_BANDIT_QUAR else []),
+        },
+        "conversion": _cortex_conversion(),
+        "demand_trend": _cortex_demand_trend(),
+        "product_backlog": _cortex_backlog(),
+        "models": _cortex_models(),
+        "verify": {
+            "scorecard": f"{base}/scorecard.json",
+            "honest_revenue": f"{base}/.well-known/honest-revenue.json",
+            "receipts": f"{base}/receipts",
+        },
+    }
+    try:
+        blob = json.dumps(brain, sort_keys=True, separators=(",", ":"),
+                          default=str)
+        brain["sha256"] = hashlib.sha256(blob.encode()).hexdigest()
+        brain["signature"] = base64.b64encode(
+            WALLET.sign(f"losbeto-cortex|{brain['sha256']}".encode())).decode()
+        brain["signer"] = WALLET.solana_address
+    except Exception:
+        pass
+    _CORTEX_CACHE.update({"ts": now, "data": brain})
+    return brain
+
+
+@app.route("/ml/insights")
+@app.route("/.well-known/ml-insights.json")
+def ml_insights():
+    return jsonify(build_cortex())
+
+
+def _cortex_digest_loop():
+    """Digest diário: manda no Telegram o que a camada de inteligência viu de
+    NOVO — backlog novo, endpoint que explodiu em demanda, quarentena mudou.
+    flock garante 1 worker; CORTEX_DIGEST=0 desliga."""
+    time.sleep(300)
+    while True:
+        try:
+            brain = build_cortex()
+            prev = {}
+            try:
+                prev = json.loads(open(_CORTEX_STATE).read())
+            except Exception:
+                pass
+            mudancas = []
+            old_paths = {b.get("requested_path")
+                         for b in (prev.get("product_backlog") or [])}
+            for b in (brain.get("product_backlog") or []):
+                if b.get("requested_path") not in old_paths:
+                    mudancas.append(
+                        f"🆕 backlog: `{b['requested_path']}` "
+                        f"({b['distinct_ips']} IPs, {b['hits_7d']} hits/7d"
+                        + (f" → alias p/ {b['closest_existing']}"
+                           if b.get("closest_existing") else ""))
+            old_q = set(prev.get("llm_routing", {}).get("quarantined_now") or [])
+            new_q = set(brain.get("llm_routing", {}).get("quarantined_now") or [])
+            for p in sorted(new_q - old_q):
+                mudancas.append(f"⛔ LLM `{p}` entrou em quarentena "
+                                f"(recompensa muito abaixo do líder)")
+            for p in sorted(old_q - new_q):
+                mudancas.append(f"✅ LLM `{p}` saiu da quarentena")
+            old_tr = {t.get("endpoint"): t.get("trend")
+                      for t in (prev.get("demand_trend") or [])}
+            for t in (brain.get("demand_trend") or []):
+                if t.get("trend") == "rising" and old_tr.get(t.get("endpoint")) != "rising":
+                    mudancas.append(f"📈 demanda subindo: `{t['endpoint']}` "
+                                    f"({t['probes_14d']} sondagens/14d)")
+            if mudancas:
+                _notify_telegram(
+                    "🧠 *CORTEX — digest diário*\n\n"
+                    + "\n".join(mudancas[:10])
+                    + f"\n\nCompleto: {_public_base()}/ml/insights")
+            try:
+                with open(_CORTEX_STATE, "w") as f:
+                    json.dump(brain, f, default=str)
+            except Exception:
+                pass
+        except Exception as e:
+            log.warning(f"cortex digest: {e}")
+        time.sleep(86400)
+
+
+def _cortex_start():
+    if os.environ.get("CORTEX_DIGEST", "1") == "0":
+        return
+    try:
+        import fcntl
+        _f = open(HOME_DIR / "cortex.lock", "w")
+        try:
+            fcntl.flock(_f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            return                      # outro worker é o dono
+        globals()["_CORTEX_LOCK_FILE"] = _f
+    except Exception:
+        pass
+    threading.Thread(target=_cortex_digest_loop, daemon=True).start()
+
+
+_cortex_start()
+log.info("🧠 v48.27.0-CORTEX ativo — /ml/insights público e assinado · "
+         "quarentena de LLM · scorecard availability corrigido · "
+         "upsell anti-operador · /live+/dash unificados · watch anti-exemplo")
+
+VERSION = "48.27.0-CORTEX"  # v48.27.0-CORTEX: /ml/insights assinado (bandit+conversao Wilson+tendencia+backlog ML) · digest Telegram diario (flock, CORTEX_DIGEST=0 off) · quarentena de exploit no bandit LLM (Gemini 9,65s fora da rota sincrona, reabilita sozinho) · scorecard availability conta challenge402 (era 7%, agora ~real) · upsell nunca mais para carteiras do operador (MRVANO recebia 104 tips/dia) · /live redireciona p/ /dash (uma pagina, uma verdade; sem token = telemetria publica) · x402-watch recusa dominios de exemplo (45 watches medindo example.com) · head da landing com rel=alternate/JSON-LD p/ crawlers agneticos | base: v48.26.5-LINTP5
