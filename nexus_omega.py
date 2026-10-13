@@ -25791,7 +25791,7 @@ def post_fork_boot():
     try:
         def _warm_worker():
             try:
-                time.sleep(4.0 + random.random() * 36.0)  # v48.29.0: escalona os workers (janela larga — 4 warms ONNX/sklearn juntos derrubavam 1 worker por WORKER TIMEOUT 120s no boot)
+                time.sleep(10.0 + random.random() * 90.0)  # v48.30.1: janela 10-100s — na 48.30.0 os 4 warms ainda colidiam no 1º minuto e 2 workers morreram (SIGKILL pós-timeout 120s); espalhados em ~1,5 min a contenção de CPU/RAM some
                 _ml_boot_warm()
             except Exception:
                 pass
@@ -35078,3 +35078,119 @@ log.warning("🧺 v48.30.0-BUNDLE ativo — Telegram reply entende proposta "
             BUNDLE_PRICE, BUNDLE_MIN_ITEMS, BUNDLE_MAX_ITEMS)
 
 VERSION = "48.30.0-BUNDLE"  # v48.30.0-BUNDLE: FIX Telegram — reply nativo do operador numa PROPOSTA caia no aviso de "visitante nao mapeado" (a 48.29 pulava toda mensagem com reply_to_message; prova no export do chat: "Sim"/"Yes" perdidos). Agora 3 mapas em ordem: visitante (intocado) → proposta (message_id capturado no envio e persistido no registro) → intencao sobre pendentes. Novo produto /bundle ($0.20 fixo, BUNDLE_PRICE): 1 pagamento x402 → 2-5 endpoints do catalogo numa resposta; ?paths= explicito com validacao previa (rejeitados com motivo; <2 validos = erro + estorno total pelo wrapper) ou auto-selecao pelos endpoints mais sondados pelo IP em 7d + fallback utilitario; item valido falho = estorno parcial proporcional em credito; transparencia valor a la carte vs bundle. bundle_offer do closer 402 passa a citar /bundle alem de /batch+creditos. | base: v48.29.1-SWEEP
+
+# ============================================================================
+# v48.30.1-GLAMA — O NÓ FALA MCP NA RAIZ + REIVINDICAÇÃO GLAMA + BACKLOG
+#
+#   1. /.well-known/glama.json — prova de propriedade do diretório Glama
+#      (1,6M visitas/mês): JSON público com o token de claim (estável, ligado
+#      à conta Glama do operador; o Glama re-verifica DIARIAMENTE — o arquivo
+#      precisa ficar no ar para sempre). Token via env GLAMA_CLAIM_TOKEN, com
+#      default = o token emitido em 13/out/2026 (ele é público por desenho).
+#   2. POST / com corpo JSON-RPC agora fala MCP — o health check do Glama
+#      (e de qualquer diretório) aponta para a RAIZ do domínio e tomava 405:
+#      era por isso que o listing marcava "Unhealthy, 0.0% over 57 days" com
+#      o /mcp 100% funcional. GET / (a landing) intocado; POST não-JSON-RPC
+#      segue com 405 didático.
+#   3. Três itens do backlog real (planner 13/out): /model → 308 /models,
+#      /api/v1/ping → 308 /health, e /facilitator/supported passa a servir os
+#      "kinds" x402 que o nó aceita (a convenção que os clientes x402 sondam;
+#      respondido com honestidade: este nó é vendedor, não facilitator).
+#   4. Boot: stagger do warm ML 10-100s (no deploy da 48.30.0 os 4 warms
+#      colidiam no 1º minuto — 2 WORKER TIMEOUT, auto-recuperado) e gunicorn
+#      --timeout 120→180 no start.sh (folga para o warm mais lento).
+# ============================================================================
+
+GLAMA_CLAIM_TOKEN = os.environ.get(
+    "GLAMA_CLAIM_TOKEN", "glama_claim_nua5scf5vqDbdZIIQbou_IXqJPw1leCT")
+
+
+def glama_claim_file():
+    """Prova de propriedade do Glama — pública, HTTPS, SEM redirect (os três
+    requisitos que o verificador deles checa; re-verificação diária).
+
+    SUBSTITUI a view antiga `manifest_glama` (metadados no schema server.json
+    — convenção que o Glama aposentou: o fluxo de claim atual exige o schema
+    CONNECTOR com a chave "claim" NESTE MESMO path). Os metadados do servidor
+    seguem públicos em /server.json e /.well-known/mcp.json — nada se perde."""
+    return app.response_class(
+        json.dumps({"$schema": "https://glama.ai/mcp/schemas/connector.json",
+                    "claim": GLAMA_CLAIM_TOKEN}, separators=(",", ":")),
+        mimetype="application/json")
+
+
+# a rota /.well-known/glama.json já existia (manifest_glama, v46) — troca-se
+# a view mantendo o path exato que o verificador do Glama consulta:
+app.view_functions["manifest_glama"] = glama_claim_file
+
+
+# -------------------------------- POST / fala MCP ----------------------------
+def _root_post_mcp():
+    """Diretórios (Glama, Smithery, scanners caseiros) testam o servidor MCP
+    POSTando `initialize` na RAIZ do host. Antes: 405 → 'Unhealthy 0.0%'."""
+    try:
+        body = request.get_json(silent=True)
+    except Exception:
+        body = None
+    if isinstance(body, dict) and (body.get("jsonrpc") or body.get("method")):
+        try:
+            return mcp_streamable()
+        except Exception as e:
+            log.warning(f"root mcp: {e}")
+    return (jsonify({
+        "error": "method not allowed",
+        "hint": ("This host speaks MCP (JSON-RPC 2.0): POST initialize / "
+                 "tools/list here or at /mcp. Humans: GET / for the landing "
+                 "page, /llms.txt for agent guidance."),
+    }), 405)
+
+
+app.add_url_rule("/", "root_mcp_rpc", _root_post_mcp, methods=["POST"])
+
+
+# --------------------------------- backlog real ------------------------------
+@app.route("/model")
+def _alias_model_singular():
+    from flask import redirect as _r
+    return _r("/models", code=308)
+
+
+@app.route("/api/v1/ping")
+def _alias_api_ping():
+    from flask import redirect as _r
+    return _r("/health", code=308)
+
+
+@app.route("/facilitator/supported")
+def facilitator_supported():
+    """A convenção que clientes x402 sondam para descobrir o que um host
+    aceita. Resposta honesta: este nó é VENDEDOR (seller), não facilitator —
+    estes são os 'kinds' que os endpoints pagos aceitam no 402."""
+    kinds = [
+        {"x402Version": 2, "scheme": "exact", "network": "eip155:8453",
+         "asset": "USDC", "extra": {"name": "Base"}},
+        {"x402Version": 2, "scheme": "exact", "network": "solana",
+         "asset": "USDC-SPL"},
+        {"x402Version": 2, "scheme": "exact", "network": "algorand",
+         "asset": "USDC-ASA"},
+        {"x402Version": 2, "scheme": "exact", "network": "eip155:137",
+         "asset": "USDC", "extra": {"name": "Polygon"}},
+    ]
+    return jsonify({
+        "kinds": kinds,
+        "role": "seller — this node accepts these payment kinds on its priced "
+                "endpoints; it is not a payment facilitator",
+        "facilitators_used": ["cdp", "payai", "manual-rail"],
+        "mpp": {"tempo": True},
+        "manifest": f"{_public_base()}/.well-known/x402.json",
+        "ts": int(time.time()),
+        "version": VERSION,
+    })
+
+
+log.warning("🛡 v48.30.1-GLAMA ativo — /.well-known/glama.json (claim do "
+            "diretório) · POST / fala MCP (fim do 'Unhealthy 0.0%' no Glama) · "
+            "backlog: /model→/models, /api/v1/ping→/health, "
+            "/facilitator/supported serve os kinds x402 · warm 10-100s")
+
+VERSION = "48.30.1-GLAMA"  # v48.30.1-GLAMA: /.well-known/glama.json publico p/ reivindicacao do diretorio Glama (re-verificado diariamente; token via GLAMA_CLAIM_TOKEN com default publico) · POST / com corpo JSON-RPC agora responde MCP de verdade — o health check do Glama aponta para a raiz e tomava 405, causa do "Unhealthy 0.0% over 57 days" com o /mcp 100% funcional; GET / intocado, POST nao-JSON-RPC segue 405 didatico · backlog do planner: /model → 308 /models, /api/v1/ping → 308 /health, /facilitator/supported serve os kinds x402 aceitos (resposta honesta: vendedor, nao facilitator) · boot: stagger do warm ML 10-100s + gunicorn --timeout 180 (2 WORKER TIMEOUT auto-recuperados no deploy da 48.30.0, warms colidindo no 1o minuto) | base: v48.30.0-BUNDLE
