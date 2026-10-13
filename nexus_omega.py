@@ -25792,7 +25792,7 @@ def post_fork_boot():
         def _warm_worker():
             try:
                 time.sleep(10.0 + random.random() * 90.0)  # v48.30.1: janela 10-100s — na 48.30.0 os 4 warms ainda colidiam no 1º minuto e 2 workers morreram (SIGKILL pós-timeout 120s); espalhados em ~1,5 min a contenção de CPU/RAM some
-                _ml_boot_warm()
+                _ml_boot_warm_serialized()   # v48.31.0: 1 worker aquecendo por vez (flock /data) — 4 ONNX+sklearn simultâneos seguiam matando 1 worker por deploy mesmo com a janela larga
             except Exception:
                 pass
         threading.Thread(target=_warm_worker, daemon=True,
@@ -33980,13 +33980,21 @@ def _ops_llm_planner():
         '"new_price":0.02,"reason":"..."},\n'
         ' {"action":"pause_endpoint","endpoint":"...","reason":"..."},\n'
         ' {"action":"resume_endpoint","endpoint":"<from paused_now>","reason":"..."},\n'
+        ' {"action":"factory_product","path":"<backlog item, ONE segment>",'
+        '"price":0.01,"desc":"what it returns (20-280 chars)",'
+        '"upstream":"https://<keyless public JSON API; {param} placeholders>",'
+        '"params":{"param":"default"},"pick":"dotted.path.to.data (optional)",'
+        '"reason":"..."},\n'
         ' {"action":"queue_product","path":"<backlog item with NO close match>",'
         '"reason":"what product should exist"},\n'
         ' {"action":"note","text":"one sharp observation for the operator"}]}\n'
         "Hard rules: use ONLY paths/endpoints that appear in the telemetry; at "
         "most 5 actions; create_alias only when the close match is a real "
         "substitute; new_price within +/-30% of current; high demand + zero "
-        "sales means LOWER the price, not raise; output the JSON and nothing "
+        "sales means LOWER the price, not raise; factory_product ONLY with a "
+        "real, well-known, KEYLESS public JSON upstream you are confident "
+        "exists — the apply step probe-tests it and the product dies if the "
+        "probe fails; output the JSON and nothing "
         "else.\nTelemetry: " + json.dumps(state, ensure_ascii=False)[:3500])
     txt = LLM.ask(prompt, max_tokens=700, temperature=0.2, cache=False)
     if not txt:
@@ -35194,3 +35202,367 @@ log.warning("🛡 v48.30.1-GLAMA ativo — /.well-known/glama.json (claim do "
             "/facilitator/supported serve os kinds x402 · warm 10-100s")
 
 VERSION = "48.30.1-GLAMA"  # v48.30.1-GLAMA: /.well-known/glama.json publico p/ reivindicacao do diretorio Glama (re-verificado diariamente; token via GLAMA_CLAIM_TOKEN com default publico) · POST / com corpo JSON-RPC agora responde MCP de verdade — o health check do Glama aponta para a raiz e tomava 405, causa do "Unhealthy 0.0% over 57 days" com o /mcp 100% funcional; GET / intocado, POST nao-JSON-RPC segue 405 didatico · backlog do planner: /model → 308 /models, /api/v1/ping → 308 /health, /facilitator/supported serve os kinds x402 aceitos (resposta honesta: vendedor, nao facilitator) · boot: stagger do warm ML 10-100s + gunicorn --timeout 180 (2 WORKER TIMEOUT auto-recuperados no deploy da 48.30.0, warms colidindo no 1o minuto) | base: v48.30.0-BUNDLE
+
+# ============================================================================
+# v48.31.0-FACTORY — A FÁBRICA DE PRODUTOS: CRIAR SEM DEPLOY
+#
+# O degrau final de autonomia. Até aqui o loop autônomo pausava, retomava,
+# precificava e aliasava sem deploy — mas PRODUTO NOVO exigia código. Agora
+# o planner (ou o operador, via /ops) transforma um item do backlog real em
+# endpoint pago EM MINUTOS, sem tocar no Railway:
+#
+#   backlog real (7d de notfound) → LLM propõe factory_product {path, price,
+#   desc, upstream https sem chave, params, pick} → guardrails determinísticos
+#   (path seguro, preço $0.005-0.05, upstream https fora de host próprio/IP
+#   interno, desc 20-280, ≤6 params, anti-alucinação: path TEM que estar no
+#   backlog) → operador aprova no Telegram (botão ou reply "sim") → SONDA DE
+#   CRIAÇÃO executa a chamada real ao upstream — falhou, o produto MORRE ali
+#   → aprovado: entra em /data/factory_products.json e TODOS os workers
+#   enxergam por mtime-reload (mesmo padrão dos aliases do radar): nasce em
+#   BASE_PRICES/ENDPOINT_DESC/ENDPOINT_HANDLERS → aparece sozinho em
+#   get-pricing, openapi, manifesto x402, /api/for-you, recommended_next,
+#   /batch e /bundle → cobra via paid_endpoint normal (402, settle, funnel,
+#   preview grátis, delivery-or-refund, error-watch auto-pausa se reembolsar
+#   demais). Pausa/retomada/preço usam os comandos /ops de sempre.
+#
+#   + warm de boot SERIALIZADO (flock /data/ml_warm.lock, 1 worker por vez,
+#   espera máx 6min senão pula — o lazy async cobre): fim da classe WORKER
+#   TIMEOUT de boot (1 ocorrência auto-recuperada no deploy da 48.30.1).
+#   + backlog de 13/out: /api/supported → /facilitator/supported,
+#   /api/status → /health, /api/chat → /.well-known/agent.json (308).
+# ============================================================================
+
+_FACTORY_FILE = HOME_DIR / "factory_products.json"
+_FACTORY = {"mtime": 0.0, "items": {}, "owned": set()}
+_FACTORY_PATH_RE = re.compile(r"^/[a-z0-9][a-z0-9\-]{2,48}$")
+FACTORY_MAX_PRODUCTS = int(os.environ.get("FACTORY_MAX_PRODUCTS", "30"))
+FACTORY_TIMEOUT_S = float(os.environ.get("FACTORY_TIMEOUT_S", "8"))
+FACTORY_MAX_BYTES = int(os.environ.get("FACTORY_MAX_BYTES", "262144"))
+FACTORY_MIN_PRICE = float(os.environ.get("FACTORY_MIN_PRICE", "0.005"))
+FACTORY_MAX_PRICE = float(os.environ.get("FACTORY_MAX_PRICE", "0.05"))
+
+
+def _factory_upstream_ok(url):
+    """Guarda SSRF: https público, nunca o próprio host, nunca IP interno.
+    (A aprovação humana no Telegram é o guarda final — isto é o cinto.)"""
+    try:
+        from urllib.parse import urlparse
+        import ipaddress
+        u = urlparse(str(url or ""))
+        if u.scheme != "https":
+            return False, "somente https"
+        host = (u.hostname or "").lower()
+        if not host:
+            return False, "host vazio"
+        own = (urlparse(_public_base()).hostname or "").lower()
+        own_hosts = {own, "api.losbeto.xyz", "losbeto.xyz", "www.losbeto.xyz"}
+        if host in own_hosts or host.endswith(".railway.app") \
+                or host.endswith(".railway.internal"):
+            return False, "host próprio"
+        if host in ("localhost",):
+            return False, "host bloqueado"
+        try:
+            ip = ipaddress.ip_address(host)
+            if (ip.is_private or ip.is_loopback or ip.is_link_local
+                    or ip.is_reserved or ip.is_multicast):
+                return False, "IP interno"
+        except ValueError:
+            pass
+        return True, "ok"
+    except Exception as e:
+        return False, str(e)[:80]
+
+
+def _factory_fetch(spec, params):
+    """Executa a chamada real ao upstream (usada pela sonda de criação E pelo
+    handler em produção). (ok, data|erro)."""
+    from urllib.parse import quote, urlparse
+    try:
+        url = str(spec.get("upstream") or "")
+        for k, v in (params or {}).items():
+            url = url.replace("{" + str(k) + "}", quote(str(v), safe=""))
+        if "{" in url or "}" in url:
+            return False, "missing required param"
+        ok_u, why_u = _factory_upstream_ok(url)
+        if not ok_u:
+            return False, f"upstream blocked: {why_u}"
+        r = requests.get(url, timeout=FACTORY_TIMEOUT_S,
+                         headers={"User-Agent": "Losbeto-Factory/1.0 "
+                                  "(+https://api.losbeto.xyz)",
+                                  "Accept": "application/json"})
+        if r.status_code != 200:
+            return False, f"upstream HTTP {r.status_code}"
+        if len(r.content or b"") > FACTORY_MAX_BYTES:
+            return False, "upstream response too large"
+        data = r.json()
+        pick = str(spec.get("pick") or "").strip()
+        if pick:
+            for k, v in (params or {}).items():
+                pick = pick.replace("{" + str(k) + "}", str(v))
+            node = data
+            for part in pick.split("."):
+                if part == "":
+                    continue
+                if isinstance(node, dict):
+                    node = node.get(part)
+                elif isinstance(node, list) and part.isdigit():
+                    i = int(part)
+                    node = node[i] if 0 <= i < len(node) else None
+                else:
+                    return False, f"pick lost at '{part}'"
+            if node is None:
+                return False, "pick resolved to null"
+            data = node
+        return True, data
+    except Exception as e:
+        return False, str(e)[:160]
+
+
+def _make_factory_handler(path):
+    def _h_factory():
+        spec = (_FACTORY["items"].get(path) or {})
+        params = dict(spec.get("params") or {})
+        for k in list(params):
+            v = request.args.get(k)
+            if v is not None and str(v).strip() != "":
+                params[k] = str(v)[:120]
+        ok, out = _factory_fetch(spec, params)
+        if not ok:
+            # dict com "error" → wrapper v48.10.2 estorna 100% e o error-watch
+            # pausa o produto sozinho se ele reembolsar mais do que entrega.
+            return {"error": "upstream_failed", "detail": str(out)[:200],
+                    "endpoint": path}
+        from urllib.parse import urlparse
+        return {"endpoint": path,
+                "product": spec.get("desc"),
+                "params": params,
+                "data": out,
+                "source": (urlparse(str(spec.get("upstream", ""))).hostname
+                           or "upstream"),
+                "factory": True,
+                "ts": int(time.time()),
+                "version": VERSION}
+    return _h_factory
+
+
+def _factory_reload(force=False):
+    """Sincroniza os dicts-vitrine com /data/factory_products.json (mtime —
+    um worker cria, todos enxergam no próximo request)."""
+    try:
+        st = os.stat(str(_FACTORY_FILE))
+        if not force and st.st_mtime == _FACTORY["mtime"]:
+            return
+        items = _ops_read_json(_FACTORY_FILE, {})
+        if not isinstance(items, dict):
+            items = {}
+        live = {p: s for p, s in items.items()
+                if isinstance(s, dict) and s.get("status") == "live"
+                and _FACTORY_PATH_RE.match(p)}
+        # remove o que morreu/saiu do ar (só entradas que a fábrica possui)
+        for p in list(_FACTORY["owned"]):
+            if p not in live:
+                for d in (BASE_PRICES, ENDPOINT_DESC, ENDPOINT_HANDLERS,
+                          ENDPOINT_PARAM_HINTS):
+                    d.pop(p, None)
+                _FACTORY["owned"].discard(p)
+        for p, s in live.items():
+            if _route_now_live(p):
+                continue          # deploy futuro com rota real vence a fábrica
+            BASE_PRICES[p] = float(s.get("price", 0.01))
+            ENDPOINT_DESC[p] = str(s.get("desc", ""))[:280]
+            ENDPOINT_PARAM_HINTS[p] = dict(s.get("params") or {})
+            ENDPOINT_HANDLERS[p] = _make_factory_handler(p)
+            _FACTORY["owned"].add(p)
+        _FACTORY["items"] = items
+        _FACTORY["mtime"] = st.st_mtime
+    except FileNotFoundError:
+        _FACTORY["items"] = {}
+    except Exception as e:
+        log.debug(f"factory reload: {e}")
+
+
+@app.before_request
+def _factory_dispatch():
+    """Despachante da fábrica: path de produto vivo sem rota real → cobra e
+    executa inline via paid_endpoint (closure pura, segura por request)."""
+    try:
+        p = request.path
+        if p in _FACTORY["items"]:
+            spec = _FACTORY["items"].get(p) or {}
+            if spec.get("status") == "live" and not _route_now_live(p):
+                h = ENDPOINT_HANDLERS.get(p)
+                if h:
+                    return paid_endpoint(p)(h)()
+        elif not _route_now_live(p):
+            _factory_reload()      # enxerga produtos criados por outros workers
+    except Exception:
+        return None
+
+
+# ------------------------- integração com o ops planejador --------------------
+_OPS_VALIDATE_48301 = _ops_validate
+
+
+def _ops_validate(action, candidates):
+    k = action.get("action")
+    if k == "factory_product":
+        path = str(action.get("path", ""))
+        if path not in (candidates.get("backlog") or {}):
+            return False, "path fora do backlog real (anti-alucinação)"
+        if not _FACTORY_PATH_RE.match(path):
+            return False, "path inseguro (1 segmento, a-z0-9-)"
+        if _route_now_live(path) or path in BASE_PRICES:
+            return False, "rota já existe"
+        items = _ops_read_json(_FACTORY_FILE, {})
+        if path in items:
+            return False, "já existe na fábrica"
+        live_n = sum(1 for s in items.values()
+                     if isinstance(s, dict) and s.get("status") == "live")
+        if live_n >= FACTORY_MAX_PRODUCTS:
+            return False, "limite de produtos da fábrica"
+        try:
+            price = float(action.get("price"))
+        except Exception:
+            return False, "preço inválido"
+        if not (FACTORY_MIN_PRICE <= price <= FACTORY_MAX_PRICE):
+            return False, (f"preço fora da faixa {FACTORY_MIN_PRICE}-"
+                           f"{FACTORY_MAX_PRICE}")
+        ok_u, why_u = _factory_upstream_ok(action.get("upstream"))
+        if not ok_u:
+            return False, f"upstream: {why_u}"
+        desc = str(action.get("desc", "")).strip()
+        if not (20 <= len(desc) <= 280):
+            return False, "desc 20-280 chars"
+        params = action.get("params") or {}
+        if not isinstance(params, dict) or len(params) > 6:
+            return False, "params: dict com até 6 chaves"
+        for kk, vv in params.items():
+            if (not re.match(r"^[a-zA-Z][a-zA-Z0-9_]{0,20}$", str(kk))
+                    or not isinstance(vv, (str, int, float))):
+                return False, f"param inválido: {kk}"
+        pick = str(action.get("pick") or "")
+        if len(pick) > 80 or re.search(r"[^a-zA-Z0-9_{}.\[\]]", pick):
+            return False, "pick inválido"
+        return True, "approval"
+    return _OPS_VALIDATE_48301(action, candidates)
+
+
+_OPS_APPLY_48301 = _ops_apply
+
+
+def _ops_apply(action, actor):
+    if action.get("action") == "factory_product":
+        path = str(action["path"])
+        spec = {"price": round(float(action["price"]), 4),
+                "desc": str(action["desc"]).strip()[:280],
+                "upstream": str(action["upstream"]).strip()[:300],
+                "params": {str(kk): str(vv) for kk, vv in
+                           (action.get("params") or {}).items()},
+                "pick": str(action.get("pick") or "")[:80],
+                "ts": int(time.time()), "by": str(actor)[:24],
+                "status": "live"}
+        ok_p, out_p = _factory_fetch(spec, dict(spec["params"]))
+        if not ok_p:
+            _ops_audit(actor, "factory_probe_failed", path,
+                       {"detail": str(out_p)[:160]}, "failed")
+            return False, (f"sonda de criação FALHOU — produto não entrou "
+                           f"no ar: {str(out_p)[:120]}")
+        items = _ops_read_json(_FACTORY_FILE, {})
+        items[path] = spec
+        _ops_write_json(_FACTORY_FILE, items)
+        _factory_reload(force=True)
+        log.warning(f"🏭 FACTORY: {path} NO AR (${spec['price']:.4f}) — "
+                    f"aprovado por {actor}, sonda OK")
+        return True, (f"{path} NO AR (${spec['price']:.4f}) — sonda OK; já "
+                      "consta em get-pricing, openapi e manifesto x402")
+    return _OPS_APPLY_48301(action, actor)
+
+
+_OPS_DESCRIBE_48301 = _ops_describe
+
+
+def _ops_describe(action):
+    if action.get("action") == "factory_product":
+        from urllib.parse import urlparse as _up
+        host = _up(str(action.get("upstream", ""))).hostname or "?"
+        why = TelegramBot.esc(str(action.get("reason", ""))[:220])
+        return (f"🏭 FÁBRICA — novo produto "
+                f"`{TelegramBot.esc(str(action.get('path')))}` "
+                f"${float(action.get('price', 0)):.4f}\n"
+                f"Fonte: `{TelegramBot.esc(host)}` — sonda real obrigatória "
+                f"antes de entrar no ar\n"
+                f"_{TelegramBot.esc(str(action.get('desc', ''))[:140])}_\n"
+                f"_{why}_")
+    return _OPS_DESCRIBE_48301(action)
+
+
+# ------------------------- warm serializado (boot limpo) ----------------------
+def _ml_boot_warm_serialized():
+    """1 worker aquecendo por vez (flock em /data): 4 loads ONNX+sklearn
+    simultâneos seguiam derrubando 1 worker por deploy mesmo com a janela
+    10-100s (48.30.1, 13/out 16:55). Espera até 6min; se não conseguir, pula —
+    o fallback lazy async (_emb_catalog_async) cobre as primeiras requests."""
+    try:
+        import fcntl as _fc
+    except Exception:
+        _ml_boot_warm()
+        return
+    lf = None
+    try:
+        lf = open("/data/ml_warm.lock", "w")
+        t0 = time.time()
+        got = False
+        while time.time() - t0 < 360:
+            try:
+                _fc.flock(lf, _fc.LOCK_EX | _fc.LOCK_NB)
+                got = True
+                break
+            except OSError:
+                time.sleep(3.0)
+        if not got:
+            log.info("🧠 warm: lock não veio em 6min — pulando (lazy cobre)")
+            return
+        try:
+            _ml_boot_warm()
+        finally:
+            try:
+                _fc.flock(lf, _fc.LOCK_UN)
+            except Exception:
+                pass
+    except Exception as e:
+        log.debug(f"warm serializado: {e}")
+    finally:
+        try:
+            if lf:
+                lf.close()
+        except Exception:
+            pass
+
+
+# ----------------------------- backlog 13/out ---------------------------------
+@app.route("/api/supported")
+def _alias_api_supported():
+    from flask import redirect as _r
+    return _r("/facilitator/supported", code=308)
+
+
+@app.route("/api/status")
+def _alias_api_status():
+    from flask import redirect as _r
+    return _r("/health", code=308)
+
+
+@app.route("/api/chat")
+def _alias_api_chat():
+    from flask import redirect as _r
+    return _r("/.well-known/agent.json", code=308)
+
+
+_factory_reload(force=True)
+
+log.warning("🏭 v48.31.0-FACTORY ativo — produtos novos SEM deploy (backlog → "
+            "proposta → aprovação Telegram → sonda real → no ar em todos os "
+            "catálogos; falha = estorno + auto-pausa) · warm de boot "
+            "serializado · 3 aliases do backlog")
+
+VERSION = "48.31.0-FACTORY"  # v48.31.0-FACTORY: o loop autonomo passa a CRIAR produtos sem deploy — acao factory_product do planner (path do backlog real + upstream https sem chave + params + pick), guardrails deterministicos (path seguro, preco 0.005-0.05, SSRF: sem host proprio/IP interno, anti-alucinacao via backlog), aprovacao humana no Telegram, SONDA DE CRIACAO real antes de ativar (falhou = produto morre), config em /data/factory_products.json com mtime-reload em todos os workers (mesmo padrao dos aliases do radar): nasce em BASE_PRICES/ENDPOINT_DESC/ENDPOINT_HANDLERS e aparece sozinho em get-pricing/openapi/manifesto x402/for-you/recommended_next/batch/bundle; cobra via paid_endpoint normal (402/settle/funil/preview/delivery-or-refund/error-watch auto-pausa) · warm de boot SERIALIZADO por flock (fim da classe WORKER TIMEOUT de boot) · aliases do backlog 13/out: /api/supported→/facilitator/supported, /api/status→/health, /api/chat→/.well-known/agent.json | base: v48.30.1-GLAMA
