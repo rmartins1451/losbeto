@@ -25,6 +25,11 @@
 # worker TRAVANDO no encerramento do interpretador (SIGSEGV/SIGABRT de
 # biblioteca nativa no teardown, típico de ONNX/gRPC com threads vivas) e o
 # arbiter matando por timeout 120s: 4 dos 6 CRITICALs do dia vieram disso,
+# v48.30.1-GLAMA: --timeout 120 → 180. O deploy da 48.30.0 (13/out 14:23 UTC)
+# matou 2 workers no boot: os 4 warms de ML (ONNX+sklearn) colidiam no 1º
+# minuto pós-fork. A janela do stagger abriu para 10-100s no nexus e o timeout
+# ganha 60s de folga para o warm mais lento — o serviço se auto-recuperou nas
+# duas vezes, mas worker morto no boot é risco desnecessário em deploy.
 # não de venda. Restart ~6x mais raro (1x a cada ~2 dias por worker) corta
 # ~85% desse ruído e continua limitando crescimento de memória.
 # v48.23.0-FORKSAFE: hook post_fork via config GERADA AQUI (sem arquivo novo
@@ -53,4 +58,4 @@ def post_fork(server, worker):
     nexus_omega.post_fork_boot()
 PYEOF
 
-exec gunicorn --config /tmp/gunicorn_conf.py --worker-class sync --workers 4 --preload --timeout 120 --graceful-timeout 20 --keep-alive 30 --max-requests 30000 --max-requests-jitter 3000 --bind 0.0.0.0:${PORT:-8080} nexus_omega:app 2>&1
+exec gunicorn --config /tmp/gunicorn_conf.py --worker-class sync --workers 4 --preload --timeout 180 --graceful-timeout 20 --keep-alive 30 --max-requests 30000 --max-requests-jitter 3000 --bind 0.0.0.0:${PORT:-8080} nexus_omega:app 2>&1
