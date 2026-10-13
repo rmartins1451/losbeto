@@ -34561,3 +34561,520 @@ log.warning("🏪 v48.29.0-SALESMIND ativo — /models+/v1/models grátis com st
             "escalonado 4-40s")
 
 VERSION = "48.29.0-SALESMIND"  # v48.29.0-SALESMIND: venda em cima da sondagem — /models e /v1/models gratis (convenção OpenAI, backlog nº1) com latencia/reward AO VIVO do bandit por provedor + caminho de compra do /llm · captura 308 de /.well-known/openapi.json e /mcp/.well-known/agent.json (demanda real que o radar nao aliasava) · 402 closer: cheaper_alternatives por categoria MCP + bundle_offer /batch para IP que sondou 3+ endpoints em 1h (accepts/precos intocados) · Telegram em linguagem natural aplica/rejeita propostas pendentes (keywords PT/EN + intencao via LLM; reply de visitante intacto) — corrige as 3 propostas que ficaram penduradas em producao · stagger do warm ML 4-40s contra WORKER TIMEOUT no boot | base: v48.28.0-AUTONOMOUS
+
+# ============================================================================
+# v48.29.1-SWEEP — HIGIENE DO LOOP AUTÔNOMO
+#
+# Em produção (12/out 23:43) o planner repropôs /models e as duas capturas
+# well-known 4 minutos DEPOIS delas entrarem no ar: o backlog do cortex olha
+# o histórico de 7 dias de notfound e não sabia que a rota já existia. As 3
+# propostas viraram 6 e iam continuar duplicando a cada 6h. Quatro correções:
+#   1. backlog filtra rotas vivas (mesmo juiz do radar: _route_now_live);
+#   2. proposta pendente cujo alvo já tem rota vira 'superseded' no ciclo de
+#      15 min, com auditoria e aviso no Telegram;
+#   3. _ops_propose deduplica (mesma ação+alvo pendente reutiliza o id);
+#   4. /models: x_live.bandit_quarantined (a quarentena de exploit do bandit)
+#      ao lado de .quarantined (disjuntor de indisponibilidade) — eram dois
+#      conceitos com o mesmo nome.
+# ============================================================================
+
+# ------------------------------------------------- 1. backlog honesto -------
+_CORTEX_BACKLOG_ORIG = _cortex_backlog
+
+
+def _cortex_backlog(days: int = 7, min_ips: int = 3, limit: int = 12) -> list:
+    """Demanda REALMENTE não atendida: histórico de notfound MENOS o que já
+    tem rota viva hoje (a janela de 7d não perdoa produto recém-nascido)."""
+    rows = _CORTEX_BACKLOG_ORIG(days, min_ips, limit * 3)
+    out = []
+    for b in rows:
+        p = b.get("requested_path") if isinstance(b, dict) else None
+        if p:
+            try:
+                if _route_now_live(p):
+                    continue          # já nasceu — não é mais backlog
+            except Exception:
+                pass
+        out.append(b)
+        if len(out) >= limit:
+            break
+    return out
+
+
+# ------------------------------------ 2. sweep de propostas obsoletas -------
+_OPS_PROPOSALS_EXPIRE_ORIG = _ops_proposals_expire
+
+
+def _ops_proposals_expire():
+    """Antes do TTL normal: pendente de queue_product/create_alias cujo alvo
+    JÁ está no ar é obsoleto — cancela com auditoria (e um aviso só)."""
+    superseded = []
+    try:
+        _ops_proposals_reload()
+        for k, rec in _OPS_PROPOSALS["items"].items():
+            if rec.get("status") != "pending":
+                continue
+            a = rec.get("action") or {}
+            tgt = _ops_target(a)
+            if (a.get("action") in ("queue_product", "create_alias")
+                    and tgt and _route_now_live(tgt)):
+                rec["status"] = "superseded"
+                rec["result"] = "route already live — nothing to build"
+                superseded.append(tgt)
+                _ops_audit("ops-agent", "supersede", tgt, {"id": k},
+                           "superseded")
+        if superseded:
+            _ops_proposals_save()
+            log.info(f"🧹 ops: {len(superseded)} proposta(s) obsoletas "
+                     f"canceladas: {superseded}")
+            _notify_telegram(
+                "🧹 *OPS — propostas obsoletas canceladas*\n\n"
+                + "\n".join(f"• `{TelegramBot.esc(t)}` — a rota já está no ar"
+                            for t in superseded[:8])
+                + "\n\n_O backlog olhava o histórico de 7d; corrigido na "
+                  "48.29.1 — não duplica mais._")
+    except Exception as e:
+        log.debug(f"ops supersede: {e}")
+    return _OPS_PROPOSALS_EXPIRE_ORIG()
+
+
+# ------------------------------------------------------- 3. dedupe ----------
+_OPS_PROPOSE_ORIG = _ops_propose
+
+
+def _ops_propose(action, by):
+    """Mesma ação + mesmo alvo já pendente → reutiliza o id existente em vez
+    de abrir duplicata (o planner roda a cada 6h sobre janelas sobrepostas)."""
+    try:
+        tgt = _ops_target(action)
+        for pid, rec in _ops_pending().items():
+            a = rec.get("action") or {}
+            if a.get("action") == action.get("action") and _ops_target(a) == tgt:
+                return pid
+    except Exception:
+        pass
+    return _OPS_PROPOSE_ORIG(action, by)
+
+
+# --------------------------- 4. /models: as DUAS quarentenas nomeadas -------
+_MODELS_CATALOG_ORIG = app.view_functions.get("models_catalog")
+
+
+def _models_catalog_v2():
+    r = _MODELS_CATALOG_ORIG()
+    try:
+        j = r.get_json(silent=True)
+        if isinstance(j, dict):
+            bq = set(_llm_bandit_quarantined() if _LLM_BANDIT_QUAR else [])
+            for mdl in (j.get("data") or []):
+                xl = mdl.get("x_live")
+                if isinstance(xl, dict):
+                    xl["bandit_quarantined"] = mdl.get("owned_by") in bq
+            xl2 = j.get("x_losbeto")
+            if isinstance(xl2, dict):
+                xl2["bandit_quarantined_now"] = sorted(bq)
+            r.set_data(json.dumps(j))
+    except Exception:
+        pass
+    return r
+
+
+if _MODELS_CATALOG_ORIG:
+    app.view_functions["models_catalog"] = _models_catalog_v2
+
+
+log.info("🧹 v48.29.1-SWEEP ativo — backlog só com demanda não atendida · "
+         "proposta obsoleta vira superseded · dedupe de propostas · "
+         "/models com as duas quarentenas nomeadas")
+
+VERSION = "48.29.1-SWEEP"  # v48.29.1-SWEEP: corrige o planner que repropunha rotas recem-nascidas a cada 6h (backlog olhava o historico de 7d de notfound sem checar rota viva) — _cortex_backlog agora filtra _route_now_live como o radar · proposta pendente de queue_product/create_alias com alvo no ar vira 'superseded' no ciclo de 15min com auditoria+Telegram · _ops_propose deduplica mesma acao+alvo · /models x_live.bandit_quarantined nomeado ao lado do disjuntor | base: v48.29.0-SALESMIND
+
+# ============================================================================
+# v48.30.0-BUNDLE — REPLY QUE ENTENDE + O BUNDLE QUE VENDE
+#
+# Dois buracos medidos em produção (12-13/out):
+#
+#   1. TELEGRAM — o operador RESPONDIA (arrastava reply) a proposta do planner
+#      com "Sim"/"Yes" e recebia "⚠ não é reply de visitante mapeada": o
+#      wrapper da 48.29 pulava qualquer mensagem com reply_to_message e o
+#      handler original só conhecia o mapa visitante↔sessão. A prova estava
+#      no export do chat: duas confirmações perdidas. Agora o reply passa por
+#      TRÊS mapas em ordem — visitante (intocado) → proposta mapeada (o
+#      message_id da PROPOSTA passa a ser capturado no envio e persistido no
+#      registro) → intenção sobre as pendentes (fallback da 48.29). Responder
+#      "sim" numa proposta aplica EXATAMENTE ela; sem mapa, aplica/recusa o
+#      conjunto pendente como a 48.29 já fazia; sem pendência nenhuma, o aviso
+#      didático original permanece.
+#
+#   2. /bundle ($0.20, BUNDLE_PRICE) — o bundle_offer do closer vira produto:
+#      um pagamento x402 único devolve 2-5 endpoints do catálogo numa só
+#      resposta. Explícito (?paths=/a,/b,/c — validação antes da execução,
+#      rejeitados listados com motivo, menos de 2 válidos = erro completo e o
+#      wrapper v48.10.2 estorna 100%) ou AUTOMÁTICO (sem paths: top endpoints
+#      sondados pelo PRÓPRIO IP do comprador em 7d, com fallback para um set
+#      utilitário elegível). Falha de item válido = estorno parcial
+#      proporcional em crédito; transparência de valor (preço somado à la
+#      carte vs. do bundle) em toda resposta. Preço FIXO — P6 price-integrity
+#      intocada: o desafio 402 não depende dos parâmetros.
+# ============================================================================
+
+BUNDLE_PRICE     = float(os.environ.get("BUNDLE_PRICE", "0.20"))
+BUNDLE_MAX_ITEMS = int(os.environ.get("BUNDLE_MAX_ITEMS", "5"))
+BUNDLE_MIN_ITEMS = 2
+BUNDLE_BUDGET_S  = float(os.environ.get("BUNDLE_BUDGET_S", "25"))
+_BUNDLE_EXCLUDED = ("/batch", "/bundle", "/starter-pack")
+
+
+# -------------------------------- 1. Telegram: reply que entende -------------
+
+def _tg_send_capture_buttons(text, buttons):
+    """sendMessage COM botões que DEVOLVE o message_id (o TG_BOT.send é
+    fogo-e-esquece; sem o id, o reply nativo na proposta não tinha para onde
+    apontar). Fallback para texto puro se o Markdown quebrar."""
+    if not (TG_TOKEN and TG_CHAT):
+        return None
+    for payload in (
+            {"chat_id": TG_CHAT, "text": text, "parse_mode": "Markdown",
+             "disable_web_page_preview": True,
+             "reply_markup": {"inline_keyboard": buttons}},
+            {"chat_id": TG_CHAT, "text": text,
+             "disable_web_page_preview": True,
+             "reply_markup": {"inline_keyboard": buttons}}):
+        try:
+            r = requests.post(
+                f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
+                json=payload, timeout=8)
+            if r.ok:
+                return (r.json().get("result") or {}).get("message_id")
+            log.warning(f"TG proposal send HTTP {r.status_code}: {r.text[:140]}")
+        except Exception as e:
+            log.warning(f"TG proposal send: {str(e).replace(TG_TOKEN or '', '***')}")
+    return None
+
+
+def _ops_propose(action, by):
+    """Criação da proposta com dedupe (mesma regra da 48.29.1) e, agora,
+    CAPTURA do message_id do Telegram no registro — é o que liga o reply
+    nativo do operador à proposta certa."""
+    try:
+        tgt = _ops_target(action)
+        for pid, rec in _ops_pending().items():
+            a = rec.get("action") or {}
+            if a.get("action") == action.get("action") and _ops_target(a) == tgt:
+                return pid
+    except Exception:
+        pass
+    _ops_proposals_reload()
+    pid = int(_OPS_PROPOSALS["next_id"])
+    _OPS_PROPOSALS["next_id"] = pid + 1
+    rec = {"action": action, "by": str(by)[:24],
+           "ts": int(time.time()), "status": "pending"}
+    _OPS_PROPOSALS["items"][str(pid)] = rec
+    items = _OPS_PROPOSALS["items"]
+    if len(items) > 60:
+        for old in sorted(items, key=lambda i: items[i].get("ts", 0))[:-60]:
+            items.pop(old, None)
+    _ops_audit(by, f"propose:{action.get('action')}", _ops_target(action),
+               {"id": pid, "reason": str(action.get("reason", ""))[:200]},
+               "proposed")
+    mid = _tg_send_capture_buttons(
+        f"🤖 *PROPOSTA #{pid}* — {TelegramBot.esc(by)}\n\n"
+        f"{_ops_describe(action)}\n\n"
+        f"Expira em {OPS_PROPOSAL_TTL_S // 3600}h. "
+        f"_Responda ESTA mensagem com `sim` ou `não`._",
+        [[{"text": "✅ Aplicar", "callback_data": f"/ops ok {pid}"},
+          {"text": "❌ Recusar", "callback_data": f"/ops no {pid}"}]])
+    if mid:
+        rec["tg_msg_id"] = int(mid)
+    _ops_proposals_save()
+    return pid
+
+
+def _ops_pid_by_tgmsg(tg_msg_id):
+    """message_id do Telegram → id da proposta pendente (ou None)."""
+    try:
+        tg_msg_id = int(tg_msg_id)
+    except Exception:
+        return None
+    try:
+        _ops_proposals_reload()
+        for k, rec in _OPS_PROPOSALS["items"].items():
+            if (rec.get("status") == "pending"
+                    and int(rec.get("tg_msg_id") or 0) == tg_msg_id):
+                return int(k)
+    except Exception:
+        pass
+    return None
+
+
+_TG_HANDLE_48291 = TelegramBot._handle   # cadeia: 48.29 (NL sem reply)
+
+
+def _tg_handle_opsreply(self, msg):
+    """Reply nativo com TRÊS mapas, em ordem:
+    1) notificação de visitante → handler original (nunca interceptado);
+    2) PROPOSTA mapeada → 'sim/não' decide EXATAMENTE ela;
+    3) outra mensagem do bot com pendências → intenção sobre o conjunto.
+    Sem pendência e sem mapa: cai no original (aviso didático)."""
+    try:
+        text = (msg.get("text") or "").strip()
+    except Exception:
+        text = ""
+    reply_to = (msg.get("reply_to_message") or {}).get("message_id")
+    if reply_to and text and not text.startswith("/"):
+        try:
+            chat_id = msg["chat"]["id"]
+            if _chat_sid_from_tg(reply_to):
+                return _TG_HANDLE_48291(self, msg)          # 1. visitante
+            pid = _ops_pid_by_tgmsg(reply_to)
+            if pid is not None:                              # 2. proposta
+                intent = _ops_nl_intent(text)
+                if intent in ("approve", "reject"):
+                    _ok, out = _ops_decide(pid, intent == "approve")
+                    self.send(chat_id, "🤖 *OPS*\n\n" + TelegramBot.esc(out))
+                else:
+                    self.send(chat_id,
+                        f"🤖 Reply na *PROPOSTA #{pid}* — responda `sim` para "
+                        "aplicar ou `não` para recusar (ou toque nos botões).")
+                return
+            pend = _ops_pending()                            # 3. conjunto
+            if pend:
+                intent = _ops_nl_intent(text)
+                if intent in ("approve", "reject"):
+                    res = _ops_nl_apply_all(intent == "approve")
+                    self.send(chat_id,
+                              "🤖 *OPS — decisão registrada*\n\n"
+                              + "\n".join(TelegramBot.esc(r) for r in res))
+                else:
+                    self.send(chat_id,
+                        f"🤖 Há {len(pend)} proposta(s) pendente(s): responda "
+                        "`sim`/`não`, toque nos botões ✅/❌ ou use `/ops ok <n>`.")
+                return
+        except Exception as e:
+            log.warning(f"tg opsreply: {e}")
+    return _TG_HANDLE_48291(self, msg)
+
+
+TelegramBot._handle = _tg_handle_opsreply
+
+
+# ------------------------------------------------ 2. /bundle -----------------
+
+def _bundle_eligible(path):
+    """O que pode entrar num bundle: endpoint pago real, com handler, vendável
+    AGORA, dentro do teto anti-arbitragem (mesmo do /batch), fora de planos e
+    de meta-endpoints (batch/bundle/starter-pack)."""
+    try:
+        if not path or path in CREDIT_PLANS or path in _BUNDLE_EXCLUDED:
+            return False
+        if path not in BASE_PRICES or path not in ENDPOINT_HANDLERS:
+            return False
+        p = get_dynamic_price(path)
+        if p <= 0 or p > BATCH_ITEM_CAP:
+            return False
+        if not _sellable_now(path):
+            return False
+        return True
+    except Exception:
+        return False
+
+
+def _bundle_auto_paths(ip, n):
+    """Auto-seleção: os endpoints que ESTE IP mais sondou em 7d (probes e
+    desafios 402 — a intenção declarada da máquina), filtrados pelo elegível;
+    se o histórico não bastar, completa com o set utilitário da casa."""
+    out = []
+    try:
+        with LEDGER._conn() as c:
+            rows = c.execute(
+                "SELECT endpoint, COUNT(*) FROM requests WHERE ts>? AND ip=? "
+                "AND kind IN ('probe','challenge402') GROUP BY endpoint "
+                "ORDER BY 2 DESC LIMIT 40",
+                (int(time.time()) - 7 * 86400, ip)).fetchall()
+        for ep, _cnt in rows:
+            if _bundle_eligible(ep) and ep not in out:
+                out.append(ep)
+            if len(out) >= n:
+                return out[:n]
+    except Exception:
+        pass
+    for ep in ("/fear-greed", "/pyth-price", "/gas-price", "/web-search",
+               "/llm", "/weather"):
+        if ep not in out and _bundle_eligible(ep):
+            out.append(ep)
+        if len(out) >= n:
+            break
+    return out[:n]
+
+
+def _h_bundle():
+    from flask import g as _g
+    t0 = time.time()
+    try:
+        if request.method == "POST":
+            body = request.get_json(silent=True) or {}
+        else:
+            body = dict(request.args)
+    except Exception:
+        body = {}
+    raw_paths = body.get("paths") or body.get("endpoints") or ""
+    if isinstance(raw_paths, (list, tuple)):
+        want = [str(p).strip() for p in raw_paths]
+    else:
+        want = [p.strip() for p in str(raw_paths).split(",")]
+    want = [("/" + p.lstrip("/")) for p in want if p and p.strip()]
+    seen = set()
+    want = [p for p in want if not (p in seen or seen.add(p))]
+    # parâmetros compartilhados: tudo que não é a lista de paths vale para
+    # todos os itens (ex.: ?paths=/pyth-price,/stock-quote&symbol=SOL);
+    # defaults didáticos (ENDPOINT_PARAM_HINTS) preenchem o que faltar.
+    shared = {k: v for k, v in body.items()
+              if k not in ("paths", "endpoints")}
+
+    rejected = []
+    if want:
+        mode = "explicit"
+        paths = []
+        for p in want:
+            if _bundle_eligible(p):
+                paths.append(p)
+            else:
+                if p in CREDIT_PLANS or p in _BUNDLE_EXCLUDED:
+                    why = "meta-endpoint/plan — not bundleable"
+                elif p not in BASE_PRICES or p not in ENDPOINT_HANDLERS:
+                    why = "unknown endpoint"
+                elif get_dynamic_price(p) > BATCH_ITEM_CAP:
+                    why = (f"price above the ${BATCH_ITEM_CAP:.2f} bundle "
+                           "item cap — buy it directly")
+                else:
+                    why = "not sellable right now (no charge for no delivery)"
+                rejected.append({"endpoint": p, "reason": why})
+        paths = paths[:BUNDLE_MAX_ITEMS]
+        if len(paths) < BUNDLE_MIN_ITEMS:
+            return ({"error": "bundle needs at least "
+                     f"{BUNDLE_MIN_ITEMS} valid catalog endpoints",
+                     "valid": paths, "rejected": rejected,
+                     "hint": ("GET /get-pricing lists every priced path; any "
+                              f"endpoint priced up to ${BATCH_ITEM_CAP:.2f} is "
+                              "bundleable. Or omit ?paths= and we auto-pick "
+                              "from your own probe history."),
+                     "charged": False}, 400)
+    else:
+        mode = "auto"
+        ip = (request.headers.get("X-Forwarded-For", request.remote_addr or "")
+              or "").split(",")[0].strip() or "unknown"
+        paths = _bundle_auto_paths(ip, BUNDLE_MAX_ITEMS)
+        if len(paths) < BUNDLE_MIN_ITEMS:
+            return ({"error": "not enough sellable endpoints to bundle "
+                     "right now", "charged": False}, 503)
+
+    payer = ""
+    tx = ""
+    try:
+        payer = getattr(_g, "losbeto_payer", "") or ""
+        tx = (getattr(_g, "losbeto_payment", {}) or {}).get("tx", "")
+    except Exception:
+        pass
+
+    results, delivered, fails = [], 0, 0
+    for p in paths:
+        if time.time() - t0 > BUNDLE_BUDGET_S:
+            fails += 1
+            results.append({"endpoint": p, "ok": False,
+                            "error": "bundle time budget exhausted — refunded"})
+            continue
+        h = ENDPOINT_HANDLERS.get(p)
+        params = dict(ENDPOINT_PARAM_HINTS.get(p, {}))
+        params.update(shared)
+        try:
+            raw = _batch_exec(h, params)
+            status, data = _batch_unpack(raw)
+        except Exception as e:
+            fails += 1
+            results.append({"endpoint": p, "ok": False,
+                            "error": f"handler exception: {str(e)[:120]}"})
+            continue
+        if _is_error_result(raw) or (status and status >= 500):
+            fails += 1
+            results.append({"endpoint": p, "ok": False, "status": status,
+                            "error": "endpoint did not deliver — refunded",
+                            "detail": data if isinstance(data, dict) else None})
+        else:
+            delivered += 1
+            results.append({"endpoint": p, "ok": True, "status": status or 200,
+                            "data": data})
+
+    resp = {"bundle": True, "mode": mode, "items": len(paths),
+            "delivered": delivered,
+            "price_usdc": f"{BUNDLE_PRICE:.4f}",
+            "results": results}
+    if rejected:
+        resp["rejected"] = rejected
+    try:
+        alacarte = sum(get_dynamic_price(p) for p in paths)
+        resp["value_if_bought_separately_usdc"] = round(alacarte, 4)
+        if alacarte > BUNDLE_PRICE:
+            resp["savings_pct"] = round(100.0 * (alacarte - BUNDLE_PRICE)
+                                        / alacarte, 1)
+    except Exception:
+        pass
+    if fails:
+        refund = round(BUNDLE_PRICE * fails / max(1, len(paths)), 6)
+        key = _refund_as_credit(payer, refund, "/bundle", tx)
+        resp["partial_refund_usdc"] = refund
+        resp["refund_api_key"] = key
+        resp["refund_note"] = ("Items that failed were refunded as credit — "
+                               "send the key as X-API-Key on any endpoint, "
+                               "valid 30 days.")
+    if mode == "auto":
+        resp["auto_picked_from"] = ("your own probe history (7d) topped up "
+                                    "with the house utility set — pass "
+                                    "?paths=/a,/b,/c for an explicit bundle")
+    resp["ts"] = int(time.time())
+    resp["version"] = VERSION
+    return jsonify(resp)
+
+
+BASE_PRICES["/bundle"] = BUNDLE_PRICE
+ENDPOINT_DESC["/bundle"] = (
+    "One x402 payment, 2-5 catalog endpoints in a single response. Pass "
+    "?paths=/a,/b,/c (any priced endpoint up to the item cap) or omit it and "
+    "the node auto-picks from YOUR own probe history. Failed items are "
+    "refunded proportionally as credit. Fixed price — the 402 challenge "
+    "never depends on parameters.")
+ENDPOINT_PARAM_HINTS["/bundle"] = {"paths": "/fear-greed,/pyth-price,/gas-price"}
+ENDPOINT_HANDLERS["/bundle"] = _h_bundle
+app.add_url_rule("/bundle", "bundle_checkout",
+                 paid_endpoint("/bundle")(_h_bundle),
+                 methods=["GET", "POST"])
+
+
+# ------------------------- 3. closer: bundle_offer aponta o produto real ----
+_REACTIVE_402_4829 = _reactive_402
+
+
+def _reactive_402(path, ip):
+    r = _REACTIVE_402_4829(path, ip)
+    try:
+        body = r.get_json(silent=True)
+        if (isinstance(body, dict)
+                and isinstance(body.get("bundle_offer"), dict)
+                and "bundle" not in body["bundle_offer"]):
+            body["bundle_offer"]["bundle"] = (
+                f"{_public_base()}/bundle — one payment, {BUNDLE_MIN_ITEMS}-"
+                f"{BUNDLE_MAX_ITEMS} endpoints in one response "
+                f"(${BUNDLE_PRICE:.2f}); omit ?paths= and we auto-pick from "
+                "your own probes")
+            r.set_data(json.dumps(body))
+    except Exception:
+        pass
+    return r
+
+
+log.warning("🧺 v48.30.0-BUNDLE ativo — Telegram reply entende proposta "
+            "(message_id capturado e persistido) · /bundle $%.2f: 1 pagamento "
+            "→ %d-%d endpoints (explícito ou auto pelo histórico de probes do "
+            "IP), estorno parcial por item falho · closer oferece /bundle",
+            BUNDLE_PRICE, BUNDLE_MIN_ITEMS, BUNDLE_MAX_ITEMS)
+
+VERSION = "48.30.0-BUNDLE"  # v48.30.0-BUNDLE: FIX Telegram — reply nativo do operador numa PROPOSTA caia no aviso de "visitante nao mapeado" (a 48.29 pulava toda mensagem com reply_to_message; prova no export do chat: "Sim"/"Yes" perdidos). Agora 3 mapas em ordem: visitante (intocado) → proposta (message_id capturado no envio e persistido no registro) → intencao sobre pendentes. Novo produto /bundle ($0.20 fixo, BUNDLE_PRICE): 1 pagamento x402 → 2-5 endpoints do catalogo numa resposta; ?paths= explicito com validacao previa (rejeitados com motivo; <2 validos = erro + estorno total pelo wrapper) ou auto-selecao pelos endpoints mais sondados pelo IP em 7d + fallback utilitario; item valido falho = estorno parcial proporcional em credito; transparencia valor a la carte vs bundle. bundle_offer do closer 402 passa a citar /bundle alem de /batch+creditos. | base: v48.29.1-SWEEP
