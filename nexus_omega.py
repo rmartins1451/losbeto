@@ -35612,10 +35612,13 @@ def actions_json_manifest():
 
 @app.route("/.well-known/solana.txt")
 def well_known_solana_txt():
-    """Identidade Solana do nó em texto puro — uma linha, um endereço (o
-    mesmo payTo USDC-SPL dos checkouts e do did.json)."""
-    resp = app.response_class(WALLET.solana_address + "\n",
-                              mimetype="text/plain")
+    """Identidade Solana do nó em texto puro — uma linha, um endereço.
+    v48.31.2: serve o RECEIVE_ADDRESS (payTo USDC-SPL dos 402/checkouts),
+    não o signer interno — verificadores de pagamento comparam ESTE
+    arquivo com o payTo do desafio x402; divergência = verificação falha.
+    (O signer Ed25519 das provas continua publicado no did.json.)"""
+    addr = (RECEIVE_ADDRESS or WALLET.solana_address or "").strip()
+    resp = app.response_class(addr + "\n", mimetype="text/plain")
     resp.headers["Cache-Control"] = "public, max-age=3600"
     resp.headers["Access-Control-Allow-Origin"] = "*"
     return resp
@@ -35676,4 +35679,9 @@ log.warning("🪪 v48.31.1-IDENTITY ativo — /actions.json (Solana Actions/Blin
             "marcou 'not built' (17 pedidos · 5 IPs cada em 7d) agora vivos e "
             "grátis · /catalog sai do 404 e vira o catálogo-máquina canônico")
 
-VERSION = "48.31.1-IDENTITY"  # v48.31.1-IDENTITY: descriptors de identidade pedidos pelas maquinas (radar 7d: /actions.json, /.well-known/solana.txt, /.well-known/atproto-did — 17 hits · 5 IPs cada) servidos gratis com CORS+cache · /catalog (404 linkado no /live) vira JSON canonico com endpoints+precos+categorias+manifestos · llms.txt e sitemap registram as novas rotas | base: v48.31.0-FACTORY
+log.warning("🔧 v48.31.2-PAYTO ativo — solana.txt passa a servir o "
+            "RECEIVE_ADDRESS (payTo USDC-SPL dos 402), nao o signer interno: "
+            "verificadores de pagamento batem o arquivo com o payTo do "
+            "desafio e a divergencia derrubava a checagem")
+
+VERSION = "48.31.2-PAYTO"  # v48.31.2-PAYTO: FIX /.well-known/solana.txt serve RECEIVE_ADDRESS (payTo real dos 402/checkouts) em vez do signer interno WALLET — verificadores de identidade de pagamento comparam o txt com o payTo do desafio x402 e a divergencia falhava a verificacao; signer Ed25519 das provas segue no did.json | base: v48.31.1-IDENTITY
