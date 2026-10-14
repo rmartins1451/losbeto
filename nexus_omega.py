@@ -11903,7 +11903,9 @@ def sitemap_xml():
             "/.well-known/x402.json", "/.well-known/mcp.json", "/.well-known/agent.json",
             "/llms.txt", "/bazaar.json", "/sample", "/get-pricing", "/pricing", "/ip",
             "/receipts", "/launch-risk-preview", "/credits-status",
-            "/skill.md", "/terms", "/privacy", "/impressum", "/jobs"]
+            "/skill.md", "/terms", "/privacy", "/impressum", "/jobs",
+            "/actions.json", "/catalog",
+            "/.well-known/solana.txt", "/.well-known/atproto-did"]
     for ep in BASE_PRICES: urls.append(ep)
     body = ['<?xml version="1.0" encoding="UTF-8"?>',
             '<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">']
@@ -22503,6 +22505,10 @@ def llms_txt():
               f"- A2A:        {base}/.well-known/agent.json",
               f"- Verify:     {base}/.well-known/verify-manifest (prova criptográfica de posse)",
               f"- Bazaar:     {base}/bazaar.json",
+              f"- Actions:    {base}/actions.json (Solana Actions / Blinks manifest)",
+              f"- Solana ID:  {base}/.well-known/solana.txt",
+              f"- ATProto:    {base}/.well-known/atproto-did (did:web)",
+              f"- Catalog:    {base}/catalog (JSON canônico: endpoints, preços, categorias)",
               f"- llms.txt:   {base}/llms.txt"]
     return app.response_class("\n".join(lines), mimetype="text/plain")
 
@@ -35566,3 +35572,99 @@ log.warning("🏭 v48.31.0-FACTORY ativo — produtos novos SEM deploy (backlog 
             "serializado · 3 aliases do backlog")
 
 VERSION = "48.31.0-FACTORY"  # v48.31.0-FACTORY: o loop autonomo passa a CRIAR produtos sem deploy — acao factory_product do planner (path do backlog real + upstream https sem chave + params + pick), guardrails deterministicos (path seguro, preco 0.005-0.05, SSRF: sem host proprio/IP interno, anti-alucinacao via backlog), aprovacao humana no Telegram, SONDA DE CRIACAO real antes de ativar (falhou = produto morre), config em /data/factory_products.json com mtime-reload em todos os workers (mesmo padrao dos aliases do radar): nasce em BASE_PRICES/ENDPOINT_DESC/ENDPOINT_HANDLERS e aparece sozinho em get-pricing/openapi/manifesto x402/for-you/recommended_next/batch/bundle; cobra via paid_endpoint normal (402/settle/funil/preview/delivery-or-refund/error-watch auto-pausa) · warm de boot SERIALIZADO por flock (fim da classe WORKER TIMEOUT de boot) · aliases do backlog 13/out: /api/supported→/facilitator/supported, /api/status→/health, /api/chat→/.well-known/agent.json | base: v48.30.1-GLAMA
+# ============================================================================
+# v48.31.1-IDENTITY — DESCRITORES DE IDENTIDADE (demanda real do radar)
+# ============================================================================
+# Radar 14/out (7d): /actions.json (17 pedidos · 5 IPs),
+# /.well-known/solana.txt (17 · 5) e /.well-known/atproto-did (17 · 5) —
+# demanda "not built" REAL. São descriptors ESTÁTICOS de identidade, não
+# wrappers de upstream: a factory não os cobre. Servidos grátis (verificação
+# de identidade exige acesso livre), com CORS e cache público, registrados
+# no sitemap + llms.txt. /catalog (404 até aqui, com link no /live) vira o
+# catálogo-máquina canônico em JSON.
+
+
+@app.route("/actions.json", methods=["GET", "OPTIONS"])
+def actions_json_manifest():
+    """Solana Actions (Blinks) manifest — a spec exige CORS aberto no
+    actions.json. Mapeamento identidade: qualquer URL do domínio já é uma
+    ação pagável x402 — o blink client que seguir encontra o 402 real."""
+    if request.method == "OPTIONS":
+        resp = app.response_class("", status=204)
+    else:
+        resp = jsonify({"rules": [{"pathPattern": "/**", "apiPath": "/**"}]})
+    resp.headers["Access-Control-Allow-Origin"] = "*"
+    resp.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, OPTIONS"
+    resp.headers["Access-Control-Allow-Headers"] = (
+        "Content-Type, Authorization, Content-Encoding, Accept-Encoding")
+    resp.headers["Cache-Control"] = "public, max-age=300"
+    return resp
+
+
+@app.route("/.well-known/solana.txt")
+def well_known_solana_txt():
+    """Identidade Solana do nó em texto puro — uma linha, um endereço (o
+    mesmo payTo USDC-SPL dos checkouts e do did.json)."""
+    resp = app.response_class(WALLET.solana_address + "\n",
+                              mimetype="text/plain")
+    resp.headers["Cache-Control"] = "public, max-age=3600"
+    resp.headers["Access-Control-Allow-Origin"] = "*"
+    return resp
+
+
+@app.route("/.well-known/atproto-did")
+def well_known_atproto_did():
+    """AT Protocol handle → DID. did:web, coerente com o /.well-known/did.json
+    que o nó já serve (mesma identidade, mesma chave Ed25519)."""
+    host = _public_base().split("://")[-1].split("/")[0]
+    resp = app.response_class("did:web:" + host + "\n", mimetype="text/plain")
+    resp.headers["Cache-Control"] = "public, max-age=3600"
+    resp.headers["Access-Control-Allow-Origin"] = "*"
+    return resp
+
+
+@app.route("/catalog")
+def catalog_machine():
+    """Catálogo-máquina canônico: endpoint, preço, categoria e descrição de
+    tudo que é cobrado + os manifestos de descoberta. Grátis — é a porta."""
+    base = _public_base()
+    items = [{"endpoint": p,
+              "price_usdc": round(BASE_PRICES[p], 4),
+              "category": _mcp_category_of(p),
+              "description": ENDPOINT_DESC.get(p, "")}
+             for p in sorted(BASE_PRICES)]
+    resp = jsonify({
+        "node": "losbeto",
+        "version": VERSION,
+        "endpoints": len(items),
+        "payment": {"protocol": "x402", "asset": "USDC",
+                    "networks": ["eip155:8453", "solana", "algorand",
+                                 "eip155:137"],
+                    "facilitators": ["cdp", "payai", "manual-rail"]},
+        "manifests": {
+            "x402":    f"{base}/.well-known/x402.json",
+            "mcp":     f"{base}/.well-known/mcp.json",
+            "openapi": f"{base}/openapi.json",
+            "actions": f"{base}/actions.json",
+            "llms":    f"{base}/llms.txt",
+            "did":     f"{base}/.well-known/did.json",
+            "solana":  f"{base}/.well-known/solana.txt",
+            "atproto": f"{base}/.well-known/atproto-did",
+            "verify":  f"{base}/.well-known/verify-manifest",
+        },
+        "free": ["/try", "/live", "/models", "/health", "/ip", "/sample",
+                 "/get-pricing", "/catalog"],
+        "catalog": items,
+    })
+    resp.headers["Cache-Control"] = "public, max-age=120"
+    resp.headers["Access-Control-Allow-Origin"] = "*"
+    return resp
+
+
+log.warning("🪪 v48.31.1-IDENTITY ativo — /actions.json (Solana Actions/Blinks, "
+            "CORS aberto) · /.well-known/solana.txt · /.well-known/atproto-did "
+            "(did:web, coerente com did.json) — os 3 descriptors que o radar "
+            "marcou 'not built' (17 pedidos · 5 IPs cada em 7d) agora vivos e "
+            "grátis · /catalog sai do 404 e vira o catálogo-máquina canônico")
+
+VERSION = "48.31.1-IDENTITY"  # v48.31.1-IDENTITY: descriptors de identidade pedidos pelas maquinas (radar 7d: /actions.json, /.well-known/solana.txt, /.well-known/atproto-did — 17 hits · 5 IPs cada) servidos gratis com CORS+cache · /catalog (404 linkado no /live) vira JSON canonico com endpoints+precos+categorias+manifestos · llms.txt e sitemap registram as novas rotas | base: v48.31.0-FACTORY
