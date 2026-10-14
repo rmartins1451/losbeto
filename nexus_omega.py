@@ -34864,6 +34864,15 @@ def _tg_handle_opsreply(self, msg):
                         f"🤖 Há {len(pend)} proposta(s) pendente(s): responda "
                         "`sim`/`não`, toque nos botões ✅/❌ ou use `/ops ok <n>`.")
                 return
+            # v48.31.1: reply sim/não SEM nenhuma pendência — feedback
+            # explícito em vez de cair no aviso genérico de visitante (o
+            # operador respondia e achava que "nada aconteceu").
+            _toks = set(re.findall(r"[a-zà-ÿ]+", text.lower()))
+            if _toks & (set(_OPS_YES_WORDS) | set(_OPS_NO_WORDS)):
+                self.send(chat_id,
+                          "🤖 Nenhuma proposta pendente no momento — nada a "
+                          "aplicar. `/ops` mostra o estado do node.")
+                return
         except Exception as e:
             log.warning(f"tg opsreply: {e}")
     return _TG_HANDLE_48291(self, msg)
