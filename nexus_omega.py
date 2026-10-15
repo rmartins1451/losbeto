@@ -11905,7 +11905,8 @@ def sitemap_xml():
             "/receipts", "/launch-risk-preview", "/credits-status",
             "/skill.md", "/terms", "/privacy", "/impressum", "/jobs",
             "/actions.json", "/catalog",
-            "/.well-known/solana.txt", "/.well-known/atproto-did"]
+            "/.well-known/solana.txt", "/.well-known/atproto-did",
+            "/x402/discovery/resources", "/ads.txt"]
     for ep in BASE_PRICES: urls.append(ep)
     body = ['<?xml version="1.0" encoding="UTF-8"?>',
             '<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">']
@@ -22509,6 +22510,7 @@ def llms_txt():
               f"- Solana ID:  {base}/.well-known/solana.txt",
               f"- ATProto:    {base}/.well-known/atproto-did (did:web)",
               f"- Catalog:    {base}/catalog (JSON canônico: endpoints, preços, categorias)",
+              f"- Discovery:  {base}/x402/discovery/resources (schema x402 Bazaar, paginado)",
               f"- llms.txt:   {base}/llms.txt"]
     return app.response_class("\n".join(lines), mimetype="text/plain")
 
@@ -35662,6 +35664,7 @@ def catalog_machine():
             "did":     f"{base}/.well-known/did.json",
             "solana":  f"{base}/.well-known/solana.txt",
             "atproto": f"{base}/.well-known/atproto-did",
+            "discovery": f"{base}/x402/discovery/resources",
             "verify":  f"{base}/.well-known/verify-manifest",
         },
         "free": ["/try", "/live", "/models", "/health", "/ip", "/sample",
@@ -35685,3 +35688,100 @@ log.warning("🔧 v48.31.2-PAYTO ativo — solana.txt passa a servir o "
             "desafio e a divergencia derrubava a checagem")
 
 VERSION = "48.31.2-PAYTO"  # v48.31.2-PAYTO: FIX /.well-known/solana.txt serve RECEIVE_ADDRESS (payTo real dos 402/checkouts) em vez do signer interno WALLET — verificadores de identidade de pagamento comparam o txt com o payTo do desafio x402 e a divergencia falhava a verificacao; signer Ed25519 das provas segue no did.json | base: v48.31.1-IDENTITY
+# ============================================================================
+# v48.31.3-DISCOVERY — O PATH QUE OS AGENTES BAZAAR RASTREIAM
+# ============================================================================
+# Radar 15/out: /x402/discovery/resources e /v2/x402/discovery/resources —
+# 5 IPs distintos cada (7d) tomando 404 didático. É o path da Discovery API
+# do ecossistema x402 (api.circle.com/v2/x402/discovery/resources): agentes
+# Bazaar-compatíveis rastejam exatamente ele para montar o índice de
+# vendedores. Agora servem o catálogo REAL no schema discovery (items[].accepts
+# com payTo/asset/network por chain, paginado) — grátis, CORS aberto.
+# /ads.txt (proposta #21, 5 IPs) — IAB: vendedor direto, sem intermediários.
+
+
+@app.route("/x402/discovery/resources")
+@app.route("/v2/x402/discovery/resources")
+def x402_discovery_resources():
+    """Catálogo no schema x402 Bazaar Discovery — os accepts carregam os
+    MESMOS payTo/asset/network que o 402 emite (uma verdade só)."""
+    base = _public_base()
+    try:
+        limit = max(1, min(200, int(request.args.get("limit", "200"))))
+        offset = max(0, int(request.args.get("offset", "0")))
+    except Exception:
+        limit, offset = 200, 0
+    paths = [p for p in sorted(BASE_PRICES) if _sellable_now(p)]
+    total = len(paths)
+    items = []
+    now_iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    for p in paths[offset:offset + limit]:
+        url = f"{base}{p}"
+        price = get_dynamic_price(p)
+        micro = str(int(round(price * 1_000_000)))
+        desc = ENDPOINT_DESC.get(p, p)
+        accepts = []
+        if ENABLE_BASE and BASE_PAYTO_EVM:
+            accepts.append({
+                "scheme": "exact", "network": "eip155:8453",
+                "maxAmountRequired": micro, "resource": url,
+                "description": desc, "mimeType": "application/json",
+                "payTo": BASE_PAYTO_EVM, "asset": BASE_USDC,
+                "maxTimeoutSeconds": 300,
+                "extra": {"name": "USD Coin", "version": "2"},
+            })
+        accepts.append({
+            "scheme": "exact", "network": f"solana:{SOL_GENESIS}",
+            "maxAmountRequired": micro, "resource": url,
+            "description": desc, "mimeType": "application/json",
+            "payTo": RECEIVE_ADDRESS, "asset": USDC_MINT,
+            "maxTimeoutSeconds": 300,
+            "extra": {"name": "USDC", "version": "2"},
+        })
+        if ENABLE_ALGO:
+            accepts.append({
+                "scheme": "exact", "network": ALGO_CAIP2,
+                "maxAmountRequired": micro, "resource": url,
+                "description": desc, "mimeType": "application/json",
+                "payTo": ALGO_PAYTO, "asset": ALGO_USDC_ASA,
+                "maxTimeoutSeconds": 300,
+            })
+        items.append({
+            "resource": url, "type": "http", "x402Version": 2,
+            "accepts": accepts, "lastUpdated": now_iso,
+            "metadata": {"category": _mcp_category_of(p),
+                         "provider": "Losbeto",
+                         "price_usdc": round(price, 4)},
+        })
+    resp = jsonify({
+        "x402Version": 2,
+        "items": items,
+        "pagination": {"limit": limit, "offset": offset, "total": total},
+    })
+    resp.headers["Cache-Control"] = "public, max-age=120"
+    resp.headers["Access-Control-Allow-Origin"] = "*"
+    return resp
+
+
+@app.route("/ads.txt")
+def ads_txt():
+    """IAB ads.txt — o nó vende DIRETO, sem ad networks nem intermediários.
+    Crawlers IAB/verificadores de vendedor pedem este arquivo por convenção."""
+    base = _public_base()
+    body = ("# ads.txt — losbeto.xyz\n"
+            "# Venda direta de serviços de dados p/ agentes (x402 · USDC).\n"
+            "# Sem ad networks nem revendedores autorizados.\n"
+            f"# catálogo: {base}/catalog · pagamento: {base}/.well-known/x402.json\n"
+            "losbeto.xyz, losbeto-x402, DIRECT\n")
+    resp = app.response_class(body, mimetype="text/plain")
+    resp.headers["Cache-Control"] = "public, max-age=3600"
+    resp.headers["Access-Control-Allow-Origin"] = "*"
+    return resp
+
+
+log.warning("🛰 v48.31.3-DISCOVERY ativo — /x402/discovery/resources (+/v2/) "
+            "serve o catálogo no schema x402 Bazaar (accepts = payTo/asset "
+            "reais do 402, paginado; 5+5 IPs do radar tomavam 404) · /ads.txt "
+            "(proposta #21) · sitemap/llms/catalog registram")
+
+VERSION = "48.31.3-DISCOVERY"  # v48.31.3-DISCOVERY: paths da Discovery API do ecossistema x402 (/x402/discovery/resources + /v2/) saem do 404 e servem o catalogo real no schema Bazaar (items[].accepts com payTo/asset/network por chain, paginacao limit/offset) — e o que os agentes Bazaar-compativeis rastejam p/ indexar vendedores (radar: 5 IPs cada, 7d) · /ads.txt IAB (vendedor direto) · sitemap+llms+catalog registram | base: v48.31.2-PAYTO
