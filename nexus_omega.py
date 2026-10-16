@@ -35921,7 +35921,8 @@ def _ops_reminder_once():
         btts.append([{"text": f"✅ #{pid}", "callback_data": f"/ops ok {pid}"},
                      {"text": f"❌ #{pid}", "callback_data": f"/ops no {pid}"}])
     linhas += ["", "_Reply aqui decide a mais antiga; os botões decidem cada "
-               "uma; `sim N` / `não N` sem reply também vale._"]
+               "uma; `sim N` / `não N` sem reply também vale; "
+               "`/ops ok N` fura qualquer privacy mode._"]
     mid = _tg_send_capture_buttons("\n".join(linhas), btts)
     if mid:
         orec["tg_msg_id"] = int(mid)   # reply fresco aponta p/ a mais antiga
@@ -35978,3 +35979,115 @@ log.warning("📨 v48.31.4-TGPROOF ativo — toda mensagem inbound vira log + "
             ">24h ganha re-ping com botões e message_id fresco")
 
 VERSION = "48.31.4-TGPROOF"  # v48.31.4-TGPROOF: fim do 'respondi e nada acontece' — inbox Telegram 100% logado (INFO + ring /data/tg_inbox.json visivel no /ops/log com classificacao visitor/proposal#N/all-pending) · webhook guard remove webhook fantasma que mudava o polling (causa classica de silencio total) · NL com numero ('sim 17'/'nao 17') decide a proposta exata sem reply · lembrete consolidado 12h p/ proposta >24h com botoes e tg_msg_id recapturado | base: v48.31.3-DISCOVERY
+
+
+# ============================================================================
+# v48.31.5-BOTPING — O CANAL SE AUTO-TESTA A CADA DEPLOY
+# ============================================================================
+# Diagnóstico 15/out: infra 100% limpa (polling único via flock, webhook guard
+# sem fantasma, zero 409/401, inbox gravando TUDO) e inbox VAZIO desde o boot —
+# ou seja: nenhuma mensagem do operador chegou ao getUpdates. Em vez de esperar
+# a próxima proposta para testar, o próprio boot agora entrega um alvo de
+# teste: mensagem com botão 🏓 (callback = prova de vida mesmo em grupo com
+# privacy mode, pois botão da própria msg do bot sempre chega) + reply `ok` na
+# mensagem de boot (reply a msg do bot também fura privacy mode) + comando
+# `/ops ping` (comandos sempre chegam). Três caminhos independentes — se NENHUM
+# registrar no tg_inbox, o problema é fora do código (token/chat errado).
+
+_TG_BOOT_FILE = HOME_DIR / "tg_boot.json"
+
+_TG_PING_WORDS = {"ok", "ping", "pong", "teste", "test", "oi", "ola", "olá",
+                  "testando", "sim", "funciona", "no ar", "no-ar"}
+
+
+def _tg_boot_ping():
+    """Mensagem de boot com botão de auto-teste — 1x por container (flock)."""
+    if not (TG_TOKEN and TG_CHAT):
+        return
+    try:
+        pend = _ops_pending()
+        linhas = [f"✅ *v{VERSION} online* — canal de comando no ar.", ""]
+        if pend:
+            linhas.append(f"📋 *{len(pend)} proposta(s) aguardando decisão* "
+                          "— botões ✅/❌ nelas, ou `/ops ok N`.")
+            linhas.append("")
+        linhas.append("🏓 *Teste o canal em 2s*: toque no botão abaixo ou "
+                      "responda ESTA mensagem com `ok`.")
+        linhas.append("_Tudo que chegar vira rastro no tg_inbox do /ops/log._")
+        mid = _tg_send_capture_buttons(
+            "\n".join(linhas),
+            [[{"text": "🏓 Testar canal", "callback_data": "/ops ping"}]])
+        _ops_write_json(_TG_BOOT_FILE, {"ts": int(time.time()),
+                                        "msg_id": mid, "version": VERSION})
+        log.info(f"🏓 boot-ping enviado (msg_id={mid}) — canal auto-testável")
+    except Exception as e:
+        log.warning(f"boot ping: {e}")
+
+
+# ---- /ops ping (comando fura privacy mode de grupos) -----------------------
+_OPS_TG_CMD_48314 = _ops_tg_command
+
+
+def _ops_tg_command(bot, msg, text):  # noqa: F811 — camada 48.31.5
+    parts = text.strip().split()
+    if len(parts) >= 2 and parts[1].lower() == "ping":
+        n = len(_ops_read_json(_TG_INBOX_FILE, []))
+        bot.send(msg["chat"]["id"],
+                 f"🏓 pong — canal 100% · v{VERSION}\n"
+                 f"inbox: {n} mensagem(ns) recentes registradas.")
+        return
+    return _OPS_TG_CMD_48314(bot, msg, text)
+
+
+# ---- reply à mensagem de boot = pong (nunca decide proposta) ---------------
+_TG_HANDLE_48314 = TelegramBot._handle   # camada proof (grava inbox)
+
+
+def _tg_handle_botping(self, msg):
+    try:
+        text_raw = (msg.get("text") or "").strip()
+        text = text_raw.lower().strip("!.?")
+        reply_to = (msg.get("reply_to_message") or {}).get("message_id")
+        boot = _ops_read_json(_TG_BOOT_FILE, {})
+        if (reply_to and boot.get("msg_id")
+                and int(boot["msg_id"]) == int(reply_to)
+                and text in _TG_PING_WORDS):
+            chat_id = msg.get("chat", {}).get("id")
+            log.info(f"📨 TG in: boot-ping chat={chat_id}")
+            _tg_inbox_record({"ts": int(time.time()), "chat": str(chat_id),
+                              "text": text_raw[:80], "reply_to": reply_to,
+                              "via": "boot-ping"})
+            n = len(_ops_read_json(_TG_INBOX_FILE, []))
+            self.send(chat_id,
+                      f"🏓 *pong* — canal 100% · v{VERSION}\n"
+                      f"Sua mensagem foi registrada no inbox ({n} recentes). "
+                      "Pode responder as propostas normalmente.")
+            return
+    except Exception as e:
+        log.debug(f"botping: {e}")
+    return _TG_HANDLE_48314(self, msg)
+
+
+TelegramBot._handle = _tg_handle_botping
+
+
+# ---- boot ping no arranque (worker dono do flock) ---------------------------
+_START_BG_48315 = _start_background_once
+
+
+def _start_background_once():
+    owned = _START_BG_48315()
+    try:
+        if owned:
+            _tg_boot_ping()
+    except Exception as e:
+        log.warning(f"boot ping start: {e}")
+    return owned
+
+
+_start_background_once = _start_background_once
+
+VERSION = "48.31.5-BOTPING"  # v48.31.5-BOTPING: canal Telegram se auto-testa a cada deploy — msg de boot com botão 🏓 (callback fura privacy mode) + reply `ok` na msg de boot = pong + `/ops ping`; tg_inbox já provava, agora o operador TEM um alvo de teste imediato sem esperar proposta | base: v48.31.4-TGPROOF
+log.warning("🏓 v48.31.5-BOTPING ativo — a cada deploy o Telegram recebe uma "
+            "mensagem-teste (botão 🏓 + reply `ok` = pong + `/ops ping`); "
+            "se nada registrar no tg_inbox, o problema é fora do código")
