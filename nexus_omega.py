@@ -35040,7 +35040,13 @@ def _h_bundle():
             continue
         if _is_error_result(raw) or (status and status >= 500):
             fails += 1
-            _bundle_fail_note(p, f"status {status}")
+            _w200 = ""
+            try:
+                if isinstance(data, dict) and data.get("error"):
+                    _w200 = f" · error: {str(data.get('error'))[:70]}"
+            except Exception:
+                pass
+            _bundle_fail_note(p, f"status {status}{_w200}")
             results.append({"endpoint": p, "ok": False, "status": status,
                             "error": "endpoint did not deliver — refunded",
                             "detail": data if isinstance(data, dict) else None})
@@ -36230,3 +36236,50 @@ def _bundle_auto_paths(ip, n):  # noqa: F811 — camada 48.31.7
 VERSION = "48.31.7-BUNDLEWATCH"  # v48.31.7-BUNDLEWATCH: estorno de bundle com os NOMES dos itens falhos no log + contador por endpoint (24h) + ≥2 falhas tira o endpoint da auto-seleção de bundle (explícito continua, com estorno se falhar) + alerta Telegram 1×/path/janela — auto-cura sem deploy | base: v48.31.6-AUTOPILOT
 log.warning("🧺 v48.31.7-BUNDLEWATCH ativo — item falho de bundle nomeado no "
             "log · ≥2 falhas/24h sai da auto-seleção · Telegram avisa 1×/path")
+
+
+# ============================================================================
+# v48.31.8-AUTOPICK — AUTO-SELEÇÃO SÓ COM DEFAULTS QUE ENTREGAM DE VERDADE
+# ============================================================================
+# Causa-raiz medida dos estornos $0.04 em /bundle (16/out): o auto-pick
+# escolhia /x402-watch pelo histórico de probes do IP e executava com o
+# DEFAULT da doc (url=https://api.example.com/endpoint); o produto recusa
+# domínio de documentação com 200+{"error":...} (v48.27) → o juiz do bundle
+# marcava "não entregou" e estornava. O produto NÃO estava quebrado — o
+# parâmetro era lixo. Regra nova: endpoint cujo default (ENDPOINT_PARAM_HINTS
+# ou exemplo de _PARAM_REQUIRED) aponta p/ example.com/.org/.net NÃO entra na
+# AUTO-seleção (compra explícita via ?paths= continua livre). Exceções que
+# ENTREGAM com o default doc (computação pública do domínio IANA): /fetch,
+# /br-pix-code — ficam selecionáveis. /agent-call (target=peer.example.com)
+# sai da auto-seleção pelo mesmo critério.
+
+_BUNDLE_AUTOPICK_ALLOW = frozenset({"/fetch", "/br-pix-code"})
+_BUNDLE_DOC_HOSTS = ("example.com", "example.org", "example.net")
+
+
+def _bundle_autopick_ok(path):
+    if path in _BUNDLE_AUTOPICK_ALLOW:
+        return True
+    try:
+        blob = (str(ENDPOINT_PARAM_HINTS.get(path) or "") + " "
+                + str(_PARAM_REQUIRED.get(path) or "")).lower()
+        for d in _BUNDLE_DOC_HOSTS:
+            if d in blob:
+                return False
+    except Exception:
+        pass
+    return True
+
+
+_BUNDLE_AUTO_48317 = _bundle_auto_paths   # camada 48.31.7 (fail-count 24h)
+
+
+def _bundle_auto_paths(ip, n):  # noqa: F811 — camada 48.31.8
+    paths = _BUNDLE_AUTO_48317(ip, n + 3)
+    return [p for p in paths if _bundle_autopick_ok(p)][:n]
+
+
+VERSION = "48.31.8-AUTOPICK"  # v48.31.8-AUTOPICK: fim dos estornos-fantasma de bundle — auto-seleção pula endpoint cujo default é domínio de documentação (example.com/.org/.net): /x402-watch, /x402-audit, /agent-call não entram mais com parâmetro-lixo e não estornam; /fetch e /br-pix-code (entregam com o default) continuam · fail-note de error-200 agora carrega a mensagem do corpo ("Motivo: status 200 · error: ...") | base: v48.31.7-BUNDLEWATCH
+log.warning("🎯 v48.31.8-AUTOPICK ativo — auto-seleção de bundle ignora "
+            "default de domínio-doc (/x402-watch, /x402-audit, /agent-call) · "
+            "fail-note de error-200 explicativo")
