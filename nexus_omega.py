@@ -35022,6 +35022,7 @@ def _h_bundle():
     for p in paths:
         if time.time() - t0 > BUNDLE_BUDGET_S:
             fails += 1
+            _bundle_fail_note(p, "time budget")
             results.append({"endpoint": p, "ok": False,
                             "error": "bundle time budget exhausted — refunded"})
             continue
@@ -35033,11 +35034,13 @@ def _h_bundle():
             status, data = _batch_unpack(raw)
         except Exception as e:
             fails += 1
+            _bundle_fail_note(p, f"exception: {str(e)[:80]}")
             results.append({"endpoint": p, "ok": False,
                             "error": f"handler exception: {str(e)[:120]}"})
             continue
         if _is_error_result(raw) or (status and status >= 500):
             fails += 1
+            _bundle_fail_note(p, f"status {status}")
             results.append({"endpoint": p, "ok": False, "status": status,
                             "error": "endpoint did not deliver — refunded",
                             "detail": data if isinstance(data, dict) else None})
@@ -35062,6 +35065,10 @@ def _h_bundle():
         pass
     if fails:
         refund = round(BUNDLE_PRICE * fails / max(1, len(paths)), 6)
+        _feps = [r["endpoint"] for r in results if not r.get("ok")]
+        log.warning(f"↩️ /bundle: {fails}/{len(paths)} itens falhos → "
+                    f"estorno ${refund:.4f} p/ {(payer or '?')[:14]} · "
+                    f"culpados: {', '.join(_feps)}")
         key = _refund_as_credit(payer, refund, "/bundle", tx)
         resp["partial_refund_usdc"] = refund
         resp["refund_api_key"] = key
@@ -36159,3 +36166,67 @@ log.warning("🔁 v48.31.6-AUTOPILOT ativo — proposta segura expirada "
             f"{OPS_AUTO_AFTER_EXPIRY}× sem resposta é auto-aplicada "
             "(factory/pause continuam manuais) · backlog ignora quem já "
             "tem alias no ar")
+
+
+# ============================================================================
+# v48.31.7-BUNDLEWATCH — O ESTORNO AGORA TEM NOME (E O CULPADO SAI DA VITRINE)
+# ============================================================================
+# Medido em produção (16/out): 2 estornos parciais de $0.04 em /bundle sem
+# nenhuma linha de log dizendo QUAL item falhou — o operador via o estorno
+# mas não o produto problemático. Agora:
+#   (1) cada item falho do bundle vira WARNING nomeado (/ep + motivo + contagem);
+#   (2) contador por endpoint em /data/bundle_item_fails.json (janela 24h);
+#   (3) ≥2 falhas em 24h → o endpoint sai da AUTO-seleção de bundle (compra
+#       explícita via ?paths= continua — quem pediu nominalmente recebe a
+#       tentativa + estorno se falhar) e o Telegram avisa 1× por path/janela;
+#   (4) a linha do estorno lista os culpados: "culpados: /x, /y".
+# Auto-cura sem deploy: endpoint ruim para de ser empacotado até se provar.
+
+_BUNDLE_FAIL_FILE = HOME_DIR / "bundle_item_fails.json"
+_BUNDLE_FAIL_WINDOW_S = 24 * 3600
+_BUNDLE_FAIL_MAX = 2
+
+
+def _bundle_fail_count_24h(path):
+    try:
+        d = _ops_read_json(_BUNDLE_FAIL_FILE, {})
+        return sum(1 for t in (d.get(path) or [])
+                   if time.time() - float(t) < _BUNDLE_FAIL_WINDOW_S)
+    except Exception:
+        return 0
+
+
+def _bundle_fail_note(path, why):
+    try:
+        d = _ops_read_json(_BUNDLE_FAIL_FILE, {})
+        arr = [t for t in (d.get(path) or [])
+               if time.time() - float(t) < _BUNDLE_FAIL_WINDOW_S]
+        arr.append(int(time.time()))
+        d[path] = arr[-10:]
+        _ops_write_json(_BUNDLE_FAIL_FILE, d)
+        n = len(arr)
+        log.warning(f"↩️ /bundle item falhou: {path} ({str(why)[:90]}) — "
+                    f"{n}× em 24h")
+        if n == _BUNDLE_FAIL_MAX:
+            _notify_telegram(
+                f"🧺 *BUNDLE WATCH*\n\n`{TelegramBot.esc(path)}` falhou "
+                f"{n}× em bundles (24h) — fora da AUTO-seleção até se provar. "
+                "Compra explícita (?paths=) segue tentando + estornando.\n"
+                f"Motivo: {TelegramBot.esc(str(why)[:120])}")
+    except Exception as e:
+        log.debug(f"bundle fail note: {e}")
+
+
+_BUNDLE_AUTO_48316 = _bundle_auto_paths
+
+
+def _bundle_auto_paths(ip, n):  # noqa: F811 — camada 48.31.7
+    """Auto-seleção original menos quem está falhando em bundle (24h)."""
+    paths = _BUNDLE_AUTO_48316(ip, n + 3)
+    out = [p for p in paths if _bundle_fail_count_24h(p) < _BUNDLE_FAIL_MAX]
+    return out[:n]
+
+
+VERSION = "48.31.7-BUNDLEWATCH"  # v48.31.7-BUNDLEWATCH: estorno de bundle com os NOMES dos itens falhos no log + contador por endpoint (24h) + ≥2 falhas tira o endpoint da auto-seleção de bundle (explícito continua, com estorno se falhar) + alerta Telegram 1×/path/janela — auto-cura sem deploy | base: v48.31.6-AUTOPILOT
+log.warning("🧺 v48.31.7-BUNDLEWATCH ativo — item falho de bundle nomeado no "
+            "log · ≥2 falhas/24h sai da auto-seleção · Telegram avisa 1×/path")
