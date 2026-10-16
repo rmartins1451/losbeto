@@ -33958,7 +33958,7 @@ def _ops_llm_planner():
     backlog = {}
     for b in (brain.get("product_backlog") or [])[:8]:
         p = b.get("requested_path")
-        if p:
+        if p and p not in _AUTO_ALIASES:
             backlog[p] = {"hits": b.get("hits_7d", 0),
                           "ips": b.get("distinct_ips", 0),
                           "closest": b.get("closest_existing")}
@@ -34033,7 +34033,22 @@ def _ops_llm_planner():
                         f"🤖 *OPS AUTO-APLICADO*\n\n{_ops_describe(a)}\n"
                         f"Resultado: {TelegramBot.esc(str(msg)[:160])}")
             elif mode == "approval":
-                if proposed < 3:
+                if _ops_autodecide_ok(a):
+                    ok2, msg = _ops_apply(a, "autopilot")
+                    _ops_audit("autopilot", a["action"], tgt,
+                               {"reason": str(a.get("reason", ""))[:200],
+                                "result": str(msg)[:200],
+                                "expiry_count": _ops_expiry_count(a)},
+                               "applied" if ok2 else "failed")
+                    if ok2:
+                        applied += 1
+                        _notify_telegram(
+                            f"🔁 *OPS AUTO-DECIDIDA* — expirou "
+                            f"{_ops_expiry_count(a)}× sem resposta\n\n"
+                            f"{_ops_describe(a)}\n"
+                            f"Resultado: {TelegramBot.esc(str(msg)[:160])}\n"
+                            "_Para reverter: /ops pause /ep ou /ops price._")
+                elif proposed < 3:
                     _ops_propose(a, "llm-planner")
                     proposed += 1
             elif mode == "note":
@@ -36091,3 +36106,56 @@ VERSION = "48.31.5-BOTPING"  # v48.31.5-BOTPING: canal Telegram se auto-testa a 
 log.warning("🏓 v48.31.5-BOTPING ativo — a cada deploy o Telegram recebe uma "
             "mensagem-teste (botão 🏓 + reply `ok` = pong + `/ops ping`); "
             "se nada registrar no tg_inbox, o problema é fora do código")
+
+
+# ============================================================================
+# v48.31.6-AUTOPILOT — CONSCIÊNCIA DE DESISTÊNCIA (decide quando você some)
+# ============================================================================
+# Medido em produção: 9+ propostas (#13–#25) giraram em propose→expira→repropõe
+# sem nunca registrar decisão — o planner gastava o orçamento de 3 propostas
+# por ciclo repetindo os MESMOS alvos (/vip ×2, /rate ×2, /price ×2,
+# /x402/supported já com alias). Regra nova: mesma ação+alvo expirou
+# OPS_AUTO_AFTER_EXPIRY× (default 2 = ~4 dias + lembretes + botões) sem
+# resposta → o planner APLICA em vez de propor a 3ª vez. Guardrails intactos:
+#   • só classes de risco limitado: adjust_price (passo ±30%, faixa MIN/MAX,
+#     ENV-pin respeitado), queue_product (wishlist — nada vai ao ar),
+#     resume_endpoint (sonda obrigatória no resume);
+#   • factory_product JAMAIS auto-aplica (cria endpoint pago real — humano);
+#   • pause_endpoint JAMAIS (quem pausa é o error-watch);
+#   • OPS_AUTO_AFTER_EXPIRY=0 desliga (modo 100% manual).
+# E o backlog do planner para de oferecer paths que já têm alias no ar —
+# fim das propostas #24 (/x402/supported já servido).
+
+OPS_AUTO_AFTER_EXPIRY = int(os.environ.get("OPS_AUTO_AFTER_EXPIRY", "2") or 2)
+_OPS_AUTO_CLASSES = frozenset({"adjust_price", "queue_product",
+                               "resume_endpoint"})
+
+
+def _ops_expiry_count(action):
+    """Quantas vezes essa MESMA ação+alvo já expirou sem decisão."""
+    k, tgt = action.get("action"), _ops_target(action)
+    n = 0
+    try:
+        for rec in (_OPS_PROPOSALS.get("items") or {}).values():
+            a = rec.get("action") or {}
+            if (rec.get("status") == "expired" and a.get("action") == k
+                    and _ops_target(a) == tgt):
+                n += 1
+    except Exception:
+        pass
+    return n
+
+
+def _ops_autodecide_ok(action):
+    if OPS_AUTO_AFTER_EXPIRY <= 0:
+        return False
+    if action.get("action") not in _OPS_AUTO_CLASSES:
+        return False
+    return _ops_expiry_count(action) >= OPS_AUTO_AFTER_EXPIRY
+
+
+VERSION = "48.31.6-AUTOPILOT"  # v48.31.6-AUTOPILOT: consciência de desistência — mesma ação+alvo expirou 2× sem resposta (4 dias + lembretes) → planner auto-aplica em vez de propor a 3ª vez (só adjust_price/queue_product/resume_endpoint; factory_product e pause_endpoint continuam 100% humanos; OPS_AUTO_AFTER_EXPIRY=0 desliga) · backlog do planner filtra paths com alias no ar (fim do loop /x402/supported) | base: v48.31.5-BOTPING
+log.warning("🔁 v48.31.6-AUTOPILOT ativo — proposta segura expirada "
+            f"{OPS_AUTO_AFTER_EXPIRY}× sem resposta é auto-aplicada "
+            "(factory/pause continuam manuais) · backlog ignora quem já "
+            "tem alias no ar")
