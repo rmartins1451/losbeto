@@ -34205,8 +34205,10 @@ def ops_log_private():
         "paused": _ops_paused(),
         "pending_proposals": [
             {"id": pid, "by": r.get("by"), "ts": r.get("ts"),
+             "tg_msg_id": r.get("tg_msg_id"),
              "action": r.get("action")} for pid, r in sorted(pend.items())],
         "product_queue": _ops_read_json(_OPS_PRODUCT_QUEUE, []),
+        "tg_inbox": _ops_read_json(_TG_INBOX_FILE, []),
         "audit": _ops_audit_recent(100),
         "ts": int(time.time()),
     })
@@ -35785,3 +35787,194 @@ log.warning("🛰 v48.31.3-DISCOVERY ativo — /x402/discovery/resources (+/v2/)
             "(proposta #21) · sitemap/llms/catalog registram")
 
 VERSION = "48.31.3-DISCOVERY"  # v48.31.3-DISCOVERY: paths da Discovery API do ecossistema x402 (/x402/discovery/resources + /v2/) saem do 404 e servem o catalogo real no schema Bazaar (items[].accepts com payTo/asset/network por chain, paginacao limit/offset) — e o que os agentes Bazaar-compativeis rastejam p/ indexar vendedores (radar: 5 IPs cada, 7d) · /ads.txt IAB (vendedor direto) · sitemap+llms+catalog registram | base: v48.31.2-PAYTO
+# ============================================================================
+# v48.31.4-TGPROOF — O TELEGRAM AGORA DEIXA RASTRO (E SE AUTO-CURA)
+# ============================================================================
+# O operador responde "sim" e reporta silêncio; a cadeia passa 8/8 em
+# simulação. Sem rastro de inbound em produção, ninguém prova nada — então:
+# (1) TODA mensagem inbound vira log INFO + ring buffer em /data/tg_inbox.json
+#     com a classificação do destino, visível em /ops/log;
+# (2) WEBHOOK GUARD: webhook fantasma é a causa clássica de polling 100%
+#     mudo — getWebhookInfo no arranque e a cada ~6h, remove e avisa;
+# (3) "sim 17"/"não 17" decide a proposta exata SEM reply;
+# (4) proposta parada >24h ganha re-ping consolidado (botões por proposta,
+#     tg_msg_id fresco recapturado) — a fila nunca mais morre enterrada.
+
+_TG_INBOX_FILE = HOME_DIR / "tg_inbox.json"
+_TG_REMINDER_FILE = HOME_DIR / "ops_reminder.json"
+
+
+def _tg_inbox_record(entry):
+    try:
+        buf = _ops_read_json(_TG_INBOX_FILE, [])
+        buf.append(entry)
+        _ops_write_json(_TG_INBOX_FILE, buf[-30:])
+    except Exception:
+        pass
+
+
+_TG_HANDLE_4830 = TelegramBot._handle   # cadeia: 48.30 (reply em proposta)
+
+_TG_YESNUM_RE = re.compile(
+    r"^(?:sim|s|ok|aprova|aprovar|aprove|yes|manda|faz|pode\s+adicionar)"
+    r"\s*#?(\d{1,4})$", re.I)
+_TG_NONUM_RE = re.compile(
+    r"^(?:não|nao|n|no|rejeita|rejeitar|recusa|recusar)\s*#?(\d{1,4})$",
+    re.I)
+
+
+def _tg_handle_proof(self, msg):
+    """(1) prova de vida do inbox; (2) 'sim 17'/'não 17' sem reply decide a
+    proposta exata; (3) todo o resto segue a cadeia intacta."""
+    try:
+        text = (msg.get("text") or "").strip()
+    except Exception:
+        text = ""
+    try:
+        chat_id = msg.get("chat", {}).get("id")
+        reply_to = (msg.get("reply_to_message") or {}).get("message_id")
+        via = "none"
+        if reply_to:
+            if _chat_sid_from_tg(reply_to):
+                via = "visitor"
+            else:
+                _pid = _ops_pid_by_tgmsg(reply_to)
+                via = (f"proposal#{_pid}" if _pid is not None else
+                       ("all-pending" if _ops_pending() else "no-pending"))
+        elif text.startswith("/ops"):
+            via = "cmd"
+        elif _ops_pending():
+            via = "nl-pending"
+        log.info(f"📨 TG in: chat={chat_id} text=\"{text[:60]}\" "
+                 f"reply_to={reply_to or '-'} via={via}")
+        _tg_inbox_record({"ts": int(time.time()), "chat": str(chat_id),
+                          "text": text[:80], "reply_to": reply_to,
+                          "via": via})
+        if chat_id is not None and text and not text.startswith("/"):
+            mY = _TG_YESNUM_RE.match(text)
+            mN = _TG_NONUM_RE.match(text) if not mY else None
+            mm = mY or mN
+            if mm:
+                pid = int(mm.group(2))
+                if pid in _ops_pending():
+                    _ok, out = _ops_decide(pid, mY is not None)
+                    self.send(chat_id, "🤖 *OPS*\n\n" + TelegramBot.esc(out))
+                    return
+    except Exception as e:
+        log.warning(f"tg proof: {e}")
+    return _TG_HANDLE_4830(self, msg)
+
+
+TelegramBot._handle = _tg_handle_proof
+
+
+# ---------------------------------------------------------- webhook guard ----
+def _tg_webhook_guard():
+    """Webhook setado = polling mudo para sempre (updates iam para uma URL
+    morta). Se houver, remove e avisa — auto-cura da falha de silêncio."""
+    if not TG_TOKEN:
+        return False
+    try:
+        r = requests.get(
+            f"https://api.telegram.org/bot{TG_TOKEN}/getWebhookInfo", timeout=10)
+        url = ((r.json().get("result") or {}).get("url") or "").strip()
+        if url:
+            requests.post(
+                f"https://api.telegram.org/bot{TG_TOKEN}/deleteWebhook",
+                json={"drop_pending_updates": False}, timeout=10)
+            log.warning(f"📨 TG webhook fantasma REMOVIDO ({url[:60]}) — "
+                        "polling volta a receber tudo")
+            try:
+                _notify_telegram("⚠️ *TG self-heal*: um webhook fantasma "
+                                 "estava desviando seus replies — removido. "
+                                 "Pode responder as propostas normalmente.")
+            except Exception:
+                pass
+            return True
+    except Exception as e:
+        log.debug(f"webhook guard: {e}")
+    return False
+
+
+# ----------------------------------------------------- lembrete 24h -----------
+def _ops_reminder_once():
+    """Uma passada do lembrete: proposta mais antiga >24h parada → re-ping
+    consolidado (máx 3) com botões e tg_msg_id fresco. Máx 1x a cada 12h."""
+    if not (TG_TOKEN and TG_CHAT):
+        return False
+    pend = _ops_pending()
+    if not pend:
+        return False
+    oldest = sorted(pend.items(), key=lambda kv: kv[1].get("ts", 0))
+    opid, orec = oldest[0]
+    if time.time() - float(orec.get("ts", 0)) < 24 * 3600:
+        return False
+    rem = _ops_read_json(_TG_REMINDER_FILE, {})
+    now = time.time()
+    if now - float(rem.get("ts", 0)) < 12 * 3600:
+        return False
+    top3 = oldest[:3]
+    linhas = ["⏰ *OPS — propostas esperando sua decisão*", ""]
+    btts = []
+    for pid, r in top3:
+        linhas.append(f"*#{pid}* — {_ops_describe(r.get('action') or {})}")
+        btts.append([{"text": f"✅ #{pid}", "callback_data": f"/ops ok {pid}"},
+                     {"text": f"❌ #{pid}", "callback_data": f"/ops no {pid}"}])
+    linhas += ["", "_Reply aqui decide a mais antiga; os botões decidem cada "
+               "uma; `sim N` / `não N` sem reply também vale._"]
+    mid = _tg_send_capture_buttons("\n".join(linhas), btts)
+    if mid:
+        orec["tg_msg_id"] = int(mid)   # reply fresco aponta p/ a mais antiga
+        _ops_proposals_save()
+    _ops_write_json(_TG_REMINDER_FILE,
+                    {"ts": int(now), "pendentes": len(pend),
+                     "msg_id": mid, "guard_ts": int(rem.get("guard_ts", 0))})
+    _ops_audit("ops-reminder", "remind", f"#{opid}",
+               {"pendentes": len(pend), "msg_id": mid}, "applied")
+    return True
+
+
+def _ops_reminder_loop():
+    time.sleep(420)                    # deixa o boot assentar
+    _tg_webhook_guard()
+    while True:
+        try:
+            _ops_reminder_once()
+        except Exception as e:
+            log.debug(f"ops reminder: {e}")
+        try:
+            rem = _ops_read_json(_TG_REMINDER_FILE, {})
+            if time.time() - float(rem.get("guard_ts", 0)) > 6 * 3600:
+                _tg_webhook_guard()
+                rem["guard_ts"] = int(time.time())
+                _ops_write_json(_TG_REMINDER_FILE, rem)
+        except Exception:
+            pass
+        time.sleep(3600)
+
+
+_START_BG_48314 = _start_background_once
+
+
+def _start_background_once():
+    """Mesmo boot de sempre + o loop TG-proof no worker dono do flock."""
+    owned = _START_BG_48314()
+    try:
+        if owned:
+            threading.Thread(target=_ops_reminder_loop, daemon=True,
+                             name="v48314-tgproof").start()
+            log.info("📨 TG proof ativo — inbox logado (/data/tg_inbox.json + "
+                     "/ops/log) · webhook guard · lembrete de proposta >24h")
+    except Exception as e:
+        log.warning(f"tg proof start: {e}")
+    return owned
+
+
+_start_background_once = _start_background_once
+
+log.warning("📨 v48.31.4-TGPROOF ativo — toda mensagem inbound vira log + "
+            "/data/tg_inbox.json (via /ops/log) · webhook fantasma removido "
+            "sozinho · 'sim 17'/'não 17' sem reply decide a exata · proposta "
+            ">24h ganha re-ping com botões e message_id fresco")
+
+VERSION = "48.31.4-TGPROOF"  # v48.31.4-TGPROOF: fim do 'respondi e nada acontece' — inbox Telegram 100% logado (INFO + ring /data/tg_inbox.json visivel no /ops/log com classificacao visitor/proposal#N/all-pending) · webhook guard remove webhook fantasma que mudava o polling (causa classica de silencio total) · NL com numero ('sim 17'/'nao 17') decide a proposta exata sem reply · lembrete consolidado 12h p/ proposta >24h com botoes e tg_msg_id recapturado | base: v48.31.3-DISCOVERY
