@@ -24621,7 +24621,16 @@ class TelegramBot:
                 log.warning(f"TG getUpdates HTTP {r.status_code}: {r.text[:120]}")
                 time.sleep(5)
                 return
-            for u in r.json().get("result", []):
+            _us = r.json().get("result", [])
+            if _us:
+                try:
+                    _types = [next((k for k in u if k != "update_id"), "?")
+                              for u in _us]
+                    log.info(f"📨 TG poll: {len(_us)} update(s): "
+                             f"{','.join(_types)}")
+                except Exception:
+                    pass
+            for u in _us:
                 self.last_update = u["update_id"]
                 if "callback_query" in u:
                     self._handle_button(u["callback_query"])
@@ -36927,3 +36936,190 @@ log.warning("🎯 v48.32.0-ZEROWARN ativo — BCB à prova de queda (cache "
             "last-good) · /br-archive sem estorno por gap recente · snapshot "
             "com alerta TG · botões TG com rastro+toast · corpo v1 payTo "
             "único (P7→100) · fila de produto auto-aprova em 36h")
+
+
+
+# ============================================================================
+# v48.32.1-WEBOPS — o Telegram sai do caminho crítico das decisões
+#
+# Prova fechada (logs 19/out, 16:43→21:46 UTC): com a instrumentação da
+# 48.32.0 ligada, NENHUM "📨 TG cb" apareceu — callback_query simplesmente
+# não chega ao getUpdates (mensagens chegam: via=nl-pending e reply "sim").
+# O problema é externo ao código (cliente/conta Telegram do operador).
+#
+# Resposta de engenharia (pedido explícito do operador: "não depender de
+# ação manual em canal que falha"):
+#
+#  1. /ops/panel?token=DASH_TOKEN — painel WEB mobile de decisões: lista as
+#     propostas pendentes com botões gigantes ✅ Aplicar / ❌ Recusar. Um
+#     toque decide via HTTP DIRETO no servidor (o mesmo _ops_decide dos
+#     botões/reply) — zero dependência de entrega de callback do Telegram.
+#     Após decidir, remove os botões da proposta no Telegram (se houver
+#     tg_msg_id) e mostra o histórico recente. Auto-refresh 60s.
+#
+#  2. TG poll cru: todo lote de updates loga os TIPOS recebidos
+#     ("📨 TG poll: 2 update(s): message,callback_query"). Se um clique de
+#     botão nem aparecer AQUI, a prova é matemática: o update não saiu do
+#     Telegram.
+#
+#  3. /ops tgdiag — diagnóstico sob demanda: getMe + getWebhookInfo (url,
+#     pending_update_count) + nova mensagem-teste com botão 🏓.
+#
+#  4. /ops status passa a exibir o link do painel web.
+# ============================================================================
+
+# ---------------------------------------------------- 2. /ops tgdiag --------
+_OPS_TG_CMD_48320 = _ops_tg_command
+
+
+def _ops_tg_command(bot, msg, text):  # noqa: F811 — camada 48.32.1
+    parts = text.strip().split()
+    if len(parts) >= 2 and parts[1].lower() == "tgdiag":
+        chat_id = msg["chat"]["id"]
+        linhas = ["🩺 *TG DIAG*", ""]
+        try:
+            r = requests.get(f"https://api.telegram.org/bot{TG_TOKEN}/getMe",
+                             timeout=8)
+            me = (r.json().get("result") or {})
+            linhas.append(f"bot: @{me.get('username')} id={me.get('id')}")
+        except Exception as e:
+            linhas.append(f"getMe falhou: {str(e)[:80]}")
+        try:
+            r = requests.get(
+                f"https://api.telegram.org/bot{TG_TOKEN}/getWebhookInfo",
+                timeout=8)
+            wi = (r.json().get("result") or {})
+            linhas.append(f"webhook: \"{(wi.get('url') or '(nenhum — correto)')}\"")
+            linhas.append(f"updates pendentes: {wi.get('pending_update_count')}")
+        except Exception as e:
+            linhas.append(f"getWebhookInfo falhou: {str(e)[:80]}")
+        linhas += ["",
+                   "Toque no 🏓 abaixo: se NADA aparecer no log como "
+                   "`📨 TG poll ... callback_query`, o update não saiu do "
+                   "Telegram (problema de cliente/conta, não do node).",
+                   "_O painel web decide sem depender disso: veja /ops._"]
+        mid = _tg_send_capture_buttons(
+            "\n".join(linhas),
+            [[{"text": "🏓 Testar canal", "callback_data": "/ops ping"}]])
+        log.info(f"🩺 tgdiag enviado (msg_id={mid})")
+        return
+    return _OPS_TG_CMD_48320(bot, msg, text)
+
+
+# ---------------------------------------------------- 1. painel web ---------
+def _ops_panel_html(flash, rows, decisions, token):
+    def esc(s):
+        return (str(s).replace("&", "&amp;").replace("<", "&lt;")
+                      .replace(">", "&gt;").replace('"', "&quot;"))
+    body = ["""<!doctype html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta http-equiv="refresh" content="60">
+<title>losbeto · ops panel</title>
+<style>
+body{background:#0b0e14;color:#e6e9ef;font-family:-apple-system,system-ui,sans-serif;margin:0;padding:16px;max-width:640px}
+h1{font-size:20px;margin:8px 0 4px}
+.sub{color:#8b93a7;font-size:13px;margin-bottom:16px}
+.card{background:#151a24;border:1px solid #232a3a;border-radius:12px;padding:14px;margin:12px 0}
+.card .pid{color:#8b93a7;font-size:12px}
+.card .txt{font-size:15px;margin:8px 0 12px;white-space:pre-wrap;word-break:break-word}
+.btn{display:inline-block;padding:14px 22px;border-radius:10px;font-size:16px;font-weight:700;text-decoration:none;margin-right:10px}
+.ok{background:#16a34a;color:#fff}
+.no{background:#dc2626;color:#fff}
+.flash{background:#14532d;border:1px solid #16a34a;border-radius:10px;padding:12px;margin:12px 0;font-size:14px}
+.hist{color:#8b93a7;font-size:13px;margin-top:20px}
+.hist div{padding:4px 0;border-bottom:1px solid #1c2331}
+a{color:#7dd3fc}
+</style></head><body>
+<h1>🤖 losbeto · painel de decisões</h1>
+<div class="sub">Um toque decide — direto no servidor, sem Telegram. Atualiza sozinho a cada 60s.</div>"""]
+    if flash:
+        body.append(f'<div class="flash">{esc(flash)}</div>')
+    if not rows:
+        body.append('<div class="card"><div class="txt">✅ Nenhuma proposta '
+                    'pendente. O node está governado.</div></div>')
+    for pid_, desc, age_h in rows:
+        body.append(
+            f'<div class="card"><div class="pid">PROPOSTA #{pid_} · há '
+            f'{age_h}h</div><div class="txt">{esc(desc)}</div>'
+            f'<a class="btn ok" href="/ops/panel?token={esc(token)}&decide=ok&pid={pid_}">✅ Aplicar</a>'
+            f'<a class="btn no" href="/ops/panel?token={esc(token)}&decide=no&pid={pid_}">❌ Recusar</a>'
+            f'</div>')
+    if decisions:
+        body.append('<div class="hist"><b>Últimas decisões:</b>')
+        for d_ in decisions[-8:][::-1]:
+            age = int((time.time() - float(d_.get("ts", 0) or 0)) // 3600)
+            body.append(f"<div>{esc(d_.get('status'))} · "
+                        f"{esc(d_.get('action'))} {esc(d_.get('target'))} "
+                        f"· há {age}h · {esc(d_.get('by'))}</div>")
+        body.append("</div>")
+    body.append("</body></html>")
+    return "".join(body)
+
+
+@app.route("/ops/panel")
+def ops_panel():
+    """Painel WEB de decisões (DASH_TOKEN) — o canal que não depende de
+    callback do Telegram. GET com decide=ok|no&pid=N aplica/recusa."""
+    token = request.args.get("token", "")
+    if not _dash_token_ok(token):
+        return jsonify({"error": "forbidden",
+                        "hint": "GET /ops/panel?token=<DASH_TOKEN>"}), 403
+    flash = ""
+    pid = request.args.get("pid", "").strip()
+    decide = request.args.get("decide", "").strip()
+    if pid.isdigit() and decide in ("ok", "no"):
+        ok, msgout = _ops_decide(int(pid), decide == "ok", actor="web-panel")
+        flash = ("✅ " if ok else "⚠ ") + str(msgout)
+        log.info(f"🌐 ops-panel: #{pid} decide={decide} → ok={ok} {msgout}")
+        _ops_audit("web-panel", f"decide:{decide}", f"#{pid}",
+                   {"result": str(msgout)[:200]}, "applied" if ok else "failed")
+        try:  # tira os botões da proposta no Telegram (anti dupla decisão)
+            _ops_proposals_reload()
+            rec = (_OPS_PROPOSALS.get("items") or {}).get(pid) or {}
+            mid = rec.get("tg_msg_id")
+            if mid and TG_TOKEN and TG_CHAT:
+                requests.post(
+                    f"https://api.telegram.org/bot{TG_TOKEN}/editMessageReplyMarkup",
+                    json={"chat_id": TG_CHAT, "message_id": int(mid),
+                          "reply_markup": {"inline_keyboard": []}}, timeout=8)
+        except Exception:
+            pass
+    rows = []
+    try:
+        for pid_, rec in sorted(_ops_pending().items(),
+                                key=lambda kv: kv[1].get("ts", 0)):
+            a = rec.get("action") or {}
+            age_h = int((time.time() - float(rec.get("ts", 0) or 0)) // 3600)
+            desc = re.sub(r"[*_`\\]", "", _ops_describe(a))
+            rows.append((pid_, desc, age_h))
+    except Exception as e:
+        flash = flash or f"⚠ erro lendo propostas: {e}"
+    try:
+        decisions = _ops_decisions()
+    except Exception:
+        decisions = []
+    return app.response_class(
+        _ops_panel_html(flash, rows, decisions, token),
+        mimetype="text/html")
+
+
+# ---------------------------------------------------- 4. link no /ops -------
+_OPS_TG_STATUS_48320 = _ops_tg_status
+
+
+def _ops_tg_status():  # noqa: F811 — camada 48.32.1
+    txt = _OPS_TG_STATUS_48320()
+    try:
+        dash_tok = os.environ.get("DASH_TOKEN", "")
+        if dash_tok:
+            txt += (f"\n\n🌐 *Painel web* (decide sem depender de botão):\n"
+                    f"{_public_base()}/ops/panel?token={dash_tok}")
+    except Exception:
+        pass
+    return txt
+
+
+VERSION = "48.32.1-WEBOPS"  # v48.32.1-WEBOPS: o Telegram sai do caminho crítico — /ops/panel?token=DASH_TOKEN: painel web mobile com ✅/❌ que decide via HTTP direto no servidor (mesmo _ops_decide), remove botões TG após decidir, histórico de decisões, auto-refresh 60s · TG poll cru loga TODOS os tipos de update (prova matemática: callback_query nunca chegou em 7+ dias de logs) · /ops tgdiag (getMe+getWebhookInfo+botão-teste fresco) · /ops status exibe o link do painel | base: v48.32.0-ZEROWARN
+log.warning("🌐 v48.32.1-WEBOPS ativo — painel web de decisões "
+            "(/ops/panel?token=DASH_TOKEN): um toque decide, zero Telegram · "
+            "poll cru com tipos de update · /ops tgdiag")
