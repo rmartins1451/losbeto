@@ -5920,7 +5920,7 @@ class Brain:
             results[name] = {"role": role, "vote": stance,
                              "reason": reason or f"rule-based {stance.lower()} signal from {role} data"}
         for a in AGENTS:
-            t = _th.Thread(target=_run, args=a); t.start(); threads.append(t)
+            t = _th.Thread(target=_run, args=a, daemon=True); t.start(); threads.append(t)
         for t in threads: t.join(timeout=25)
 
         votes = [r["vote"] for r in results.values()]
@@ -19718,7 +19718,7 @@ def _bcb_parallel(series: dict) -> dict:
                 out[nome] = {"ok": False, "bcb_series": code,
                              "description": desc, "source": "BCB/SGS"}
 
-    ths = [threading.Thread(target=_one, args=(n, c, d))
+    ths = [threading.Thread(target=_one, args=(n, c, d), daemon=True)
            for n, (c, d) in series.items()]
     for t in ths:
         t.start()
@@ -25001,9 +25001,14 @@ def sweeper_loop():
         try:
             bal = SOL.get_balance_usdc(RECEIVE_ADDRESS)
             if bal >= SWEEP_THRESHOLD:
-                log.info(f"💸 Sweep: ${bal:.4f} → {BINANCE_ADDRESS}")
-                LEDGER.log_sweep(bal, "pending-impl", BINANCE_ADDRESS)
-                _notify_telegram(f"💸 Sweep solicitado: ${bal:.4f}\nDestino: {BINANCE_ADDRESS}")
+                # v48.31.9: o nó é NÃO-CUSTODIAL — não há chave privada no
+                # servidor, então nenhum código move fundos. O stub antigo
+                # dizia "Sweep solicitado" sem transferir 1 centavo
+                # ("pending-impl"). Agora: aviso verdadeiro 1×/dia.
+                log.info(f"💸 Saldo acumulado: ${bal:.4f} (resgate manual — "
+                         f"nó não-custodial)")
+                LEDGER.log_sweep(bal, "manual-required", BINANCE_ADDRESS)
+                _sweep_notify_once_daily(bal)
         except Exception as e:
             log.warning(f"sweep: {e}")
 
@@ -30009,6 +30014,7 @@ def x402_watch_loop():
                                   "last_check=?,alerts=alerts+? WHERE id=?",
                                   (m["http"], str(m.get("price_usdc") or ""),
                                    now, 1 if changed else 0, wid))
+                    _watch_zero_track(wid, url, m.get("http"), now)
                     if changed:
                         log.info(f"👁 x402-watch {wid}: {url[:70]} → http {m['http']} "
                                  f"${m.get('price_usdc')}")
@@ -34003,7 +34009,8 @@ def _ops_llm_planner():
         "real, well-known, KEYLESS public JSON upstream you are confident "
         "exists — the apply step probe-tests it and the product dies if the "
         "probe fails; output the JSON and nothing "
-        "else.\nTelemetry: " + json.dumps(state, ensure_ascii=False)[:3500])
+        "else.\n" + _ops_planner_memory_text() + "\nTelemetry: "
+        + json.dumps(state, ensure_ascii=False)[:3500])
     txt = LLM.ask(prompt, max_tokens=700, temperature=0.2, cache=False)
     if not txt:
         log.info("🤖 ops-planner: LLM indisponível neste ciclo")
@@ -36283,3 +36290,320 @@ VERSION = "48.31.8-AUTOPICK"  # v48.31.8-AUTOPICK: fim dos estornos-fantasma de 
 log.warning("🎯 v48.31.8-AUTOPICK ativo — auto-seleção de bundle ignora "
             "default de domínio-doc (/x402-watch, /x402-audit, /agent-call) · "
             "fail-note de error-200 explicativo")
+
+
+# ============================================================================
+# v48.31.9-MEMORY — O PLANNER AGORA LEMBRA O QUE VOCÊ DECIDIU
+# ============================================================================
+# Medido em produção (16-19/out): a MESMA pergunta voltava a cada 6h no
+# Telegram — /site/ 7× (#30,42,45,46,49,52,56), /press/ 6×, /news/ 5×,
+# /vip 3×, /notice 2×. Causa-raiz tripla:
+#   (1) o dedupe de _ops_propose só olha propostas PENDENTES — depois de
+#       aplicada/recusada/expirada, o planner recebia a mesma telemetria 6h
+#       depois e sugeria de novo; (2) queue_product aprovada cai numa fila
+#       que nada consumia → a demanda seguia "não atendida" → loop eterno;
+#   (3) a higiene de 60 itens do ops_proposals.json apagava o histórico.
+# Correções:
+#   1. MEMÓRIA DE DECISÃO persistente (/data/ops_decisions.json, 500 regs,
+#      sobrevive a restart e à higiene): toda transição terminal (applied /
+#      rejected / expired / superseded) vira registro com action+target+ts.
+#   2. _ops_propose ganha SUPRESSÃO determinística: já na fila de produto →
+#      nunca repropõe; recusada → 30d; aplicada → até 30d por classe; rota
+#      viva → nunca; factory expirada → 7d; adjust_price é CONSCIENTE DE
+#      PREÇO — a escada /pyth-price 0.010→0.008→0.006 segue livre, só morre
+#      a repetição idêntica.
+#   3. O PROMPT do planner recebe a memória e a fila de produto: o LLM para
+#      de sugerir o decidido e pode transformar fila em factory_product —
+#      o caminho que o /price provou (fila → fábrica → NO AR = endpoint 119).
+#   4. /ops status lista a fila de produto (o que já foi aprovado e espera).
+#   5. WATCHDOG DE WATCH ZUMBI: alvo com http 0 (DNS/conexão) em 48 ciclos
+#      seguidos (~24h) → watch cancelado + aviso 1× (o w_y5hQL0zbp-qq
+#      apontado p/ api.example.com poluía o log a cada 31 min desde 16/out).
+#   6. SWEEP HONESTO: sem chave no servidor (não-custodial), o aviso agora
+#      diz a verdade 1×/dia com instrução de resgate — nada de "solicitado".
+#   7. Threads /council e br-paridade daemon=True — sobrevivente de
+#      join(timeout) não segura o teardown do worker (classe dos WORKER
+#      TIMEOUT/SIGABRT de 18/out nos recycles por max-requests).
+# ---------------------------------------------------------------- memória ---
+
+_OPS_DECISIONS_FILE = HOME_DIR / "ops_decisions.json"
+
+
+def _ops_decisions():
+    d = _ops_read_json(_OPS_DECISIONS_FILE, [])
+    return d if isinstance(d, list) else []
+
+
+def _ops_decision_record(action, status, by):
+    """Append de decisão terminal — a memória longa do planner."""
+    try:
+        k = str((action or {}).get("action") or "")
+        if not k or k == "note":
+            return
+        rec = {"action": k, "target": _ops_target(action),
+               "status": str(status), "by": str(by)[:24],
+               "ts": int(time.time())}
+        if (action or {}).get("new_price") is not None:
+            try:
+                rec["new_price"] = float(action.get("new_price"))
+            except Exception:
+                pass
+        d = _ops_decisions()
+        d.append(rec)
+        _ops_write_json(_OPS_DECISIONS_FILE, d[-500:])
+    except Exception as e:
+        log.debug(f"ops decision record: {e}")
+
+
+def _ops_decision_suppress(action):
+    """(suprimir, porquê) — o decidido não volta a perguntar."""
+    k = str((action or {}).get("action") or "")
+    tgt = _ops_target(action or {})
+    if not k or not tgt or k == "note":
+        return False, ""
+    now = int(time.time())
+    try:
+        if k in ("queue_product", "factory_product", "create_alias") \
+                and _route_now_live(tgt):
+            return True, "a rota já está no ar"
+    except Exception:
+        pass
+    if k == "queue_product":
+        try:
+            q = _ops_read_json(_OPS_PRODUCT_QUEUE, [])
+            if any(isinstance(i, dict) and str(i.get("path")) == tgt
+                   for i in q):
+                return True, "já está na fila de produto (aprovado antes)"
+        except Exception:
+            pass
+    np_ = None
+    try:
+        if (action or {}).get("new_price") is not None:
+            np_ = float(action.get("new_price"))
+    except Exception:
+        np_ = None
+    for d in reversed(_ops_decisions()):
+        if d.get("action") != k or d.get("target") != tgt:
+            continue
+        st = str(d.get("status") or "")
+        try:
+            age = now - int(d.get("ts", 0) or 0)
+        except Exception:
+            age = 0
+        if k == "adjust_price":
+            try:
+                dp = float(d.get("new_price"))
+            except Exception:
+                dp = None
+            if np_ is not None and dp is not None and abs(np_ - dp) >= 0.0005:
+                continue            # preço diferente — a escada segue livre
+            if st == "rejected" and age < 14 * 86400:
+                return True, f"mesmo ajuste recusado há {age // 86400}d"
+            if st == "applied" and age < 3 * 86400:
+                return True, f"mesmo ajuste aplicado há {age // 86400}d"
+            continue
+        if st == "rejected" and age < 30 * 86400:
+            return True, f"recusada há {age // 86400}d (cooldown 30d)"
+        if st == "applied" and age < 30 * 86400:
+            return True, f"aplicada há {age // 86400}d (cooldown 30d)"
+        if st == "superseded":
+            return True, "rota já nasceu (superseded)"
+        if st == "expired":
+            lim = 7 * 86400 if k == "factory_product" else 4 * 86400
+            if age < lim:
+                return True, f"expirou sem resposta há {age // 86400}d"
+    return False, ""
+
+
+# -------------------------------------------------- gravação das decisões ---
+_OPS_APPLY_48318 = _ops_apply
+
+
+def _ops_apply(action, actor):  # noqa: F811 — camada 48.31.9
+    ok, msg = _OPS_APPLY_48318(action, actor)
+    try:
+        if ok:
+            _ops_decision_record(action, "applied", actor)
+    except Exception:
+        pass
+    return ok, msg
+
+
+_OPS_DECIDE_48318 = _ops_decide
+
+
+def _ops_decide(pid, approve, actor="operator"):  # noqa: F811 — camada 48.31.9
+    ok, msg = _OPS_DECIDE_48318(pid, approve, actor)
+    try:
+        if not approve and ok:
+            rec = (_OPS_PROPOSALS.get("items") or {}).get(str(pid)) or {}
+            if rec.get("status") == "rejected" and rec.get("action"):
+                _ops_decision_record(rec["action"], "rejected", actor)
+    except Exception:
+        pass
+    return ok, msg
+
+
+_OPS_EXPIRE_48318 = _ops_proposals_expire
+
+
+def _ops_proposals_expire():  # noqa: F811 — camada 48.31.9
+    try:
+        _ops_proposals_reload()
+        before = {k: (v.get("status"), v.get("action"))
+                  for k, v in (_OPS_PROPOSALS.get("items") or {}).items()
+                  if isinstance(v, dict)}
+    except Exception:
+        before = {}
+    out = _OPS_EXPIRE_48318()
+    try:
+        for k, rec in (_OPS_PROPOSALS.get("items") or {}).items():
+            if not isinstance(rec, dict):
+                continue
+            b = before.get(k)
+            if b and b[0] == "pending" and rec.get("status") in (
+                    "expired", "superseded"):
+                _ops_decision_record(b[1] or {}, rec.get("status"), "ops-agent")
+    except Exception:
+        pass
+    return out
+
+
+# ------------------------------------------------------- supressão no ponto ---
+_OPS_PROPOSE_48318 = _ops_propose
+
+
+def _ops_propose(action, by):  # noqa: F811 — camada 48.31.9
+    try:
+        sup, why = _ops_decision_suppress(action)
+        if sup:
+            log.info(f"🧠 ops-memória: {action.get('action')} "
+                     f"{_ops_target(action)} suprimida — {why}")
+            _ops_audit("ops-memory", f"suppress:{action.get('action')}",
+                       _ops_target(action), {"why": str(why)[:120]},
+                       "suppressed")
+            return -1
+    except Exception:
+        pass
+    return _OPS_PROPOSE_48318(action, by)
+
+
+# ------------------------------------------------------- memória no prompt ---
+def _ops_planner_memory_text():
+    """Resumo das decisões + fila de produto — o LLM para de sugerir o que
+    já foi decidido e vê o que pode virar fábrica."""
+    try:
+        parts = []
+        dec = _ops_decisions()[-25:]
+        if dec:
+            parts.append(
+                "Already decided (NEVER re-propose the same action+target): "
+                + "; ".join(f"{d.get('action')} {d.get('target')} "
+                            f"-> {d.get('status')}" for d in dec))
+        q = _ops_read_json(_OPS_PRODUCT_QUEUE, [])
+        paths = [str(i.get("path")) for i in q if isinstance(i, dict)][-12:]
+        if paths:
+            parts.append(
+                "Product queue (ALREADY approved by the operator — NEVER "
+                "queue_product these again; you MAY propose factory_product "
+                "for one of them when confident in a keyless public JSON "
+                "upstream): " + ", ".join(paths))
+        return ("\n" + "\n".join(parts)) if parts else ""
+    except Exception:
+        return ""
+
+
+# ------------------------------------------------------- fila visível no /ops
+_OPS_TG_STATUS_48318 = _ops_tg_status
+
+
+def _ops_tg_status():  # noqa: F811 — camada 48.31.9
+    txt = _OPS_TG_STATUS_48318()
+    try:
+        q = _ops_read_json(_OPS_PRODUCT_QUEUE, [])
+        if q:
+            lines = ["", "📥 *Fila de produto* (aprovada — aguarda a fábrica):"]
+            for i in q[-8:]:
+                if not isinstance(i, dict):
+                    continue
+                age = (int(time.time()) - int(i.get("ts", 0) or 0)) // 86400
+                lines.append(f"• `{TelegramBot.esc(str(i.get('path')))}` "
+                             f"há {age}d")
+            txt += "\n".join(lines)
+    except Exception:
+        pass
+    return txt
+
+
+# ------------------------------------------------------- watchdog de zumbi ---
+_WATCH_ZERO_FILE = HOME_DIR / "x402_watch_zero.json"
+_WATCH_ZERO_MAX = int(os.environ.get("WATCH_ZERO_EXPIRE", "48") or 48)
+
+
+def _watch_zero_track(wid, url, http, now):
+    """Watch zumbi (http 0 = DNS/conexão morta) por 48 ciclos seguidos (~24h)
+    é cancelado: limpa o log, libera o loop e avisa 1×. Watch nunca cobra —
+    era só ruído."""
+    try:
+        d = _ops_read_json(_WATCH_ZERO_FILE, {})
+        if not isinstance(d, dict):
+            d = {}
+        if http:
+            if wid in d:
+                d.pop(wid, None)
+                _ops_write_json(_WATCH_ZERO_FILE, d)
+            return
+        n = int(d.get(wid) or 0) + 1
+        d[wid] = n
+        if len(d) > 400:
+            for k_ in list(d)[:-400]:
+                d.pop(k_, None)
+        _ops_write_json(_WATCH_ZERO_FILE, d)
+        if n == _WATCH_ZERO_MAX:
+            with LEDGER.lock, LEDGER._conn() as c:
+                c.execute("DELETE FROM watches WHERE id=?", (wid,))
+            d.pop(wid, None)
+            _ops_write_json(_WATCH_ZERO_FILE, d)
+            _ops_audit("watchdog", "watch_zero_expire", str(url)[:80],
+                       {"id": wid, "zeros": n}, "applied")
+            log.info(f"🧹 x402-watch zumbi expirado: {wid} ({url[:60]}) "
+                     f"— {n} falhas seguidas")
+            _notify_telegram(
+                "🧹 *x402-watch expirado (alvo morto)*\n\n"
+                f"`{TelegramBot.esc(str(url)[:90])}`\n"
+                f"{n} checagens seguidas sem conectar (~24h) — watch "
+                "cancelado. _Watch não cobra nada; era só ruído no log._")
+    except Exception as e:
+        log.debug(f"watch zero track: {e}")
+
+
+# ------------------------------------------------------------- sweep honesto --
+_SWEEP_NAG_FILE = HOME_DIR / "sweep_nag.json"
+
+
+def _sweep_notify_once_daily(bal):
+    """A verdade operacional 1×/dia: o saldo é SEU, na SUA carteira — este
+    nó não tem chave e não move fundos. Sweep automático real = hot-wallet
+    dedicada (decisão do operador)."""
+    try:
+        d = _ops_read_json(_SWEEP_NAG_FILE, {})
+        now = int(time.time())
+        if now - int(d.get("ts", 0) or 0) < 86400:
+            return
+        d["ts"] = now
+        _ops_write_json(_SWEEP_NAG_FILE, d)
+        _notify_telegram(
+            f"💸 *Saldo acumulado: ${bal:.4f} USDC* (Solana)\n\n"
+            "O nó é não-custodial: não há chave no servidor, então NADA move "
+            "fundos sozinho. Resgate manual: envie da carteira "
+            f"`{TelegramBot.esc(RECEIVE_ADDRESS)}` para o depósito USDC-SPL "
+            "da Binance (rede Solana).\n"
+            "_Quer sweep automático de verdade? Peça a hot-wallet dedicada._")
+    except Exception as e:
+        log.debug(f"sweep nag: {e}")
+
+
+VERSION = "48.31.9-MEMORY"  # v48.31.9-MEMORY: fim do Telegram repetindo pergunta — memória de decisão persistente (ops_decisions.json) com supressão determinística em _ops_propose: já-na-fila/recusada(30d)/aplicada(30d)/rota-viva/expirada(4-7d) não repropõe, e adjust_price fica consciente de preço (escada livre, repetição idêntica morre) · prompt do planner recebe decisões + fila de produto (fila vira fábrica) · /ops status mostra a fila · watchdog expira watch zumbi http-0 em ~24h (api.example.com fora do log) · sweep honesto 1×/dia (nó não-custodial — fim do "Sweep solicitado" fantasma) · threads /council e br-paridade daemon=True (teardown limpo) | base: v48.31.8-AUTOPICK
+log.warning("🧠 v48.31.9-MEMORY ativo — planner com memória de decisão "
+            "(nada de pergunta repetida) · fila de produto vira fábrica · "
+            "watch zumbi expira em ~24h · sweep honesto · threads daemon")

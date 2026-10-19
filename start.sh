@@ -58,4 +58,10 @@ def post_fork(server, worker):
     nexus_omega.post_fork_boot()
 PYEOF
 
-exec gunicorn --config /tmp/gunicorn_conf.py --worker-class sync --workers 4 --preload --timeout 180 --graceful-timeout 20 --keep-alive 30 --max-requests 30000 --max-requests-jitter 3000 --bind 0.0.0.0:${PORT:-8080} nexus_omega:app 2>&1
+# v48.31.9-MEMORY: --max-requests 30000→120000 (jitter 3000→12000).
+# Motivo: RAM sobra (uso <1GB de 5GB) e CADA recycle arriscava 180s de
+# worker pendurado no teardown de biblioteca nativa (ONNX/gRPC) — os 3
+# WORKER TIMEOUT/SIGABRT de 18/out (16:40, 19:04, 20:36) foram dessa
+# classe. Anti-vazamento segue ativo, só ~4× mais raro (~1x/10d por
+# worker no tráfego atual de ~55k probes/dia).
+exec gunicorn --config /tmp/gunicorn_conf.py --worker-class sync --workers 4 --preload --timeout 180 --graceful-timeout 20 --keep-alive 30 --max-requests 120000 --max-requests-jitter 12000 --bind 0.0.0.0:${PORT:-8080} nexus_omega:app 2>&1
