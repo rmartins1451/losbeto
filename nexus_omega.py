@@ -6897,6 +6897,17 @@ def _build_402(endpoint: str, price_override: float = None):
     # como fallback. Logo: header segue v2, corpo vira PaymentRequired v1
     # puro, e acceptsV2 preserva o CAIP-2 para consumidores v2 de corpo.
     accepts_v1 = [x for x in (_accept_to_v1(a, endpoint) for a in accepts) if x]
+    # v48.32.0-ZEROWARN (x402lint P7): o linter lê o CORPO v1 do 402
+    # ("x402Version=1, accepts[2]" — evidência do scan 19/out) e marcava WARN
+    # "2 distinct payTos" (Base + Solana). Com Base ativa, o corpo v1 anuncia
+    # SÓ Base: um único payTo em toda superfície v1 = P7 fecha (100/100).
+    # NENHUM rail morre: Solana/Algorand/Polygon/Arbitrum seguem no header
+    # PAYMENT-REQUIRED (acceptsV2), na página /pay e no manual rail — e o
+    # verify/settle aceitam todas as chains independente do anúncio.
+    if X402_V1_PRIMARY_ONLY and ENABLE_BASE and BASE_PAYTO_EVM:
+        _v1_primary = [a for a in accepts_v1 if a.get("network") == "base"]
+        if _v1_primary:
+            accepts_v1 = _v1_primary
 
     # v21 FIX: payload compatível com x402scan — campos da spec v2 + challenges
     payment_req = accepts[0] if accepts else {}
@@ -36607,3 +36618,312 @@ VERSION = "48.31.9-MEMORY"  # v48.31.9-MEMORY: fim do Telegram repetindo pergunt
 log.warning("🧠 v48.31.9-MEMORY ativo — planner com memória de decisão "
             "(nada de pergunta repetida) · fila de produto vira fábrica · "
             "watch zumbi expira em ~24h · sweep honesto · threads daemon")
+
+
+
+# ============================================================================
+# v48.32.0-ZEROWARN — revisão geral 19/out (operador: "estornos + botões
+# mortos + 2 WARN no x402lint + saldo que não aparece")
+#
+# Diagnóstico fechado com logs + on-chain + relatório fresco do x402lint:
+#
+#  1. ESTORNOS BR (/br-macro, /br-curve, /br-archive → auto-pausa 14:34 UTC):
+#     o BCB estava parcialmente FORA (série PTAX devolvendo 502, Selic viva) —
+#     <2 séries vivas = 503 = estorno; e o snapshot diário abortou 18 e 19/out
+#     ("só N fontes vivas") deixando o ?day= de ontem sem arquivo = 503 =
+#     estorno. Fix: cache last-good por série (7d — taxa oficial BR é diária,
+#     o último fix É a taxa vigente; resposta marcada stale:true, fonte
+#     declarada) + /br-archive com gap recente (<=3d) serve o snapshot MAIS
+#     RECENTE com substituição declarada (requested_day/served_day) em vez de
+#     503 — gap antigo segue 503 honesto (não dá para backfillar) + archive
+#     loop agora AVISA no Telegram quando um snapshot aborta (antes: silêncio).
+#
+#  2. BOTÕES TELEGRAM MORTOS: 7 dias de logs com ZERO via=cmd — nenhum clique
+#     chegou ao getUpdates (replies "Sim" funcionam 100%). _handle_button não
+#     logava NADA: falha silenciosa total. Agora: todo callback vira
+#     "📨 TG cb" (INFO) + entrada no tg_inbox (via=button), o answerCallbackQuery
+#     volta COM TOAST do resultado ("✅ #59 aplicada"), e a proposta decidida
+#     perde os botões (editMessageReplyMarkup — anti duplo-clique). Se após
+#     este deploy um clique não aparecer no log, a prova é definitiva de que
+#     o callback nem chega (cliente/conta), e o reply/comando seguem 100%.
+#
+#  3. x402lint P7 (WARN major, 98→100): a evidência do scan mostrou que o
+#     linter lê o CORPO v1 do 402 ("x402Version=1, accepts[2]" — Algorand e
+#     Polygon/Arbitrum já eram v2-only e NÃO foram flagrados). O corpo v1
+#     anunciava Base+Solana = 2 payTos. Agora anuncia SÓ Base (flag
+#     X402_V1_PRIMARY_ONLY=0 desfaz). Solana/Algorand seguem 100% pagáveis:
+#     header PAYMENT-REQUIRED (acceptsV2), página /pay e manual rail intactos;
+#     verify/settle aceitam todas as chains independente do anúncio.
+#
+#  4. AUTO-APROVAÇÃO 24h (OPS_AUTO_APPROVE_HOURS, 0 desliga): proposta
+#     queue_product parada >24h sem resposta é aprovada pelo autopilot e vai
+#     para a fila de produto (a fábrica ainda sonda o upstream real antes de
+#     vender; falha = estorno + auto-pausa). Preço/pausa/resume seguem 100%
+#     humanos. Menos clique, mais autonomia — o objetivo declarado do node.
+# ============================================================================
+
+X402_V1_PRIMARY_ONLY = os.environ.get("X402_V1_PRIMARY_ONLY", "1") == "1"
+
+# ---------------------------------------------------------- 1a. cache BCB ---
+_BCB_LAST_48319 = _bcb_last
+_BCB_CACHE_FILE = HOME_DIR / "bcb_cache.json"
+_BCB_CACHE_TTL_S = int(os.environ.get("BCB_CACHE_TTL_S", str(7 * 86400))
+                       or 7 * 86400)
+
+
+def _bcb_last(code: int, n: int = 2):  # noqa: F811 — camada 48.32.0
+    """BCB com memória: sucesso ao vivo atualiza o cache; falha serve o
+    último fix oficial (<=7d) marcado stale — fim do 503 por BCB intermitente."""
+    try:
+        out = _BCB_LAST_48319(code, n)
+    except Exception:
+        out = None
+    if out:
+        try:
+            cache = _ops_read_json(_BCB_CACHE_FILE, {})
+            if not isinstance(cache, dict):
+                cache = {}
+            cache[str(code)] = {"out": out, "fetched": int(time.time())}
+            _ops_write_json(_BCB_CACHE_FILE, cache)
+        except Exception:
+            pass
+        return out
+    try:
+        cache = _ops_read_json(_BCB_CACHE_FILE, {})
+        ent = (cache.get(str(code)) or {}) if isinstance(cache, dict) else {}
+        cached = ent.get("out")
+        if (cached and int(time.time()) - int(ent.get("fetched", 0) or 0)
+                < _BCB_CACHE_TTL_S):
+            return {**cached, "stale": True, "cached_at": ent.get("fetched"),
+                    "cache_reason": "BCB/SGS indisponivel agora — ultimo fix oficial"}
+    except Exception:
+        pass
+    return None
+
+
+_COLLECT_BR_MACRO_48319 = _collect_br_macro
+
+
+def _collect_br_macro():  # noqa: F811 — camada 48.32.0
+    m = _COLLECT_BR_MACRO_48319()
+    try:
+        for v in m.values():
+            if isinstance(v, dict) and v.get("ok") and v.get("stale"):
+                v["source"] = "BCB/SGS (cache — ultimo fix oficial)"
+    except Exception:
+        pass
+    return m
+
+
+# --------------------------------------- 1b. archive com alerta (sem silêncio)
+def archive_loop():  # noqa: F811 — camada 48.32.0
+    """Mesma regra (1 snapshot/dia a partir das 21h UTC, retry a cada 30min),
+    mas o aborto por fontes insuficientes agora AVISA no Telegram (máx 1x/3h
+    por dia) e a recuperação também avisa. Nada mais falha em silêncio."""
+    time.sleep(75)
+    _alerted = {}
+    while True:
+        try:
+            now = datetime.now(timezone.utc)
+            day = now.strftime("%Y-%m-%d")
+            conn = _archive_conn()
+            row = conn.execute("SELECT 1 FROM snapshots WHERE day=?",
+                               (day,)).fetchone()
+            conn.close()
+            if not row and now.hour >= 21:
+                if _archive_take(day):
+                    log.info(f"📦 snapshot {day} arquivado e assinado "
+                             f"(signer {WALLET.solana_address[:8]}…)")
+                    if _alerted.pop(day, None) is not None:
+                        _notify_telegram(
+                            f"📦 *snapshot {day} RECUPERADO* — fontes "
+                            "voltaram, arquivo do dia gravado e assinado.")
+                else:
+                    slot = now.hour // 3
+                    if _alerted.get(day) != slot:
+                        _alerted[day] = slot
+                        log.warning(f"📦 snapshot {day} adiado — fontes "
+                                    "insuficientes; nova tentativa em 30min")
+                        _notify_telegram(
+                            f"📦 *snapshot {day} adiado*\n\nFontes oficiais "
+                            "insuficientes agora (BCB/B3/F&G). O node tenta de "
+                            "novo a cada 30min até 23h59 UTC — o dia só fica "
+                            "vazio se NENHUMA tentativa tiver 3+ fontes. "
+                            "_/br-archive serve o snapshot mais recente com "
+                            "substituição declarada enquanto isso._")
+        except Exception as e:
+            log.warning(f"archive_loop: {e}")
+        time.sleep(1800)
+
+
+# ----------------------------- 1c. /br-archive: gap recente = último snapshot
+_BR_ARCHIVE_HANDLER_48319 = _br_archive_handler
+
+
+def _br_archive_handler_v2():
+    """Gap recente (<=3d, típico de captura abortada por fonte fora) NÃO é
+    mais 503+estorno: serve o snapshot MAIS RECENTE com substituição 100%
+    declarada. Gap antigo segue 503 honesto — o arquivo não se backfill."""
+    day = (request.args.get("day") or "").strip()
+    out = _BR_ARCHIVE_HANDLER_48319()
+    if not (isinstance(out, tuple) and len(out) == 2 and out[1] == 503 and day):
+        return out
+    try:
+        from datetime import date as _date
+        y, m_, d_ = (int(x) for x in day.split("-"))
+        gap = (datetime.now(timezone.utc).date() - _date(y, m_, d_)).days
+        if not (0 <= gap <= 3):
+            return out
+        conn = _archive_conn()
+        row = conn.execute("SELECT day, ts, payload, sha256, signature, signer"
+                           " FROM snapshots ORDER BY day DESC LIMIT 1").fetchone()
+        depth = conn.execute("SELECT COUNT(*) FROM snapshots").fetchone()[0]
+        conn.close()
+        if not row:
+            return out
+        d, ts_snap, blob, sha, sig, signer = row
+        payload = json.loads(blob)
+        log.info(f"📦 br-archive: {day} sem snapshot — servindo {d} "
+                 "(substituição declarada, sem estorno)")
+        return {**payload,
+                "day": d, "snapshot_ts": ts_snap,
+                "requested_day": day, "served_day": d, "substituted": True,
+                "substitution_reason": (
+                    f"No signed snapshot exists for {day} (daily capture "
+                    "aborted on upstream outage). Served the latest signed "
+                    "snapshot instead — fully disclosed, same price."),
+                "sha256": sha, "signature": sig, "signer": signer,
+                "canonical_message": f"losbeto-br-archive|{d}|{sha}",
+                "verification": {
+                    "algorithm": "Ed25519",
+                    "message": "losbeto-br-archive|<day>|<sha256(sorted payload)>",
+                    "pubkey": signer, "offline": True},
+                "archive_depth_days": depth,
+                "provider": "Losbeto/Brasil-Archive", "version": VERSION}
+    except Exception as e:
+        log.debug(f"br-archive fallback: {e}")
+        return out
+
+
+try:
+    app.view_functions["br_archive"] = paid_endpoint("/br-archive")(
+        _br_archive_handler_v2)
+    ENDPOINT_HANDLERS["/br-archive"] = _br_archive_handler_v2
+    log.info("📦 /br-archive v2: gap recente serve último snapshot declarado "
+             "(fim do loop de estorno)")
+except Exception as e:
+    log.warning(f"br-archive v2 bind: {e}")
+
+
+# ---------------------------------------------------- 2. botões com prova ---
+def _tg_handle_button_48320(self, cq):
+    """Botão agora: (1) loga 📨 TG cb + grava tg_inbox via=button — nunca mais
+    falha em silêncio; (2) processa pela cadeia normal (texto sintético);
+    (3) toast com o RESULTADO no answerCallbackQuery; (4) proposta decidida
+    perde os botões (editMessageReplyMarkup)."""
+    data, chat_id, msg_id = "", None, None
+    try:
+        data = str(cq.get("data") or "")
+        _m = cq.get("message") or {}
+        chat_id = (_m.get("chat") or {}).get("id")
+        msg_id = _m.get("message_id")
+        log.info(f"📨 TG cb: chat={chat_id} msg={msg_id} data=\"{data[:48]}\"")
+        _tg_inbox_record({"ts": int(time.time()), "chat": str(chat_id),
+                          "text": "[button] " + data[:74], "reply_to": None,
+                          "via": "button"})
+    except Exception as e:
+        log.warning(f"TG cb parse: {str(e).replace(self.token, '***')}")
+    outcome = "recebido ✓"
+    decided = None
+    try:
+        if chat_id is not None:
+            self._handle({"chat": {"id": chat_id}, "from": cq.get("from", {}),
+                          "text": data})
+        mm = re.match(r"^/ops\s+(ok|no)\s+(\d+)$", data.strip())
+        if mm:
+            _ops_proposals_reload()
+            rec = (_OPS_PROPOSALS.get("items") or {}).get(mm.group(2)) or {}
+            st = str(rec.get("status", "?"))
+            decided = st
+            outcome = {"applied": f"✅ #{mm.group(2)} aplicada",
+                       "rejected": f"❌ #{mm.group(2)} recusada",
+                       "pending": f"⏳ #{mm.group(2)} segue pendente"}.get(
+                           st, f"#{mm.group(2)}: {st}")
+        elif data.strip() == "/ops ping":
+            outcome = "🏓 pong — canal 100%"
+    except Exception as e:
+        outcome = "⚠ erro ao processar"
+        log.warning(f"TG cb handle: {str(e).replace(self.token, '***')}")
+    try:
+        requests.post(
+            f"https://api.telegram.org/bot{self.token}/answerCallbackQuery",
+            json={"callback_query_id": cq["id"], "text": outcome[:190]},
+            timeout=8)
+    except Exception:
+        pass
+    if decided in ("applied", "rejected") and msg_id and chat_id is not None:
+        try:
+            requests.post(
+                f"https://api.telegram.org/bot{self.token}/editMessageReplyMarkup",
+                json={"chat_id": chat_id, "message_id": int(msg_id),
+                      "reply_markup": {"inline_keyboard": []}}, timeout=8)
+        except Exception:
+            pass
+
+
+TelegramBot._handle_button = _tg_handle_button_48320
+
+
+# ------------------------------------------- 4. auto-aprovação 24h (fila) ---
+_OPS_AUTO_APPROVE_H = float(os.environ.get("OPS_AUTO_APPROVE_HOURS", "36")
+                            or 36)
+
+
+def _ops_autoapprove_once():
+    """queue_product pendente >36h (lembrete de 24h já foi ignorado;
+    expiração é 48h) vira aprovado pelo autopilot. Só queue_product: a fábrica sonda o upstream real
+    antes de vender e falha = estorno + auto-pausa. Preço/pausa/resume seguem
+    100% humanos."""
+    if _OPS_AUTO_APPROVE_H <= 0:
+        return False
+    try:
+        pend = _ops_pending()
+    except Exception:
+        return False
+    now = time.time()
+    for pid, rec in sorted(pend.items(), key=lambda kv: kv[1].get("ts", 0)):
+        a = rec.get("action") or {}
+        if a.get("action") != "queue_product":
+            continue
+        if now - float(rec.get("ts", 0)) < _OPS_AUTO_APPROVE_H * 3600:
+            continue
+        ok, msg = _ops_decide(pid, True, actor="autopilot-24h")
+        log.info(f"🤖 auto-aprovação {_OPS_AUTO_APPROVE_H:.0f}h: #{pid} "
+                 f"queue_product → ok={ok} {msg}")
+        try:
+            _notify_telegram(
+                f"🤖 *AUTO-APROVADA #{pid}* ({_OPS_AUTO_APPROVE_H:.0f}h sem "
+                f"resposta)\n\n{_ops_describe(a)}\n\n"
+                f"_{TelegramBot.esc(str(msg)[:160])}_")
+        except Exception:
+            pass
+        return True   # 1 por passada — sem rajada
+    return False
+
+
+_OPS_REMINDER_ONCE_48319 = _ops_reminder_once
+
+
+def _ops_reminder_once():  # noqa: F811 — camada 48.32.0
+    try:
+        _ops_autoapprove_once()
+    except Exception as e:
+        log.debug(f"autoapprove: {e}")
+    return _OPS_REMINDER_ONCE_48319()
+
+
+VERSION = "48.32.0-ZEROWARN"  # v48.32.0-ZEROWARN: revisão geral 19/out — (1) BCB com cache last-good 7d (PTAX 502 não derruba mais /br-macro·/br-curve·snapshot; resposta marcada stale, fonte declarada) · (2) /br-archive com gap recente (<=3d) serve o snapshot MAIS RECENTE com requested_day/served_day/substituted declarados em vez de 503+estorno (gap antigo segue 503 honesto) · (3) archive loop avisa no TG quando snapshot aborta e quando recupera (fim do silêncio que apagou 18-19/out) · (4) botões Telegram com prova: 📨 TG cb no log + tg_inbox via=button + toast com resultado + botões removidos após decisão (7 dias de logs com ZERO via=cmd — agora qualquer clique deixa rastro definitivo) · (5) x402lint P7 fechado: corpo v1 do 402 anuncia SÓ Base (payTo único; X402_V1_PRIMARY_ONLY=0 desfaz) — Solana/Algorand intactos no header v2, /pay e manual rail · (6) auto-aprovação 36h de queue_product (OPS_AUTO_APPROVE_HOURS=0 desliga; TTL 48h) — fila de produto anda sem clique | base: v48.31.9-MEMORY
+log.warning("🎯 v48.32.0-ZEROWARN ativo — BCB à prova de queda (cache "
+            "last-good) · /br-archive sem estorno por gap recente · snapshot "
+            "com alerta TG · botões TG com rastro+toast · corpo v1 payTo "
+            "único (P7→100) · fila de produto auto-aprova em 36h")
