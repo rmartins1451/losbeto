@@ -13374,7 +13374,7 @@ maintains about this node. Every seal below opens the public proof.</p>
     Reputation registry live.</span></a>
   <a class="seal" href="https://x402lint.dev/o/api.losbeto.xyz" target="_blank" rel="noopener">
     <b><span class="ok">✓</span> x402lint — Grade A</b>
-    <span>Protocol-compliance scan: 98/100 (PASS 23 · FAIL 0) on the
+    <span>Protocol-compliance scan: 100/100 (FAIL 0 · scan 19/Oct/2026) on the
     independent x402 linter.</span></a>
   <a class="seal" href="https://www.x402scan.com" target="_blank" rel="noopener">
     <b><span class="ok">✓</span> x402scan</b>
@@ -37483,3 +37483,102 @@ VERSION = "48.33.0-CONVERT"  # v48.33.0-CONVERT: revisão geral 21/out — (1) O
 log.warning("🧠 v48.33.0-CONVERT ativo — ops-inbox externo · self-pay cobre "
             "rajada Algorand · agent-skills 301 · /press/ + /site/ · "
             "lead-alert no TG (≥3 previews distintos/2h)")
+
+
+# ===========================================================================
+# v48.33.1-STABILITY — 21/out (camada terminal; nada acima é tocado).
+#
+# Contexto: primeiro dia de vendas orgânicas fortes ($6,04/24h — cliente
+# testou 2 endpoints baratos e carregou 6× /buy-credits = $5,94 em 22min).
+# Revisão pós-vitória achou 2 ferimentos pequenos e reais:
+#
+#   (1) HEALTH GRACE — o probe do forex flappou 12× hoje (exchangerate-api
+#       free) e, com o probe-cache de 900s, UMA fonte em fallback-static
+#       derrubava premium_ready GLOBAL por até 15 min: todos os endpoints
+#       premium 503avam (sem cobrar) no nosso melhor dia de vendas. Agora
+#       cada fonte tem grace de HEALTH_GRACE_S (default 600s) de falha
+#       CONTÍNUA antes de contar como down — flapping de segundos não fecha
+#       mais a loja; falha sustentada continua fechando (proteção intacta).
+#       Fonte em grace é declarada ("· grace") — honestidade preservada.
+#   (2) SELO LINT — a landing dizia "98/100"; o re-scan de 19/10 deu
+#       100/100 · 0 FAIL. Corrigido no fonte (linha do selo).
+#
+# Flag: HEALTH_GRACE_S=0 desliga a histerese (comportamento antigo).
+# | base: v48.33.0-CONVERT
+# ===========================================================================
+
+_HEALTH_GRACE_S = int(os.environ.get("HEALTH_GRACE_S", "600"))
+_HEALTH_GRACE_FILE = "health_grace.json"
+
+
+def _health_grace_read() -> dict:
+    try:
+        p = HOME_DIR / _HEALTH_GRACE_FILE
+        if p.exists():
+            return json.loads(p.read_text() or "{}")
+    except Exception:
+        pass
+    return {}
+
+
+def _health_grace_write(d: dict) -> None:
+    try:
+        (HOME_DIR / _HEALTH_GRACE_FILE).write_text(json.dumps(d))
+    except Exception:
+        pass
+
+
+_HP_48330 = health_providers  # referência da cadeia anterior (48.33.0)
+
+
+def _health_providers_48331():
+    """Histerese por fonte de mercado: live→down só depois de HEALTH_GRACE_S
+    de falha contínua. O probe-cache de 900s amplificava um flap de segundos
+    em 15 min de loja premium fechada."""
+    resp = _HP_48330()
+    if _HEALTH_GRACE_S <= 0:
+        return resp
+    try:
+        data = resp.get_json(silent=True)
+        if not isinstance(data, dict):
+            return resp
+        md = data.get("market_data")
+        if not isinstance(md, dict):
+            return resp
+        state = _health_grace_read()
+        now = time.time()
+        changed = False
+        for path, chk in md.items():
+            if not isinstance(chk, dict):
+                continue
+            if chk.get("live"):
+                if path in state:
+                    state.pop(path, None)
+                    changed = True
+                continue
+            first = state.get(path)
+            if not first:
+                state[path] = now
+                changed = True
+                chk["live"] = True
+                chk["source"] = f"{chk.get('source')} · grace"
+            elif now - float(first) < _HEALTH_GRACE_S:
+                chk["live"] = True
+                chk["source"] = f"{chk.get('source')} · grace"
+            # else: falha sustentada > grace — segue down (proteção real)
+        if changed:
+            _health_grace_write(state)
+        ai_live = bool((data.get("ai") or {}).get("live"))
+        data["premium_ready"] = ai_live and all(
+            v.get("live") for v in md.values() if isinstance(v, dict))
+        return jsonify(data)
+    except Exception as e:
+        log.debug(f"health grace: {e}")
+        return resp
+
+
+app.view_functions["health_providers"] = _health_providers_48331
+
+VERSION = "48.33.1-STABILITY"  # v48.33.1-STABILITY: histerese por fonte no premium_ready (flap do forex não fecha mais a loja premium por 15min; falha sustentada >HEALTH_GRACE_S continua fechando) · selo x402lint da landing 98→100/100 | base: v48.33.0-CONVERT
+log.warning("🛡 v48.33.1-STABILITY ativo — premium_ready com grace "
+            f"{_HEALTH_GRACE_S}s por fonte · selo x402lint 100/100")
