@@ -37123,3 +37123,363 @@ VERSION = "48.32.1-WEBOPS"  # v48.32.1-WEBOPS: o Telegram sai do caminho crític
 log.warning("🌐 v48.32.1-WEBOPS ativo — painel web de decisões "
             "(/ops/panel?token=DASH_TOKEN): um toque decide, zero Telegram · "
             "poll cru com tipos de update · /ops tgdiag")
+
+
+# ===========================================================================
+# v48.33.0-CONVERT — revisão geral 21/out (camada terminal; nada acima é
+# tocado). Tema: converter máquinas em compradores, com governança humana.
+#
+#   (1) OPSINBOX   POST /ops/propose (DASH_TOKEN) — propostas externas caem
+#                  na MESMA fila do llm-planner (_ops_validate + backlog real
+#                  anti-alucinação). Nada executa: decisão segue 100% humana
+#                  no /ops/panel ou Telegram.
+#   (2) SELFPAY    _self_pay_wallets passa a incluir os pagadores de rajada
+#                  (_sweep_payers_cached) — a Conta B Algorand (MRVA6O…) não
+#                  está em nenhuma env de endereço, então o upsell falava com
+#                  o próprio nó: 2.899 "savings tip" em 05–11/out (medido).
+#                  Mesma definição do classify_payer, como a docstring manda.
+#   (3) SKILLS     /.well-known/agent-skills (404 hoje) → 301 para
+#                  /.well-known/agent-skills/index.json — é o path curto que
+#                  a listagem pública divulga.
+#   (4) PRESS/SITE /press/ e /site/ — demanda MEDIDA no radar (10 hits ·
+#                  3 IPs cada em 7d, sem rota). Páginas humanas com números
+#                  vivos do próprio ledger; cache 300s; sem JS.
+#   (5) LEAD-ALERT scoring de intenção: UA (ex-scanners) que prova ≥3
+#                  endpoints distintos em 2h vira "lead quente" no Telegram,
+#                  no máx. 1x/dia/UA (rate-limit persistido em /data).
+#
+# Flags: OPSINBOX=0 · PRESS_PAGE=0 · LEAD_ALERT=0 desligam cada parte.
+# | base: v48.32.1-WEBOPS
+# ===========================================================================
+
+# ------------------------------------------------------------- (2) SELFPAY --
+def _self_pay_wallets():  # noqa: F811 — camada 48.33.0
+    """Todo endereço que este nó controla — agora incluindo pagadores de
+    varredura detectados pela rajada (a Conta B Algorand só existe como
+    mnemonic na env; o endereço dela nunca entrou em _self_pay_wallets, e o
+    motor de upsell recomendou plano ao próprio nó 2.899× em 7 dias)."""
+    s = {str(a).lower() for a in OPERATOR_WALLETS if a}
+    s |= {str(a).lower() for a in BUYER_WALLETS if a}
+    for a in (RECEIVE_ADDRESS, BASE_PAYTO_EVM, ALGO_PAYTO,
+              getattr(WALLET, "solana_address", "")):
+        if a:
+            s.add(str(a).lower())
+    try:
+        s |= {str(p).lower() for p in (_sweep_payers_cached() or set()) if p}
+    except Exception:
+        pass  # detector indisponível → conjunto base (comportamento antigo)
+    return s
+
+
+# ------------------------------------------------------------- (1) OPSINBOX --
+def _ops_candidates_live():
+    """Mesmo recorte que o llm-planner enxerga (backlog real da telemetria)."""
+    backlog = {}
+    try:
+        brain = _BUILD_CORTEX_ORIG() or {}
+        for b in (brain.get("product_backlog") or [])[:8]:
+            p = b.get("requested_path")
+            if p and p not in _AUTO_ALIASES:
+                backlog[p] = {"hits": b.get("hits_7d", 0),
+                              "ips": b.get("distinct_ips", 0),
+                              "closest": b.get("closest_existing")}
+    except Exception as e:
+        log.debug(f"opsinbox candidates: {e}")
+    return {"backlog": backlog, "endpoints": {}}
+
+
+if os.environ.get("OPSINBOX", "1") != "0":
+    @app.route("/ops/propose", methods=["POST"])
+    def ops_propose_external():  # v48.33.0 — endpoint name único
+        tok = (request.args.get("token", "")
+               or request.headers.get("X-Dash-Token", ""))
+        if not _dash_token_ok(tok):
+            return jsonify({"error": "forbidden",
+                            "hint": "POST /ops/propose?token=<DASH_TOKEN>"}), 403
+        body = request.get_json(silent=True) or {}
+        action = body.get("action") or {}
+        ok, mode = _ops_validate(action, _ops_candidates_live())
+        if not ok:
+            return jsonify({"rejected": mode}), 422
+        pid = _ops_propose(action, "external")
+        log.info(f"📥 ops-inbox: proposta externa #{pid} "
+                 f"({action.get('action')}) — aguardando decisão humana")
+        return jsonify({"proposed": pid,
+                        "decide": f"{_public_base()}/ops/panel"}), 202
+
+
+# -------------------------------------------------------------- (3) SKILLS --
+@app.route("/.well-known/agent-skills")
+def v48330_agent_skills_alias():
+    """A listagem pública divulga o path curto; a RFC Cloudflare serve o
+    index.json. 301 fino, sem duplicar conteúdo."""
+    return redirect(
+        f"{_public_base()}/.well-known/agent-skills/index.json", code=301)
+
+
+# ------------------------------------------------------------ (4) PRESS/SITE --
+_PRESS_CACHE = {"ts": 0.0, "html": {}}
+_PRESS_TTL_S = 300
+
+
+def _v48330_public_numbers() -> dict:
+    """Números vivos, lidos do próprio ledger (leitura WAL sem lock — padrão
+    v48.3.2). Só o que é público por natureza: endpoints, versão, settlements
+    e disponibilidade das últimas 24h."""
+    n = {"endpoints": len(BASE_PRICES), "version": VERSION}
+    try:
+        lim = int(time.time()) - 86400
+        with LEDGER._conn() as c:
+            n["settlements_24h"] = c.execute(
+                "SELECT COUNT(*) FROM revenue WHERE ts>?",
+                (lim,)).fetchone()[0]
+            r = c.execute(
+                "SELECT COUNT(*), SUM(ok) FROM requests WHERE ts>?",
+                (lim,)).fetchone()
+            if r and r[0]:
+                n["uptime_24h_pct"] = round(100.0 * (r[1] or 0) / float(r[0]), 2)
+    except Exception as e:
+        log.debug(f"press numbers: {e}")
+    return n
+
+
+def _v48330_render(kind: str) -> str:
+    now = time.time()
+    if now - _PRESS_CACHE["ts"] < _PRESS_TTL_S and kind in _PRESS_CACHE["html"]:
+        return _PRESS_CACHE["html"][kind]
+    n = _v48330_public_numbers()
+    base = _public_base()
+    up = n.get("uptime_24h_pct")
+    up_txt = f"{up:.2f}% (24h, medido no próprio ledger)" if up else "n/a"
+    if kind == "press":
+        title = "Losbeto — Press & verification kit"
+        rows = [
+            ("What it is", "x402-paid LLM gateway + cross-asset market "
+             "intelligence for AI agents. One USDC micropayment per call; "
+             "the payment is the auth. No signup."),
+            ("Endpoints", f"{n['endpoints']} monetized (live count from the "
+             "running node)"),
+            ("Version", n["version"]),
+            ("Settlements (24h)", str(n.get("settlements_24h", "n/a"))),
+            ("Availability", up_txt),
+            ("Chains", "USDC on Base · Solana · Algorand · Polygon"),
+            ("Identity", "Registered ERC-8004 agent #87048 on Base — "
+             "<a href='https://8004scan.io/agents/base/87048'>8004scan.io</a>"),
+            ("Compliance", "Grade A 98/100 on x402lint (as of Oct 2026) — "
+             "<a href='https://api.x402lint.dev/v1/report?url=https://api.losbeto.xyz'>live report</a>"),
+            ("Directory", "Monitored on "
+             "<a href='https://x402-list.com/services/losbeto-cross-asset-market-intelligence'>x402-list</a> "
+             "(uptime & volume medidos por terceiro)"),
+            ("Registry", "Official MCP Registry: "
+             "<code>io.github.rmartins1451/losbeto</code>"),
+            ("Transparency", f"<a href='{base}/receipts'>/receipts</a> — every "
+             f"settlement public, operator purchases labelled · "
+             f"<a href='{base}/.well-known/honest-revenue.json'>honest-revenue</a> "
+             f"separates organic from operator-funded · "
+             f"<a href='{base}/scorecard.json'>scorecard.json</a>"),
+            ("Contact", "Roberto Martins — roberto.martins622@gmail.com"),
+        ]
+        trs = "".join(
+            f"<tr><th>{k}</th><td>{v}</td></tr>" for k, v in rows)
+        html = f"""<!doctype html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>{title}</title>
+<style>
+body{{font-family:-apple-system,system-ui,sans-serif;max-width:760px;margin:40px auto;padding:0 16px;color:#1a1a1a;line-height:1.55}}
+h1{{font-size:26px;margin-bottom:4px}} .sub{{color:#666;margin-bottom:24px}}
+table{{border-collapse:collapse;width:100%}} th{{text-align:left;width:180px;vertical-align:top;color:#444}}
+th,td{{border-bottom:1px solid #e5e5e5;padding:10px 8px;font-size:15px}}
+code{{background:#f5f5f5;padding:1px 5px;border-radius:4px}}
+footer{{color:#888;font-size:13px;margin-top:28px}}
+</style></head><body>
+<h1>Losbeto</h1>
+<p class="sub">Press &amp; verification kit — every claim links to a third-party
+or to this node's own public ledger. No marketing adjectives, just pointers.</p>
+<table>{trs}</table>
+<footer>Numbers on this page are read live from the running node
+({n['version']}) · cached 5 min · machine-readable: <a href="{base}/agents.json">agents.json</a></footer>
+</body></html>"""
+    else:  # site
+        links = [
+            ("/get-pricing", "Full catalog with prices (machine-readable)"),
+            ("/plans", "Plans: credits, day/week passes, subscriptions"),
+            ("/pricing", "Plans, human-readable"),
+            ("/try", "Free taste — delayed samples of paid endpoints"),
+            ("/llm/free", "Free LLM tier, 5 calls/day"),
+            ("/receipts", "Every settlement, public and labelled"),
+            ("/scorecard.json", "24h availability + latency, signed"),
+            ("/.well-known/honest-revenue.json", "Organic vs operator-funded revenue"),
+            ("/agents.json", "Outcome-based flows for agents"),
+            ("/openapi.json", "OpenAPI contract"),
+            ("/.well-known/agent.json", "A2A agent card"),
+            ("/mcp", "MCP streamable-http endpoint"),
+            ("/press/", "Press & verification kit"),
+            ("/impressum", "Imprint"),
+        ]
+        lis = "".join(f"<li><a href='{base}{p}'>{p}</a> — {d}</li>"
+                      for p, d in links)
+        html = f"""<!doctype html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Losbeto — site index</title>
+<style>
+body{{font-family:-apple-system,system-ui,sans-serif;max-width:680px;margin:40px auto;padding:0 16px;color:#1a1a1a;line-height:1.6}}
+h1{{font-size:26px}} li{{margin:7px 0}} code{{background:#f5f5f5;padding:1px 5px}}
+footer{{color:#888;font-size:13px;margin-top:28px}}
+</style></head><body>
+<h1>Losbeto — everything, one page</h1>
+<p>{n['endpoints']} paid endpoints · {n['version']} ·
+{up_txt}</p>
+<ul>{lis}</ul>
+<footer>For machines: <code>/.well-known/x402.json</code> ·
+<code>/agents.json</code> · <code>/openapi.json</code></footer>
+</body></html>"""
+    _PRESS_CACHE["ts"] = now
+    _PRESS_CACHE["html"][kind] = html
+    return html
+
+
+if os.environ.get("PRESS_PAGE", "1") != "0":
+    @app.route("/press/")
+    def v48330_press():
+        return app.response_class(_v48330_render("press"),
+                                  mimetype="text/html")
+
+    @app.route("/site/")
+    def v48330_site():
+        return app.response_class(_v48330_render("site"),
+                                  mimetype="text/html")
+
+
+# ---------------------------------------------------------- (5) LEAD-ALERT --
+LEAD_ALERT_ON = os.environ.get("LEAD_ALERT", "1") != "0"
+LEAD_ALERT_SECS = int(os.environ.get("LEAD_ALERT_SECS", "1800"))       # varredura
+LEAD_ALERT_MIN_EPS = int(os.environ.get("LEAD_ALERT_MIN_ENDPOINTS", "3"))
+LEAD_ALERT_GAP_S = int(os.environ.get("LEAD_ALERT_GAP_S", "86400"))    # 1x/dia/UA
+_LEAD_SEEN = {}  # ua -> ts do último alerta (memória do worker)
+_LEAD_FILE = "lead_alerts.json"
+# scanners/monitores conhecidos nunca são leads (medido nos top_uas):
+_LEAD_UA_BLOCK = ("monitor", "probe", "scanner", "crawler", "uptime",
+                  "healthcheck", "x402-list", "carbonmonitor", "bazaar",
+                  "lumiere", "x402-observer", "x402lint", "agentrank",
+                  "losbeto-x402", "x402-watch", "x402-audit")
+
+
+def _lead_seen_load() -> dict:
+    try:
+        p = HOME_DIR / _LEAD_FILE
+        if p.exists():
+            return json.loads(p.read_text() or "{}")
+    except Exception:
+        pass
+    return {}
+
+
+def _lead_seen_save(d: dict) -> None:
+    try:
+        (HOME_DIR / _LEAD_FILE).write_text(json.dumps(d))
+    except Exception:
+        pass
+
+
+def _lead_scan_once() -> None:
+    """Quem está AVALIANDO de verdade: previews de ≥N endpoints distintos em
+    2h. Scanner conhecido nunca vira lead. Alerta no máx. 1x/dia/UA, com
+    rate-limit persistido (cross-worker) — o Telegram não vira spam."""
+    if not (TG_BOT and TG_CHAT):
+        return
+    lim = int(time.time()) - 7200
+    with LEDGER._conn() as c:  # leitura WAL sem lock (padrão v48.3.2)
+        rows = c.execute(
+            "SELECT COALESCE(NULLIF(ua,''),'(no user-agent)') u, endpoint, "
+            "COUNT(*) n FROM requests WHERE ts>? AND kind='preview' "
+            "GROUP BY u, endpoint", (lim,)).fetchall()
+        ips_q = {r[0]: r[1] for r in c.execute(
+            "SELECT COALESCE(NULLIF(ua,''),'(no user-agent)') u, "
+            "COUNT(DISTINCT ip) FROM requests WHERE ts>? AND kind='preview' "
+            "GROUP BY u", (lim,)).fetchall()}
+    by_ua = {}
+    for ua, ep, n in rows:
+        by_ua.setdefault(ua, {})[ep] = int(n)
+    seen = _lead_seen_load()
+    now = time.time()
+    dirty = False
+    for ua, eps in sorted(by_ua.items(),
+                          key=lambda kv: -len(kv[1]))[:12]:
+        if len(eps) < LEAD_ALERT_MIN_EPS:
+            continue
+        low = ua.lower()
+        if any(b in low for b in _LEAD_UA_BLOCK):
+            continue
+        last = max(float(_LEAD_SEEN.get(ua, 0)),
+                   float(seen.get(ua, 0) or 0))
+        if now - last < LEAD_ALERT_GAP_S:
+            continue
+        top = sorted(eps.items(), key=lambda kv: -kv[1])[:5]
+        lista = ", ".join(f"{e} ({n}×)" for e, n in top)
+        TG_BOT.send(
+            TG_CHAT,
+            f"🔥 *LEAD QUENTE* — avaliador provando o catálogo\n\n"
+            f"UA: `{TelegramBot.esc(ua[:70])}`\n"
+            f"{len(eps)} endpoints distintos em 2h · "
+            f"{ips_q.get(ua, 1)} ip(s)\n"
+            f"Top: {TelegramBot.esc(lista[:180])}\n\n"
+            f"_Janela de conversão: agora. O savings-tip automático fala no "
+            f"primeiro pagamento._")
+        _LEAD_SEEN[ua] = now
+        seen[ua] = now
+        dirty = True
+        log.info(f"🔥 lead-alert: {ua[:40]} provou {len(eps)} endpoints/2h")
+    if dirty:
+        _lead_seen_save(seen)
+
+
+def _lead_alert_loop() -> None:
+    # flock próprio: um dono por container (padrão _start_background_once)
+    try:
+        import fcntl
+        lf = open(HOME_DIR / "lead_alert.lock", "w")
+        try:
+            fcntl.flock(lf, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            log.info("⏭ lead-alert: outro worker é o dono")
+            return
+        globals()["_LEAD_LOCK_FILE"] = lf  # mantém o lock vivo
+    except Exception as e:
+        log.debug(f"lead-alert lock: {e}")
+    while True:
+        try:
+            _lead_scan_once()
+        except Exception as e:
+            log.debug(f"lead-alert scan: {e}")
+        time.sleep(LEAD_ALERT_SECS)
+
+
+_LEAD_STARTED = False
+
+
+def _lead_alert_start_once() -> None:
+    global _LEAD_STARTED
+    if _LEAD_STARTED or not LEAD_ALERT_ON:
+        return
+    _LEAD_STARTED = True
+    threading.Thread(target=_lead_alert_loop, daemon=True,
+                     name="lead-alert").start()
+
+
+# plug no boot pós-fork existente (hook do gunicorn chama o NOME global; o
+# fallback @app.before_request idem — as duas vias pegam este wrapper):
+_POSTFORK_BOOT_48321 = post_fork_boot
+
+
+def post_fork_boot():  # noqa: F811 — camada 48.33.0
+    _POSTFORK_BOOT_48321()
+    try:
+        _lead_alert_start_once()
+    except Exception as e:
+        log.debug(f"lead-alert start: {e}")
+
+
+VERSION = "48.33.0-CONVERT"  # v48.33.0-CONVERT: revisão geral 21/out — (1) OPSINBOX: POST /ops/propose (DASH_TOKEN) alimenta a fila de decisão; execução só com OK humano · (2) SELFPAY: _self_pay_wallets inclui pagadores de rajada — fim dos 2.899 savings-tips para a própria Conta B Algorand (05–11/out) · (3) /.well-known/agent-skills → 301 p/ index.json (path curto que a listagem divulga) · (4) /press/ + /site/: páginas humanas com números vivos do ledger (demanda medida no radar: 10 hits · 3 IPs cada/7d) · (5) LEAD-ALERT: UA que prova ≥3 endpoints em 2h vira lead quente no TG (1x/dia/UA, rate-limit em /data) · flags: OPSINBOX=0 · PRESS_PAGE=0 · LEAD_ALERT=0 | base: v48.32.1-WEBOPS
+log.warning("🧠 v48.33.0-CONVERT ativo — ops-inbox externo · self-pay cobre "
+            "rajada Algorand · agent-skills 301 · /press/ + /site/ · "
+            "lead-alert no TG (≥3 previews distintos/2h)")
