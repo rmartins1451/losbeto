@@ -37486,27 +37486,53 @@ log.warning("🧠 v48.33.0-CONVERT ativo — ops-inbox externo · self-pay cobre
 
 
 # ===========================================================================
-# v48.33.1-STABILITY — 21/out (camada terminal; nada acima é tocado).
+# v48.33.1-STABILITY — 22/out (camada terminal; nada acima é tocado).
+# Revisão ponta a ponta com os dados do melhor ciclo de vendas até aqui
+# (orgânico 24h: $0,03 → $0,07 → $6,04 → 23 vendas recorrentes de catálogo).
 #
-# Contexto: primeiro dia de vendas orgânicas fortes ($6,04/24h — cliente
-# testou 2 endpoints baratos e carregou 6× /buy-credits = $5,94 em 22min).
-# Revisão pós-vitória achou 2 ferimentos pequenos e reais:
+#   (1) HEALTH GRACE — o probe do forex flappou 25× na janela (exchangerate-
+#       api free); com o probe-cache de 900s, UMA fonte em fallback-static
+#       derrubava premium_ready GLOBAL por até 15 min: premium 503ando (sem
+#       cobrar) no melhor dia de vendas. Agora cada fonte tem grace de
+#       HEALTH_GRACE_S (default 600s) de falha CONTÍNUA antes de contar como
+#       down — flap de segundos não fecha a loja; falha sustentada continua
+#       fechando (proteção intacta). Fonte em grace é declarada ("· grace").
+#   (2) SELO LINT — landing dizia "98/100"; re-scan 19/10: 100/100 · 0 FAIL.
+#       Corrigido no fonte (linha do selo).
+#   (3) /sw.js — 4 IPs/7d pediam e tomavam 404 (browsers/PWA). Agora serve
+#       um service worker no-op deliberado: sem fetch handler, sem cache —
+#       zero efeito sobre a página, fim do 404 no radar.
+#   (4) LOG HYGIENE — sklearn UserWarning "delayed" disparava 1.103× na
+#       janela (1 por inferência do recommender/anomaly): ruído que esconde
+#       sinal. Filtro cirúrgico só dessa mensagem; demais warnings intactos.
 #
-#   (1) HEALTH GRACE — o probe do forex flappou 12× hoje (exchangerate-api
-#       free) e, com o probe-cache de 900s, UMA fonte em fallback-static
-#       derrubava premium_ready GLOBAL por até 15 min: todos os endpoints
-#       premium 503avam (sem cobrar) no nosso melhor dia de vendas. Agora
-#       cada fonte tem grace de HEALTH_GRACE_S (default 600s) de falha
-#       CONTÍNUA antes de contar como down — flapping de segundos não fecha
-#       mais a loja; falha sustentada continua fechando (proteção intacta).
-#       Fonte em grace é declarada ("· grace") — honestidade preservada.
-#   (2) SELO LINT — a landing dizia "98/100"; o re-scan de 19/10 deu
-#       100/100 · 0 FAIL. Corrigido no fonte (linha do selo).
-#
-# Flag: HEALTH_GRACE_S=0 desliga a histerese (comportamento antigo).
+# Flags: HEALTH_GRACE_S=0 desliga a histerese · SW_NOOP=0 desliga o /sw.js.
 # | base: v48.33.0-CONVERT
 # ===========================================================================
 
+# ------------------------------------------------------------ (4) LOG HYGIENE
+import warnings as _warnings
+_warnings.filterwarnings(
+    "ignore",
+    message=r".*sklearn\.utils\.parallel\.delayed.*",
+    category=UserWarning)
+
+# ------------------------------------------------------------- (3) /sw.js ---
+if os.environ.get("SW_NOOP", "1") != "0":
+    @app.route("/sw.js")
+    def v48331_sw_noop():
+        """Service worker no-op: instala e ativa, não intercepta NADA.
+        Browsers que pedem /sw.js (PWA check) levam 200 em vez de 404."""
+        return app.response_class(
+            "// losbeto sw.js — no-op deliberado (v48.33.1): sem cache, sem "
+            "fetch handler; a página segue 100% network-first.\n"
+            "self.addEventListener('install', e => self.skipWaiting());\n"
+            "self.addEventListener('activate', e => e.waitUntil("
+            "self.clients.claim()));\n",
+            mimetype="application/javascript")
+
+
+# --------------------------------------------------------- (1) HEALTH GRACE --
 _HEALTH_GRACE_S = int(os.environ.get("HEALTH_GRACE_S", "600"))
 _HEALTH_GRACE_FILE = "health_grace.json"
 
@@ -37579,6 +37605,7 @@ def _health_providers_48331():
 
 app.view_functions["health_providers"] = _health_providers_48331
 
-VERSION = "48.33.1-STABILITY"  # v48.33.1-STABILITY: histerese por fonte no premium_ready (flap do forex não fecha mais a loja premium por 15min; falha sustentada >HEALTH_GRACE_S continua fechando) · selo x402lint da landing 98→100/100 | base: v48.33.0-CONVERT
+VERSION = "48.33.1-STABILITY"  # v48.33.1-STABILITY: histerese por fonte no premium_ready (flap do forex não fecha mais a loja premium; falha sustentada >HEALTH_GRACE_S continua fechando) · selo x402lint 98→100/100 · /sw.js no-op (4 IPs/7d tomavam 404) · filtro do sklearn UserWarning (1.103×/janela poluíam o log) | base: v48.33.0-CONVERT
 log.warning("🛡 v48.33.1-STABILITY ativo — premium_ready com grace "
-            f"{_HEALTH_GRACE_S}s por fonte · selo x402lint 100/100")
+            f"{_HEALTH_GRACE_S}s/fonte · selo 100/100 · /sw.js no-op · "
+            "log sem o spam sklearn")
