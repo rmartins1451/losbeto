@@ -37609,3 +37609,219 @@ VERSION = "48.33.1-STABILITY"  # v48.33.1-STABILITY: histerese por fonte no prem
 log.warning("🛡 v48.33.1-STABILITY ativo — premium_ready com grace "
             f"{_HEALTH_GRACE_S}s/fonte · selo 100/100 · /sw.js no-op · "
             "log sem o spam sklearn")
+
+
+# ===========================================================================
+# v48.33.2-FACTORYCARE — 22/out (camada terminal; nada acima é tocado).
+#
+# Causa raiz das falhas do indexar de 21-22/out (medido nos passes pagos):
+#   · /telescope  → NASA api read timeout 8s (falhou nas DUAS rails)
+#   · /pyth-price → Pyth falhou + CoinGecko 429 (free tier) — 2 dias seguidos
+# Em ambos: "charged":true + estorno em crédito — dinheiro protegido, mas o
+# cliente paga e não recebe na 1ª tentativa. A fábrica e o preço não tinham
+# nem retry nem último-bom — classes inteiras de falha transitória viravam
+# 502. Agora:
+#
+#   (1) FACTORY FETCH v2 — todo produto da fábrica ganha: timeout 8s→20s
+#       (env FACTORY_TIMEOUT_S segue mandando) · 1 retry com respiro de 2s
+#       · LAST-GOOD 24h: se o upstream falha 2×, serve a última resposta boa
+#       do próprio /data marcada stale:true + age_s (mesmo padrão do cache
+#       BCB da 48.32.0) — o cliente recebe dado declarado em vez de 502.
+#       A sonda de criação NÃO usa cache (sonda mede o upstream de verdade).
+#   (2) _sym_price v2 — Pyth ganha 1 retry (2s); CoinGecko ganha 1 retry com
+#       respiro de 3s (429 pede pausa); 3ª fonte: último preço do próprio
+#       histórico ML (ml_price_history, <24h) rotulado "last-good (N min)".
+#       Rótulo de fonte segue honesto em todas as saídas.
+#
+# Flag: FACTORY_LASTGOOD=0 desliga o cache da fábrica (retry continua).
+# | base: v48.33.1-STABILITY
+# ===========================================================================
+
+# ---------------------------------------------------- (1) FACTORY FETCH v2 --
+FACTORY_TIMEOUT_S = float(os.environ.get("FACTORY_TIMEOUT_S", "20"))  # noqa: F811
+_FACTORY_LG_ON = os.environ.get("FACTORY_LASTGOOD", "1") != "0"
+_FACTORY_LG_FILE = "factory_lastgood.json"
+_FACTORY_LG_MAX_AGE_S = 86400
+
+
+def _factory_lg_key(url_final: str, pick: str) -> str:
+    import hashlib
+    return hashlib.sha1(f"{url_final}|{pick}".encode()).hexdigest()[:16]
+
+
+def _factory_lg_read() -> dict:
+    try:
+        p = HOME_DIR / _FACTORY_LG_FILE
+        if p.exists():
+            return json.loads(p.read_text() or "{}")
+    except Exception:
+        pass
+    return {}
+
+
+def _factory_lg_write(d: dict) -> None:
+    try:
+        if len(d) > 200:  # higiene: guarda só as 200 mais recentes
+            d = dict(sorted(d.items(), key=lambda kv: kv[1].get("ts", 0))[-200:])
+        (HOME_DIR / _FACTORY_LG_FILE).write_text(json.dumps(d, default=str))
+    except Exception:
+        pass
+
+
+_FACTORY_CTX = threading.local()  # probe=True ⇒ sonda mede o upstream real
+
+
+def _factory_fetch(spec, params, _allow_cache=True):  # noqa: F811 — 48.33.2
+    """Executa a chamada real ao upstream (sonda de criação E handler em
+    produção). (ok, data|erro). v48.33.2: retry 1× (2s) + last-good 24h
+    marcado stale — fonte free lenta/flapping não vira mais 502 charged.
+    Em modo sonda (probe), o cache é ignorado: produto novo só entra no ar
+    com o upstream respondendo DE VERDADE naquele instante."""
+    from urllib.parse import quote
+    url = str(spec.get("upstream") or "")
+    for k, v in (params or {}).items():
+        url = url.replace("{" + str(k) + "}", quote(str(v), safe=""))
+    if "{" in url or "}" in url:
+        return False, "missing required param"
+    ok_u, why_u = _factory_upstream_ok(url)
+    if not ok_u:
+        return False, f"upstream blocked: {why_u}"
+    _probe_mode = bool(getattr(_FACTORY_CTX, "probe", False))
+    _use_cache = _FACTORY_LG_ON and _allow_cache and not _probe_mode
+    pick = str(spec.get("pick") or "").strip()
+    if pick:
+        for k, v in (params or {}).items():
+            pick = pick.replace("{" + str(k) + "}", str(v))
+
+    def _once():
+        r = requests.get(url, timeout=FACTORY_TIMEOUT_S,
+                         headers={"User-Agent": "Losbeto-Factory/1.0 "
+                                  "(+https://api.losbeto.xyz)",
+                                  "Accept": "application/json"})
+        if r.status_code != 200:
+            return False, f"upstream HTTP {r.status_code}"
+        if len(r.content or b"") > FACTORY_MAX_BYTES:
+            return False, "upstream response too large"
+        data = r.json()
+        if pick:
+            node = data
+            for part in pick.split("."):
+                if part == "":
+                    continue
+                if isinstance(node, dict):
+                    node = node.get(part)
+                elif isinstance(node, list) and part.isdigit():
+                    i = int(part)
+                    node = node[i] if 0 <= i < len(node) else None
+                else:
+                    return False, f"pick lost at '{part}'"
+            if node is None:
+                return False, "pick resolved to null"
+            data = node
+        return True, data
+
+    err = "unknown"
+    for tentativa in range(2):
+        ok, out = _once()
+        if ok:
+            if _use_cache:
+                try:
+                    lg = _factory_lg_read()
+                    lg[_factory_lg_key(url, pick)] = {"ts": int(time.time()),
+                                                      "data": out}
+                    _factory_lg_write(lg)
+                except Exception:
+                    pass
+            return True, out
+        err = out
+        if tentativa == 0:
+            time.sleep(2)  # respiro — transitório de fonte free costuma passar
+
+    # last-good: melhor um dado declarado velho que um 502 cobrado
+    if _use_cache:
+        try:
+            rec = (_factory_lg_read() or {}).get(_factory_lg_key(url, pick))
+            if rec and time.time() - float(rec.get("ts", 0)) < _FACTORY_LG_MAX_AGE_S:
+                data = rec.get("data")
+                age = int(time.time() - float(rec.get("ts", 0)))
+                if isinstance(data, dict):
+                    data = dict(data)
+                    data["stale"] = True
+                    data["served_from"] = "last-good cache"
+                    data["age_s"] = age
+                    data["upstream_error"] = str(err)[:120]
+                log.info(f"🏭 factory last-good: {spec.get('path') or url[:40]} "
+                         f"servido do cache ({age}s) — upstream: {str(err)[:60]}")
+                return True, data
+        except Exception:
+            pass
+    return False, str(err)[:160]
+
+
+# --- a sonda de criação (ramo factory_product do _ops_apply) em probe-mode --
+_OPS_APPLY_48331 = _ops_apply
+
+
+def _ops_apply(action, actor):  # noqa: F811 — camada 48.33.2
+    """Sonda honesta: durante a aprovação de um factory_product, o last-good
+    é desligado — o upstream precisa responder de verdade para o produto
+    entrar no ar (thread-local: requests pagos em outras threads seguem com
+    cache normal)."""
+    if isinstance(action, dict) and action.get("action") == "factory_product":
+        _FACTORY_CTX.probe = True
+        try:
+            return _OPS_APPLY_48331(action, actor)
+        finally:
+            _FACTORY_CTX.probe = False
+    return _OPS_APPLY_48331(action, actor)
+
+
+# ------------------------------------------------------ (2) _sym_price v2 ---
+def _sym_price(symbol):  # noqa: F811 — camada 48.33.2
+    """Preço USD do símbolo do universo _FC_FEEDS: Pyth (com retry) →
+    CoinGecko (com retry + respiro p/ 429) → último preço do histórico ML
+    (<24h, rotulado last-good). Rótulo de fonte SEMPRE honesto."""
+    sym = symbol.upper()
+    fid, cg = _FC_FEEDS[sym]
+    for tentativa in range(2):
+        try:
+            p = _pyth_latest([fid])[fid.lower().lstrip("0x")]
+            pd2 = p.get("price", {})
+            price = float(pd2.get("price", 0)) * (10 ** float(pd2.get("expo", 0)))
+            conf = float(pd2.get("conf", 0)) * (10 ** float(pd2.get("expo", 0)))
+            if price > 0:
+                return {"price": price, "conf": round(conf, 6),
+                        "source": "Pyth Network"}
+        except Exception:
+            if tentativa == 0:
+                time.sleep(2)  # transitório de rede no Hermes
+    for tentativa in range(2):
+        try:
+            j = _cg_simple_prices([cg])
+            price = float((j.get(cg) or {}).get("usd", 0))
+            if price > 0:
+                return {"price": price, "conf": None,
+                        "source": "CoinGecko (Pyth fallback)"}
+        except Exception:
+            if tentativa == 0:
+                time.sleep(3)  # 429 do free tier pede pausa, não martelo
+    try:
+        with LEDGER._conn() as c:  # leitura WAL sem lock (padrão v48.3.2)
+            row = c.execute(
+                "SELECT ts, price FROM ml_price_history WHERE symbol=? "
+                "ORDER BY ts DESC LIMIT 1", (sym,)).fetchone()
+        if row and row[1] and float(row[1]) > 0 \
+                and time.time() - float(row[0]) < 86400:
+            age = int(time.time() - float(row[0]))
+            log.info(f"💲 {sym}: last-good servido ({age}s) — Pyth e CG fora")
+            return {"price": float(row[1]), "conf": None,
+                    "source": f"last-good ({age // 60} min) — Pyth/CoinGecko "
+                              "indisponíveis"}
+    except Exception:
+        pass
+    raise RuntimeError("sem preco em nenhuma fonte")
+
+
+VERSION = "48.33.2-FACTORYCARE"  # v48.33.2-FACTORYCARE: fim do 502-charged em falha transitória — fábrica com timeout 20s + retry 2s + last-good 24h marcado stale (causa do /telescope falhar nas duas rails: NASA read timeout 8s) · _sym_price com retry Pyth (2s) + retry CoinGecko c/ respiro 3s p/ 429 + 3ª fonte last-good do ml_price_history (causa do /pyth-price falhar 2 dias seguidos) · FACTORY_LASTGOOD=0 desliga o cache | base: v48.33.1-STABILITY
+log.warning("🏭 v48.33.2-FACTORYCARE ativo — fábrica com retry+last-good 24h "
+            "· _sym_price com Pyth/CG retry + last-good ML (rótulo honesto)")
