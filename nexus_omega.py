@@ -37922,3 +37922,115 @@ VERSION = "48.33.3-CLEANSLATE"  # v48.33.3-CLEANSLATE: auditoria profunda — ba
 log.warning("🧹 v48.33.3-CLEANSLATE ativo — backlog anti-fuzz (planner sem "
             "lixo de scanner) · /service-worker.js no-op · CAIP-2/AVM "
             "documentado")
+
+
+# ===========================================================================
+# v48.33.4-HOTFIX — 23/out (camada terminal; nada acima é tocado).
+#
+# BUG REAL introduzido pela 48.33.2 (provado no log: 5× "Exception on
+# /ops/panel [GET]" ao aprovar a proposta #77 /horizon): a _factory_fetch
+# original tinha try/except cobrindo TUDO — timeout/conexão do upstream
+# virava (False, erro) e a sonda falhava LIMPA. A reescrita com retry +
+# last-good deixou o requests.get sem proteção: exceção de rede subia e
+# derrubava o painel inteiro com "internal". A proposta ficava pendente e
+# cada clique em ✅ repetia o 500.
+# Fix: o loop de retry captura a exceção por tentativa — o contrato
+# "nunca levanta" está restaurado, com retry e last-good intactos.
+# (Lição registrada: camada que reescreve função defensiva preserva o
+# try/except total da original.)
+# | base: v48.33.3-CLEANSLATE
+# ===========================================================================
+
+def _factory_fetch(spec, params, _allow_cache=True):  # noqa: F811 — 48.33.4
+    """(ok, data|erro) — NUNCA levanta. retry 1× (2s) + last-good 24h stale.
+    Em probe-mode (sonda de criação) o cache é ignorado."""
+    from urllib.parse import quote
+    try:
+        url = str(spec.get("upstream") or "")
+        for k, v in (params or {}).items():
+            url = url.replace("{" + str(k) + "}", quote(str(v), safe=""))
+        if "{" in url or "}" in url:
+            return False, "missing required param"
+        ok_u, why_u = _factory_upstream_ok(url)
+        if not ok_u:
+            return False, f"upstream blocked: {why_u}"
+        pick = str(spec.get("pick") or "").strip()
+        if pick:
+            for k, v in (params or {}).items():
+                pick = pick.replace("{" + str(k) + "}", str(v))
+    except Exception as e:
+        return False, f"spec inválida: {str(e)[:120]}"
+
+    def _once():
+        r = requests.get(url, timeout=FACTORY_TIMEOUT_S,
+                         headers={"User-Agent": "Losbeto-Factory/1.0 "
+                                  "(+https://api.losbeto.xyz)",
+                                  "Accept": "application/json"})
+        if r.status_code != 200:
+            return False, f"upstream HTTP {r.status_code}"
+        if len(r.content or b"") > FACTORY_MAX_BYTES:
+            return False, "upstream response too large"
+        data = r.json()
+        if pick:
+            node = data
+            for part in pick.split("."):
+                if part == "":
+                    continue
+                if isinstance(node, dict):
+                    node = node.get(part)
+                elif isinstance(node, list) and part.isdigit():
+                    i = int(part)
+                    node = node[i] if 0 <= i < len(node) else None
+                else:
+                    return False, f"pick lost at '{part}'"
+            if node is None:
+                return False, "pick resolved to null"
+            data = node
+        return True, data
+
+    _probe_mode = bool(getattr(_FACTORY_CTX, "probe", False))
+    _use_cache = _FACTORY_LG_ON and _allow_cache and not _probe_mode
+
+    err = "unknown"
+    for tentativa in range(2):
+        try:
+            ok, out = _once()
+        except Exception as e:
+            ok, out = False, str(e)[:160]   # ← o fix: timeout/rede não levanta
+        if ok:
+            if _use_cache:
+                try:
+                    lg = _factory_lg_read()
+                    lg[_factory_lg_key(url, pick)] = {"ts": int(time.time()),
+                                                      "data": out}
+                    _factory_lg_write(lg)
+                except Exception:
+                    pass
+            return True, out
+        err = out
+        if tentativa == 0:
+            time.sleep(2)
+
+    if _use_cache:
+        try:
+            rec = (_factory_lg_read() or {}).get(_factory_lg_key(url, pick))
+            if rec and time.time() - float(rec.get("ts", 0)) < _FACTORY_LG_MAX_AGE_S:
+                data = rec.get("data")
+                age = int(time.time() - float(rec.get("ts", 0)))
+                if isinstance(data, dict):
+                    data = dict(data)
+                    data["stale"] = True
+                    data["served_from"] = "last-good cache"
+                    data["age_s"] = age
+                    data["upstream_error"] = str(err)[:120]
+                log.info(f"🏭 factory last-good: {url[:40]} servido do cache "
+                         f"({age}s) — upstream: {str(err)[:60]}")
+                return True, data
+        except Exception:
+            pass
+    return False, str(err)[:160]
+
+
+VERSION = "48.33.4-HOTFIX"  # v48.33.4-HOTFIX: _factory_fetch volta a NUNCA levantar (o retry da 48.33.2 deixou requests.get sem try/except — timeout de upstream derrubava /ops/panel com 'internal' ao aprovar proposta; 5× no log, proposta #77). Sonda limpa, retry e last-good intactos | base: v48.33.3-CLEANSLATE
+log.warning("🔧 v48.33.4-HOTFIX ativo — _factory_fetch nunca levanta; "
+            "sonda de fábrica falha limpa (sem 500 no painel)")
