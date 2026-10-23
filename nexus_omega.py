@@ -37825,3 +37825,100 @@ def _sym_price(symbol):  # noqa: F811 — camada 48.33.2
 VERSION = "48.33.2-FACTORYCARE"  # v48.33.2-FACTORYCARE: fim do 502-charged em falha transitória — fábrica com timeout 20s + retry 2s + last-good 24h marcado stale (causa do /telescope falhar nas duas rails: NASA read timeout 8s) · _sym_price com retry Pyth (2s) + retry CoinGecko c/ respiro 3s p/ 429 + 3ª fonte last-good do ml_price_history (causa do /pyth-price falhar 2 dias seguidos) · FACTORY_LASTGOOD=0 desliga o cache | base: v48.33.1-STABILITY
 log.warning("🏭 v48.33.2-FACTORYCARE ativo — fábrica com retry+last-good 24h "
             "· _sym_price com Pyth/CG retry + last-good ML (rótulo honesto)")
+
+
+# ===========================================================================
+# v48.33.3-CLEANSLATE — 23/out (camada terminal; nada acima é tocado).
+#
+# Auditoria profunda pedida pelo operador após alerta externo. Resultados da
+# varredura estática (37,8k linhas): 0 bare-except · 0 rotas duplicadas ·
+# 0 dívidas reais marcadas · redefinições só as intencionais de camada.
+# O que a auditoria ACHOU de verdade (medido no painel/logs, não na teoria):
+#
+#   (1) BACKLOG ANTI-FUZZ — o radar de 404s tratava scanner de segurança
+#       como demanda de produto: /zzq-not-a-real-route-7f3 (canário de
+#       fuzzer), /api/config e /service-worker.js chegaram à fila e um foi
+#       APROVADO por engano. Agora o backlog do planner filtra: (a) padrões
+#       de security-scan (wp-*, .env, xmlrpc, actuator, config, php/asp/jsp…)
+#       e (b) extensões de arquivo estático (.js/.css/.png/.xml/…) — produto
+#       x402 é dado, não arquivo. O llm-planner deixa de gastar cota Groq
+#       analisando lixo e o painel para de propor fuzzing.
+#   (2) /service-worker.js — variante longa que browsers pedem (estava no
+#       radar e na fila como "produto" — errado: é arquivo estático). Agora
+#       serve o mesmo no-op do /sw.js. Demanda atendida, fila limpa.
+#
+# Nota CAIP-2/Algorand (auditoria do email SpendPreflight): a string
+# anunciada "algorand:wGHE2…=" segue EXATAMENTE a implementação de
+# referência @x402/avm e o único facilitador AVM (GoPlausible /supported).
+# A forma CAIP-2-namespace estrita (url-safe, 32 chars, sem "=") NÃO é
+# aceita pelo facilitador — mudar o anúncio quebraria a rail. Divergência
+# upstream documentada; entrada e settle seguem a referência x402 AVM.
+#
+# | base: v48.33.2-FACTORYCARE
+# ===========================================================================
+
+# ------------------------------------------------ (1) BACKLOG ANTI-FUZZ -----
+_FUZZ_SUBSTR = (
+    "zzq", "wp-admin", "wp-content", "wp-includes", "wordpress", ".env",
+    ".git", "xmlrpc", "phpmyadmin", "pma", "/admin", "administrator",
+    "actuator", "server-status", "server-info", "web.config", ".aws",
+    ".ssh", "cgi-bin", "/vendor/", "/config", "configuration", "/debug",
+    "/trace", "elmah", "boaform", "hudson", "jenkins", "manager/html",
+    "/solr", "struts", "invoker", ".php", ".asp", ".jsp", ".do", "/owa/",
+    "/ecp/", "autodiscover", "/mifs/", "fgt_lang", "/geoserver", "/kibana",
+    "/console/", "phpinfo", "eval-stdin", "/_profiler", "/telescope/requests",
+    ".bak", ".old", ".swp", ".sql", "/dump", "/backup", "db.sql",
+)
+_STATIC_EXT = (".js", ".css", ".map", ".png", ".jpg", ".jpeg", ".gif",
+               ".ico", ".svg", ".xml", ".txt", ".woff", ".woff2", ".ttf",
+               ".eot", ".pdf", ".webp", ".mp4", ".webmanifest")
+
+
+def _is_fuzz_or_static(path: str) -> bool:
+    p = str(path or "").lower()
+    if not p:
+        return True
+    if any(p.endswith(ext) for ext in _STATIC_EXT):
+        return True  # produto x402 é dado; arquivo estático não é produto
+    return any(s in p for s in _FUZZ_SUBSTR)
+
+
+_CORTEX_BACKLOG_48332 = _cortex_backlog
+
+
+def _cortex_backlog(days: int = 7, min_ips: int = 3, limit: int = 12):  # noqa: F811
+    """Backlog do planner sem lixo de scanner: fuzzing de segurança e
+    extensões estáticas nunca viram proposta de produto. O radar do /live
+    segue vendo tudo (telemetria intacta) — o filtro é só na porta do
+    planejador, que é onde lixo virava fila/proposta e gastava LLM."""
+    rows = _CORTEX_BACKLOG_48332(days, min_ips, limit * 3)
+    out = []
+    for b in rows:
+        p = b.get("requested_path") if isinstance(b, dict) else None
+        if p and _is_fuzz_or_static(p):
+            log.debug(f"backlog anti-fuzz: {p} descartado (scanner/estático)")
+            continue
+        out.append(b)
+        if len(out) >= limit:
+            break
+    return out
+
+
+# ------------------------------------------------ (2) /service-worker.js ----
+@app.route("/service-worker.js")
+def v48333_service_worker_alias():
+    """Variante longa que browsers/PWAs pedem (estava no radar como demanda
+    e na fila como 'produto' — errado nas duas: é arquivo estático)."""
+    return app.response_class(
+        "// losbeto service-worker.js — no-op deliberado (v48.33.3): "
+        "mesmo papel do /sw.js; sem cache, sem fetch handler.\n"
+        "self.addEventListener('install', e => self.skipWaiting());\n"
+        "self.addEventListener('activate', e => e.waitUntil("
+        "self.clients.claim()));\n",
+        mimetype="application/javascript")
+
+
+VERSION = "48.33.3-CLEANSLATE"  # v48.33.3-CLEANSLATE: auditoria profunda — backlog do planner ganha filtro anti-fuzzing (security-scan e arquivos estáticos nunca viram proposta de produto: fim do /zzq e /api/config na fila; menos cota LLM gasta em lixo) · /service-worker.js serve o no-op do sw.js (demanda de browser atendida; fora da fila de produto) · nota CAIP-2/Algorand documentada: seguimos a referência @x402/avm + facilitador; a forma estrita quebraria o settle — divergência upstream | base: v48.33.2-FACTORYCARE
+log.warning("🧹 v48.33.3-CLEANSLATE ativo — backlog anti-fuzz (planner sem "
+            "lixo de scanner) · /service-worker.js no-op · CAIP-2/AVM "
+            "documentado")
