@@ -38034,3 +38034,44 @@ def _factory_fetch(spec, params, _allow_cache=True):  # noqa: F811 — 48.33.4
 VERSION = "48.33.4-HOTFIX"  # v48.33.4-HOTFIX: _factory_fetch volta a NUNCA levantar (o retry da 48.33.2 deixou requests.get sem try/except — timeout de upstream derrubava /ops/panel com 'internal' ao aprovar proposta; 5× no log, proposta #77). Sonda limpa, retry e last-good intactos | base: v48.33.3-CLEANSLATE
 log.warning("🔧 v48.33.4-HOTFIX ativo — _factory_fetch nunca levanta; "
             "sonda de fábrica falha limpa (sem 500 no painel)")
+
+
+# ===========================================================================
+# v48.33.5-BUNDLEBAN — 24/out (camada terminal; nada acima é tocado).
+#
+# Recorrência medida: /chain-tx falhou no /bundle 2× em 22/out e 2× em
+# 23/out (estornos automáticos — MRVA + cliente externo). O BUNDLEWATCH
+# (48.31.7) bane por 24h, mas a janela expira e o endpoint re-entra na
+# auto-seleção e falha de novo — o autopick não injeta params e /chain-tx
+# exige hash obrigatório (_PARAM_REQUIRED) sem exemplo em
+# ENDPOINT_PARAM_HINTS. Regra nova: ≥3 falhas acumuladas no registro
+# persistente (/data) = fora da AUTO-seleção até se provar — o ban deixa de
+# ser só "24h" e passa a ter memória longa. Compra explícita via ?paths=
+# continua livre (com estorno se falhar), como sempre foi.
+# | base: v48.33.4-HOTFIX
+# ===========================================================================
+
+_BUNDLE_AUTO_48334 = _bundle_auto_paths  # cadeia vigente (48.31.8)
+
+
+def _bundle_auto_paths(ip, n):  # noqa: F811 — camada 48.33.5
+    """Auto-seleção = cadeia anterior + memória longa: quem acumulou ≥3
+    falhas de bundle no registro persistente não volta mais pelo piloto
+    automático (o ban de 24h sozinho deixava /chain-tx re-entrar e falhar
+    toda semana — 4 estornos medidos em 22–23/out)."""
+    paths = _BUNDLE_AUTO_48334(ip, n + 3)
+    out = []
+    for p in paths:
+        try:
+            d = _ops_read_json(_BUNDLE_FAIL_FILE, {})
+            if len(d.get(p) or []) >= 3:
+                continue  # falhão crônico (ex.: /chain-tx) — ban duradouro
+        except Exception:
+            pass
+        out.append(p)
+    return out[:n]
+
+
+VERSION = "48.33.5-BUNDLEBAN"  # v48.33.5-BUNDLEBAN: auto-seleção do /bundle com memória longa — ≥3 falhas acumuladas no registro persistente = fora da auto-seleção até se provar (fim da recorrência /chain-tx: 4 estornos em 22–23/out; o ban de 24h expirava e ele voltava a falhar) · ?paths= explícito segue livre | base: v48.33.4-HOTFIX
+log.warning("🧺 v48.33.5-BUNDLEBAN ativo — auto-seleção de bundle com ban "
+            "duradouro p/ falhão crônico (≥3 falhas acumuladas)")
