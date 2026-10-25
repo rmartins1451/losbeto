@@ -38075,3 +38075,100 @@ def _bundle_auto_paths(ip, n):  # noqa: F811 — camada 48.33.5
 VERSION = "48.33.5-BUNDLEBAN"  # v48.33.5-BUNDLEBAN: auto-seleção do /bundle com memória longa — ≥3 falhas acumuladas no registro persistente = fora da auto-seleção até se provar (fim da recorrência /chain-tx: 4 estornos em 22–23/out; o ban de 24h expirava e ele voltava a falhar) · ?paths= explícito segue livre | base: v48.33.4-HOTFIX
 log.warning("🧺 v48.33.5-BUNDLEBAN ativo — auto-seleção de bundle com ban "
             "duradouro p/ falhão crônico (≥3 falhas acumuladas)")
+
+
+# ===========================================================================
+# v48.33.6-FUZZWALL — 25/out (camada terminal; nada acima é tocado).
+#
+# Medido no painel de decisões: a fila de produto aprovada tinha 8 paths
+# que são credential-hunting PURO — /.netrc, /keyfile.json, /sa.json (GCP
+# service account), /aws.json, /terraform.tfvars, /terraform.tfstate,
+# /asset-manifest.json, /api/settings — scanner procurando SEGREDO, não
+# demanda de produto. O anti-fuzz da 48.33.3 cobria wp-*/.env/config… mas
+# não "settings", não ".json" final, não os arquivos-clássico de credencial.
+# Duas frentes:
+#
+#   (1) FILTRO AMPLIADO — _is_fuzz_or_static ganha a classe credential-hunter
+#       (netrc/keyfile/terraform/credentials/secrets/sa.json/aws.json/
+#       kubeconfig/wp-config/.npmrc/id_rsa…) e as extensões de config/
+#       dados estáticos (.json .yaml .yml .toml .ini .cfg .conf .log .sql).
+#       Os .json de documento do nó (actions.json, auth.json…) são rota viva
+#       — já saem do backlog antes deste filtro; aqui só chega o que NÃO
+#       existe. Planner nunca mais gasta LLM propondo caça-segredo.
+#   (2) LIMPEZA DA FILA (1× no boot, idempotente) — os paths de credencial
+#       JÁ aprovados saem da product_queue e viram decisão "rejected" na
+#       memória longa (planner não repõe por 30d). Com TG-aviso da limpeza.
+#
+# | base: v48.33.5-BUNDLEBAN
+# ===========================================================================
+
+# --- (1) filtro ampliado (a 48.33.3 chama este nome — pega a versão nova) --
+_IS_FUZZ_48333 = _is_fuzz_or_static
+
+_FUZZ_CREDENTIALS = (
+    "settings", ".netrc", "keyfile", "terraform", "credentials", "secret",
+    "wp-config", ".npmrc", ".pgpass", "id_rsa", ".htpasswd", "kubeconfig",
+    "aws.json", "sa.json", "client_secret", ".docker", "gcloud", "azure",
+    "webhooks", "/.svn", "/.hg", ".gitconfig", "docker-compose",
+)
+_STATIC_EXT_48336 = _STATIC_EXT + (
+    ".json", ".yaml", ".yml", ".toml", ".ini", ".cfg", ".conf", ".log",
+    ".sql", ".db", ".sqlite", ".pem", ".key", ".p12", ".jks", ".env",
+)
+
+
+def _is_fuzz_or_static(path: str) -> bool:  # noqa: F811 — camada 48.33.6
+    p = str(path or "").lower()
+    if not p:
+        return True
+    if any(p.endswith(ext) for ext in _STATIC_EXT_48336):
+        return True
+    if any(s in p for s in _FUZZ_CREDENTIALS):
+        return True
+    return _IS_FUZZ_48333(p)
+
+
+# --- (2) limpeza única da fila de produto (boot; idempotente) ---------------
+def _fuzzwall_queue_sweep():
+    """Paths de credential-hunting já aprovados saem da fila e viram
+    'rejected' na memória de decisões — o planner não repropõe por 30d."""
+    try:
+        q = _ops_read_json(_OPS_PRODUCT_QUEUE, [])
+        if not isinstance(q, list) or not q:
+            return
+        keep, dropped = [], []
+        for it in q:
+            p = str((it or {}).get("path") or "")
+            if p and _is_fuzz_or_static(p):
+                dropped.append(p)
+                try:
+                    _ops_decision_record(
+                        {"action": "queue_product", "path": p},
+                        "rejected", "fuzzwall")
+                except Exception:
+                    pass
+            else:
+                keep.append(it)
+        if dropped:
+            _ops_write_json(_OPS_PRODUCT_QUEUE, keep)
+            log.warning(f"🧹 FUZZWALL: {len(dropped)} path(s) de "
+                        f"credential-hunter fora da fila de produto: "
+                        f"{dropped} — marcados rejected (30d)")
+            try:
+                _notify_telegram(
+                    "🧹 *FUZZWALL* — higiene da fila de produto\n\n"
+                    f"{len(dropped)} path(s) eram caça-segredo de scanner "
+                    f"(não demanda real) e saíram da fila:\n"
+                    + "\n".join(f"• `{TelegramBot.esc(p)}`" for p in dropped)
+                    + "\n\n_Memória: rejected por 30d — o planner não repõe._")
+            except Exception:
+                pass
+    except Exception as e:
+        log.debug(f"fuzzwall sweep: {e}")
+
+
+_fuzzwall_queue_sweep()
+
+VERSION = "48.33.6-FUZZWALL"  # v48.33.6-FUZZWALL: o painel aprovou 8 paths que eram credential-hunting puro (/.netrc /keyfile.json /sa.json /aws.json /terraform.tfvars/.tfstate /asset-manifest.json /api/settings) — (1) filtro anti-fuzz ampliado: classe caça-segredo + extensões de config/dados (.json/.yaml/.toml…) nunca viram proposta; (2) limpeza única da fila no boot (idempotente): os 8 saem e viram 'rejected' na memória longa do planner (30d) + aviso no TG | base: v48.33.5-BUNDLEBAN
+log.warning("🧹 v48.33.6-FUZZWALL ativo — filtro anti-credential-hunter "
+            "ampliado · fila de produto higienizada (fuzzing vira rejected)")
