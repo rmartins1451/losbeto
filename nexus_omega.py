@@ -8704,7 +8704,7 @@ def _preflight_param_check(path: str, check_required: bool = False):
         seen_invalid = None
         ok = False
         for name, pat, ex in group:
-            raw = request.args.get(name)
+            raw = _pp_value(name)   # v48.35.0: query OU corpo JSON (POST)
             if raw is None or raw.strip() == "":
                 continue
             val = raw.strip()
@@ -24682,6 +24682,7 @@ def dash_api():
                                   headers={"X-Cache": "hit"})
     _resp = jsonify({
         "version":         VERSION,
+        "v4835":           _v4835_snapshot(),
         "node_id":         WALLET.node_id,
         "solana_address":  RECEIVE_ADDRESS,
         "signer_address":  WALLET.solana_address,
@@ -38450,9 +38451,345 @@ log.info("🛡 v48.34.1-GUARDFIX: /prompt-guard em _PARAM_REQUIRED — texto "
          "vazio com pagamento = 400 grátis ANTES do settle (fim do ciclo "
          "cobre→400→estorno→auto-pausa medido na rodada indexar)")
 
-VERSION = "48.34.1-GUARDFIX"  # v48.34.1-GUARDFIX: /prompt-guard entra em _PARAM_REQUIRED — o handler exige ?text= mas o endpoint não estava na barreira que devolve 400 grátis antes do settle; na rodada indexar cobrava, o handler 400ava, 3 estornos e auto-pausa. Agora texto vazio+pagamento = 400 grátis sem mover USDC (sem settle, sem estorno). /job/br-market-brief: a 'falha' do indexar foi falso positivo do critério sem-tx-hash (funil fechado 2×, sem estorno) | base: v48.34.0-GUARD
+VERSION = "48.35.0-DELIVER"  # v48.34.1-GUARDFIX: /prompt-guard entra em _PARAM_REQUIRED — o handler exige ?text= mas o endpoint não estava na barreira que devolve 400 grátis antes do settle; na rodada indexar cobrava, o handler 400ava, 3 estornos e auto-pausa. Agora texto vazio+pagamento = 400 grátis sem mover USDC (sem settle, sem estorno). /job/br-market-brief: a 'falha' do indexar foi falso positivo do critério sem-tx-hash (funil fechado 2×, sem estorno) | base: v48.34.0-GUARD
 log.warning("🛡 v48.34.1-GUARDFIX ativo — /prompt-guard com barreira de "
             "obrigatório: 400 grátis antes do settle quando falta ?text=")
+
+
+# ===========================================================================
+# v48.35.0-DELIVER — camada terminal (nada acima é reescrito; tudo abaixo é
+# aditivo e FAIL-OPEN: qualquer exceção aqui devolve o fluxo ao caminho antigo).
+#
+# Pesquisa (out/2026): o índice CDP Bazaar tem 28.087 listagens, mediana de 2
+# chamadas/30d e o 1% do topo concentra 84,1% das chamadas; o Circle Agent
+# Marketplace tem ~600 serviços curados. Agente compra de quem (a) é achado por
+# busca semântica/filtro, (b) aceita a chamada na primeira tentativa e (c) não
+# o deixa pagar sem receber. Esta camada ataca (b) e (c) — e mede (a).
+#
+#  1. ENTREGA IDEMPOTENTE. _verify_payment marca o hash do pagamento como
+#     "visto" depois do settle. Se a resposta se perde (timeout de LLM de 5-20 s,
+#     queda de rede) e o agente repete a MESMA chamada com o MESMO pagamento, ele
+#     recebia "replay-blocked" → 402: pagou e ficou sem dado. Agora a resposta
+#     entregue fica guardada por 15 min (SQLite = vale entre os 2 workers) e a
+#     repetição IDÊNTICA (mesmo método, URL e corpo) recebe o mesmo resultado,
+#     sem novo settle e sem novo handler. Parâmetros diferentes NÃO reaproveitam.
+#  2. BARREIRA GRÁTIS para POST e lacunas: /classify /summarize /extract
+#     /translate /v1/chat/completions /fetch /x402-audit /br-bizdays e
+#     /agent-reputation devolviam 400 DEPOIS do settle (→ estorno em crédito,
+#     que não é dinheiro de volta). Agora: parâmetro ausente + pagamento anexado
+#     = 400 didático ANTES de qualquer settle. (Auditoria dinâmica de todos os
+#     handlers pagos sem parâmetros: 9 lacunas achadas, fechadas.)
+#  3. TOLERÂNCIA DE PARÂMETROS. Agente guiado por LLM erra o NOME do parâmetro
+#     (Symbol, zip, wallet, link, target_lang). Se o nome canônico falta e há um
+#     alias conhecido — que não seja ele próprio canônico naquela rota — o valor
+#     é copiado. Conta o que foi "resgatado" (aparece em /dash/api/stats).
+#  4. SCHEMA DE SAÍDA REAL no Bazaar: o blob trazia só um placeholder em
+#     schema.output.example; com amostra no cache, passa a declarar o JSON
+#     Schema inferido (tipos reais) — é o que listagens curadas pedem.
+#  5. CAPTURA DE INTENÇÃO: o que agentes pedem em ?task= / ?q= (texto livre)
+#     vira ranking de intenções — backlog de produto vindo de quem pergunta.
+# ===========================================================================
+import collections as _collections
+from werkzeug.datastructures import MultiDict as _MultiDict
+
+_DELIVER_TTL_S = int(os.environ.get("DELIVER_TTL_S", "900"))
+_DELIVER_MAX_BYTES = 262144
+_DELIVERED: Dict[str, tuple] = {}
+_REPLAYS_SERVED = {"n": 0, "stored": 0}
+_ALIAS_STATS: Dict[tuple, int] = _collections.Counter()
+_INTENTS: Dict[str, int] = _collections.Counter()
+
+_ARG_ALIASES = {
+    "symbol":  ("ticker", "asset", "coin", "token", "sym", "instrument", "currency", "base"),
+    "address": ("wallet", "addr", "account", "owner", "wallet_address", "public_key", "pubkey"),
+    "text":    ("content", "input", "prompt", "body", "document", "message", "string", "data"),
+    "url":     ("link", "uri", "target_url", "endpoint_url", "page", "website", "href"),
+    "q":       ("query", "question", "search", "term", "keywords", "keyword", "prompt"),
+    "pair":    ("currency_pair", "fx", "cross", "symbol_pair"),
+    "doc":     ("document", "documento", "tax_id", "cnpj", "cpf", "value"),
+    "cnpj":    ("doc", "document", "documento", "tax_id", "cnpj_number"),
+    "cep":     ("zip", "zipcode", "zip_code", "postal", "postal_code"),
+    "hash":    ("tx", "txhash", "tx_hash", "transaction", "txid", "transaction_hash"),
+    "mint":    ("token", "token_address", "contract", "ca", "address"),
+    "date":    ("asof", "as_of", "day", "on"),
+    "from":    ("start", "start_date", "date_from", "begin"),
+    "to":      ("end", "end_date", "date_to", "target", "target_lang", "target_language", "language", "lang"),
+    "task":    ("goal", "intent", "need", "request", "instruction"),
+    "agentId": ("agent_id", "agentid", "id", "agent"),
+    "labels":  ("categories", "classes", "options", "choices", "label_set"),
+    "fields":  ("keys", "columns", "attributes", "properties"),
+    "series":  ("indicator", "serie", "metric"),
+    "name":    ("domain", "ens", "ens_name"),
+    "code":    ("brcode", "pix", "payload", "emv"),
+}
+
+
+def _nk(k: str) -> str:
+    return re.sub(r"[^a-z0-9]", "", str(k).lower())
+
+
+def _canon_params(path: str) -> set:
+    c = set((ENDPOINT_PARAM_HINTS.get(path) or {}).keys())
+    for grp in (_PARAM_REQUIRED.get(path) or []):
+        for item in grp:
+            c.add(item[0])
+    if path in ENDPOINT_BODY_SCHEMAS:
+        try:
+            c |= set((ENDPOINT_BODY_SCHEMAS[path]["schema"].get("properties") or {}).keys())
+        except Exception:
+            pass
+    c.discard("format")
+    c.discard("preview")
+    return c
+
+
+def _alias_fill(path: str, have: dict) -> dict:
+    """have: {chave_original: valor}. Devolve {canonico: valor} a acrescentar."""
+    canon = _canon_params(path)
+    if not canon:
+        return {}
+    present = {_nk(k): k for k in have}
+    add = {}
+    for c in canon:
+        if c in have and str(have[c]).strip() != "":
+            continue
+        src = present.get(_nk(c))
+        if src is None or str(have.get(src, "")).strip() == "":
+            src = None
+            for al in _ARG_ALIASES.get(c, ()):
+                if al in canon:        # alias que é canônico nesta rota: não confundir
+                    continue
+                k2 = present.get(_nk(al))
+                if k2 and str(have.get(k2, "")).strip() != "":
+                    src = k2
+                    break
+        if src is not None and src != c:
+            add[c] = have[src]
+            _ALIAS_STATS[(path, str(src)[:24], c)] += 1
+    return add
+
+
+def _pp_value(name: str):
+    v = request.args.get(name)
+    if v is not None and str(v).strip() != "":
+        return v
+    if request.method == "POST":
+        body = request.get_json(silent=True)
+        if isinstance(body, dict):
+            bv = body.get(name)
+            if bv is not None:
+                if isinstance(bv, (list, dict)):
+                    return json.dumps(bv) if bv else None
+                return str(bv)
+    return v
+
+
+_PARAM_REQUIRED.update({
+    "/classify":  [[("text", None, "My card was charged twice")],
+                   [("labels", None, "billing,shipping,technical,other")]],
+    "/summarize": [[("text", r"[\s\S]{40,}",
+                     "The central bank held the policy rate at 15% for a third meeting, "
+                     "citing sticky services inflation.")]],
+    "/extract":   [[("text", None, "Invoice 2041 from Acme, total 1250.00, due 2026-10-12")],
+                   [("schema", None, '{"total":"number"}'),
+                    ("fields", None, "invoice_number,total,due_date")]],
+    "/translate": [[("text", None, "Selic mantida em 15% ao ano")],
+                   [("to", None, "en")]],
+    "/v1/chat/completions": [[("messages", None, '[{"role":"user","content":"hello"}]'),
+                              ("prompt", None, "hello"), ("q", None, "hello")]],
+    "/fetch":     [[("url", r"^https?://", "https://example.com")]],
+    "/x402-audit": [[("url", r"^https?://", "https://api.example.com/endpoint")]],
+    "/br-bizdays": [[("from", r"^\d{4}-\d{2}-\d{2}$", "2026-01-02"),
+                     ("year", r"^\d{4}$", "2026")],
+                    [("to", r"^\d{4}-\d{2}-\d{2}$", "2026-07-01"),
+                     ("year", r"^\d{4}$", "2026")]],
+    "/agent-reputation": [[("agentId", r"^\d{1,12}$", "87048")]],
+})
+
+
+# ---- 3 + 5: normalização de parâmetros e captura de intenção (before_request)
+_INTENT_PATHS = {"/agent-call": "task", "/api/v1/best": "task", "/web-search": "q",
+                 "/research-brief": "q", "/llm": "q"}
+
+
+@app.before_request
+def _v4835_args_and_intents():
+    try:
+        path = request.path
+        if path not in BASE_PRICES or request.method not in ("GET", "POST"):
+            return None
+        # 3a) query string
+        if request.args:
+            add = _alias_fill(path, {k: request.args.get(k) for k in request.args.keys()})
+            if add:
+                md = _MultiDict(request.args)
+                for k, v in add.items():
+                    md[k] = v
+                request.__dict__["args"] = md
+        # 3b) corpo JSON
+        if request.method == "POST":
+            body = request.get_json(silent=True)
+            if isinstance(body, dict) and body:
+                addb = _alias_fill(path, body)
+                if addb:
+                    nb = dict(body)
+                    nb.update(addb)
+                    request._cached_json = (nb, nb)
+        # 5) intenção em texto livre
+        key = _INTENT_PATHS.get(path)
+        if key:
+            t = (request.args.get(key) or "").strip().lower()
+            if 6 <= len(t) <= 160 and not t.startswith(("your prompt", "hello", "fear and greed index")):
+                if len(_INTENTS) >= 600 and t not in _INTENTS:
+                    for k_, _v in _INTENTS.most_common()[:-100]:
+                        _INTENTS.pop(k_, None)
+                _INTENTS[t] += 1
+    except Exception as e:
+        log.debug(f"v48.35 args/intents: {e}")
+    return None
+
+
+# ---- 1: entrega idempotente --------------------------------------------------
+def _pay_sig():
+    return (request.headers.get("X-PAYMENT") or request.headers.get("X-Payment")
+            or request.headers.get("PAYMENT-SIGNATURE") or request.headers.get("Payment-Signature"))
+
+
+def _deliver_fp() -> str:
+    return hashlib.sha256(b"|".join([request.method.encode(), request.path.encode(),
+                                     request.query_string, request.get_data()])).hexdigest()
+
+
+@app.before_request
+def _v4835_replay_delivered():
+    try:
+        if request.method not in ("GET", "POST") or request.path not in BASE_PRICES:
+            return None
+        sig = _pay_sig()
+        if not sig:
+            return None
+        h = hashlib.sha256(sig.strip().encode()).hexdigest()
+        now = time.time()
+        hit = _DELIVERED.get(h)
+        if hit is None:
+            row = LEDGER.cache_get("dlv:" + h, _DELIVER_TTL_S)
+            if row:
+                hit = (row["ts"], row["fp"], row["status"], row["body"], row["mime"], row["hdr"])
+        if not hit or now - hit[0] > _DELIVER_TTL_S or hit[1] != _deliver_fp():
+            return None
+        resp = app.response_class(hit[3], status=hit[2], mimetype=hit[4])
+        for k, v in (hit[5] or {}).items():
+            resp.headers[k] = v
+        resp.headers["X-Payment-Replay"] = "delivered-from-cache"
+        resp.headers["Access-Control-Expose-Headers"] = (
+            resp.headers.get("Access-Control-Expose-Headers", "") + ",X-Payment-Replay").strip(",")
+        _REPLAYS_SERVED["n"] += 1
+        log.info(f"♻️ entrega idempotente {request.path}: retry do mesmo pagamento "
+                 f"servido do cache (sem novo settle)")
+        return resp
+    except Exception as e:
+        log.debug(f"v48.35 replay lookup: {e}")
+        return None
+
+
+_DELIVER_HDRS = ("PAYMENT-RESPONSE", "X-PAYMENT-RESPONSE", "Payment-Receipt", "X-Session-Token",
+                 "X-Session-TTL", "X-First-Call-Bonus", "X-Next-Step", "X-Savings-Tip")
+
+
+@app.after_request
+def _v4835_store_delivered(resp):
+    try:
+        if (request.method not in ("GET", "POST") or request.path not in BASE_PRICES
+                or not (200 <= resp.status_code < 300) or resp.direct_passthrough
+                or "PAYMENT-RESPONSE" not in resp.headers):
+            return resp
+        if "X-Payment-Replay" in resp.headers:
+            return resp
+        sig = _pay_sig()
+        if not sig:
+            return resp
+        body = resp.get_data()
+        if not body or len(body) > _DELIVER_MAX_BYTES:
+            return resp
+        h = hashlib.sha256(sig.strip().encode()).hexdigest()
+        rec = {"ts": time.time(), "fp": _deliver_fp(), "status": resp.status_code,
+               "body": body.decode("utf-8", "replace"), "mime": resp.mimetype,
+               "hdr": {k: resp.headers[k] for k in _DELIVER_HDRS if k in resp.headers}}
+        if len(_DELIVERED) > 500:
+            for k_ in sorted(_DELIVERED, key=lambda x: _DELIVERED[x][0])[:100]:
+                _DELIVERED.pop(k_, None)
+        _DELIVERED[h] = (rec["ts"], rec["fp"], rec["status"], rec["body"], rec["mime"], rec["hdr"])
+        LEDGER.cache_set("dlv:" + h, rec)
+        _REPLAYS_SERVED["stored"] += 1
+    except Exception as e:
+        log.debug(f"v48.35 store delivered: {e}")
+    return resp
+
+
+# ---- 4: JSON Schema de saída inferido da amostra real -------------------------
+def _infer_schema(v, depth: int = 0):
+    if isinstance(v, bool):
+        return {"type": "boolean"}
+    if isinstance(v, int):
+        return {"type": "integer"}
+    if isinstance(v, float):
+        return {"type": "number"}
+    if isinstance(v, str):
+        return {"type": "string"}
+    if v is None:
+        return {}
+    if isinstance(v, list):
+        return {"type": "array", "items": (_infer_schema(v[0], depth + 1) if v and depth < 3 else {})}
+    if isinstance(v, dict):
+        if depth >= 3:
+            return {"type": "object"}
+        return {"type": "object",
+                "properties": {str(k)[:48]: _infer_schema(x, depth + 1) for k, x in list(v.items())[:30]}}
+    return {}
+
+
+_BAZAAR_BLOB_PREV = globals()["_bazaar_blob"]
+
+
+def _bazaar_blob_v4835(endpoint):
+    blob = _BAZAAR_BLOB_PREV(endpoint)
+    try:
+        ex = (((blob.get("info") or {}).get("output") or {}).get("example"))
+        if isinstance(ex, dict) and ex:
+            sch = _infer_schema(ex)
+            outp = (((blob.get("schema") or {}).get("properties") or {}).get("output"))
+            if isinstance(outp, dict):
+                outp["properties"] = {"example": sch}
+            if len(json.dumps(sch)) <= 700:     # duplicata só quando pequena (header ~8KB)
+                blob["outputSchema"] = sch
+            if len(json.dumps(blob, default=str)) > 5200:   # header PAYMENT-REQUIRED tem teto prático (~8KB)
+                blob.pop("outputSchema", None)
+                if isinstance(outp, dict):
+                    outp["properties"] = {"example": {"type": "object"}}
+    except Exception as e:
+        log.debug(f"v48.35 output schema {endpoint}: {e}")
+    return blob
+
+
+globals()["_bazaar_blob"] = _bazaar_blob_v4835
+
+
+def _v4835_snapshot() -> dict:
+    try:
+        return {
+            "replays_served": _REPLAYS_SERVED["n"], "deliveries_stored": _REPLAYS_SERVED["stored"],
+            "arg_rescues_total": int(sum(_ALIAS_STATS.values())),
+            "arg_rescues_top": [{"path": k[0], "sent": k[1], "mapped_to": k[2], "n": n}
+                                for k, n in _ALIAS_STATS.most_common(10)],
+            "intents_top": [{"ask": t, "n": n} for t, n in _INTENTS.most_common(15)],
+        }
+    except Exception:
+        return {}
+
+
+log.info("📦 v48.35.0-DELIVER ativo — entrega idempotente, barreira POST, aliases, schema de saída, intenções")
+
+# v48.35.0-DELIVER: (1) retry do MESMO pagamento ja liquidado recebe a resposta entregue (15 min, SQLite, entre workers) em vez de replay-blocked → 402 | (2) barreira de obrigatorios enxerga corpo JSON; +9 rotas (classify summarize extract translate v1/chat fetch x402-audit br-bizdays agent-reputation) | (3) aliases de parametro (Symbol/zip/wallet/link/target_lang...) com contagem | (4) JSON Schema de saida inferido da amostra real no Bazaar | (5) ranking de intencoes de ?task=/?q= no /dash/api/stats | base: v48.34.1-GUARDFIX
 
 
 # ============================================================================
@@ -38663,4 +39000,4 @@ def _chat_add(sid, who, text, ip="", ua=""):  # noqa: F811 — camada 48.35.0
             pass
     return rid
 
-VERSION = "48.35.0-CONTACT"
+VERSION = "48.36.0-CLOSE"
