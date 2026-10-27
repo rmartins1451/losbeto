@@ -38453,3 +38453,214 @@ log.info("🛡 v48.34.1-GUARDFIX: /prompt-guard em _PARAM_REQUIRED — texto "
 VERSION = "48.34.1-GUARDFIX"  # v48.34.1-GUARDFIX: /prompt-guard entra em _PARAM_REQUIRED — o handler exige ?text= mas o endpoint não estava na barreira que devolve 400 grátis antes do settle; na rodada indexar cobrava, o handler 400ava, 3 estornos e auto-pausa. Agora texto vazio+pagamento = 400 grátis sem mover USDC (sem settle, sem estorno). /job/br-market-brief: a 'falha' do indexar foi falso positivo do critério sem-tx-hash (funil fechado 2×, sem estorno) | base: v48.34.0-GUARD
 log.warning("🛡 v48.34.1-GUARDFIX ativo — /prompt-guard com barreira de "
             "obrigatório: 400 grátis antes do settle quando falta ?text=")
+
+
+# ============================================================================
+# v48.35.0-CONTACT — captura de contato no chat + resposta do operador por email
+# O visitante pergunta, a IA responde, mas se ele sai da página a resposta
+# humana posterior se perde. Agora o nó (1) detecta email/telefone/nome na
+# própria conversa e guarda por sessão, (2) avisa o operador no Telegram quando
+# um contato chega, (3) pede o contato após a resposta da IA (sem BLOQUEAR a
+# resposta — bloquear faria o lead sumir sem deixar nada), e (4) quando o
+# operador responde — tanto /r quanto REPLY nativo, pois ambos gravam via
+# _chat_add(who="operator") — envia TAMBÉM por email se houver um salvo.
+# Tudo por wrappers; a base do chat fica intacta.
+# Envs (Railway Variables, nunca no repo):
+#   CHAT_CONTACT=1 (default)
+#   SMTP_HOST / SMTP_PORT / SMTP_USER / SMTP_PASS / SMTP_FROM (Gmail: senha de APP)
+# Sem SMTP configurado o email não é enviado; o resto funciona normalmente.
+# ============================================================================
+import smtplib as _smtplib_contact
+from email.mime.text import MIMEText as _MimeTextContact
+
+CHAT_CONTACT = os.environ.get("CHAT_CONTACT", "1") != "0"
+
+def _contact_db():
+    c = _chat_db()
+    try:
+        c.execute("""CREATE TABLE IF NOT EXISTS chat_contact(
+            sid TEXT PRIMARY KEY, name TEXT, email TEXT, phone TEXT,
+            raw TEXT, asked INTEGER DEFAULT 0, ts INTEGER)""")
+        c.commit()
+    except Exception:
+        pass
+    return c
+
+def _contact_get(sid):
+    try:
+        c = _contact_db()
+        try:
+            r = c.execute("SELECT name,email,phone,asked FROM chat_contact WHERE sid=?",
+                          (sid,)).fetchone()
+        finally:
+            c.close()
+        if r:
+            return {"name": r[0] or "", "email": r[1] or "", "phone": r[2] or "",
+                    "asked": r[3] or 0}
+    except Exception:
+        pass
+    return {"name": "", "email": "", "phone": "", "asked": 0}
+
+_EMAIL_RE = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
+_PHONE_RE = re.compile(r"(\+\d[\d\s().-]{7,17}\d|\(\d{2,3}\)\s*\d{4,5}[\s-]?\d{4})")
+_NAME_RE = re.compile(r"(?:meu nome (?:é|e)|me chamo|my name is|i'?m|i am|sou|eu sou|this is)"
+                      r"\s+([A-Za-zÀ-ÿ][A-Za-zÀ-ÿ' .-]{1,50})", re.I)
+
+def _contact_extract(texto):
+    out = {"name": "", "email": "", "phone": ""}
+    if not texto:
+        return out
+    m = _EMAIL_RE.search(texto)
+    if m:
+        out["email"] = m.group(0)[:120]
+    p = _PHONE_RE.search(texto)
+    if p:
+        out["phone"] = re.sub(r"\s+", " ", p.group(0)).strip()[:30]
+    n = _NAME_RE.search(texto)
+    if n:
+        cand = _EMAIL_RE.sub("", n.group(1).strip()).strip(" .,-")
+        if 1 <= len(cand.split()) <= 4:
+            out["name"] = cand[:60]
+    return out
+
+def _contact_save(sid, found, raw=""):
+    if not (found.get("email") or found.get("phone") or found.get("name")):
+        return False
+    cur = _contact_get(sid)
+    email = found.get("email") or cur["email"]
+    phone = found.get("phone") or cur["phone"]
+    name = found.get("name") or cur["name"]
+    novo = (found.get("email") and found["email"] != cur["email"]) or \
+           (found.get("phone") and found["phone"] != cur["phone"])
+    try:
+        c = _contact_db()
+        try:
+            c.execute("INSERT OR REPLACE INTO chat_contact(sid,name,email,phone,raw,asked,ts) "
+                      "VALUES(?,?,?,?,?,?,?)",
+                      (sid, name, email, phone, (raw or "")[:200], cur["asked"], int(time.time())))
+            c.commit()
+        finally:
+            c.close()
+    except Exception:
+        pass
+    return bool(novo)
+
+def _contact_mark_asked(sid):
+    try:
+        cur = _contact_get(sid)
+        c = _contact_db()
+        try:
+            c.execute("INSERT OR REPLACE INTO chat_contact(sid,name,email,phone,raw,asked,ts) "
+                      "VALUES(?,?,?,?,?,?,?)",
+                      (sid, cur["name"], cur["email"], cur["phone"], "",
+                       (cur["asked"] or 0) + 1, int(time.time())))
+            c.commit()
+        finally:
+            c.close()
+    except Exception:
+        pass
+
+def _contact_ask_text(texto):
+    pt = bool(re.search(r"[ãõçáéíóú]|\b(você|obrigad|preço|pagar|quanto)\b",
+                        (texto or "").lower()))
+    if pt:
+        return ("📇 Para eu poder te responder mesmo se você sair desta página, "
+                "me passa seu **nome e email** (ou WhatsApp/Telegram). Assim a resposta "
+                "humana chega até você por email. Não envio spam.")
+    return ("📇 So I can reach you even after you leave this page, may I have your "
+            "**name and email** (or WhatsApp/Telegram)? That way a human reply still "
+            "finds you by email. No spam, ever.")
+
+def _send_email_contact(to_addr, subject, body):
+    host = os.environ.get("SMTP_HOST", "").strip()
+    user = os.environ.get("SMTP_USER", "").strip()
+    pw = os.environ.get("SMTP_PASS", "").strip()
+    if not (host and user and pw and to_addr):
+        return False
+    port = int(os.environ.get("SMTP_PORT", "587"))
+    sender = os.environ.get("SMTP_FROM", user).strip() or user
+    try:
+        msg = _MimeTextContact(body, "plain", "utf-8")
+        msg["Subject"] = subject
+        msg["From"] = sender
+        msg["To"] = to_addr
+        if port == 465:
+            srv = _smtplib_contact.SMTP_SSL(host, port, timeout=12)
+        else:
+            srv = _smtplib_contact.SMTP(host, port, timeout=12)
+            srv.starttls()
+        try:
+            srv.login(user, pw)
+            srv.sendmail(sender, [to_addr], msg.as_string())
+        finally:
+            try:
+                srv.quit()
+            except Exception:
+                pass
+        return True
+    except Exception as e:
+        log.warning(f"contact email: {e}")
+        return False
+
+_CHAT_AI_WORKER_ORIG_CONTACT = _chat_ai_worker
+def _chat_ai_worker(sid, texto, curto, hist_n, ua):  # noqa: F811 — camada 48.35.0
+    if CHAT_CONTACT:
+        try:
+            found = _contact_extract(texto)
+            if _contact_save(sid, found, raw=texto):
+                cc = _contact_get(sid)
+                quem = cc["name"] or "visitante"
+                meio = cc["email"] or cc["phone"]
+                _tg_send_capture(f"📇 *Contato capturado* `[{curto}]`\n\n"
+                                 f"{quem} — {meio}\n\nAgora sua resposta também sai por email.")
+        except Exception:
+            pass
+    _CHAT_AI_WORKER_ORIG_CONTACT(sid, texto, curto, hist_n, ua)
+    if not CHAT_CONTACT:
+        return
+    try:
+        cc = _contact_get(sid)
+        if cc["email"] or cc["phone"]:
+            return
+        c = _chat_db()
+        try:
+            last = c.execute("SELECT who FROM chat WHERE sid=? ORDER BY id DESC LIMIT 1",
+                             (sid,)).fetchone()
+        finally:
+            c.close()
+        if last and last[0] == "ai" and (cc["asked"] or 0) < 3:
+            _chat_add(sid, "system", _contact_ask_text(texto))
+            _contact_mark_asked(sid)
+    except Exception:
+        pass
+
+# Cobre /r E REPLY nativo: os dois gravam a resposta do operador via _chat_add.
+_CHAT_ADD_ORIG_CONTACT = _chat_add
+def _chat_add(sid, who, text, ip="", ua=""):  # noqa: F811 — camada 48.35.0
+    rid = _CHAT_ADD_ORIG_CONTACT(sid, who, text, ip, ua)
+    if who == "operator" and CHAT_CONTACT:
+        try:
+            cc = _contact_get(sid)
+            if cc["email"]:
+                nome = cc["name"] or "there"
+                body = (f"Hi {nome},\n\n{text}\n\n—\nRoberto · Losbeto\n"
+                        f"Continue the conversation: {_public_base()}/\n")
+                curto = _chat_short(sid)
+                def _bg():
+                    sent = _send_email_contact(cc["email"], "Losbeto — reply to your message", body)
+                    try:
+                        if sent:
+                            _CHAT_ADD_ORIG_CONTACT(sid, "system",
+                                "📧 This reply was also sent to your email.")
+                            _tg_send_capture(f"📧 Resposta também enviada por email para {cc['email']} `[{curto}]`")
+                        else:
+                            _tg_send_capture(f"⚠️ Email NÃO enviado para {cc['email']} `[{curto}]` — "
+                                             f"confira SMTP_HOST/USER/PASS nas Variables.")
+                    except Exception:
+                        pass
+                threading.Thread(target=_bg, daemon=True).start()
+        except Exception:
+            pass
+    return rid
+
+VERSION = "48.35.0-CONTACT"
