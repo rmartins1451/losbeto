@@ -9148,7 +9148,12 @@ def paid_endpoint(path):
             api_key = (request.headers.get("X-API-Key")
                        or request.headers.get("X-Credit-Token")
                        or request.args.get("api_key", "")).strip()
-            if api_key:
+            # v48.36.1-SEAL: PLANOS NUNCA são pagos com X-API-Key/saldo.
+            # Antes: uma key UNLIMITED (balance=-1) passava em api_key_use sem
+            # debitar nada e COMPRAVA outros planos (enterprise/founding/whale)
+            # de graça — notificava "plano vendido" sem USDC on-chain entrar.
+            # Plano é receita NOVA: exige o fluxo 402 on-chain abaixo.
+            if api_key and path not in CREDIT_PLANS:
                 cost = get_dynamic_price(path)
                 used = LEDGER.api_key_use(api_key, cost)
                 if used is not None:
@@ -39000,4 +39005,4 @@ def _chat_add(sid, who, text, ip="", ua=""):  # noqa: F811 — camada 48.35.0
             pass
     return rid
 
-VERSION = "48.36.0-CLOSE"
+VERSION = "48.36.1-SEAL"
