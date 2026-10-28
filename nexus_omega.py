@@ -9323,7 +9323,11 @@ def paid_endpoint(path):
                 if _fcb_tok:
                     try:
                         _fcb = LEDGER.cache_get(f"fcb:{_fcb_tok}", 7 * 86400)
-                        if _fcb and int(_fcb.get("n", 0)) > 0:
+                        # v48.36.3-SEAL: o bônus de 1ª compra NÃO vale para PLANOS.
+                        # Um bot comprava um endpoint de $0.001, ganhava o bônus e
+                        # "comprava" enterprise/founding de GRAÇA (sem settle, sem
+                        # USDC). Bônus vale para ENDPOINTS; plano exige on-chain.
+                        if _fcb and int(_fcb.get("n", 0)) > 0 and path not in CREDIT_PLANS:
                             # v48.26.1: obrigatório faltando → 400 didático
                             # grátis SEM queimar o bônus (a chamada não seria
                             # entregue de qualquer forma).
@@ -39073,4 +39077,4 @@ def ops_farmed_keys():
                  "Compras Pix e reembolsos nunca são tocados."),
         "keys": rows})
 
-VERSION = "48.36.2-REVOKE"
+VERSION = "48.36.3-SEAL"
