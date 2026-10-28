@@ -39006,3 +39006,71 @@ def _chat_add(sid, who, text, ip="", ua=""):  # noqa: F811 — camada 48.35.0
     return rid
 
 VERSION = "48.36.1-SEAL"
+
+
+# ============================================================================
+# v48.36.2-REVOKE — auditoria e revogação de keys de plano criadas SEM pagamento
+# Complemento do SEAL (48.36.1): o SEAL estanca o vazamento; esta camada limpa
+# o passado. Marca como SUSPEITA toda key de plano com tx_sig vazio (sem TX
+# on-chain) e payer que não é Pix. Compras Pix (tx_sig="pix:...") e reembolsos
+# (plan="refund") NUNCA entram. Fluxo em 2 passos: GET lista (dry-run), e só
+# revoga com POST ?confirm=1 — revogar = expires=0 (expira na hora, sem deletar,
+# preservando a trilha de auditoria). Protegido por DASH_TOKEN.
+# ============================================================================
+_PLAN_VALUES = {"credits", "day-pass", "week", "pro", "whale", "founding", "enterprise"}
+
+def _farmed_keys():
+    out = []
+    try:
+        with LEDGER._conn() as c:
+            rows = c.execute(
+                "SELECT key, payer, plan, balance_usd, created, expires, calls_used "
+                "FROM api_keys WHERE (tx_sig IS NULL OR tx_sig='')").fetchall()
+        now = int(time.time())
+        for key, payer, plan, bal, created, expires, used in rows:
+            if plan not in _PLAN_VALUES:
+                continue                      # refund e afins ficam fora
+            if str(payer or "").startswith("pix:"):
+                continue                      # compra Pix legítima fica fora
+            out.append({"key_prefix": key[:14] + "…", "payer": payer, "plan": plan,
+                        "balance_usd": ("unlimited" if (bal is not None and bal < 0) else bal),
+                        "created": created, "expires": expires, "calls_used": used,
+                        "active": bool(expires and expires > now)})
+        out.sort(key=lambda r: (not r["active"], -(r["created"] or 0)))
+    except Exception as e:
+        log.warning(f"farmed-keys scan: {e}")
+    return out
+
+@app.route("/ops/farmed-keys", methods=["GET", "POST"])
+def ops_farmed_keys():
+    if not _dash_token_ok(request.args.get("token", "") or request.headers.get("X-Dash-Token", "")):
+        return jsonify({"error": "forbidden"}), 403
+    rows = _farmed_keys()
+    if request.method == "POST" and request.args.get("confirm") == "1":
+        revoked, skipped = 0, 0
+        try:
+            now = int(time.time())
+            with LEDGER.lock, LEDGER._conn() as c:
+                for r in rows:
+                    if not r["active"]:
+                        skipped += 1
+                        continue
+                    c.execute("UPDATE api_keys SET expires=? WHERE key LIKE ? AND plan=? "
+                              "AND (tx_sig IS NULL OR tx_sig='')",
+                              (now - 1, r["key_prefix"].rstrip("…") + "%", r["plan"]))
+                    revoked += 1
+            _notify_telegram(f"🧹 Revogação SEAL: {revoked} key(s) de plano sem TX expiradas "
+                             f"({skipped} já inativas). Acesso farmado encerrado.")
+        except Exception as e:
+            return jsonify({"error": str(e)}), 500
+        return jsonify({"revoked": revoked, "already_inactive": skipped})
+    return jsonify({
+        "suspect_keys": len(rows),
+        "active_suspect": sum(1 for r in rows if r["active"]),
+        "note": ("Keys de plano criadas SEM TX on-chain e sem Pix = acesso obtido sem "
+                 "pagamento (vetor X-API-Key/unlimited ou partner). Revise a lista; para "
+                 "expirar as ativas, POST /ops/farmed-keys?token=<DASH_TOKEN>&confirm=1. "
+                 "Compras Pix e reembolsos nunca são tocados."),
+        "keys": rows})
+
+VERSION = "48.36.2-REVOKE"
