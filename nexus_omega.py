@@ -6162,6 +6162,14 @@ def _rl_check(ip: str, wallet: str = "") -> bool:
 def _public_base() -> str:
     return PUBLIC_URL or f"http://localhost:{X402_PORT}"
 
+
+def _mpp_realm() -> str:
+    """Host do nó para o MPP realm (v48.37)."""
+    try:
+        return _public_base().split("://")[-1].split("/")[0] or "api.losbeto.xyz"
+    except Exception:
+        return "api.losbeto.xyz"
+
 _INLINE_SAMPLE_MAX = int(os.environ.get("INLINE_SAMPLE_MAX_CHARS", "900"))
 
 def _inline_sample(endpoint: str) -> dict:
@@ -7382,7 +7390,7 @@ def _mpp_challenge(endpoint: str, primary: dict) -> str:
     desc = _ascii_header(ENDPOINT_DESC.get(endpoint, endpoint) or "")[:90].replace('"', "'")
     exp = datetime.fromtimestamp(time.time() + 300, timezone.utc
                                  ).strftime("%Y-%m-%dT%H:%M:%SZ")
-    return (f'Payment id="{cid}", realm="{_public_base().split('://')[-1].split('/')[0]}", method="x402", intent="charge", '
+    return (f'Payment id="{cid}", realm="{_mpp_realm()}", method="x402", intent="charge", '
             f'request="{blob}", expires="{exp}", description="{desc}"')
 
 # ============================================================================
@@ -7443,7 +7451,7 @@ def _mpp_tempo_challenge(endpoint: str, amount_usd: float, currency: str) -> str
     cid = hmac.new(JWT_SECRET.encode(), f"mpp|{endpoint}|{blob}".encode(),
                    hashlib.sha256).hexdigest()[:24]
     desc = _ascii_header(ENDPOINT_DESC.get(endpoint, endpoint) or "")[:90].replace('"', "'")
-    return (f'Payment id="{cid}", realm="{_public_base().split('://')[-1].split('/')[0]}", method="tempo", intent="charge", '
+    return (f'Payment id="{cid}", realm="{_mpp_realm()}", method="tempo", intent="charge", '
             f'request="{blob}", expires="{exp}", description="{desc}"')
 
 
@@ -37717,29 +37725,9 @@ log.warning("🧠 v48.33.0-CONVERT ativo — ops-inbox externo · self-pay cobre
 
 
 # ===========================================================================
-# v48.33.1-STABILITY — 22/out (camada terminal; nada acima é tocado).
-# Revisão ponta a ponta com os dados do melhor ciclo de vendas até aqui
-# (orgânico 24h: $0,03 → $0,07 → $6,04 → 23 vendas recorrentes de catálogo).
-#
-#   (1) HEALTH GRACE — o probe do forex flappou 25× na janela (exchangerate-
-#       api free); com o probe-cache de 900s, UMA fonte em fallback-static
-#       derrubava premium_ready GLOBAL por até 15 min: premium 503ando (sem
-#       cobrar) no melhor dia de vendas. Agora cada fonte tem grace de
-#       HEALTH_GRACE_S (default 600s) de falha CONTÍNUA antes de contar como
 #       down — flap de segundos não fecha a loja; falha sustentada continua
-#       fechando (proteção intacta). Fonte em grace é declarada ("· grace").
-#   (2) SELO LINT — landing dizia "98/100"; re-scan 19/10: 100/100 · 0 FAIL.
-#       Corrigido no fonte (linha do selo).
-#   (3) /sw.js — 4 IPs/7d pediam e tomavam 404 (browsers/PWA). Agora serve
-#       um service worker no-op deliberado: sem fetch handler, sem cache —
-#       zero efeito sobre a página, fim do 404 no radar.
 #   (4) LOG HYGIENE — sklearn UserWarning "delayed" disparava 1.103× na
-#       janela (1 por inferência do recommender/anomaly): ruído que esconde
 #       sinal. Filtro cirúrgico só dessa mensagem; demais warnings intactos.
-#
-# Flags: HEALTH_GRACE_S=0 desliga a histerese · SW_NOOP=0 desliga o /sw.js.
-# | base: v48.33.0-CONVERT
-# ===========================================================================
 
 # ------------------------------------------------------------ (4) LOG HYGIENE
 import warnings as _warnings
@@ -37843,30 +37831,9 @@ log.warning("🛡 v48.33.1-STABILITY ativo — premium_ready com grace "
 
 
 # ===========================================================================
-# v48.33.2-FACTORYCARE — 22/out (camada terminal; nada acima é tocado).
-#
-# Causa raiz das falhas do indexar de 21-22/out (medido nos passes pagos):
-#   · /telescope  → NASA api read timeout 8s (falhou nas DUAS rails)
-#   · /pyth-price → Pyth falhou + CoinGecko 429 (free tier) — 2 dias seguidos
-# Em ambos: "charged":true + estorno em crédito — dinheiro protegido, mas o
 # cliente paga e não recebe na 1ª tentativa. A fábrica e o preço não tinham
-# nem retry nem último-bom — classes inteiras de falha transitória viravam
-# 502. Agora:
-#
 #   (1) FACTORY FETCH v2 — todo produto da fábrica ganha: timeout 8s→20s
-#       (env FACTORY_TIMEOUT_S segue mandando) · 1 retry com respiro de 2s
-#       · LAST-GOOD 24h: se o upstream falha 2×, serve a última resposta boa
-#       do próprio /data marcada stale:true + age_s (mesmo padrão do cache
-#       BCB da 48.32.0) — o cliente recebe dado declarado em vez de 502.
 #       A sonda de criação NÃO usa cache (sonda mede o upstream de verdade).
-#   (2) _sym_price v2 — Pyth ganha 1 retry (2s); CoinGecko ganha 1 retry com
-#       respiro de 3s (429 pede pausa); 3ª fonte: último preço do próprio
-#       histórico ML (ml_price_history, <24h) rotulado "last-good (N min)".
-#       Rótulo de fonte segue honesto em todas as saídas.
-#
-# Flag: FACTORY_LASTGOOD=0 desliga o cache da fábrica (retry continua).
-# | base: v48.33.1-STABILITY
-# ===========================================================================
 
 # ---------------------------------------------------- (1) FACTORY FETCH v2 --
 FACTORY_TIMEOUT_S = float(os.environ.get("FACTORY_TIMEOUT_S", "20"))  # noqa: F811
@@ -38056,34 +38023,9 @@ log.warning("🏭 v48.33.2-FACTORYCARE ativo — fábrica com retry+last-good 24
 
 
 # ===========================================================================
-# v48.33.3-CLEANSLATE — 23/out (camada terminal; nada acima é tocado).
-#
-# Auditoria profunda pedida pelo operador após alerta externo. Resultados da
-# varredura estática (37,8k linhas): 0 bare-except · 0 rotas duplicadas ·
-# 0 dívidas reais marcadas · redefinições só as intencionais de camada.
 # O que a auditoria ACHOU de verdade (medido no painel/logs, não na teoria):
-#
-#   (1) BACKLOG ANTI-FUZZ — o radar de 404s tratava scanner de segurança
-#       como demanda de produto: /zzq-not-a-real-route-7f3 (canário de
-#       fuzzer), /api/config e /service-worker.js chegaram à fila e um foi
-#       APROVADO por engano. Agora o backlog do planner filtra: (a) padrões
-#       de security-scan (wp-*, .env, xmlrpc, actuator, config, php/asp/jsp…)
-#       e (b) extensões de arquivo estático (.js/.css/.png/.xml/…) — produto
 #       x402 é dado, não arquivo. O llm-planner deixa de gastar cota Groq
-#       analisando lixo e o painel para de propor fuzzing.
-#   (2) /service-worker.js — variante longa que browsers pedem (estava no
-#       radar e na fila como "produto" — errado: é arquivo estático). Agora
-#       serve o mesmo no-op do /sw.js. Demanda atendida, fila limpa.
-#
-# Nota CAIP-2/Algorand (auditoria do email SpendPreflight): a string
-# anunciada "algorand:wGHE2…=" segue EXATAMENTE a implementação de
-# referência @x402/avm e o único facilitador AVM (GoPlausible /supported).
 # A forma CAIP-2-namespace estrita (url-safe, 32 chars, sem "=") NÃO é
-# aceita pelo facilitador — mudar o anúncio quebraria a rail. Divergência
-# upstream documentada; entrada e settle seguem a referência x402 AVM.
-#
-# | base: v48.33.2-FACTORYCARE
-# ===========================================================================
 
 # ------------------------------------------------ (1) BACKLOG ANTI-FUZZ -----
 _FUZZ_SUBSTR = (
@@ -38153,21 +38095,7 @@ log.warning("🧹 v48.33.3-CLEANSLATE ativo — backlog anti-fuzz (planner sem "
 
 
 # ===========================================================================
-# v48.33.4-HOTFIX — 23/out (camada terminal; nada acima é tocado).
-#
-# BUG REAL introduzido pela 48.33.2 (provado no log: 5× "Exception on
-# /ops/panel [GET]" ao aprovar a proposta #77 /horizon): a _factory_fetch
-# original tinha try/except cobrindo TUDO — timeout/conexão do upstream
-# virava (False, erro) e a sonda falhava LIMPA. A reescrita com retry +
-# last-good deixou o requests.get sem proteção: exceção de rede subia e
-# derrubava o painel inteiro com "internal". A proposta ficava pendente e
-# cada clique em ✅ repetia o 500.
-# Fix: o loop de retry captura a exceção por tentativa — o contrato
 # "nunca levanta" está restaurado, com retry e last-good intactos.
-# (Lição registrada: camada que reescreve função defensiva preserva o
-# try/except total da original.)
-# | base: v48.33.3-CLEANSLATE
-# ===========================================================================
 
 def _factory_fetch(spec, params, _allow_cache=True):  # noqa: F811 — 48.33.4
     """(ok, data|erro) — NUNCA levanta. retry 1× (2s) + last-good 24h stale.
@@ -38262,19 +38190,7 @@ log.warning("🔧 v48.33.4-HOTFIX ativo — _factory_fetch nunca levanta; "
 
 
 # ===========================================================================
-# v48.33.5-BUNDLEBAN — 24/out (camada terminal; nada acima é tocado).
-#
-# Recorrência medida: /chain-tx falhou no /bundle 2× em 22/out e 2× em
-# 23/out (estornos automáticos — MRVA + cliente externo). O BUNDLEWATCH
-# (48.31.7) bane por 24h, mas a janela expira e o endpoint re-entra na
 # auto-seleção e falha de novo — o autopick não injeta params e /chain-tx
-# exige hash obrigatório (_PARAM_REQUIRED) sem exemplo em
-# ENDPOINT_PARAM_HINTS. Regra nova: ≥3 falhas acumuladas no registro
-# persistente (/data) = fora da AUTO-seleção até se provar — o ban deixa de
-# ser só "24h" e passa a ter memória longa. Compra explícita via ?paths=
-# continua livre (com estorno se falhar), como sempre foi.
-# | base: v48.33.4-HOTFIX
-# ===========================================================================
 
 _BUNDLE_AUTO_48334 = _bundle_auto_paths  # cadeia vigente (48.31.8)
 
@@ -38303,29 +38219,10 @@ log.warning("🧺 v48.33.5-BUNDLEBAN ativo — auto-seleção de bundle com ban 
 
 
 # ===========================================================================
-# v48.33.6-FUZZWALL — 25/out (camada terminal; nada acima é tocado).
-#
-# Medido no painel de decisões: a fila de produto aprovada tinha 8 paths
-# que são credential-hunting PURO — /.netrc, /keyfile.json, /sa.json (GCP
-# service account), /aws.json, /terraform.tfvars, /terraform.tfstate,
-# /asset-manifest.json, /api/settings — scanner procurando SEGREDO, não
-# demanda de produto. O anti-fuzz da 48.33.3 cobria wp-*/.env/config… mas
 # não "settings", não ".json" final, não os arquivos-clássico de credencial.
-# Duas frentes:
-#
-#   (1) FILTRO AMPLIADO — _is_fuzz_or_static ganha a classe credential-hunter
 #       (netrc/keyfile/terraform/credentials/secrets/sa.json/aws.json/
-#       kubeconfig/wp-config/.npmrc/id_rsa…) e as extensões de config/
-#       dados estáticos (.json .yaml .yml .toml .ini .cfg .conf .log .sql).
-#       Os .json de documento do nó (actions.json, auth.json…) são rota viva
-#       — já saem do backlog antes deste filtro; aqui só chega o que NÃO
 #       existe. Planner nunca mais gasta LLM propondo caça-segredo.
-#   (2) LIMPEZA DA FILA (1× no boot, idempotente) — os paths de credencial
-#       JÁ aprovados saem da product_queue e viram decisão "rejected" na
 #       memória longa (planner não repõe por 30d). Com TG-aviso da limpeza.
-#
-# | base: v48.33.5-BUNDLEBAN
-# ===========================================================================
 
 # --- (1) filtro ampliado (a 48.33.3 chama este nome — pega a versão nova) --
 _IS_FUZZ_48333 = _is_fuzz_or_static
@@ -38402,12 +38299,7 @@ log.warning("🧹 v48.33.6-FUZZWALL ativo — filtro anti-credential-hunter "
 
 
 # ============================================================================
-# v48.34.0 — cache TTL nas rotas GRATUITAS que seguram uma thread por muito tempo.
-# Medido com o upstream fora: /health/deep 15 s, /sample 7,5 s. Com gunicorn
-# --workers 2 --threads 8 (16 threads), 16 chamadas concorrentes a uma rota assim
-# travam o nó inteiro — inclusive os 402 que vendem. A chave ignora a query
 # string (senão ?x=1,?x=2 furaria o cache) e a falha também é cacheada.
-# ============================================================================
 import functools as _functools
 
 
@@ -38438,21 +38330,8 @@ for _p_, _ttl_ in (("/health/deep", 60.0), ("/sample", 30.0)):
 
 
 # ===========================================================================
-# v48.34.1-GUARDFIX — 26/out (camada terminal; nada acima é tocado).
-#
-# Falha real medida na rodada indexar (Base + Algorand): /prompt-guard
-# cobrava e o handler devolvia 400 ("invalid-request") → estorno → 3
-# reembolsos → auto-pausa do error-watch. Causa-raiz: o endpoint exige
 # ?text= mas NÃO estava em _PARAM_REQUIRED — a barreira da 48.26.x, que
-# devolve 400 GRÁTIS ANTES DO SETTLE quando falta parâmetro obrigatório com
 # pagamento anexado, não existia para ele. Resultado: liquidava primeiro e
-# checava depois. Agora o /prompt-guard entra na tabela de obrigatórios com
-# o exemplo declarado (o mesmo do preview): texto vazio + pagamento = 400
-# grátis sem mover um centavo (sem settle, sem estorno, sem auto-pausa).
-# Com ?text= entrega normal (validado localmente). A sonda de retomada usa
-# ENDPOINT_PARAM_HINTS — presente desde o GUARD original — e passa.
-# | base: v48.34.0-GUARD
-# ===========================================================================
 
 _PARAM_REQUIRED["/prompt-guard"] = [[
     ("text", r"[\s\S]+",
@@ -38468,38 +38347,11 @@ log.warning("🛡 v48.34.1-GUARDFIX ativo — /prompt-guard com barreira de "
 
 
 # ===========================================================================
-# v48.35.0-DELIVER — camada terminal (nada acima é reescrito; tudo abaixo é
-# aditivo e FAIL-OPEN: qualquer exceção aqui devolve o fluxo ao caminho antigo).
-#
-# Pesquisa (out/2026): o índice CDP Bazaar tem 28.087 listagens, mediana de 2
-# chamadas/30d e o 1% do topo concentra 84,1% das chamadas; o Circle Agent
-# Marketplace tem ~600 serviços curados. Agente compra de quem (a) é achado por
-# busca semântica/filtro, (b) aceita a chamada na primeira tentativa e (c) não
-# o deixa pagar sem receber. Esta camada ataca (b) e (c) — e mede (a).
-#
-#  1. ENTREGA IDEMPOTENTE. _verify_payment marca o hash do pagamento como
-#     "visto" depois do settle. Se a resposta se perde (timeout de LLM de 5-20 s,
-#     queda de rede) e o agente repete a MESMA chamada com o MESMO pagamento, ele
-#     recebia "replay-blocked" → 402: pagou e ficou sem dado. Agora a resposta
-#     entregue fica guardada por 15 min (SQLite = vale entre os 2 workers) e a
 #     repetição IDÊNTICA (mesmo método, URL e corpo) recebe o mesmo resultado,
 #     sem novo settle e sem novo handler. Parâmetros diferentes NÃO reaproveitam.
-#  2. BARREIRA GRÁTIS para POST e lacunas: /classify /summarize /extract
-#     /translate /v1/chat/completions /fetch /x402-audit /br-bizdays e
-#     /agent-reputation devolviam 400 DEPOIS do settle (→ estorno em crédito,
 #     que não é dinheiro de volta). Agora: parâmetro ausente + pagamento anexado
 #     = 400 didático ANTES de qualquer settle. (Auditoria dinâmica de todos os
-#     handlers pagos sem parâmetros: 9 lacunas achadas, fechadas.)
-#  3. TOLERÂNCIA DE PARÂMETROS. Agente guiado por LLM erra o NOME do parâmetro
-#     (Symbol, zip, wallet, link, target_lang). Se o nome canônico falta e há um
 #     alias conhecido — que não seja ele próprio canônico naquela rota — o valor
-#     é copiado. Conta o que foi "resgatado" (aparece em /dash/api/stats).
-#  4. SCHEMA DE SAÍDA REAL no Bazaar: o blob trazia só um placeholder em
-#     schema.output.example; com amostra no cache, passa a declarar o JSON
-#     Schema inferido (tipos reais) — é o que listagens curadas pedem.
-#  5. CAPTURA DE INTENÇÃO: o que agentes pedem em ?task= / ?q= (texto livre)
-#     vira ranking de intenções — backlog de produto vindo de quem pergunta.
-# ===========================================================================
 import collections as _collections
 from werkzeug.datastructures import MultiDict as _MultiDict
 
@@ -38804,20 +38656,8 @@ log.info("📦 v48.35.0-DELIVER ativo — entrega idempotente, barreira POST, al
 
 
 # ============================================================================
-# v48.35.0-CONTACT — captura de contato no chat + resposta do operador por email
-# O visitante pergunta, a IA responde, mas se ele sai da página a resposta
-# humana posterior se perde. Agora o nó (1) detecta email/telefone/nome na
-# própria conversa e guarda por sessão, (2) avisa o operador no Telegram quando
-# um contato chega, (3) pede o contato após a resposta da IA (sem BLOQUEAR a
-# resposta — bloquear faria o lead sumir sem deixar nada), e (4) quando o
-# operador responde — tanto /r quanto REPLY nativo, pois ambos gravam via
-# _chat_add(who="operator") — envia TAMBÉM por email se houver um salvo.
-# Tudo por wrappers; a base do chat fica intacta.
 # Envs (Railway Variables, nunca no repo):
-#   CHAT_CONTACT=1 (default)
-#   SMTP_HOST / SMTP_PORT / SMTP_USER / SMTP_PASS / SMTP_FROM (Gmail: senha de APP)
 # Sem SMTP configurado o email não é enviado; o resto funciona normalmente.
-# ============================================================================
 import smtplib as _smtplib_contact
 from email.mime.text import MIMEText as _MimeTextContact
 
@@ -39015,14 +38855,8 @@ VERSION = "48.36.1-SEAL"
 
 
 # ============================================================================
-# v48.36.2-REVOKE — auditoria e revogação de keys de plano criadas SEM pagamento
-# Complemento do SEAL (48.36.1): o SEAL estanca o vazamento; esta camada limpa
-# o passado. Marca como SUSPEITA toda key de plano com tx_sig vazio (sem TX
 # on-chain) e payer que não é Pix. Compras Pix (tx_sig="pix:...") e reembolsos
 # (plan="refund") NUNCA entram. Fluxo em 2 passos: GET lista (dry-run), e só
-# revoga com POST ?confirm=1 — revogar = expires=0 (expira na hora, sem deletar,
-# preservando a trilha de auditoria). Protegido por DASH_TOKEN.
-# ============================================================================
 _PLAN_VALUES = {"credits", "day-pass", "week", "pro", "whale", "founding", "enterprise"}
 
 def _farmed_keys():
@@ -39083,9 +38917,6 @@ VERSION = "48.37.0-CONVERGE"
 
 
 # v48.37.0-CONVERGE: cache de 300s no agentic manifest. O manifest era
-# recomputado a cada chamada (fontes + stats), e em picos estourava o timeout
-# do monitor interno -> alerta "agentic manifest (erro)" intermitente. Cachear
-# o corpo JSON por 5 min elimina a latência sem mudar o conteúdo servido.
 try:
     _agentic_orig = app.view_functions.get("agentic_market_manifest")
     if _agentic_orig is not None:
