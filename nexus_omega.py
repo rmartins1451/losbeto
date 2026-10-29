@@ -228,7 +228,7 @@ PREFER_BASE       = os.environ.get("PREFER_BASE", "1") != "0"
 #    UM merchant — o catálogo inteiro compete como uma única entrada forte.
 ALGO_PAYTO         = os.environ.get("ALGORAND_WALLET_ADDRESS", "").strip()
 ALGO_USDC_ASA      = "31566704"
-ALGO_CAIP2         = "algorand:wGHE2Pwdvd7S12BL5FaOP20EGYesN73ktiC1qzkkit8="
+ALGO_CAIP2         = "algorand:wGHE2Pwdvd7S12BL5FaOP20EGYesN73k"
 ALGO_FEEPAYER      = "ZMFK2OI7ZBD2U27ISERZC4S6LKM6WMFJPZQ4MYNJDZ2VNBNMBA67RA22AA"
 GO_FACILITATOR_URL = os.environ.get("GOPLAUSIBLE_FACILITATOR",
                                     "https://facilitator.goplausible.xyz").strip()
@@ -6967,8 +6967,9 @@ def _build_402(endpoint: str, price_override: float = None):
             "tags":        _service_tags(endpoint),
             "iconUrl":     f"{base}/favicon.png",
         },
-        "accepts":    accepts_v1,     # v1 (client stock lê o corpo)
-        "acceptsV2":  accepts,        # v2 CAIP-2 (header + consumidores v2)
+        "accepts":    accepts,         # v2 CAIP-2 (padrão da spec v2 no corpo)
+        "acceptsV2":  accepts,        # alias redundante v2
+        "acceptsV1":  accepts_v1,     # v1 explícito p/ quem precisar
         # v39.7: a alternativa mais barata, no momento exato da decisão.
         "alternatives": _subscription_offer(endpoint, amount_usdc),
         # v47.6.3 (parceria stipend.sh): agente SEM carteira recebe o caminho
@@ -7381,7 +7382,7 @@ def _mpp_challenge(endpoint: str, primary: dict) -> str:
     desc = _ascii_header(ENDPOINT_DESC.get(endpoint, endpoint) or "")[:90].replace('"', "'")
     exp = datetime.fromtimestamp(time.time() + 300, timezone.utc
                                  ).strftime("%Y-%m-%dT%H:%M:%SZ")
-    return (f'Payment id="{cid}", realm="losbeto", method="x402", intent="charge", '
+    return (f'Payment id="{cid}", realm="{_public_base().split('://')[-1].split('/')[0]}", method="x402", intent="charge", '
             f'request="{blob}", expires="{exp}", description="{desc}"')
 
 # ============================================================================
@@ -7442,7 +7443,7 @@ def _mpp_tempo_challenge(endpoint: str, amount_usd: float, currency: str) -> str
     cid = hmac.new(JWT_SECRET.encode(), f"mpp|{endpoint}|{blob}".encode(),
                    hashlib.sha256).hexdigest()[:24]
     desc = _ascii_header(ENDPOINT_DESC.get(endpoint, endpoint) or "")[:90].replace('"', "'")
-    return (f'Payment id="{cid}", realm="losbeto", method="tempo", intent="charge", '
+    return (f'Payment id="{cid}", realm="{_public_base().split('://')[-1].split('/')[0]}", method="tempo", intent="charge", '
             f'request="{blob}", expires="{exp}", description="{desc}"')
 
 
@@ -9118,7 +9119,7 @@ def paid_endpoint(path):
             # honesta). Chave errada cai no fluxo normal (402) sem revelar
             # que o recurso existe.
             _pk = (request.headers.get("X-Partner-Key") or "").strip()
-            if _pk and PARTNER_KEY and _pk == PARTNER_KEY:
+            if _pk and PARTNER_KEY and hmac.compare_digest(_pk, PARTNER_KEY) and path not in CREDIT_PLANS:
                 try:
                     from flask import g as _g
                     _g.losbeto_payer = "partner:storefront"
@@ -16892,7 +16893,7 @@ def acp_discovery():
             "assets":     ["USDC"],
             "networks":   ["eip155:8453",
                             "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp",
-                            "algorand:wGHE2Pwdvd7S12BL5FaOP20EGYesN73ktiC1qzkkit8="],
+                            "algorand:wGHE2Pwdvd7S12BL5FaOP20EGYesN73k"],
             "facilitators": ["https://api.cdp.coinbase.com/platform/v2/x402"],
             "settlement": "instant, non-custodial — funds land directly in the seller wallet"},
         "transports": {"rest": "https://api.losbeto.xyz",
@@ -23933,7 +23934,7 @@ def scan_tx():
         if abs(delta) > 1e-9:
             transfers.append({"owner": owner, "mint": mint, "delta": delta,
                               "is_usdc": mint == USDC_MINT})
-    ok, info = SOL.verify_payment(sig, 0.005, RECEIVE_ADDRESS, max_age=86400 * 30)
+    ok, info = SOL.verify_payment(sig, 0.0005, RECEIVE_ADDRESS, max_age=86400 * 30)
     is_valid = bool(ok)
     delta_to_us = 0.0
     payer = ""
@@ -23969,7 +23970,7 @@ def reconcile_tx():
     for sig in sigs[:50]:
         sig = str(sig).strip()
         try:
-            ok, info = SOL.verify_payment(sig, 0.005, RECEIVE_ADDRESS, max_age=86400 * 30)
+            ok, info = SOL.verify_payment(sig, 0.0005, RECEIVE_ADDRESS, max_age=86400 * 30)
             if ok:
                 payer = info.get("payer", "") if isinstance(info, dict) else ""
                 amount = round(float(info.get("delta", 0.01)), 6) if isinstance(info, dict) else 0.01
@@ -24110,7 +24111,7 @@ def debug_tx():
                         "dest_owner_is_receive": dest_owner == RECEIVE_ADDRESS,
                     })
     analysis["method2_inner_instructions"] = m2_results
-    ok, info = SOL.verify_payment(sig, 0.005, RECEIVE_ADDRESS, max_age=86400*30)
+    ok, info = SOL.verify_payment(sig, 0.0005, RECEIVE_ADDRESS, max_age=86400*30)
     analysis["verify_payment_result"] = {"ok": ok, "info": info}
     return jsonify({
         "signature": sig,
@@ -24154,7 +24155,7 @@ def verify_signature_manual():
     if not sig:
         return jsonify({"error": "signature required in body"}), 400
     # 1. Verifica on-chain (janela ampla: 30 dias)
-    ok, info = SOL.verify_payment(sig, 0.005, RECEIVE_ADDRESS, max_age=86400 * 30)
+    ok, info = SOL.verify_payment(sig, 0.0005, RECEIVE_ADDRESS, max_age=86400 * 30)
     if not ok:
         return jsonify({
             "success": False,
@@ -24245,7 +24246,7 @@ def debug_x402scan():
         diagnosis["note"] = "Passe ?sig=<signature> para diagnosticar uma tx específica"
         return jsonify(diagnosis)
     # Diagnóstico completo da tx
-    ok, info = SOL.verify_payment(sig, 0.005, RECEIVE_ADDRESS, max_age=86400 * 30)
+    ok, info = SOL.verify_payment(sig, 0.0005, RECEIVE_ADDRESS, max_age=86400 * 30)
     with LEDGER._conn() as c:
         row = c.execute(
             "SELECT ts, endpoint, amount, source FROM revenue WHERE tx_sig=?", (sig,)
@@ -28671,6 +28672,7 @@ def build_transparency() -> dict:
 
 
 @app.route("/transparency")
+@app.route("/transparency.json")
 @app.route("/.well-known/transparency.json")
 def transparency_doc():
     resp = jsonify(build_transparency())
@@ -39077,4 +39079,34 @@ def ops_farmed_keys():
                  "Compras Pix e reembolsos nunca são tocados."),
         "keys": rows})
 
-VERSION = "48.36.3-SEAL"
+VERSION = "48.37.0-CONVERGE"
+
+
+# v48.37.0-CONVERGE: cache de 300s no agentic manifest. O manifest era
+# recomputado a cada chamada (fontes + stats), e em picos estourava o timeout
+# do monitor interno -> alerta "agentic manifest (erro)" intermitente. Cachear
+# o corpo JSON por 5 min elimina a latência sem mudar o conteúdo servido.
+try:
+    _agentic_orig = app.view_functions.get("agentic_market_manifest")
+    if _agentic_orig is not None:
+        _agentic_store = {}
+        def _agentic_cached_view():
+            from flask import Response as _Resp, make_response as _mk
+            _now = time.time()
+            _hit = _agentic_store.get("v")
+            if _hit and _now - _hit["ts"] < 300:
+                return _Resp(_hit["body"], status=_hit["status"],
+                             content_type="application/json")
+            _resp = _agentic_orig()
+            try:
+                _r = _mk(_resp)
+                _agentic_store["v"] = {"ts": _now, "body": _r.get_data(),
+                                       "status": _r.status_code}
+            except Exception:
+                pass
+            return _resp
+        _agentic_cached_view.__name__ = "agentic_market_manifest"
+        _agentic_cached_view.__doc__ = _agentic_orig.__doc__
+        app.view_functions["agentic_market_manifest"] = _agentic_cached_view
+except Exception:
+    pass
