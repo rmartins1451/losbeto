@@ -17561,8 +17561,23 @@ _SCAN_NOISE = re.compile(
     r"not-a-real-route|(^|/)zz[a-z]?-|openid-configuration|"
     r"oauth-(authorization-server|protected-resource)$)", re.I)
 
+
+# v48.38.0-SIGNAL: famílias de scanner que escapavam do _SCAN_NOISE e viravam
+# "produto novo"/"alias" no radar (/netrc, /server-status, /api/v1/users/N,
+# /tmp, /old, /db, /uploads, Yii/Laravel debug, configs de cloud). Validado
+# contra os 133 endpoints reais: zero falsos positivos.
+_SCAN_NOISE_EXTRA = re.compile(
+    r"\.netrc$|\.pgpass$|\.git-credentials|\.dockercfg|\.netlify|\.htpasswd|"
+    r"(^|/)(server-status|server-info|nginx_status|apache-status)(/|$)|"
+    r"(^|/)api/v?\d*/(users?|orders?|accounts?|customers?|admin|version|config)(/|$)|"
+    r"(^|/)users?/\d+(/|$)|"
+    r"(^|/)(tmp|temp|old|_old|backup|backups|bak|db|dump|uploads?|files?|archive|old_site)(/|$)|"
+    r"(^|/)frontend/web/debug|(^|/)debug/|_debugbar|(^|/)telescope/requests|"
+    r"(^|/)(aws|gcp|azure|firebase|supabase)\.(ya?ml|json)$",
+    re.I)
+
 def _is_scan_noise(path: str) -> bool:
-    return bool(_SCAN_NOISE.search(path or ""))
+    return bool(_SCAN_NOISE.search(path or "") or _SCAN_NOISE_EXTRA.search(path or ""))
 
 def _route_now_live(path: str) -> bool:
     """v44.1.0: a rota pedida EXISTE hoje? O radar é janela de 7 dias — um
@@ -38913,7 +38928,7 @@ def ops_farmed_keys():
                  "Compras Pix e reembolsos nunca são tocados."),
         "keys": rows})
 
-VERSION = "48.37.0-CONVERGE"
+VERSION = "48.38.0-SIGNAL"
 
 
 # v48.37.0-CONVERGE: cache de 300s no agentic manifest. O manifest era
