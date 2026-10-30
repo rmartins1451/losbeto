@@ -1566,6 +1566,13 @@ class LedgerV10:
                 return False
             return int(time.time()) < r[0]
 
+    def jwt_payment(self, jti: str, endpoint: str) -> dict:
+        with self._conn() as c:
+            r = c.execute(
+                "SELECT payer,tx_sig FROM jwt_sessions WHERE jti=? AND endpoint=?",
+                (jti, endpoint)).fetchone()
+        return {"payer": r[0] or "", "tx": r[1] or ""} if r else {}
+
     # ---------- PEERS ----------
     def upsert_peer(self, node_id: str, url: str, public_key: str, win_rate: float = 50.0):
         with self.lock, self._conn() as c:
@@ -6177,6 +6184,9 @@ def _inline_sample(endpoint: str) -> dict:
     Vem do cache de preview (populado pelo warmer, sem custo). Truncada para
     não canibalizar a venda: mostra a FORMA e a veracidade, não o conteúdo todo."""
     try:
+        if endpoint in _PREVIEW_REQUIRE_PAYMENT:
+            return {"status": "payment_required",
+                    "hint": "Purchase endpoints never expose cached credentials."}
         cached = _PREVIEW_CACHE.get(endpoint) or _preview_db_get(endpoint)
         if not cached:
             return {"status": "warming", "hint": f"GET {endpoint}?preview=1 for a free sample"}
@@ -6496,7 +6506,8 @@ def _bazaar_blob(endpoint: str) -> dict:
     # exemplo de saída: dado real que o warmer já mantém quente (custo zero)
     example_out = {}
     try:
-        cached = _PREVIEW_CACHE.get(endpoint) or _preview_db_get(endpoint)
+        cached = (None if endpoint in _PREVIEW_REQUIRE_PAYMENT else
+                  (_PREVIEW_CACHE.get(endpoint) or _preview_db_get(endpoint)))
         if cached:
             data = cached.get("data")
             if isinstance(data, dict):
@@ -6945,6 +6956,20 @@ def _build_402(endpoint: str, price_override: float = None):
     # v48.9.23-BAZAARFIX: o blob é montado UMA vez aqui — além de ir ao campo
     # extensions, ele alimenta o outputSchema V1 por accept (fix adiante).
     _bz_blob = _bazaar_blob(endpoint)
+    if endpoint in _PREVIEW_REQUIRE_PAYMENT:
+        _preview_ad = "On-chain payment required: no free execution on purchase endpoints"
+        _free_preview = {"available": False, "cost": "n/a",
+                         "note": "This purchase endpoint requires settled on-chain payment."}
+        _try_free = [f"{base}/try", f"{base}/sample",
+                     f"{base}/losbeto-alpha", f"{base}/receipts"]
+    else:
+        _preview_ad = f"Free delayed sample: GET {base}{endpoint}?preview=1"
+        _free_preview = {
+            "available": True, "endpoint": f"{base}{endpoint}?preview=1",
+            "cost": "0.00",
+            "note": "Same resource, real data delayed ~15min. Evaluate before paying."}
+        _try_free = [f"{base}{endpoint}?preview=1", f"{base}/try", f"{base}/sample",
+                     f"{base}/losbeto-alpha", f"{base}/receipts"]
     payload = {
         # v48.9.12-DUAL: o CORPO é um PaymentRequired v1 (o client stock v1 só
         # lê o corpo; o client v2 lê o header PAYMENT-REQUIRED, que segue v2).
@@ -6959,7 +6984,7 @@ def _build_402(endpoint: str, price_override: float = None):
             f"Payment required: {endpoint} is ${amount_usdc:.4f}/call "
             f"(USDC on Base/Solana/Algorand). "
             f"{_pitch}. "
-            f"Free delayed sample: GET {base}{endpoint}?preview=1 | "
+            f"{_preview_ad} | "
             f"1 free real-time call: {base}/welcome | "
             f"plans from $0.10: {base}/plans"
         ),
@@ -7012,12 +7037,8 @@ def _build_402(endpoint: str, price_override: float = None):
             # a amostra agora viaja DENTRO do 402: o agente vê a forma real do dado
             # na mesma resposta em que descobre o preço. Zero requests extras.
             "sample": _inline_sample(endpoint),
-            "free_preview": {
-                "endpoint": f"{base}{endpoint}?preview=1",
-                "cost": "0.00",
-                "note": "Same resource, real data delayed ~15min. Evaluate before paying."},
-            "try_free": [f"{base}{endpoint}?preview=1", f"{base}/try", f"{base}/sample",
-                         f"{base}/losbeto-alpha", f"{base}/receipts"],
+            "free_preview": _free_preview,
+            "try_free": _try_free,
             # v41: A PONTE QUE FALTAVA ENTRE AVALIAR E PAGAR.
             # O funil real mostra ~10-20 avaliações/dia (python-requests) que
             # veem a amostra ATRASADA e somem. Amostra atrasada prova que o
@@ -8998,6 +9019,9 @@ def _reactive_402(path, ip):
             pass
     return r
 
+_PREVIEW_REQUIRE_PAYMENT = frozenset(CREDIT_PLANS) | {"/bundle"}
+
+
 def paid_endpoint(path):
     def deco(handler):
         def wrapped():
@@ -9010,7 +9034,8 @@ def paid_endpoint(path):
 
             # v24.1 PREVIEW UNIVERSAL — mata a "fricção de avaliação": agente vê
             # a estrutura REAL com dados atrasados de graça, e paga pelo fresco.
-            if request.args.get("preview") == "1":
+            if (request.args.get("preview") == "1"
+                    and path not in _PREVIEW_REQUIRE_PAYMENT):
                 # v37: endpoint sob experimento — registra como avaliação
                 # bloqueada, para medirmos o efeito depois.
                 if _preview_blocked(path):
@@ -9247,6 +9272,12 @@ def paid_endpoint(path):
                 if claims and claims.get("endpoint") == path:
                     if LEDGER.jwt_valid(claims.get("jti", ""), path):
                         try:
+                            from flask import g as _g
+                            _jp = LEDGER.jwt_payment(claims.get("jti", ""), path)
+                            _g.losbeto_payer = _jp.get("payer", "")
+                            _g.losbeto_payment = {
+                                "payer": _jp.get("payer", ""),
+                                "tx": _jp.get("tx", ""), "via": "jwt-retry"}
                             result = handler()
                             # v24.10: produto indisponível (tupla ,503) — não
                             # entrega dado vazio. O day-pass/JWT segue válido para
@@ -9499,7 +9530,9 @@ def paid_endpoint(path):
                         _cur = _PREVIEW_CACHE.get(path) or _preview_db_get(path)
                         _age = (time.time() - _cur["ts"]) if _cur else 1e9
                         # v39.1: só promove a amostra se ela for apresentável.
-                        if _age >= _preview_min_age(path) and _sample_is_good(prev_data):
+                        if (path not in _PREVIEW_REQUIRE_PAYMENT
+                                and _age >= _preview_min_age(path)
+                                and _sample_is_good(prev_data)):
                             _PREVIEW_CACHE[path] = {"ts": time.time(), "data": prev_data}
                             _preview_db_put(path, prev_data)
                 except Exception: pass
@@ -11000,6 +11033,10 @@ def _credits_purchase_handler(endpoint: str):
                 return _credits_payload(endpoint, plan, existing["key"],
                                         existing["balance_usd"], existing["expires"],
                                         idempotent=True)
+        if not tx_sig or not LEDGER.tx_recorded(tx_sig):
+            log.warning(f"plano {endpoint} recusado sem settle confirmado")
+            return {"error": "plan purchase requires a settled on-chain payment",
+                    "charged": False}, 402
         key = "lsk_" + secrets.token_urlsafe(24)
         ttl = plan["ttl_days"] * 86400
         LEDGER.api_key_create(key, payer, plan["plan"], plan["balance_usd"], ttl, tx_sig)
@@ -15034,6 +15071,12 @@ def _mcp_fetch(path: str, params: dict, key: str) -> dict:
 
     live, sub = _mcp_live_allowed(key)
     price = get_dynamic_price(path)
+
+    if path in CREDIT_PLANS or (path == "/bundle" and not live):
+        return {"isError": True, "content": [{"type": "text", "text": json.dumps({
+            "error": "onchain_payment_required", "endpoint": path,
+            "buy": f"{_public_base()}{path}",
+            "note": "Purchase endpoints are not executed through free MCP sampling."})}]}
 
     # Sem assinatura: serve a amostra atrasada do cache (custo zero, dado real).
     if not live:
@@ -26522,11 +26565,21 @@ def endpoint_markdown(endpoint_name):
     # Puxa exemplo real do cache (custo zero — o warmer já mantém quente)
     example = None
     try:
-        cached = _PREVIEW_CACHE.get(path) or _preview_db_get(path)
+        cached = (None if path in _PREVIEW_REQUIRE_PAYMENT else
+                  (_PREVIEW_CACHE.get(path) or _preview_db_get(path)))
         if cached:
             example = cached.get("data")
     except Exception:
         pass
+    _preview_open = path not in _PREVIEW_REQUIRE_PAYMENT
+    _preview_line = (f"- Free preview: `{base}{path}?preview=1`" if _preview_open else
+                     "- Preview: unavailable — this purchase requires on-chain payment")
+    _preview_doc = (f"### 3. Free preview (delayed data)\n\n```bash\n"
+                    f"curl '{base}{path}?preview=1'\n```" if _preview_open else
+                    "### 3. Purchase\n\nUse the direct x402 flow above; free execution is disabled.")
+    _example_fallback = ("// Preview cache warming up — call ?preview=1 to trigger."
+                         if _preview_open else
+                         "// Response example is available after an on-chain purchase.")
     body = [
         f"# `GET {path}`",
         "",
@@ -26534,7 +26587,7 @@ def endpoint_markdown(endpoint_name):
         "",
         f"- Price: **${price:.4f} USDC** per call",
         f"- Tags: {', '.join(tags) or '—'}",
-        f"- Free preview: `{base}{path}?preview=1`",
+        _preview_line,
         f"- Networks: solana:{SOL_GENESIS}" +
         (f", {BASE_CAIP2}" if ENABLE_BASE else ""),
         "",
@@ -26567,15 +26620,12 @@ def endpoint_markdown(endpoint_name):
         f"curl -H 'X-PAYMENT: <base64_signed_payload>' '{base}{path}'",
         "```",
         "",
-        "### 3. Free preview (delayed data)",
-        "```bash",
-        f"curl '{base}{path}?preview=1'",
-        "```",
+        _preview_doc,
         "",
         "## Example response",
         "```json",
         _json.dumps(example, indent=2, default=str)[:1500] if example else
-        "// Preview cache warming up — call ?preview=1 to trigger.",
+        _example_fallback,
         "```",
         "",
         "## Related endpoints",
@@ -26647,7 +26697,9 @@ def _inject_agent_beacon(resp):
             "manifest": f"{base}/.well-known/agentic.json",
             "mcp": f"{base}/mcp",
             "docs_md": f"{base}{path}.md" if path in BASE_PRICES else f"{base}/llms-full.txt",
-            "preview": f"{base}{path}?preview=1" if path in BASE_PRICES else None,
+            "preview": (f"{base}{path}?preview=1"
+                        if path in BASE_PRICES and path not in _PREVIEW_REQUIRE_PAYMENT
+                        else None),
         }
         if path in BASE_PRICES:
             beacon["price_usdc"] = round(get_dynamic_price(path), 6)
@@ -32706,7 +32758,7 @@ def _register_doc():
         "free_evaluation": {
             "one_real_time_call_free": f"{base}/welcome",
             "six_samples_one_call": f"{base}/try",
-            "delayed_preview_any_endpoint": "?preview=1 on any paid path"},
+            "delayed_previews_on_data_endpoints": "?preview=1 on paid data paths"},
         "provider": "Losbeto", "version": VERSION}
 
 @app.route("/register", methods=["GET"])
@@ -38928,7 +38980,7 @@ def ops_farmed_keys():
                  "Compras Pix e reembolsos nunca são tocados."),
         "keys": rows})
 
-VERSION = "48.38.0-SIGNAL"
+VERSION = "48.39.0-PREVIEWSEAL"
 
 
 # v48.37.0-CONVERGE: cache de 300s no agentic manifest. O manifest era
