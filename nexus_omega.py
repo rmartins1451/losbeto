@@ -1025,7 +1025,7 @@ log.info(f"🆔 Node:   {WALLET.node_id}")
 # ============================================================================
 
 class LedgerV10:
-    SCHEMA_VERSION = 24
+    SCHEMA_VERSION = 25
     def __init__(self, path: Path):
         self.path = path
         self.lock = threading.Lock()
@@ -1094,6 +1094,26 @@ class LedgerV10:
                     log.info(f"🧭 migracao v44.8.2: {_fixed} receipts reclassificados solana→algorand")
             except Exception as _me:
                 log.warning(f"migracao chain algorand: {_me}")
+            try:
+                c.execute("""CREATE TABLE IF NOT EXISTS revenue_duplicate_archive (
+                    archive_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    tx_sig TEXT NOT NULL,
+                    original_json TEXT NOT NULL,
+                    archived_ts INTEGER NOT NULL)""")
+                _uidx = c.execute("SELECT 1 FROM sqlite_master WHERE type='index' AND name='idx_revenue_tx_unique'").fetchone()
+                if not _uidx:
+                    _dups = c.execute("SELECT tx_sig FROM revenue WHERE tx_sig IS NOT NULL AND tx_sig<>'' GROUP BY tx_sig HAVING COUNT(*)>1").fetchall()
+                    for (_dup_tx,) in _dups:
+                        _rows = c.execute("SELECT * FROM revenue WHERE tx_sig=? ORDER BY id", (_dup_tx,)).fetchall()
+                        _cols = [d[0] for d in c.execute("SELECT * FROM revenue LIMIT 0").description]
+                        for _row in _rows[1:]:
+                            c.execute("INSERT INTO revenue_duplicate_archive(tx_sig,original_json,archived_ts) VALUES(?,?,?)",
+                                      (_dup_tx, json.dumps(dict(zip(_cols, _row)), default=str), int(time.time())))
+                            c.execute("DELETE FROM revenue WHERE id=?", (_row[0],))
+                        log.warning(f"revenue TX duplicada arquivada: {_dup_tx} ({len(_rows)-1} cópia(s))")
+                    c.execute("CREATE UNIQUE INDEX idx_revenue_tx_unique ON revenue(tx_sig) WHERE tx_sig IS NOT NULL AND tx_sig<>''")
+            except Exception as _ue:
+                raise RuntimeError(f"falha ao proteger unicidade de revenue.tx_sig: {_ue}")
             c.executescript("""
             CREATE TABLE IF NOT EXISTS requests (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1107,6 +1127,36 @@ class LedgerV10:
             CREATE TABLE IF NOT EXISTS replay (
                 hash TEXT PRIMARY KEY,
                 ts INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS payment_challenges (
+                rid TEXT PRIMARY KEY,
+                endpoint TEXT NOT NULL,
+                accepts_json TEXT NOT NULL,
+                ts INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_chal_ts ON payment_challenges(ts);
+            CREATE TABLE IF NOT EXISTS payment_fingerprints (
+                fingerprint TEXT PRIMARY KEY,
+                endpoint TEXT NOT NULL,
+                tx_sig TEXT NOT NULL,
+                payer TEXT,
+                ts INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_payfp_tx ON payment_fingerprints(tx_sig);
+            CREATE TABLE IF NOT EXISTS pending_settlements (
+                fingerprint TEXT PRIMARY KEY,
+                endpoint TEXT NOT NULL,
+                tx_sig TEXT,
+                requirement_json TEXT NOT NULL,
+                payer TEXT,
+                ts INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_pending_tx ON pending_settlements(tx_sig);
+            CREATE TABLE IF NOT EXISTS revenue_duplicate_archive (
+                archive_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                tx_sig TEXT NOT NULL,
+                original_json TEXT NOT NULL,
+                archived_ts INTEGER NOT NULL
             );
             CREATE TABLE IF NOT EXISTS peers (
                 node_id TEXT PRIMARY KEY,
@@ -1232,20 +1282,23 @@ class LedgerV10:
     def add_revenue(self, endpoint: str, amount: float, tx_sig: str,
                     payer: str = "", source: str = "direct",
                     chain: str = "solana", jwt_session: str = "",
-                    referral_code: str = ""):
-        # v43: detecta PRIMEIRO settle deste pagador antes do INSERT — é o
-        # evento comercial mais importante do funil (alguém que nunca pagou
-        # virou cliente). O operador é avisado na hora, no Telegram.
+                    referral_code: str = "") -> bool:
+        """Registra receita uma única vez por TX; False significa duplicidade."""
         _new_buyer = False
+        _inserted = False
         with self.lock, self._conn() as c:
             if payer:
                 _new_buyer = c.execute(
                     "SELECT 1 FROM revenue WHERE payer=? LIMIT 1",
                     (payer,)).fetchone() is None
-            c.execute("INSERT INTO revenue(ts,endpoint,amount,tx_sig,payer,source,chain,jwt_session,referral_code) "
-                      "VALUES(?,?,?,?,?,?,?,?,?)",
-                      (int(time.time()), endpoint, amount, tx_sig, payer, source, chain, jwt_session, referral_code))
-        if _new_buyer and payer and source != "bootstrap":
+            try:
+                c.execute("INSERT INTO revenue(ts,endpoint,amount,tx_sig,payer,source,chain,jwt_session,referral_code) "
+                          "VALUES(?,?,?,?,?,?,?,?,?)",
+                          (int(time.time()), endpoint, amount, tx_sig, payer, source, chain, jwt_session, referral_code))
+                _inserted = True
+            except sqlite3.IntegrityError:
+                _new_buyer = False
+        if _inserted and _new_buyer and payer and source != "bootstrap":
             try:
                 _is_op = (payer or "").lower() in OPERATOR_WALLETS
             except Exception:
@@ -1259,6 +1312,7 @@ class LedgerV10:
                         f"É o funil fechando: sondagem → avaliação → PAGAMENTO.")
                 except Exception:
                     pass
+        return _inserted
 
     # ---------- FUNNEL (v48.17.10) ----------
     _FUNNEL_GC_EVERY = 200
@@ -1669,8 +1723,138 @@ class LedgerV10:
     def tx_recorded(self, tx_sig: str) -> bool:
         if not tx_sig:
             return False
+        if isinstance(tx_sig, str) and tx_sig.startswith("0x"):
+            tx_sig = tx_sig.lower()
         with self._conn() as c:
             return c.execute("SELECT 1 FROM revenue WHERE tx_sig=?", (tx_sig,)).fetchone() is not None
+
+    def revenue_by_tx(self, tx_sig: str) -> Optional[dict]:
+        if not tx_sig:
+            return None
+        if isinstance(tx_sig, str) and tx_sig.startswith("0x"):
+            tx_sig = tx_sig.lower()
+        with self._conn() as c:
+            r = c.execute("SELECT endpoint,amount,payer,source,chain,ts FROM revenue WHERE tx_sig=? ORDER BY id LIMIT 1",
+                          (tx_sig,)).fetchone()
+        if not r:
+            return None
+        return {"endpoint": r[0], "amount": float(r[1]), "payer": r[2] or "",
+                "source": r[3] or "", "chain": r[4] or "", "ts": int(r[5] or 0)}
+
+    def challenge_save(self, rid: str, endpoint: str, accepts: list) -> None:
+        if not rid or not accepts:
+            return
+        with self.lock, self._conn() as c:
+            c.execute("INSERT OR REPLACE INTO payment_challenges(rid,endpoint,accepts_json,ts) VALUES(?,?,?,?)",
+                      (rid, endpoint, json.dumps(accepts, sort_keys=True), int(time.time())))
+            c.execute("DELETE FROM payment_challenges WHERE ts<?", (int(time.time()) - 86400,))
+
+    def challenge_get(self, rid: str, endpoint: str) -> Optional[list]:
+        if not rid:
+            return None
+        with self._conn() as c:
+            r = c.execute("SELECT accepts_json,ts FROM payment_challenges WHERE rid=? AND endpoint=?",
+                          (rid, endpoint)).fetchone()
+        if not r or int(time.time()) - int(r[1]) > CHALLENGE_TTL:
+            return None
+        try:
+            value = json.loads(r[0])
+            return value if isinstance(value, list) else None
+        except Exception:
+            return None
+
+    def payment_fingerprint_lookup(self, fingerprint: str) -> Optional[dict]:
+        if not fingerprint:
+            return None
+        with self._conn() as c:
+            r = c.execute("SELECT endpoint,tx_sig,payer,ts FROM payment_fingerprints WHERE fingerprint=?",
+                          (fingerprint,)).fetchone()
+        return ({"endpoint": r[0], "tx": r[1], "payer": r[2] or "", "ts": int(r[3] or 0)}
+                if r else None)
+
+    def pending_save(self, fingerprint: str, endpoint: str, tx_sig: str,
+                     requirement: dict, payer: str = "") -> None:
+        if not fingerprint:
+            return
+        with self.lock, self._conn() as c:
+            c.execute("INSERT OR REPLACE INTO pending_settlements(fingerprint,endpoint,tx_sig,requirement_json,payer,ts) VALUES(?,?,?,?,?,?)",
+                      (fingerprint, endpoint, tx_sig or "", json.dumps(requirement, sort_keys=True),
+                       payer or "", int(time.time())))
+
+    def pending_get(self, fingerprint: str) -> Optional[dict]:
+        if not fingerprint:
+            return None
+        with self._conn() as c:
+            r = c.execute("SELECT endpoint,tx_sig,requirement_json,payer,ts FROM pending_settlements WHERE fingerprint=?",
+                          (fingerprint,)).fetchone()
+        if not r:
+            return None
+        try:
+            req = json.loads(r[2])
+        except Exception:
+            req = {}
+        return {"endpoint": r[0], "tx": r[1] or "", "requirement": req,
+                "payer": r[3] or "", "ts": int(r[4] or 0)}
+
+    def pending_delete(self, fingerprint: str) -> None:
+        if not fingerprint:
+            return
+        with self.lock, self._conn() as c:
+            c.execute("DELETE FROM pending_settlements WHERE fingerprint=?", (fingerprint,))
+
+    def commit_payment(self, endpoint: str, amount: float, tx_sig: str,
+                       payer: str, source: str, chain: str, fingerprint: str,
+                       header_hash: str) -> Tuple[bool, str]:
+        """Commit atômico entre workers: receita + TX + fingerprint + replay."""
+        if not tx_sig:
+            return False, "missing-transaction"
+        if tx_sig.startswith("0x"):
+            tx_sig = tx_sig.lower()
+        _new_buyer = False
+        with self.lock:
+            c = self._conn()
+            try:
+                c.execute("BEGIN IMMEDIATE")
+                if c.execute("SELECT 1 FROM revenue WHERE tx_sig=?", (tx_sig,)).fetchone():
+                    c.rollback()
+                    return False, "transaction-already-recorded"
+                _tx_key = "tx:" + chain + ":" + tx_sig
+                if c.execute("SELECT 1 FROM replay WHERE hash=?", (_tx_key,)).fetchone():
+                    c.rollback()
+                    return False, "transaction-already-claimed"
+                if fingerprint and c.execute("SELECT 1 FROM payment_fingerprints WHERE fingerprint=?",
+                                             (fingerprint,)).fetchone():
+                    c.rollback()
+                    return False, "payment-already-recorded"
+                if payer:
+                    _new_buyer = c.execute("SELECT 1 FROM revenue WHERE payer=? LIMIT 1",
+                                           (payer,)).fetchone() is None
+                c.execute("INSERT INTO revenue(ts,endpoint,amount,tx_sig,payer,source,chain) VALUES(?,?,?,?,?,?,?)",
+                          (int(time.time()), endpoint, amount, tx_sig, payer, source, chain))
+                c.execute("INSERT INTO replay(hash,ts) VALUES(?,?)", (_tx_key, int(time.time())))
+                if header_hash:
+                    c.execute("INSERT OR IGNORE INTO replay(hash,ts) VALUES(?,?)",
+                              (header_hash, int(time.time())))
+                if fingerprint:
+                    c.execute("INSERT INTO payment_fingerprints(fingerprint,endpoint,tx_sig,payer,ts) VALUES(?,?,?,?,?)",
+                              (fingerprint, endpoint, tx_sig, payer, int(time.time())))
+                    c.execute("DELETE FROM pending_settlements WHERE fingerprint=?", (fingerprint,))
+                c.commit()
+            except sqlite3.IntegrityError:
+                c.rollback()
+                return False, "payment-replay"
+            except Exception as e:
+                c.rollback()
+                log.error(f"commit_payment {endpoint} tx={tx_sig}: {e}")
+                return False, "ledger-error"
+        if _new_buyer and payer and source != "bootstrap":
+            try:
+                if payer.lower() not in OPERATOR_WALLETS:
+                    _notify_telegram(f"🆕 NOVO COMPRADOR ORGÂNICO\nCarteira: {payer[:24]}...\n"
+                                     f"Primeira compra: {endpoint} — ${amount:.4f} ({chain})")
+            except Exception:
+                pass
+        return True, "ok"
 
     # --- v23: CRÉDITOS / PASSES ---
     def api_key_create(self, key: str, payer: str, plan: str, balance_usd: float,
@@ -1680,6 +1864,30 @@ class LedgerV10:
                          VALUES(?,?,?,?,?,?,?)""",
                       (key, payer, plan, balance_usd, int(time.time()),
                        int(time.time()) + ttl_seconds, tx_sig))
+
+    def api_key_create_idempotent(self, key: str, payer: str, plan: str,
+                                  balance_usd: float, ttl_seconds: int,
+                                  tx_sig: str) -> Tuple[dict, bool]:
+        """Uma TX gera uma única key, inclusive com retries em workers distintos."""
+        with self.lock:
+            c = self._conn()
+            try:
+                c.execute("BEGIN IMMEDIATE")
+                row = c.execute("SELECT key,plan,balance_usd,expires FROM api_keys WHERE tx_sig=?",
+                                (tx_sig,)).fetchone()
+                if row:
+                    c.commit()
+                    return ({"key": row[0], "plan": row[1], "balance_usd": row[2],
+                             "expires": row[3]}, False)
+                expires = int(time.time()) + ttl_seconds
+                c.execute("INSERT INTO api_keys(key,payer,plan,balance_usd,created,expires,tx_sig) VALUES(?,?,?,?,?,?,?)",
+                          (key, payer, plan, balance_usd, int(time.time()), expires, tx_sig))
+                c.commit()
+                return ({"key": key, "plan": plan, "balance_usd": balance_usd,
+                         "expires": expires}, True)
+            except Exception:
+                c.rollback()
+                raise
 
     def api_key_by_tx(self, tx_sig: str):
         """Idempotência: se a mesma tx já gerou uma key, retorna ela (retry seguro)."""
@@ -1801,74 +2009,91 @@ class SolanaClientV10:
             total += float(info.get("tokenAmount", {}).get("uiAmount") or 0)
         return total
 
-    def verify_payment(self, signature, expected_amount, receiver_address, max_age=86400):
+    def verify_payment(self, signature, expected_amount, receiver_address, max_age=900):
+        """Prova USDC-SPL por saldo ou instrução totalmente validada; sem logs."""
         tx = self.get_tx(signature)
         if not tx:
             return False, "tx-not-found"
-        if tx.get("meta", {}).get("err"):
+        meta = tx.get("meta") or {}
+        if meta.get("err"):
             return False, "tx-failed"
-        block_time = tx.get("blockTime") or 0
-        if block_time and (time.time() - block_time) > max_age:
+        block_time = int(tx.get("blockTime") or 0)
+        if not block_time:
+            return False, "tx-time-unknown"
+        if block_time > int(time.time()) + 300 or (time.time() - block_time) > max_age:
             return False, "tx-too-old"
-        meta = tx.get("meta", {})
-        pre  = {b["accountIndex"]: b for b in meta.get("preTokenBalances", [])}
-        post = {b["accountIndex"]: b for b in meta.get("postTokenBalances", [])}
+        expected_atomic = int(round(float(expected_amount) * (10 ** USDC_DECIMALS)))
+        if expected_atomic <= 0:
+            return False, "invalid-expected-amount"
+        pre = {b.get("accountIndex"): b for b in meta.get("preTokenBalances", [])}
+        post = {b.get("accountIndex"): b for b in meta.get("postTokenBalances", [])}
+
+        def raw_amount(balance):
+            try:
+                token = (balance or {}).get("uiTokenAmount") or {}
+                if int(token.get("decimals", USDC_DECIMALS)) != USDC_DECIMALS:
+                    return 0
+                return int(str(token.get("amount") or "0"))
+            except Exception:
+                return 0
+
         payer_addr = ""
-        # Método 1: pre/post balances
         for idx, pb in post.items():
-            if pb.get("mint") != USDC_MINT:
+            if pb.get("mint") != USDC_MINT or pb.get("owner") != receiver_address:
                 continue
-            if pb.get("owner") != receiver_address:
-                continue
-            pa = float(pre.get(idx, {}).get("uiTokenAmount", {}).get("uiAmount") or 0)
-            po = float(pb.get("uiTokenAmount", {}).get("uiAmount") or 0)
-            delta = po - pa
-            if delta + 1e-9 >= expected_amount:
+            delta_atomic = raw_amount(pb) - raw_amount(pre.get(idx))
+            if delta_atomic >= expected_atomic:
                 for j, qb in pre.items():
                     if qb.get("mint") != USDC_MINT:
                         continue
-                    qa = float(qb.get("uiTokenAmount", {}).get("uiAmount") or 0)
-                    qp = float(post.get(j, {}).get("uiTokenAmount", {}).get("uiAmount") or 0)
-                    if qa - qp >= expected_amount - 1e-9:
+                    spent = raw_amount(qb) - raw_amount(post.get(j))
+                    if spent >= expected_atomic:
                         payer_addr = qb.get("owner", "")
                         break
-                return True, {"ok": True, "delta": delta, "payer": payer_addr}
-        # Método 2: inner instructions
-        inner_ixs = meta.get("innerInstructions", [])
-        for inner in inner_ixs:
-            for ix in inner.get("instructions", []):
-                prog = ix.get("programId", "")
-                if "Token" in prog or prog == "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA":
-                    parsed = ix.get("parsed", {})
-                    ix_type = parsed.get("type", "")
-                    if ix_type in ("transfer", "transferChecked"):
-                        info = parsed.get("info", {})
-                        dest = info.get("destination", "")
-                        if "tokenAmount" in info:
-                            amount_raw = int(info["tokenAmount"].get("amount", 0))
-                            decimals = info["tokenAmount"].get("decimals", USDC_DECIMALS)
-                            amount_ui = amount_raw / (10 ** decimals)
-                        else:
-                            amount_raw = int(info.get("amount", 0))
-                            amount_ui = amount_raw / (10 ** USDC_DECIMALS)
-                        dest_owner = None
-                        for b in meta.get("postTokenBalances", []):
-                            if b.get("accountIndex") == info.get("destinationIndex"):
-                                dest_owner = b.get("owner")
-                                break
-                        if not dest_owner:
-                            account_keys = tx.get("transaction", {}).get("message", {}).get("accountKeys", [])
-                            dest_idx = info.get("destinationIndex")
-                            if dest_idx is not None and dest_idx < len(account_keys):
-                                dest_owner = account_keys[dest_idx] if isinstance(account_keys[dest_idx], str) else account_keys[dest_idx].get("pubkey")
-                        if dest_owner == receiver_address and amount_ui + 1e-9 >= expected_amount:
-                            payer_addr = info.get("authority", info.get("sourceOwner", ""))
-                            return True, {"ok": True, "delta": amount_ui, "payer": payer_addr, "method": "inner-instruction"}
-        # Método 3: logs
-        logs = meta.get("logMessages", [])
-        for log_entry in logs:
-            if "Instruction: Transfer" in log_entry or "Instruction: TransferChecked" in log_entry:
-                return True, {"ok": True, "delta": expected_amount, "payer": "", "method": "log-fallback"}
+                return True, {"ok": True, "delta": delta_atomic / (10 ** USDC_DECIMALS),
+                              "payer": payer_addr, "method": "token-balances"}
+
+        message = (tx.get("transaction") or {}).get("message") or {}
+        account_keys = message.get("accountKeys") or []
+        addresses = [(k if isinstance(k, str) else k.get("pubkey", "")) for k in account_keys]
+        instructions = list(message.get("instructions") or [])
+        for inner in meta.get("innerInstructions", []) or []:
+            instructions.extend(inner.get("instructions") or [])
+        for ix in instructions:
+            program_id = str(ix.get("programId") or "")
+            program = str(ix.get("program") or "")
+            if program_id != "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA" and program != "spl-token":
+                continue
+            parsed = ix.get("parsed") or {}
+            ix_type = parsed.get("type", "")
+            if ix_type not in ("transfer", "transferChecked"):
+                continue
+            info = parsed.get("info") or {}
+            if ix_type == "transferChecked" and str(info.get("mint") or "") != USDC_MINT:
+                continue
+            destination = str(info.get("destination") or "")
+            try:
+                dest_idx = addresses.index(destination)
+            except ValueError:
+                continue
+            dest_balance = post.get(dest_idx) or {}
+            if (dest_balance.get("mint") != USDC_MINT
+                    or dest_balance.get("owner") != receiver_address):
+                continue
+            try:
+                if "tokenAmount" in info:
+                    token = info.get("tokenAmount") or {}
+                    if int(token.get("decimals", USDC_DECIMALS)) != USDC_DECIMALS:
+                        continue
+                    amount_atomic = int(str(token.get("amount") or "0"))
+                else:
+                    amount_atomic = int(str(info.get("amount") or "0"))
+            except Exception:
+                continue
+            if amount_atomic >= expected_atomic:
+                payer_addr = info.get("authority", info.get("sourceOwner", ""))
+                return True, {"ok": True, "delta": amount_atomic / (10 ** USDC_DECIMALS),
+                              "payer": payer_addr, "method": "parsed-instruction"}
         return False, "no-matching-transfer"
 
     def get_recent_txs(self, address, limit=10):
@@ -2116,36 +2341,9 @@ class FacilitatorClient:
     def settle(self, payment_payload: dict, requirements: dict,
                bazaar: Optional[dict] = None,
                resource: Optional[dict] = None) -> Tuple[bool, dict]:
+        """Só retorna True com sucesso explícito, rede e recibo do facilitador."""
         try:
             pp = payment_payload
-            # v21.13: blob de discovery do Bazaar — a CDP cataloga o endpoint
-            # quando processa o settle com esse metadata (indexação automática).
-            # v41 FIX CRÍTICO — A VENDA ACONTECIA MAS NÃO VIRAVA CATÁLOGO.
-            # Docs CDP (quickstart-for-sellers, jul/2026): o payment payload
-            # enviado ao facilitador DEVE incluir paymentPayload.resource — é
-            # esse campo que o Bazaar/Agentic.Market usa para associar o settle
-            # ao recurso e indexá-lo. Sem ele, cada settle em Base era invisível
-            # para o diretório onde os compradores descobrem serviços.
-            # ---------------------------------------------------------------
-            # v41.1 — `resource` VIROU OPT-IN. Leia antes de ligar.
-            #
-            # ATUALIZAÇÃO v48.9.19-CATALOG (25/set/2026): a dúvida original
-            # está RESOLVIDA. A documentação oficial da CDP ("Get discovered",
-            # 24/set/2026) passou a declarar explicitamente:
-            #   "The payment payload sent to the facilitator must include
-            #    paymentPayload.resource so CDP knows which resource to
-            #    catalog."
-            #   "the settle request must contain paymentPayload.resource.
-            #    Without this, the Bazaar has no way to associate the
-            #    discovery metadata with a resource."
-            # Ou seja: sem CDP_SEND_RESOURCE=1, nenhum settle vira catálogo.
-            # O flag continua existindo por segurança operacional (testar com
-            # $0.01 e conferir /bazaar-status → discovery_feedback), mas o
-            # comportamento documentado como necessário é LIGADO.
-            #
-            # Registro histórico da v41.1: o canal extensions já existia; o
-            # resource era a peça que faltava e hoje está confirmada.
-            # ---------------------------------------------------------------
             if self.is_cdp and (bazaar or (resource and CDP_SEND_RESOURCE)):
                 pp = dict(payment_payload)
                 if bazaar:
@@ -2154,24 +2352,44 @@ class FacilitatorClient:
                     pp["extensions"] = ext
                 if resource and CDP_SEND_RESOURCE:
                     pp["resource"] = resource
-                    log.info("🧪 settle CDP com paymentPayload.resource "
-                             "(experimental, CDP_SEND_RESOURCE=1)")
             r = requests.post(f"{self.url}/settle", json={
                 "x402Version": pp.get("x402Version", 2),
                 "paymentPayload": pp,
                 "paymentRequirements": requirements,
             }, headers=self._headers("POST", "/settle"), timeout=FAC_SETTLE_TIMEOUT)
+            try:
+                data = r.json() if r.text else {}
+            except Exception:
+                data = {"error": "invalid-json", "body": r.text[:300]}
+            if not isinstance(data, dict):
+                data = {"error": "invalid-settle-response"}
+            data["_http"] = r.status_code
+            reason = str(data.get("errorReason") or data.get("error") or "")
+            if reason.lower() == "settlement_pending":
+                data.update({"pending": True, "error": "settlement_pending"})
+                log.warning(f"⏳ {self.tag} settlement_pending tx={str(data.get('transaction') or '')[:24]}")
+                return False, data
             if not r.ok:
-                return False, {"error": f"facilitator-{r.status_code}", "body": r.text[:400]}
-            # v21.14: EXTENSION-RESPONSES é o mecanismo oficial de diagnóstico da
-            # indexação Bazaar — logar sempre no settle CDP (presente ou ausente).
+                data.setdefault("error", f"facilitator-{r.status_code}")
+                return False, data
+            if data.get("success") is not True:
+                data.setdefault("error", reason or "success-not-true")
+                return False, data
+            returned_network = str(data.get("network") or "")
+            if not _network_matches(requirements.get("network", ""), returned_network):
+                data.setdefault("error", "settlement-network-mismatch")
+                data["expectedNetwork"] = requirements.get("network", "")
+                return False, data
+            tx = _clean_tx(data)
+            if not tx:
+                data.setdefault("error", "missing-facilitator-transaction")
+                return False, data
+            data["_clean_tx"] = tx
             if self.is_cdp:
                 _ext = r.headers.get("EXTENSION-RESPONSES") or r.headers.get("extension-responses")
                 log.info(f"🏪 settle CDP ok | EXTENSION-RESPONSES: {_ext or 'AUSENTE'}")
-                # v48.9.19-CATALOG: persistir o veredito — sem isto, conferir a
-                # indexação exigia garimpar logs do Railway. /bazaar-status lê.
                 _bazaar_ext_note(_ext, bool(pp.get("resource")))
-            return True, r.json()
+            return True, data
         except Exception as e:
             return False, {"error": str(e)}
 
@@ -6326,20 +6544,13 @@ def _explorer_url(chain: str, sig: str) -> str:
     return f"https://solscan.io/tx/{sig}"
 
 def _clean_tx(sdata: dict, fallback: str = "") -> str:
-    """v24.7 FIX: o campo 'transaction' de alguns facilitators traz o BLOB
-    base64 da transação, não a assinatura. Isso gravava recibos com hash
-    inválido (ex.: 'AgAAAAAAAA...'), cujo link no explorer não abre — dano
-    direto à página de transparência, que é o nosso diferencial. Agora
-    priorizamos os campos de assinatura e validamos o formato."""
+    """Extrai somente o recibo emitido pelo facilitador; nunca usa o comprador."""
     for key in ("signature", "txSignature", "transactionHash", "txHash",
                 "tx", "hash", "transaction"):
         v = sdata.get(key)
         if isinstance(v, str) and _valid_txid(v):
-            return v.strip()
-        # v44.9.4: settle da PayAI voltou a trazer o BLOB base64 da transação
-        # Solana inteira em 'transaction' (campos vistos no log: success,
-        # transaction, network, payer). A assinatura são os primeiros 64
-        # bytes do blob — recuperamos em vez de gravar recibo sem link.
+            v = v.strip()
+            return v.lower() if v.startswith("0x") else v
         if isinstance(v, str) and (len(v) > 90 or any(c in v for c in "+/=")):
             try:
                 import base64 as _b64
@@ -6350,14 +6561,103 @@ def _clean_tx(sdata: dict, fallback: str = "") -> str:
                         return sig
             except Exception:
                 pass
-    if _valid_txid(fallback):
-        return fallback.strip()
-    # v44.9.4: preview do valor ofensor no log — a próxima ocorrência diz
-    # exatamente o que o facilitator mandou, sem adivinhação.
-    _prev = str(sdata.get("transaction", ""))[:40]
-    log.warning(f"⚠️ settle sem assinatura válida (campos: {list(sdata)[:6]}, "
-                f"transaction='{_prev}...') — recibo será registrado sem link de explorer")
+    log.warning(f"settle sem assinatura válida do facilitador (campos: {list(sdata)[:8]})")
     return ""
+
+
+def _canonical_network(value: str) -> str:
+    n = str(value or "").strip()
+    aliases = {
+        "base": BASE_CAIP2,
+        "solana": f"solana:{SOL_GENESIS}",
+        "algorand": ALGO_CAIP2,
+        "polygon": "eip155:137",
+        "arbitrum": "eip155:42161",
+    }
+    return aliases.get(n.lower(), n.lower())
+
+
+def _network_matches(expected: str, actual: str) -> bool:
+    return bool(expected and actual and _canonical_network(expected) == _canonical_network(actual))
+
+
+def _chain_for_network(network: str) -> str:
+    n = _canonical_network(network)
+    if n == BASE_CAIP2.lower():
+        return "base"
+    if n == "eip155:137":
+        return "polygon"
+    if n == "eip155:42161":
+        return "arbitrum"
+    if n.startswith("algorand"):
+        return "algorand"
+    if n.startswith("solana"):
+        return "solana"
+    return "unknown"
+
+
+def _requirement_amount_atomic(requirement: dict) -> int:
+    try:
+        value = int(str(requirement.get("amount") or requirement.get("maxAmountRequired") or "0"))
+        return value if value > 0 else 0
+    except Exception:
+        return 0
+
+
+def _payment_fingerprint(payload: dict) -> str:
+    """Identifica a autorização, não a formatação JSON nem o accepted ecoado."""
+    try:
+        inner = payload.get("payload")
+        if not isinstance(inner, dict) or not inner:
+            inner = {k: payload.get(k) for k in ("signature", "authorization", "transaction",
+                     "stxn", "signedTransaction", "signedTxn", "txn", "paymentGroup", "paymentIndex")
+                     if payload.get(k) is not None}
+        if not inner:
+            return ""
+        blob = json.dumps(inner, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+        return hashlib.sha256(blob.encode()).hexdigest()
+    except Exception:
+        return ""
+
+
+def _accepted_matches_requirement(payload: dict, requirement: dict) -> bool:
+    """O accepted do cliente só pode selecionar; jamais alterar a oferta."""
+    try:
+        version = int(payload.get("x402Version", 2) or 2)
+        accepted = payload.get("accepted")
+        if version >= 2:
+            if not isinstance(accepted, dict):
+                return False
+            for key in ("scheme", "network", "asset", "payTo"):
+                left = str(accepted.get(key) or "")
+                right = str(requirement.get(key) or "")
+                if key == "network":
+                    if not _network_matches(right, left):
+                        return False
+                elif key in ("asset", "payTo") and left.startswith("0x") and right.startswith("0x"):
+                    if left.lower() != right.lower():
+                        return False
+                elif left != right:
+                    return False
+            if _requirement_amount_atomic(accepted) != _requirement_amount_atomic(requirement):
+                return False
+            official_extra = requirement.get("extra") or {}
+            client_extra = accepted.get("extra") or {}
+            for key in ("requestId", "name", "version", "feePayer", "tag"):
+                if key in official_extra and key in client_extra and str(client_extra[key]) != str(official_extra[key]):
+                    return False
+            if official_extra.get("requestId") and client_extra.get("requestId") != official_extra.get("requestId"):
+                return False
+        inner = payload.get("payload") if isinstance(payload.get("payload"), dict) else payload
+        auth = inner.get("authorization") if isinstance(inner, dict) else None
+        if isinstance(auth, dict) and _chain_for_network(requirement.get("network", "")) in ("base", "polygon", "arbitrum"):
+            if str(auth.get("to") or "").lower() != str(requirement.get("payTo") or "").lower():
+                return False
+            if int(str(auth.get("value") or "0")) != _requirement_amount_atomic(requirement):
+                return False
+        return True
+    except Exception:
+        return False
 
 ENDPOINT_PARAM_HINTS = {
     # v34: o registro no x402scan avisou "Paid endpoint is missing an input
@@ -6618,23 +6918,51 @@ CHALLENGE_TTL = int(os.environ.get("CHALLENGE_TTL", "300"))
 
 
 def _challenge_remember(endpoint: str, accepts: list) -> None:
+    """Persiste o desafio por requestId, compartilhado entre workers."""
     if not accepts:
         return
+    try:
+        rid = str((accepts[0].get("extra") or {}).get("requestId") or "")
+    except Exception:
+        rid = ""
+    if not rid:
+        log.warning(f"desafio sem requestId em {endpoint}; pagamento v2 será recusado")
+        return
+    key = endpoint + ":" + rid
     with _CHALLENGE_LOCK:
-        _CHALLENGE_CACHE[endpoint] = (time.time(), accepts)
-        if len(_CHALLENGE_CACHE) > 300:
-            for k in sorted(_CHALLENGE_CACHE,
-                            key=lambda x: _CHALLENGE_CACHE[x][0])[:100]:
+        _CHALLENGE_CACHE[key] = (time.time(), copy.deepcopy(accepts) if "copy" in globals() else json.loads(json.dumps(accepts)))
+        if len(_CHALLENGE_CACHE) > 600:
+            for k in sorted(_CHALLENGE_CACHE, key=lambda x: _CHALLENGE_CACHE[x][0])[:200]:
                 _CHALLENGE_CACHE.pop(k, None)
+    try:
+        LEDGER.challenge_save(rid, endpoint, accepts)
+    except Exception as e:
+        log.warning(f"challenge_save {endpoint}: {e}")
 
 
-def _challenge_recall(endpoint: str) -> Optional[list]:
-    """Devolve os accepts realmente emitidos, se ainda dentro da janela."""
+def _challenge_recall(endpoint: str, rid: str = "") -> Optional[list]:
+    """Só recupera o desafio exato; nunca usa o desafio de outro comprador."""
+    if not rid:
+        return None
+    key = endpoint + ":" + rid
     with _CHALLENGE_LOCK:
-        hit = _CHALLENGE_CACHE.get(endpoint)
+        hit = _CHALLENGE_CACHE.get(key)
     if hit and (time.time() - hit[0]) <= CHALLENGE_TTL:
         return hit[1]
+    try:
+        accepts = LEDGER.challenge_get(rid, endpoint)
+    except Exception:
+        accepts = None
+    if accepts:
+        with _CHALLENGE_LOCK:
+            _CHALLENGE_CACHE[key] = (time.time(), accepts)
+        return accepts
     return None
+
+
+# A implementação canônica de _challenge_recall é a anterior, vinculada a
+# endpoint + requestId e ao SQLite. Não redefinir aqui: uma versão legada por
+# endpoint anularia o isolamento entre compradores e quebraria a chamada v2.
 
 
 # ---------------------------------------------------------------------------
@@ -7530,22 +7858,24 @@ def _mpp_verify_credential(endpoint: str, cred_b64: str):
             return False, "wrong-chain", {}
     except Exception:
         return False, "wrong-chain", {}
-    # Preco dinamico pode ter andado entre desafio e pagamento — honra a
-    # cotacao com 3% de tolerancia (mesma filosofia do challenge-recall x402).
+    # O HMAC prova que o servidor emitiu o valor; não há desconto no rail manual.
     cur_atomic = int(round(get_dynamic_price(endpoint) * 1_000_000))
-    if want_amt < int(cur_atomic * 0.97):
+    if want_amt != cur_atomic:
         return False, "insufficient-amount", {}
     if str(payload.get("type")) != "hash":
         return False, "unsupported-mode", {}
     txh = str(payload.get("hash", "")).lower()
     if not re.fullmatch(r"0x[0-9a-f]{64}", txh):
         return False, "bad-tx-hash", {}
-    if not LEDGER.replay_claim("mpp:" + txh):
+    if LEDGER.tx_recorded(txh):
+        return False, "replay", {}
+    tx_key = "tx:tempo:" + txh
+    if not LEDGER.replay_claim(tx_key):
         return False, "replay", {}
     try:
         rcpt = _tempo_rpc("eth_getTransactionReceipt", [txh])
         if not rcpt:
-            LEDGER.replay_unmark("mpp:" + txh)
+            LEDGER.replay_unmark(tx_key)
             return False, "tx-not-found", {}
         if str(rcpt.get("status")) != "0x1":
             return False, "tx-failed", {}
@@ -7570,19 +7900,27 @@ def _mpp_verify_credential(endpoint: str, cred_b64: str):
         tip = _tempo_rpc("eth_blockNumber", [])
         bn = int(str(rcpt.get("blockNumber", "0x0")), 16)
         if tip is not None and int(str(tip), 16) - bn < MPP_MIN_CONF:
-            LEDGER.replay_unmark("mpp:" + txh)
+            LEDGER.replay_unmark(tx_key)
             return False, "insufficient-confirmations", {}
+        block = _tempo_rpc("eth_getBlockByNumber", [hex(bn), False])
+        block_time = int(str((block or {}).get("timestamp", "0x0")), 16)
+        if not block_time or time.time() - block_time > _MPP_CHAL_TTL:
+            return False, "tx-too-old", {}
     except Exception as e:
-        LEDGER.replay_unmark("mpp:" + txh)
+        LEDGER.replay_unmark(tx_key)
         log.warning(f"mpp tempo rpc: {e}")
         return False, "rpc-error", {}
     usd = round(want_amt / 1_000_000, 6)
-    LEDGER.add_revenue(endpoint, usd, txh, payer, source="mpp", chain="tempo")
+    if not LEDGER.add_revenue(endpoint, usd, txh, payer, source="mpp", chain="tempo"):
+        return False, "replay", {}
+    _notify_telegram(f"💰 ${usd:.6f} USDC em {endpoint} (Tempo/MPP)\nTX: {txh}")
     receipt = {"method": "tempo", "reference": txh, "status": "success",
                "timestamp": datetime.fromtimestamp(time.time(), timezone.utc
                                                    ).strftime("%Y-%m-%dT%H:%M:%SZ")}
     log.info(f"💰 MPP/tempo ${usd:.4f} em {endpoint} de {payer[:14]}… tx {txh[:18]}…")
     return True, "mpp", {"payer": payer, "tx": txh,
+                         "payment_verified": True, "amount_usd": usd,
+                         "required_usd": want_amt / 1_000_000,
                          "settlement": {"success": True, "transaction": txh,
                                         "payer": payer, "network": "tempo"},
                          "mpp_receipt": receipt}
@@ -7608,15 +7946,16 @@ def _h_ecosystem_pulse():
     with LEDGER._conn() as c:
         top = c.execute(
             "SELECT endpoint, COUNT(*) n, COUNT(DISTINCT ip) ips FROM requests "
-            "WHERE ts>? GROUP BY endpoint ORDER BY n DESC LIMIT 25", (d1,)).fetchall()
+            "WHERE ts>? AND " + _DEMAND_UA_SQL +
+            " GROUP BY endpoint ORDER BY n DESC LIMIT 25", (d1,)).fetchall()
         uas = c.execute(
             "SELECT ua, COUNT(*) n FROM requests WHERE ts>? AND ua!='' "
             "GROUP BY ua ORDER BY n DESC LIMIT 80", (d1,)).fetchall()
-        cur7 = dict(c.execute("SELECT endpoint, COUNT(*) FROM requests WHERE ts>? "
-                              "GROUP BY endpoint", (d7,)).fetchall())
+        cur7 = dict(c.execute("SELECT endpoint, COUNT(*) FROM requests WHERE ts>? AND "
+                              + _DEMAND_UA_SQL + " GROUP BY endpoint", (d7,)).fetchall())
         prev7 = dict(c.execute("SELECT endpoint, COUNT(*) FROM requests "
-                               "WHERE ts>? AND ts<=? GROUP BY endpoint",
-                               (d14, d7)).fetchall())
+                               "WHERE ts>? AND ts<=? AND " + _DEMAND_UA_SQL +
+                               " GROUP BY endpoint", (d14, d7)).fetchall())
         tot24 = c.execute("SELECT COUNT(*) FROM requests WHERE ts>?", (d1,)).fetchone()[0]
         agent_ips = c.execute(
             "SELECT COUNT(DISTINCT ip) FROM requests WHERE ts>? AND "
@@ -7719,7 +8058,8 @@ def _ml_price_advisor():
     with LEDGER._conn() as c:
         probes = dict(c.execute(
             "SELECT endpoint, COUNT(*) FROM requests WHERE ts>? "
-            "AND kind IN ('probe','challenge402') GROUP BY endpoint", (d7,)).fetchall())
+            "AND kind IN ('probe','challenge402') AND " + _DEMAND_UA_SQL +
+            " GROUP BY endpoint", (d7,)).fetchall())
         previews = dict(c.execute(
             "SELECT endpoint, COUNT(*) FROM requests WHERE ts>? AND kind='preview' "
             "GROUP BY endpoint", (d7,)).fetchall())
@@ -7905,215 +8245,172 @@ def _looks_like_sol_sig(s) -> bool:
     return bool(_B58_SIG_RE.match(str(s or "").strip()))
 
 
+def _verified_payment_info(endpoint: str, requirement: dict, tx_sig: str,
+                           payer: str, proof: dict, settlement: dict,
+                           idempotent: bool = False) -> dict:
+    received = float(proof.get("received_usd", proof.get("delta", 0)) or 0)
+    return {"payer": payer or proof.get("payer") or "", "tx": tx_sig,
+            "settlement": settlement, "payment_verified": True,
+            "amount_usd": round(received, 6),
+            "required_usd": _requirement_amount_atomic(requirement) / 1_000_000,
+            "network": requirement.get("network", ""), "asset": requirement.get("asset", ""),
+            "payTo": requirement.get("payTo", ""), "idempotent": idempotent}
+
+
+def _pending_payment(endpoint: str, fingerprint: str, requirement: dict,
+                     tx_sig: str, payer: str, reason: str) -> Tuple[bool, str, dict]:
+    try:
+        LEDGER.pending_save(fingerprint, endpoint, tx_sig, requirement, payer)
+    except Exception as e:
+        log.error(f"pending_save {endpoint}: {e}")
+    return False, "settlement-pending:" + reason, {
+        "settlement_pending": True, "settlement_seen": True, "tx": tx_sig,
+        "network": requirement.get("network", ""), "payer": payer,
+        "retry": "Retry the same payment payload; do not create another payment."}
+
+
+def _finalize_facilitator_payment(endpoint: str, requirement: dict, tx_sig: str,
+                                  payer: str, proof: dict, settlement: dict,
+                                  fingerprint: str, header_hash: str, rid: str):
+    chain = _chain_for_network(requirement.get("network", ""))
+    received = round(float(proof.get("received_usd", proof.get("delta", 0)) or 0), 6)
+    committed, why = LEDGER.commit_payment(endpoint, received, tx_sig, payer,
+                                           "facilitator", chain, fingerprint, header_hash)
+    if not committed:
+        if why == "ledger-error":
+            return _pending_payment(endpoint, fingerprint, requirement, tx_sig, payer, why)
+        # Retry de plano pode recuperar a MESMA key, sem nova receita.
+        receipt = LEDGER.revenue_by_tx(tx_sig)
+        existing = LEDGER.api_key_by_tx(tx_sig) if endpoint in CREDIT_PLANS else None
+        if receipt and receipt.get("endpoint") == endpoint and existing:
+            info = _verified_payment_info(endpoint, requirement, tx_sig,
+                                          payer or receipt.get("payer", ""), proof,
+                                          settlement, idempotent=True)
+            return True, "idempotent-payment", info
+        log.warning(f"pagamento liquidado mas já consumido {endpoint} tx={tx_sig}: {why}")
+        return False, "payment-replay:" + why, {"settlement_seen": True, "tx": tx_sig}
+    try:
+        if rid and LEDGER.funnel_settle(rid, payer, chain):
+            log.info(f"🔗 funil fechado: 402→settle rid={rid} {endpoint} ({chain})")
+    except Exception:
+        pass
+    _notify_telegram(f"💰 ${received:.6f} USDC em {endpoint} ({chain}, via facilitator)\nTX: {tx_sig}")
+    return True, "ok-facilitator", _verified_payment_info(
+        endpoint, requirement, tx_sig, payer, proof, settlement)
+
+
 def _verify_payment(endpoint: str, payment_header: str):
     if not payment_header:
         return False, "missing-header", {}
     payment_header = payment_header.strip()
-    # v21: aceita header raw (v1 sig direto) OU base64 JSON (v2 payload completo)
-    h = hashlib.sha256(payment_header.encode()).hexdigest()
-    # v23 FIX CRÍTICO: a v22 gravava o hash ANTES de verificar. Qualquer falha
-    # transitória (tx-not-found por lag de RPC, 5xx do facilitator) deixava o
-    # hash preso → o retry legítimo do cliente voltava "replay-blocked" e a
-    # venda morria na linha de chegada. Agora: checa antes, marca só no settle.
-    if LEDGER.replay_seen(h):
-        return False, "replay-blocked", {}
-    tx_sig = payment_header
-    payer  = ""
+    header_hash = hashlib.sha256(payment_header.encode()).hexdigest()
+    header_replayed = LEDGER.replay_seen(header_hash)
+
+    payload, pdata = {}, {}
+    tx_sig, payer = payment_header, ""
     network = "solana"
-    payload = {}
-    last_reason = ""   # v44.2.2: motivo do facilitador, devolvido no 402
-    fac_reasons = {}   # v44.2.2: um motivo por facilitador (dedup entre accepts)
     try:
-        decoded = base64.b64decode(payment_header).decode()
-        pdata = json.loads(decoded)
+        pdata = json.loads(base64.b64decode(payment_header).decode())
+        if not isinstance(pdata, dict):
+            raise ValueError("payment-not-object")
         payload = pdata
-        if "payload" in pdata:
-            inner = pdata["payload"]
-            tx_sig = inner.get("signature") or inner.get("transaction") or inner.get("tx") or tx_sig
-            payer  = inner.get("payer") or inner.get("from") or ""
-        else:
-            tx_sig = pdata.get("signature") or pdata.get("tx") or payment_header
-            payer  = pdata.get("payer", "")
-        network = pdata.get("network", "solana")
-        # v44.2.3 FIX CRÍTICO — a rede do payload v2 mora em accepted.network.
-        # O SDK oficial v2 NÃO repete scheme/network no topo do PaymentPayload
-        # (só {x402Version, payload, resource, accepted}). Sem este fallback,
-        # um pagamento Base v2 caía no default "solana": o v21.5/v24.9 deixava
-        # o accept SOLANA ser verificado contra o payload EVM → o facilitator
-        # respondia "network_mismatch" e esse motivo-fantasma sobrescrevia o
-        # motivo REAL da tentativa correta (eip155) no 402 devolvido.
-        if isinstance(pdata.get("accepted"), dict) and pdata["accepted"].get("network"):
-            network = pdata["accepted"]["network"]
-        # v48.25.0-GLOBAL: triagem OFAC do pagador ANTES de qualquer settle —
-        # pagador sancionado recebe 402 de volta e o dinheiro nunca entra.
-        # (rede A7 designada pela OFAC em 01/out/2026; FinCEN propôs regra
-        # cobrindo crypto. Nosso payTo é depósito de exchange — fundo manchado
-        # é risco operacional real, não teoria.)
+        inner = pdata.get("payload") if isinstance(pdata.get("payload"), dict) else pdata
+        tx_sig = (inner.get("signature") or inner.get("transaction") or inner.get("tx")
+                  or tx_sig)
+        payer = inner.get("payer") or inner.get("from") or pdata.get("payer", "") or ""
+        accepted = pdata.get("accepted") if isinstance(pdata.get("accepted"), dict) else {}
+        network = pdata.get("network") or accepted.get("network") or "solana"
+    except Exception:
+        pdata, payload = {}, {}
+
+    rid = ""
+    try:
+        extra = (pdata.get("accepted") or {}).get("extra") or {}
+        candidate = extra.get("requestId")
+        if isinstance(candidate, str) and 6 <= len(candidate) <= 32:
+            rid = candidate
+    except Exception:
+        rid = ""
+    fingerprint = _payment_fingerprint(payload) if payload else ""
+
+    if fingerprint:
+        previous = LEDGER.payment_fingerprint_lookup(fingerprint)
+        if previous:
+            receipt = LEDGER.revenue_by_tx(previous.get("tx", ""))
+            if (endpoint in CREDIT_PLANS and previous.get("endpoint") == endpoint
+                    and receipt and receipt.get("endpoint") == endpoint):
+                req = {"network": receipt.get("chain", ""), "amount": str(int(round(receipt["amount"] * 1_000_000)))}
+                return True, "idempotent-payment", {
+                    "payer": previous.get("payer", ""), "tx": previous.get("tx", ""),
+                    "payment_verified": True, "amount_usd": receipt["amount"],
+                    "required_usd": receipt["amount"], "idempotent": True}
+            return False, "replay-blocked", {"settlement_seen": True,
+                                              "tx": previous.get("tx", "")}
+        pending = LEDGER.pending_get(fingerprint)
+        if pending:
+            req = pending.get("requirement") or {}
+            if pending.get("endpoint") != endpoint or not req:
+                return False, "pending-endpoint-mismatch", {"settlement_seen": True}
+            tx_pending = pending.get("tx", "")
+            if not tx_pending:
+                return _pending_payment(endpoint, fingerprint, req, tx_pending,
+                                        pending.get("payer", ""), "awaiting-transaction-hash")
+            ok_chain, why_chain, proof = _verify_settlement_onchain(tx_pending, req)
+            if ok_chain:
+                real_payer = proof.get("payer") or pending.get("payer", "")
+                settled = {"success": True, "transaction": tx_pending,
+                           "network": req.get("network", ""), "reconciled": True}
+                return _finalize_facilitator_payment(endpoint, req, tx_pending, real_payer,
+                                                     proof, settled, fingerprint, header_hash, rid)
+            if _settlement_transient(why_chain):
+                return _pending_payment(endpoint, fingerprint, req, tx_pending,
+                                        pending.get("payer", ""), why_chain)
+            mismatch = proof if isinstance(proof, dict) else {"detail": str(proof)}
+            return False, "settlement-mismatch:" + why_chain, dict(mismatch, **{
+                "settlement_seen": True, "tx": tx_pending})
+
+    if header_replayed:
+        return False, "replay-blocked", {"settlement_seen": True}
+    if payload and not _payload_shape_ok(payload):
+        return False, "invalid-payload-shape", {}
+
+    # OFAC antes de qualquer settle; dados de log nunca incluem a assinatura.
+    if payload:
         try:
-            _cand = {payer or ""}
-            _pl2 = pdata.get("payload")
-            if isinstance(_pl2, dict):
-                _au2 = _pl2.get("authorization")
-                if isinstance(_au2, dict) and _au2.get("from"):
-                    _cand.add(str(_au2["from"]))
-            if any(_payer_hit_ofac(a) for a in _cand if a):
-                log.warning(f"⛔ OFAC hit PRÉ-settle em {endpoint}: "
-                            f"{sorted(_cand)} — settle recusado")
-                try:
-                    _notify_telegram(f"⛔ OFAC: pagador sancionado tentou "
-                                     f"{endpoint} — settle RECUSADO: {sorted(_cand)}")
-                except Exception:
-                    pass
+            candidates = {payer or ""}
+            inner = payload.get("payload") if isinstance(payload.get("payload"), dict) else {}
+            auth = inner.get("authorization") if isinstance(inner.get("authorization"), dict) else {}
+            if auth.get("from"):
+                candidates.add(str(auth["from"]))
+            if any(_payer_hit_ofac(a) for a in candidates if a):
+                log.warning(f"⛔ OFAC hit PRÉ-settle em {endpoint}")
                 return False, "sanctioned-payer", {}
         except Exception:
             pass
-    except Exception:
-        tx_sig = payment_header.strip()
 
-    # v48.17.10-FUNNEL: o accept escolhido volta no PaymentPayload.accepted —
-    # o extra.requestId emitido no 402 fecha o elo probe→pagamento.
-    _rid = ""
-    try:
-        _acc = pdata.get("accepted") if isinstance(pdata, dict) else None
-        _ex = (_acc or {}).get("extra") if isinstance(_acc, dict) else None
-        _r = (_ex or {}).get("requestId") if isinstance(_ex, dict) else None
-        if isinstance(_r, str) and 6 <= len(_r) <= 32:
-            _rid = _r
-    except Exception:
-        _rid = ""
-
-    # v48.3.2: lixo estrutural NÃO vai ao facilitator — rejeição local, grátis.
-    # (payload só é não-vazio quando o header decodificou como JSON; o fluxo
-    # raw-sig legado v1, não-JSON, segue intocado para verificação on-chain.)
-    if payload and not _payload_shape_ok(payload):
-        # v48.17.8: loga as chaves vistas — diagnostica formato novo sem abrir exceção
-        try:
-            _in = payload.get("payload") if isinstance(payload.get("payload"), dict) else {}
-            _keys = sorted(str(k) for k in _in.keys())[:8]
-        except Exception:
-            _keys = ["?"]
-        log.warning(f"🧯 shape de payload inválido p/ {endpoint} — "
-                    f"rejeitado localmente (anti-abuso facilitator) keys={_keys}")
-        return False, "invalid-payload-shape", {}
-
-    # v39: o valor registrado é o que foi efetivamente cotado ao cliente.
-    _quoted = _challenge_recall(endpoint)
-    if _quoted:
-        try:
-            amount = int(_quoted[0]["amount"]) / (10 ** USDC_DECIMALS)
-        except Exception:
-            amount = get_dynamic_price(endpoint)
-    else:
-        amount = get_dynamic_price(endpoint)
-    # v44.8.2: Algorand caía no else e ia pro ledger como "solana" — receipts
-    # com txid AVM e link solscan quebrado. Detecta as 3 chains explicitamente.
-    _net_l = str(network).lower()
-    chain = ("algorand" if _net_l.startswith("algorand")
-             else "base" if ("eip155" in _net_l or _net_l.startswith("base") or str(tx_sig).startswith("0x"))
-             else "solana")
-
-    if (FACILITATOR or CDP_FAC) and payload:
-        # v21.4 FIX: sanitiza campos-objeto que cheguem como null no payload do
-        # cliente — o schema do PayAI exige record ({}), e null causa 400.
-        for _k in ("extensions", "extra"):
-            if _k in payload and payload[_k] is None:
-                payload[_k] = {}
-        if isinstance(payload.get("payload"), dict):
-            for _k in ("extensions", "extra"):
-                if _k in payload["payload"] and payload["payload"][_k] is None:
-                    payload["payload"][_k] = {}
-        # v39: prefere o desafio EMITIDO ao recalculado — ver _CHALLENGE_CACHE.
-        accepts = _challenge_recall(endpoint)
+    if (FACILITATOR or CDP_FAC or GO_FAC) and payload:
+        accepts = _challenge_recall(endpoint, rid) if rid else None
+        if rid and accepts is None:
+            return False, "unknown-or-expired-challenge", {}
         if accepts is None:
-            accepts = _build_402(endpoint).get_json()["acceptsV2"]
-        else:
-            _issued = accepts[0].get("amount") if accepts else None
-            _now_amt = str(int(get_dynamic_price(endpoint) * 10 ** USDC_DECIMALS))
-            if _issued and _issued != _now_amt:
-                log.info(f"💱 {endpoint}: preço mudou entre desafio e liquidação "
-                         f"({_issued} → {_now_amt}); honrando o valor cotado.")
-        # v21.5 FIX: só envia ao facilitator o accept cuja network bate com a do
-        # payload do cliente. Verificar payload Solana contra requirements Base
-        # (e vice-versa) é um combo inválido que pode causar 500 no facilitator.
-        # v44.2.3: rede efetiva do cliente — v1 no topo, v2 em accepted.network
-        # (a variável `network` já saiu do parse com esse fallback aplicado).
-        pay_net = str(payload.get("network")
-                      or (payload.get("accepted") or {}).get("network")
-                      or network or "")
-        # v48.9.12-DUAL: o client v1 assina com nome curto ("base"/"solana").
-        # v48.9.13-V1FIX: a conversão para CAIP-2 vale SÓ para o MATCHING
-        # local — NUNCA grave o CAIP-2 dentro de um payload v1: o facilitator
-        # casa formato↔formato e REJEITA v1 com rede CAIP-2 ("x402Version 1
-        # requires V1 network format, got 'eip155:8453'" — erro real do PayAI
-        # em 24/09). Para payload v2 (rede já é CAIP-2) a gravação é no-op.
-        _V1_TO_CAIP = {"base": BASE_CAIP2, "solana": f"solana:{SOL_GENESIS}",
-                       "base-sepolia": "eip155:84532"}
-        _raw_net = pay_net
-        if _raw_net in _V1_TO_CAIP:
-            # v48.9.13-V1FIX: NUNCA gravar network no payload — v1 exige nome
-            # curto dentro do envelope; v2 já traz CAIP-2 em accepted.network.
-            # A conversão é só da CÓPIA local, p/ casar com accepts v2.
-            pay_net = _V1_TO_CAIP[_raw_net]
-        matched = [a for a in accepts if str(a.get("network", "")) == pay_net]
-        ordered = matched if matched else accepts
-        # v21.6 DEFINITIVO (formato extraído do SDK oficial x402/PayAI):
-        # PaymentRequirements v2 = {scheme, network, asset, amount, payTo,
-        # maxTimeoutSeconds, extra}. NÃO usar maxAmountRequired/resource/
-        # description/mimeType (isso é v1 e quebra o code path v2 → 500).
-        # Melhor ainda: o PaymentPayload v2 traz "accepted" = o requirement
-        # exato que o cliente usou pra montar a transação. Usá-lo garante
-        # consistência total. Fallback: nosso accept cru (mesma shape v2).
-        candidates = []
-        client_accepted = payload.get("accepted")
-        if isinstance(client_accepted, dict) and client_accepted.get("scheme"):
-            if client_accepted.get("extra") is None:
-                client_accepted["extra"] = {}
-            candidates.append(client_accepted)
-        candidates.extend(ordered)
-        last_reason = "no-accepts"
-        tried = set()
-        for req in candidates:
-            _key = json.dumps(req, sort_keys=True, default=str)
-            if _key in tried:
+            # v1 não ecoa accepted/requestId: reconstrói SOMENTE a oferta do servidor.
+            try:
+                challenge = _build_402(endpoint).get_json() or {}
+                accepts = challenge.get("acceptsV2") or challenge.get("accepts") or []
+            except Exception:
+                accepts = []
+        pay_net = str(payload.get("network") or (payload.get("accepted") or {}).get("network") or "")
+        ordered = [a for a in accepts if _network_matches(a.get("network", ""), pay_net)]
+        if not ordered:
+            return False, "network-not-offered", {}
+        last_reason = "requirement-mismatch"
+        fac_reasons = {}
+        for official in ordered:
+            req = json.loads(json.dumps(official))
+            if not _accepted_matches_requirement(payload, req):
                 continue
-            tried.add(_key)
-            # v24.9: só tenta accepts da MESMA rede em que o cliente assinou.
-            # Antes, um pagamento Solana era reenviado ao facilitator da CDP
-            # (só EVM) → 'preflight_validation_failed', 30s de timeout gastos
-            # segurando uma thread do gunicorn e o blob da tx indo pro log.
-            # v44.2.3: payload v2 não repete network no topo — olha accepted.
-            _payload_net = str((payload or {}).get("network")
-                               or ((payload or {}).get("accepted") or {}).get("network")
-                               or (payload or {}).get("chain") or "")
-            # v48.9.13-V1FIX: nome curto v1 ("base") normalizado p/ comparar
-            # com accepts v2 (CAIP-2). Sem isso o guard abaixo descartava
-            # TODO candidato de um pagamento v1 (rede nunca casava).
-            _payload_net = _V1_TO_CAIP.get(_payload_net, _payload_net)
+            _is_v1_pay = int(payload.get("x402Version", 2) or 2) == 1
             _req_net = str(req.get("network", ""))
-            if _payload_net and _req_net and _payload_net != _req_net:
-                log.debug(f"skip accept {_req_net} (cliente pagou em {_payload_net})")
-                continue
-            # v21.13: roteamento por rede — Base vai pra CDP (indexa no Bazaar),
-            # Solana continua no PayAI. Fallback: facilitator principal.
-            # v44.2.1: se a CDP recusar um pagamento EVM, tenta o facilitador
-            # principal (PayAI) como contingência ANTES de desistir da venda
-            # (ver flag CDP_FALLBACK_PAYAI no topo). `fac` guarda quem de fato
-            # verificou — settle, bazaar blob e resource seguem esse mesmo `fac`,
-            # então blob/resource da CDP só vão quando a CDP liquidou.
-            # v44.3.3: disjuntor aberto = CDP fora da cadeia (venda vai direto
-            # ao PayAI, sem o ~1s perdido nem o WARNING por request).
-            # v48.9.15-ROUTE: envelope v1 (x402-fetch@1.x, X-PAYMENT) NÃO vai à
-            # CDP — a hosted Facilitator da Coinbase rejeita v1 com
-            # "invalid_amount" vazio (reprovado em produção 24/09 com
-            # maxAmountRequired E amount presentes; código fechado). PayAI
-            # verifica v1 comprovadamente (chega a insufficient_balance).
-            # v2 mantém CDP-first: clientes v2 (stipend/indexar/@x402) alimentam
-            # o Bazaar, que é o índice de descoberta de compradores.
-            _is_v1_pay = int((payload or {}).get("x402Version", 2) or 2) == 1
-            # v48.17.6-RAILGUARD: PayAI também tem disjuntor — com ele aberto
-            # (free_tier_exhausted desde 03/10 03:04 UTC) o settle falharia
-            # com certeza; pular economiza o round-trip e o comprador recebe
-            # o rail manual no 402 em vez de uma assinatura morta.
             _payai_up = _payai_available()
             if CDP_FAC and _req_net.startswith("eip155") and _cdp_available() and not _is_v1_pay:
                 facs = [CDP_FAC]
@@ -8122,183 +8419,130 @@ def _verify_payment(endpoint: str, payment_header: str):
             elif _is_v1_pay and FACILITATOR:
                 facs = [FACILITATOR] if _payai_up else []
             elif GO_FAC and _req_net.startswith("algorand"):
-                # v44.7.0: pagamento AVM vai SÓ ao GoPlausible — regra do
-                # challenge (settle fora dele não conta no leaderboard) e
-                # fato técnico (PayAI/CDP não verificam ASA).
                 facs = [GO_FAC]
             else:
                 facs = [FACILITATOR] if (FACILITATOR and _payai_up) else []
             if not facs:
+                last_reason = "facilitator-unavailable"
                 continue
-            # v44.2.3 FIX — O FALLBACK AGORA COBRE O SETLE TAMBÉM.
-            # Antes: verify OK na CDP → settle CDP falhava → `continue` pulava
-            # pro próximo accept sem NUNCA dar ao PayAI a chance de liquidar
-            # aquele pagamento válido. E o motivo do settle falho era
-            # sobrescrito pelo "network_mismatch" fantasma do accept Solana
-            # (bug de leitura da rede v2, corrigido acima). Sequência real de
-            # 04-06/ago: CDP verify OK → CDP settle recusou → venda morria.
-            # Agora verify+settle rodam em cadeia por facilitador: se a CDP
-            # verifica mas não liquida, o PayAI tenta verify+settle do MESMO
-            # pagamento antes de desistir. Seguro: autorização EIP-3009 é de
-            # uso único (nonce) — uma 2ª liquidação falharia on-chain.
-            settled, sdata, fac = False, {}, None
-            # v48.9.12-DUAL: payload v1 (X-PAYMENT, x402Version:1) pede
-            # paymentRequirements no formato v1 — o facilitator casa
-            # requirements↔payload e rejeita formato cruzado. Mas há
-            # facilitator estrito que só fala CAIP-2: tenta v1 E v2.
             _reqs = [req]
-            if int((payload or {}).get("x402Version", 2) or 2) == 1:
+            if _is_v1_pay:
                 _v1r = _accept_to_v1(req, endpoint)
                 _reqs = ([_v1r] if _v1r else []) + [req]
-            for _f in facs:
-                _tag = getattr(_f, 'tag', ('CDP' if getattr(_f, 'is_cdp', False) else 'PayAI'))
+            for fac in facs:
+                tag = getattr(fac, "tag", "Facilitator")
                 ok, reason, vdata = False, "", {}
-                _rq_ok = req
-                _best = None
-                for _rq in _reqs:
-                    ok, reason, vdata = _f.verify(payload, _rq)
+                req_ok = req
+                best = None
+                for candidate_req in _reqs:
+                    ok, reason, vdata = fac.verify(payload, candidate_req)
                     if ok:
-                        _rq_ok = _rq     # v48.9.13-V1FIX: settle usa QUEM VERIFICOU
+                        req_ok = candidate_req
                         break
-                    # v48.9.13: 200 com isValid=false = formato ACEITO, pagamento
-                    # recusado no mérito (ex.: insufficient_balance). Esse motivo
-                    # é o que o cliente precisa ver — não o ruído 400 do fallback
-                    # de formato (ex.: unsupported_x402_version do attempt v2).
                     if (vdata or {}).get("_http") == 200:
-                        if _best is None:
-                            _best = reason
-                        # v48.9.15: 200 isValid=false = formato ACEITO pelo
-                        # facilitator, pagamento recusado no mérito. Tentar o
-                        # fallback de formato (v2 p/ payload v1) é perda de
-                        # ~1s e ruído 400 garantido — para no primeiro mérito.
+                        best = reason
                         break
                 if not ok:
-                    # v44.2.2: motivo carimbado vai pro log E pro 402 (retorno
-                    # final) — o cliente vê na hora POR QUE recusou.
-                    fac_reasons[_tag] = str(_best or reason or 'facilitator-rejected')[:140]
-                    log.warning(f"⚠️ {_tag}.verify falhou p/ {endpoint}: {reason} | vdata={vdata}")
-                    if _tag == 'CDP':
-                        _cdp_note_failure(reason)   # v44.3.3: alimenta o disjuntor
-                    elif _tag == 'PayAI':
-                        _payai_note_failure(reason)   # v48.17.6: idem PayAI
+                    fac_reasons[tag] = str(best or reason or "facilitator-rejected")[:140]
+                    log.warning(f"⚠️ {tag}.verify falhou p/ {endpoint}: {reason}")
+                    if tag == "CDP":
+                        _cdp_note_failure(reason)
+                    elif tag == "PayAI":
+                        _payai_note_failure(reason)
                     continue
-                # v21.2 FIX: verify() só confirma a assinatura — quem move o
-                # dinheiro on-chain é settle(). bazaar blob/resource só na CDP.
-                bz = _bazaar_blob(endpoint) if getattr(_f, 'is_cdp', False) else None
-                _res = ({"url": f"{_public_base()}{endpoint}",
-                         "description": _cap500(ENDPOINT_DESC.get(endpoint, endpoint)),
-                         "mimeType": "application/json"}
-                        if getattr(_f, 'is_cdp', False) else None)
-                _ok_settle, _sdata = _f.settle(payload, _rq_ok, bazaar=bz, resource=_res)
-                if _ok_settle:
-                    settled, sdata, fac = True, _sdata, _f
-                    if _tag == 'CDP':
-                        _cdp_note_success()   # v44.3.3: fecha o disjuntor na hora
-                    elif _tag == 'PayAI':
-                        _payai_note_success()   # v48.17.6: idem PayAI
-                    break
-                fac_reasons[_tag] = f"settle:{str(_sdata.get('error', _sdata))[:120]}"
-                log.warning(f"⚠️ {_tag}.settle falhou p/ {endpoint}: {_sdata}")
-                if _tag == 'CDP':
-                    _cdp_note_failure(str(_sdata))   # v44.3.3: alimenta o disjuntor
-                elif _tag == 'PayAI':
-                    _payai_note_failure(str(_sdata))   # v48.17.6: idem PayAI
-            if fac_reasons:
-                last_reason = "; ".join(f"{k}:{v}" for k, v in fac_reasons.items())
-            if not settled or not fac:
-                continue
-            settle_tx = _clean_tx(sdata, tx_sig)
-            # v21.9 FIX: no scheme SVM patrocinado o payload do cliente não traz
-            # "payer" — o comprador real vem no SettleResponse do facilitator.
-            # Sem isso, "Compradores únicos" ficava sempre 0 no dashboard.
-            real_payer = (sdata.get("payer") or sdata.get("from")
-                          or sdata.get("sender") or sdata.get("account")
-                          or ((sdata.get("settlement") or {}).get("payer")
-                              if isinstance(sdata.get("settlement"), dict) else "")
-                          or payer or "")
-            # v48.10.1: fallback universal — o pagador está ASSINADO dentro do
-            # próprio payload em todos os rails que usam authorization (EVM
-            # EIP-3009: payload.payload.authorization.from; Algorand: remetente
-            # do grupo de pagamento). Sem isto o ledger gravava payer vazio e
-            # a receita saía sem atribuição.
-            # v48.25.0-GLOBAL: pós-settle — se o pagador real (revelado só no
-            # SettleResponse, ex.: Solana patrocinado) constar na lista OFAC,
-            # o dinheiro JÁ entrou: servir normalmente, mas alertar o operador
-            # na hora (decisão de compliance é humana: reportar/congelar via
-            # exchange de destino).
-            if real_payer:
+                bz = _bazaar_blob(endpoint) if getattr(fac, "is_cdp", False) else None
+                resource = ({"url": f"{_public_base()}{endpoint}",
+                             "description": _cap500(ENDPOINT_DESC.get(endpoint, endpoint)),
+                             "mimeType": "application/json"}
+                            if getattr(fac, "is_cdp", False) else None)
+                settled_ok, sdata = fac.settle(payload, req_ok, bazaar=bz, resource=resource)
+                if not settled_ok:
+                    if sdata.get("pending"):
+                        tx_pending = _clean_tx(sdata)
+                        return _pending_payment(endpoint, fingerprint, req, tx_pending,
+                                                payer, "settlement_pending")
+                    fac_reasons[tag] = "settle:" + str(sdata.get("error", sdata))[:120]
+                    log.warning(f"⚠️ {tag}.settle falhou p/ {endpoint}: {sdata}")
+                    if tag == "CDP":
+                        _cdp_note_failure(str(sdata))
+                    elif tag == "PayAI":
+                        _payai_note_failure(str(sdata))
+                    continue
+                if tag == "CDP":
+                    _cdp_note_success()
+                elif tag == "PayAI":
+                    _payai_note_success()
+                settle_tx = str(sdata.get("_clean_tx") or _clean_tx(sdata))
+                real_payer = (sdata.get("payer") or sdata.get("from") or sdata.get("sender")
+                              or sdata.get("account") or payer or "")
+                if not real_payer:
+                    inner = payload.get("payload") if isinstance(payload.get("payload"), dict) else {}
+                    auth = inner.get("authorization") if isinstance(inner.get("authorization"), dict) else {}
+                    real_payer = inner.get("from") or auth.get("from") or ""
+                real_payer = str(real_payer or "")
+                if real_payer.startswith("0x"):
+                    real_payer = real_payer.lower()
                 try:
-                    if _payer_hit_ofac(real_payer):
-                        log.warning(f"⛔ OFAC hit PÓS-settle: {real_payer} em {endpoint}")
-                        _notify_telegram(f"⛔ OFAC pós-settle: {real_payer} pagou "
-                                         f"{endpoint} (tx {settle_tx}) — FUNDO JÁ RECEBIDO. "
-                                         "Avaliar report/freeze no destino.")
+                    if real_payer and _payer_hit_ofac(real_payer):
+                        _notify_telegram(f"⛔ OFAC pós-settle: {real_payer} pagou {endpoint} (tx {settle_tx})")
                 except Exception:
                     pass
-            if not real_payer and isinstance(payload, dict):
-                _pl = payload.get("payload")
-                _pl = _pl if isinstance(_pl, dict) else {}
-                _au = _pl.get("authorization")
-                _au = _au if isinstance(_au, dict) else {}
-                real_payer = (_pl.get("payer") or _pl.get("from")
-                              or _pl.get("sender") or _au.get("from") or "")
-            real_payer = str(real_payer or "")
-            if str(real_payer).startswith("0x"):
-                real_payer = real_payer.lower()
-            LEDGER.replay_mark(h)
-            try:
-                LEDGER.add_revenue(endpoint, amount, settle_tx, real_payer,
-                                    source="facilitator", chain=chain)
-            except Exception as _e:
-                log.error(f"🚨 SETTLED-SEM-REGISTRO {endpoint} tx={settle_tx} ${amount}: {_e} — use /force-register-tx")
-            try:
-                if _rid and LEDGER.funnel_settle(_rid, real_payer, chain):
-                    log.info(f"🔗 funil fechado: 402→settle rid={_rid} {endpoint} ({chain})")
-            except Exception:
-                pass
-            _notify_telegram(f"💰 ${amount} USDC em {endpoint} ({chain}, via facilitator)\nTX: {str(settle_tx)[:32]}...")
-            return True, "ok-facilitator", {"payer": real_payer, "tx": settle_tx,
-                                            "settlement": sdata}
+                ok_chain, why_chain, proof = _verify_settlement_onchain(settle_tx, req)
+                if not ok_chain:
+                    if _settlement_transient(why_chain):
+                        return _pending_payment(endpoint, fingerprint, req, settle_tx,
+                                                real_payer, why_chain)
+                    log.error(f"🚨 SETTLE DIVERGENTE {endpoint} tx={settle_tx}: {why_chain} {proof}")
+                    _notify_telegram(f"🚨 SETTLE SEM ENTREGA: {endpoint} tx={settle_tx} — {why_chain}")
+                    mismatch = proof if isinstance(proof, dict) else {"detail": str(proof)}
+                    return False, "settlement-mismatch:" + why_chain, dict(mismatch, **{
+                        "settlement_seen": True, "tx": settle_tx})
+                real_payer = proof.get("payer") or real_payer
+                return _finalize_facilitator_payment(endpoint, req, settle_tx, real_payer,
+                                                     proof, sdata, fingerprint, header_hash, rid)
+            last_reason = "; ".join(f"{k}:{v}" for k, v in fac_reasons.items()) or last_reason
         log.warning(f"⚠️ Todos os accepts falharam no facilitator p/ {endpoint}: {last_reason}")
+    else:
+        last_reason = "facilitator-unavailable"
 
+    chain = _chain_for_network(network)
     if chain == "solana":
-        # v48.16.2: blob de tx v2 não é lookupável (ver _looks_like_sol_sig).
         if not _looks_like_sol_sig(tx_sig):
-            _mr = str(last_reason)[:160] if last_reason else "facilitator-unavailable"
-            return False, f"facilitator-rejected:no-direct-fallback ({_mr})", {}
-        threshold = max(0.005, amount * 0.95)
-        ok, info = SOL.verify_payment(tx_sig, threshold, RECEIVE_ADDRESS)
-        # v20 FIX: retry para tx-not-found (lag Helius/RPC pode demorar 3-6s)
-        if not ok and isinstance(info, str) and info == "tx-not-found":
+            return False, f"facilitator-rejected:no-direct-fallback ({str(last_reason)[:160]})", {}
+        if LEDGER.tx_recorded(tx_sig):
+            return False, "replay", {"settlement_seen": True, "tx": tx_sig}
+        tx_key = "tx:solana:" + tx_sig
+        if not LEDGER.replay_claim(tx_key):
+            return False, "replay", {"settlement_seen": True, "tx": tx_sig}
+        amount = get_dynamic_price(endpoint)
+        ok, info = SOL.verify_payment(tx_sig, amount, RECEIVE_ADDRESS, max_age=CHALLENGE_TTL + 300)
+        if not ok and info == "tx-not-found":
             for attempt in range(4):
-                time.sleep(1.5 * (attempt + 1))  # 1.5s, 3s, 4.5s, 6s
-                ok, info = SOL.verify_payment(tx_sig, threshold, RECEIVE_ADDRESS)
-                if ok:
-                    log.info(f"_verify_payment: recuperado após {attempt+1} retries")
-                    break
-                if isinstance(info, str) and info != "tx-not-found":
+                time.sleep(1.5 * (attempt + 1))
+                ok, info = SOL.verify_payment(tx_sig, amount, RECEIVE_ADDRESS, max_age=CHALLENGE_TTL + 300)
+                if ok or info != "tx-not-found":
                     break
         if ok:
             payer_addr = info.get("payer") if isinstance(info, dict) else payer
-            LEDGER.replay_mark(h)
-            LEDGER.add_revenue(endpoint, amount, tx_sig, payer_addr or payer,
-                                source="direct", chain="solana")
+            received = round(float(info.get("delta", amount)), 6)
+            if not LEDGER.add_revenue(endpoint, received, tx_sig, payer_addr or payer,
+                                      source="direct", chain="solana"):
+                return False, "replay", {"settlement_seen": True, "tx": tx_sig}
+            LEDGER.replay_mark(header_hash)
             try:
-                if _rid:
-                    LEDGER.funnel_settle(_rid, payer_addr or payer, "solana")
+                if rid:
+                    LEDGER.funnel_settle(rid, payer_addr or payer, "solana")
             except Exception:
                 pass
-            _notify_telegram(f"💰 ${amount} USDC em {endpoint} (Solana)\nTX: {tx_sig[:32]}...")
-            return True, "ok", {"payer": payer_addr or payer, "tx": tx_sig}
+            _notify_telegram(f"💰 ${received:.6f} USDC em {endpoint} (Solana)\nTX: {tx_sig}")
+            return True, "ok", {"payer": payer_addr or payer, "tx": tx_sig,
+                                "payment_verified": True, "amount_usd": received,
+                                "required_usd": amount}
+        if info == "tx-not-found":
+            LEDGER.replay_unmark(tx_key)
         return False, info if isinstance(info, str) else "verify-failed", {}
-    if chain == "base":
-        if not FACILITATOR and not CDP_FAC:
-            return False, "base-needs-facilitator", {}
-        # v44.2.2: devolve o motivo real do facilitador no 402 (truncado) —
-        # o cliente vê "Payment invalid: CDP:invalid_exact_evm_..." na tela
-        # em vez de um "verify-failed" genérico. Diagnóstico sem abrir log.
-        _motivo = str(last_reason)[:220] if last_reason else "sem-detalhe"
-        return False, f"facilitator-verify-failed: {_motivo}", {}
+    if chain in ("base", "polygon", "arbitrum", "algorand"):
+        return False, f"facilitator-verify-failed: {str(last_reason)[:220]}", {}
     return False, "unknown-chain", {}
 
 def _notify_telegram(text: str):
@@ -8794,15 +9038,24 @@ def _preflight_unavailable(path: str):
 
 
 def _refund_as_credit(payer: str, amount: float, endpoint: str, tx: str = "") -> Optional[str]:
-    """Emite uma API key de crédito equivalente ao valor pago.
-    Usado quando a falha acontece DEPOIS do settle. Não desfaz a transação
-    on-chain (impossível), mas devolve o poder de compra ao agente."""
+    """Crédito de falha pós-settle, idempotente por transação."""
     try:
         if amount <= 0:
             return None
+        if tx:
+            previous = LEDGER.api_key_by_tx(tx)
+            if previous:
+                return previous["key"] if previous.get("plan") == "refund" else None
         key = "lsb_refund_" + secrets.token_urlsafe(18)
-        LEDGER.api_key_create(key, payer or "unknown", "refund",
-                              round(amount, 6), 30 * 86400, tx_sig=tx)
+        if tx:
+            created, is_new = LEDGER.api_key_create_idempotent(
+                key, payer or "unknown", "refund", round(amount, 6), 30 * 86400, tx)
+            key = created["key"]
+            if not is_new:
+                return key
+        else:
+            LEDGER.api_key_create(key, payer or "unknown", "refund",
+                                  round(amount, 6), 30 * 86400, tx_sig="")
         log.warning(f"↩️ estorno em crédito ${amount:.4f} para {payer[:12]} "
                     f"({endpoint}) — key {key[:20]}…")
         _notify_telegram(f"↩️ Estorno emitido: ${amount:.4f} em {endpoint}\n"
@@ -9275,9 +9528,14 @@ def paid_endpoint(path):
                             from flask import g as _g
                             _jp = LEDGER.jwt_payment(claims.get("jti", ""), path)
                             _g.losbeto_payer = _jp.get("payer", "")
+                            _retry_tx = _jp.get("tx", "")
+                            _retry_receipt = LEDGER.revenue_by_tx(_retry_tx) or {}
+                            _retry_verified = _retry_receipt.get("endpoint") == path
                             _g.losbeto_payment = {
-                                "payer": _jp.get("payer", ""),
-                                "tx": _jp.get("tx", ""), "via": "jwt-retry"}
+                                "payer": _jp.get("payer", ""), "tx": _retry_tx,
+                                "via": "jwt-retry", "payment_verified": _retry_verified,
+                                "amount_usd": _retry_receipt.get("amount", 0),
+                                "required_usd": _retry_receipt.get("amount", 0)}
                             result = handler()
                             # v24.10: produto indisponível (tupla ,503) — não
                             # entrega dado vazio. O day-pass/JWT segue válido para
@@ -9433,8 +9691,27 @@ def paid_endpoint(path):
             else:
                 ok, reason, info = _verify_payment(path, sig)
             if not ok:
+                if isinstance(info, dict) and info.get("settlement_pending"):
+                    LEDGER.log_request(path, False, int((time.time() - t0) * 1000), ip,
+                                        kind="settlement_pending", ua=request.headers.get("User-Agent", ""),
+                                        params=_clean_params())
+                    pending_body = {"error": "settlement_pending", "status": "pending",
+                        "transaction": info.get("tx", ""), "network": info.get("network", ""),
+                        "retry": "Retry this same request with the same payment payload. Do not create another payment.",
+                        "delivered": False}
+                    pending_resp = jsonify(pending_body)
+                    pending_resp.status_code = 202
+                    pending_resp.headers["Retry-After"] = "5"
+                    return pending_resp
+                if isinstance(info, dict) and info.get("settlement_seen"):
+                    LEDGER.log_request(path, False, int((time.time() - t0) * 1000), ip,
+                                        kind="settlement_rejected", ua=request.headers.get("User-Agent", ""),
+                                        params=_clean_params())
+                    return jsonify({"error": reason, "transaction": info.get("tx", ""),
+                                    "delivered": False, "new_payment_required": False,
+                                    "note": "No new payment challenge was issued for this transaction."}), 409
                 LEDGER.log_request(path, False, int((time.time() - t0) * 1000), ip,
-                                    kind="probe", ua=request.headers.get("User-Agent",""), params=_clean_params())
+                                    kind="probe", ua=request.headers.get("User-Agent", ""), params=_clean_params())
                 r = _build_402(path)
                 body = r.get_json()
                 body["error"] = f"Payment invalid: {reason}"
@@ -11026,24 +11303,29 @@ def _credits_purchase_handler(endpoint: str):
         payer = getattr(_g, "losbeto_payer", "") or ""
         txinfo = getattr(_g, "losbeto_payment", {}) or {}
         tx_sig = txinfo.get("tx", "") if isinstance(txinfo, dict) else ""
-        # Idempotência: retry do cliente com a MESMA tx retorna a MESMA key
-        if tx_sig:
-            existing = LEDGER.api_key_by_tx(tx_sig)
-            if existing:
-                return _credits_payload(endpoint, plan, existing["key"],
-                                        existing["balance_usd"], existing["expires"],
-                                        idempotent=True)
-        if not tx_sig or not LEDGER.tx_recorded(tx_sig):
-            log.warning(f"plano {endpoint} recusado sem settle confirmado")
-            return {"error": "plan purchase requires a settled on-chain payment",
-                    "charged": False}, 402
+        receipt = LEDGER.revenue_by_tx(tx_sig) if tx_sig else None
+        paid_amount = float(txinfo.get("amount_usd", 0) or 0) if isinstance(txinfo, dict) else 0
+        verified = bool(isinstance(txinfo, dict) and txinfo.get("payment_verified"))
+        if (not tx_sig or not verified or not receipt
+                or receipt.get("endpoint") != endpoint
+                or abs(float(receipt.get("amount", 0)) - paid_amount) > 0.000001):
+            log.warning(f"plano {endpoint} recusado sem recibo compatível tx={tx_sig}")
+            return {"error": "plan purchase requires a verified on-chain payment for this exact plan",
+                    "delivered": False}, 402
+        existing = LEDGER.api_key_by_tx(tx_sig)
+        if existing:
+            return _credits_payload(endpoint, plan, existing["key"],
+                                    existing["balance_usd"], existing["expires"],
+                                    idempotent=True)
         key = "lsk_" + secrets.token_urlsafe(24)
         ttl = plan["ttl_days"] * 86400
-        LEDGER.api_key_create(key, payer, plan["plan"], plan["balance_usd"], ttl, tx_sig)
-        _notify_telegram(f"💳 Novo plano {plan['plan']} vendido ({plan['bonus']})\n"
-                         f"Payer: {payer[:20]}...")
-        return _credits_payload(endpoint, plan, key, plan["balance_usd"],
-                                int(time.time()) + ttl)
+        created, is_new = LEDGER.api_key_create_idempotent(
+            key, payer, plan["plan"], plan["balance_usd"], ttl, tx_sig)
+        if is_new:
+            _notify_telegram(f"💳 Novo plano {plan['plan']} vendido ({plan['bonus']}) — ${paid_amount:.6f}\nTX: {tx_sig}")
+        return _credits_payload(endpoint, plan, created["key"],
+                                created["balance_usd"], created["expires"],
+                                idempotent=not is_new)
     return _h
 
 def _credits_payload(endpoint, plan, key, balance_usd, expires, idempotent=False):
@@ -11816,98 +12098,208 @@ def _base_rpc_call(method: str, params: list, timeout: int = 10):
     raise last or RuntimeError("base rpc indisponivel")
 
 
-def _base_direct_verify(endpoint: str, txh: str):
-    """Mesmo contrato de _mpp_verify_credential: (ok, reason, info)."""
-    payto = (BASE_PAYTO_EVM or "").lower()
-    if not payto:
-        return False, "base-disabled", {}
-    want_atomic = int(round(get_dynamic_price(endpoint) * 1_000_000))
-    if want_atomic <= 0:
-        return False, "free-endpoint", {}
-    if not LEDGER.replay_claim("basedir:" + txh):
-        return False, "replay", {}
+DIRECT_TX_MAX_AGE = int(os.environ.get("DIRECT_TX_MAX_AGE", "900"))
+
+
+def _evm_rpc_call(network: str, method: str, params: list, timeout: int = 10):
+    if _canonical_network(network) == BASE_CAIP2.lower():
+        return _base_rpc_call(method, params, timeout=timeout)
+    chain = _chain_for_network(network)
+    configured = os.environ.get("POLYGON_RPC" if chain == "polygon" else "ARBITRUM_RPC", "").strip()
+    defaults = (["https://polygon-rpc.com", "https://rpc.ankr.com/polygon"] if chain == "polygon"
+                else ["https://arb1.arbitrum.io/rpc", "https://rpc.ankr.com/arbitrum"])
+    urls = [configured] if configured else defaults
+    last = None
+    for url in urls:
+        try:
+            r = requests.post(url, json={"jsonrpc": "2.0", "id": 1, "method": method,
+                                         "params": params}, timeout=timeout)
+            j = r.json()
+            if isinstance(j, dict) and not j.get("error"):
+                return j.get("result")
+            last = RuntimeError(str((j or {}).get("error"))[:120])
+        except Exception as e:
+            last = e
+    raise last or RuntimeError("evm rpc indisponivel")
+
+
+def _evm_receipt_verify(txh: str, requirement: dict, min_confirmations: int = 0,
+                        max_age: int = 900):
+    txh = str(txh or "").lower()
+    if not re.fullmatch(r"0x[0-9a-f]{64}", txh):
+        return False, "bad-tx-hash", {}
+    network = str(requirement.get("network") or "")
+    want_atomic = _requirement_amount_atomic(requirement)
+    asset = str(requirement.get("asset") or "").lower()
+    payto = str(requirement.get("payTo") or "").lower()
+    if not want_atomic or not asset.startswith("0x") or not payto.startswith("0x"):
+        return False, "invalid-requirement", {}
     try:
-        rcpt = _base_rpc_call("eth_getTransactionReceipt", [txh])
+        chain_id = _evm_rpc_call(network, "eth_chainId", [])
+        expected_chain = int(network.split(":", 1)[1]) if ":" in network else 0
+        if not expected_chain or int(str(chain_id), 16) != expected_chain:
+            return False, "rpc-chain-mismatch", {}
+        rcpt = _evm_rpc_call(network, "eth_getTransactionReceipt", [txh])
         if not rcpt:
-            LEDGER.replay_unmark("basedir:" + txh)
             return False, "tx-not-found", {}
         if str(rcpt.get("status")) != "0x1":
-            return False, "tx-failed", {}
-        payer, got = "", 0
-        for lg in (rcpt.get("logs") or []):
-            if str(lg.get("address", "")).lower() != _BASE_USDC.lower():
+            return False, "tx-failed", {"settlement_seen": True}
+        payer, got, largest = "", 0, 0
+        for lg in rcpt.get("logs") or []:
+            if str(lg.get("address", "")).lower() != asset:
                 continue
-            tpcs = lg.get("topics") or []
-            if (len(tpcs) < 3
-                    or str(tpcs[0]).lower() != _BASE_TRANSFER_TOPIC0):
-                continue
-            if not str(tpcs[2]).lower().endswith(payto[2:]):
+            topics = lg.get("topics") or []
+            if (len(topics) < 3 or str(topics[0]).lower() != _BASE_TRANSFER_TOPIC0
+                    or not str(topics[2]).lower().endswith(payto[2:])):
                 continue
             try:
-                v = int(str(lg.get("data", "0x0")), 16)
+                value = int(str(lg.get("data", "0x0")), 16)
             except Exception:
                 continue
-            if v > got:
-                got = v
-                payer = "0x" + str(tpcs[1])[-40:]
-        if got < int(want_atomic * 0.97):
-            return False, "insufficient-amount", {
-                "received_atomic": got, "required_atomic": want_atomic}
-        tip = _base_rpc_call("eth_blockNumber", [])
+            got += value
+            if value >= largest:
+                largest = value
+                payer = "0x" + str(topics[1])[-40:]
+        if got < want_atomic:
+            return False, "insufficient-amount", {"received_atomic": got,
+                    "required_atomic": want_atomic, "settlement_seen": True}
         bn = int(str(rcpt.get("blockNumber", "0x0")), 16)
-        if tip is not None and int(str(tip), 16) - bn < 2:
-            LEDGER.replay_unmark("basedir:" + txh)
-            return False, "insufficient-confirmations", {}
+        if min_confirmations:
+            tip = _evm_rpc_call(network, "eth_blockNumber", [])
+            if tip is None or int(str(tip), 16) - bn < min_confirmations:
+                return False, "insufficient-confirmations", {}
+        block_time = 0
+        if max_age:
+            block = _evm_rpc_call(network, "eth_getBlockByNumber", [hex(bn), False])
+            if not block:
+                return False, "block-not-found", {}
+            block_time = int(str(block.get("timestamp", "0x0")), 16)
+            if block_time > int(time.time()) + 300 or time.time() - block_time > max_age:
+                return False, "tx-too-old", {"settlement_seen": True}
+        return True, "ok", {"payer": payer, "received_atomic": got,
+                "received_usd": got / 1_000_000, "block_number": bn,
+                "block_time": block_time}
     except Exception as e:
-        LEDGER.replay_unmark("basedir:" + txh)
-        log.warning(f"base direct rpc: {e}")
+        log.warning(f"evm receipt {network} {txh[:18]}: {e}")
         return False, "rpc-error", {}
-    usd = round(got / 1_000_000, 6)
-    LEDGER.add_revenue(endpoint, usd, txh, payer, source="direct", chain="base")
-    log.info(f"💰 BASE/direto ${usd:.4f} em {endpoint} "
-             f"de {payer[:14]}… tx {txh[:18]}…")
-    return True, "direct", {"payer": payer, "tx": txh, "usd": usd}
+
+
+def _algorand_receipt_verify(txid: str, requirement: dict, max_age: int = 900):
+    want_atomic = _requirement_amount_atomic(requirement)
+    try:
+        r = requests.get(f"{ALGOD_URL}/v2/transactions/{txid}", timeout=12)
+        if r.status_code == 404:
+            return False, "tx-not-found", {}
+        if not r.ok:
+            return False, "rpc-error", {}
+        data = r.json() or {}
+        tx = data.get("transaction") or {}
+        transfer = tx.get("asset-transfer-transaction") or {}
+        if not data.get("confirmed-round") or data.get("pool-error"):
+            return False, "tx-failed", {"settlement_seen": True}
+        if int(transfer.get("asset-id") or 0) != int(str(requirement.get("asset") or "0")):
+            return False, "wrong-asset", {"settlement_seen": True}
+        if str(transfer.get("receiver") or "") != str(requirement.get("payTo") or ""):
+            return False, "wrong-recipient", {"settlement_seen": True}
+        got = int(transfer.get("amount") or 0)
+        if got < want_atomic:
+            return False, "insufficient-amount", {"received_atomic": got,
+                    "required_atomic": want_atomic, "settlement_seen": True}
+        round_time = int(data.get("round-time") or 0)
+        if max_age and (not round_time or time.time() - round_time > max_age):
+            return False, "tx-too-old", {"settlement_seen": True}
+        return True, "ok", {"payer": tx.get("sender") or "", "received_atomic": got,
+                "received_usd": got / 1_000_000, "block_time": round_time}
+    except Exception as e:
+        log.warning(f"algorand receipt {txid}: {e}")
+        return False, "rpc-error", {}
+
+
+def _verify_settlement_onchain(tx_sig: str, requirement: dict):
+    chain = _chain_for_network(requirement.get("network", ""))
+    expected = _requirement_amount_atomic(requirement) / 1_000_000
+    max_age = max(900, CHALLENGE_TTL + 300)
+    if chain in ("base", "polygon", "arbitrum"):
+        return _evm_receipt_verify(tx_sig, requirement, min_confirmations=0, max_age=max_age)
+    if chain == "solana":
+        return SOL.verify_payment(tx_sig, expected, str(requirement.get("payTo") or ""), max_age=max_age)
+    if chain == "algorand":
+        return _algorand_receipt_verify(tx_sig, requirement, max_age=max_age)
+    return False, "unknown-chain", {"settlement_seen": True}
+
+
+def _settlement_transient(reason: str) -> bool:
+    return reason in ("tx-not-found", "rpc-error", "insufficient-confirmations",
+                      "block-not-found", "tx-time-unknown")
+
+
+def _base_direct_verify(endpoint: str, txh: str):
+    """Transferência Base: preço integral, TX nova, recente e comprovada."""
+    txh = str(txh or "").lower()
+    if not re.fullmatch(r"0x[0-9a-f]{64}", txh):
+        return False, "bad-tx-hash", {}
+    if LEDGER.tx_recorded(txh):
+        return False, "replay", {}
+    req = {"scheme": "exact", "network": BASE_CAIP2, "asset": _BASE_USDC,
+           "amount": str(int(round(get_dynamic_price(endpoint) * 1_000_000))),
+           "payTo": BASE_PAYTO_EVM}
+    if _requirement_amount_atomic(req) <= 0:
+        return False, "free-endpoint", {}
+    tx_key = "tx:base:" + txh
+    if not LEDGER.replay_claim(tx_key):
+        return False, "replay", {}
+    ok, reason, proof = _evm_receipt_verify(txh, req, min_confirmations=2,
+                                            max_age=DIRECT_TX_MAX_AGE)
+    if not ok:
+        if _settlement_transient(reason):
+            LEDGER.replay_unmark(tx_key)
+        return False, reason, proof
+    usd = round(float(proof.get("received_usd", 0)), 6)
+    payer = proof.get("payer") or ""
+    if not LEDGER.add_revenue(endpoint, usd, txh, payer, source="direct", chain="base"):
+        return False, "replay", {}
+    log.info(f"💰 BASE/direto ${usd:.4f} em {endpoint} de {payer[:14]}… tx {txh[:18]}…")
+    _notify_telegram(f"💰 ${usd:.6f} USDC em {endpoint} (Base direct)\nTX: {txh}")
+    return True, "direct", {"payer": payer, "tx": txh, "usd": usd,
+                            "payment_verified": True, "amount_usd": usd,
+                            "required_usd": _requirement_amount_atomic(req) / 1_000_000}
 
 
 def _sol_direct_verify(endpoint: str, sig: str):
-    """v48.16.2 — gêmea Solana do _base_direct_verify. Uma transferência SIMPLES
-    de USDC-SPL para o payTo (Phantom send, Binance Web3, até saque de
-    exchange) vira venda SEM facilitator: verificação on-chain direta
-    (pre/post token balances do destinatário, 3 métodos de leitura), tolerância
-    de 97% do preço de tabela, anti-replay atômico com devolução da reserva em
-    falha transitória (lag de RPC logo após o envio é o caso comum — retry
-    curto dentro do request)."""
+    """Transferência Solana: preço integral, TX nova e prova SPL completa."""
     if not RECEIVE_ADDRESS:
         return False, "solana-disabled", {}
     want = get_dynamic_price(endpoint)
     if want <= 0:
         return False, "free-endpoint", {}
-    if not LEDGER.replay_claim("soldir:" + sig):
+    if LEDGER.tx_recorded(sig):
         return False, "replay", {}
-    thr = max(0.005, want * 0.97)
-    ok, info = SOL.verify_payment(sig, thr, RECEIVE_ADDRESS)
+    tx_key = "tx:solana:" + sig
+    if not LEDGER.replay_claim(tx_key):
+        return False, "replay", {}
+    ok, info = SOL.verify_payment(sig, want, RECEIVE_ADDRESS, max_age=DIRECT_TX_MAX_AGE)
     if not ok and info == "tx-not-found":
-        for _ in range(2):                      # 2 × 2.5s — lag de propagação
+        for _ in range(2):
             time.sleep(2.5)
-            ok, info = SOL.verify_payment(sig, thr, RECEIVE_ADDRESS)
+            ok, info = SOL.verify_payment(sig, want, RECEIVE_ADDRESS, max_age=DIRECT_TX_MAX_AGE)
             if ok or info != "tx-not-found":
                 break
     if not ok:
         if info == "tx-not-found":
-            LEDGER.replay_unmark("soldir:" + sig)      # transitório: devolve
+            LEDGER.replay_unmark(tx_key)
             return False, "tx-not-found", {}
-        # definitivo (falhou on-chain / velho / valor ou destino não batem):
-        # a reserva QUEIMA — hash inválido não vira cupom reutilizável.
         return False, ("tx-failed" if info == "tx-failed"
-                       else "tx-too-old" if info == "tx-too-old"
+                       else "tx-too-old" if info in ("tx-too-old", "tx-time-unknown")
                        else "insufficient-amount"), {}
     payer = (info.get("payer") or "") if isinstance(info, dict) else ""
-    usd = round(float(info.get("delta", want))
-                if isinstance(info, dict) else want, 6)
-    LEDGER.add_revenue(endpoint, usd, sig, payer, source="direct", chain="solana")
-    log.info(f"💰 SOL/direto ${usd:.4f} em {endpoint} "
-             f"de {(payer or '?')[:14]}… sig {sig[:18]}…")
-    return True, "direct", {"payer": payer, "tx": sig, "usd": usd}
+    usd = round(float(info.get("delta", want)) if isinstance(info, dict) else want, 6)
+    if not LEDGER.add_revenue(endpoint, usd, sig, payer, source="direct", chain="solana"):
+        return False, "replay", {}
+    log.info(f"💰 SOL/direto ${usd:.4f} em {endpoint} de {(payer or '?')[:14]}… sig {sig[:18]}…")
+    _notify_telegram(f"💰 ${usd:.6f} USDC em {endpoint} (Solana direct)\nTX: {sig}")
+    return True, "direct", {"payer": payer, "tx": sig, "usd": usd,
+                            "payment_verified": True, "amount_usd": usd,
+                            "required_usd": want}
 
 
 @app.route("/api/claim-transfer", methods=["POST"])
@@ -12070,16 +12462,27 @@ def bootstrap_trust():
     except Exception:
         pass
 
-    threshold = max(0.005, 0.01 * 0.95)
-    ok, info = SOL.verify_payment(tx_sig, threshold, RECEIVE_ADDRESS, max_age=86400)
+    threshold = 0.01
+    if not _looks_like_sol_sig(tx_sig):
+        return jsonify({"error": "a Solana transaction signature is required"}), 400
+    if LEDGER.tx_recorded(tx_sig):
+        return jsonify({"success": True, "already_recorded": True,
+                        "message": "TX já registrada — idempotente, sem duplicar receita."})
+    tx_key = "tx:solana:" + tx_sig
+    if not LEDGER.replay_claim(tx_key):
+        return jsonify({"success": True, "already_recorded": True,
+                        "message": "TX já reservada — idempotente."})
+    ok, info = SOL.verify_payment(tx_sig, threshold, RECEIVE_ADDRESS, max_age=900)
     if not ok and isinstance(info, str) and info == "tx-not-found":
         for attempt in range(3):
             time.sleep(2)
-            ok, info = SOL.verify_payment(tx_sig, threshold, RECEIVE_ADDRESS, max_age=86400)
+            ok, info = SOL.verify_payment(tx_sig, threshold, RECEIVE_ADDRESS, max_age=900)
             if ok:
                 break
         log.info(f"bootstrap-trust retry: attempt={attempt+1}, ok={ok}, reason={info}")
     if not ok:
+        if info == "tx-not-found":
+            LEDGER.replay_unmark(tx_key)
         return jsonify({
             "error": "Payment verification failed",
             "reason": str(info),
@@ -12094,7 +12497,8 @@ def bootstrap_trust():
                         "message": "TX já registrada — idempotente, sem duplicar receita.",
                         "tx": tx_sig[:32] + "..."})
     LEDGER.replay_mark(hashlib.sha256(tx_sig.encode()).hexdigest())
-    LEDGER.add_revenue("/bootstrap-trust", amount, tx_sig, payer, source="bootstrap", chain="solana")
+    if not LEDGER.add_revenue("/bootstrap-trust", amount, tx_sig, payer, source="bootstrap", chain="solana"):
+        return jsonify({"success": True, "already_recorded": True})
 
     stats = LEDGER.stats()
     return jsonify({
@@ -12147,10 +12551,20 @@ def stake():
     tx_sig = data.get("tx_sig", "").strip()
     if not staker or amount <= 0 or not tx_sig:
         return jsonify({"error": "staker, amount, and tx_sig required"}), 400
-    # Verifica se o pagamento foi realmente feito para RECEIVE_ADDRESS
-    ok, info = SOL.verify_payment(tx_sig, amount, RECEIVE_ADDRESS, max_age=86400)
+    # Stake consome a mesma TX global de pagamento; sem reutilização em produtos.
+    if LEDGER.tx_recorded(tx_sig):
+        return jsonify({"error": "transaction already consumed"}), 409
+    tx_key = "tx:solana:" + tx_sig
+    if not LEDGER.replay_claim(tx_key):
+        return jsonify({"error": "transaction already consumed"}), 409
+    ok, info = SOL.verify_payment(tx_sig, amount, RECEIVE_ADDRESS, max_age=900)
     if not ok:
+        if info == "tx-not-found":
+            LEDGER.replay_unmark(tx_key)
         return jsonify({"error": "payment verification failed", "details": info}), 402
+    payer = info.get("payer", "") if isinstance(info, dict) else ""
+    if payer and payer != staker:
+        return jsonify({"error": "staker must be the on-chain payer"}), 403
     LEDGER.add_stake(staker, amount, tx_sig)
     return jsonify({
         "success": True,
@@ -17616,11 +18030,56 @@ _SCAN_NOISE_EXTRA = re.compile(
     r"(^|/)users?/\d+(/|$)|"
     r"(^|/)(tmp|temp|old|_old|backup|backups|bak|db|dump|uploads?|files?|archive|old_site)(/|$)|"
     r"(^|/)frontend/web/debug|(^|/)debug/|_debugbar|(^|/)telescope/requests|"
-    r"(^|/)(aws|gcp|azure|firebase|supabase)\.(ya?ml|json)$",
+    r"(^|/)(aws|gcp|azure|firebase|supabase)\.(ya?ml|json)$|"
+    # v48.40.0: sondas de configuração Java/Sentry e descoberta fora do
+    # catálogo não são intenção de compra. Em especial, /.well-known/x402/*
+    # chegava ao planner como produto embora aliases well-known já fossem
+    # proibidos; /sentry.properties virava proposta de credential-hunting.
+    r"(^|/)[^/]*\.properties$|(^|/)\.well-known/",
     re.I)
+
 
 def _is_scan_noise(path: str) -> bool:
     return bool(_SCAN_NOISE.search(path or "") or _SCAN_NOISE_EXTRA.search(path or ""))
+
+
+# Filtro SQL para janelas históricas: mudar o kind somente no novo tráfego não
+# removeria scanners já gravados nos últimos sete dias. A cláusula é constante,
+# sem dados do request, e mantém clientes HTTP de agentes como requests/httpx.
+_DEMAND_UA_SQL = """NOT (
+    LOWER(COALESCE(ua,'')) LIKE '%spider%' OR
+    LOWER(COALESCE(ua,'')) LIKE '%crawler%' OR
+    LOWER(COALESCE(ua,'')) LIKE '%scanner%' OR
+    LOWER(COALESCE(ua,'')) LIKE '%x402scan%' OR
+    LOWER(COALESCE(ua,'')) LIKE '%x402-list%' OR
+    LOWER(COALESCE(ua,'')) LIKE '%monitor%' OR
+    LOWER(COALESCE(ua,'')) LIKE '%uptime%' OR
+    LOWER(COALESCE(ua,'')) LIKE '%healthcheck%' OR
+    LOWER(COALESCE(ua,'')) LIKE '%bazaar%' OR
+    LOWER(COALESCE(ua,'')) LIKE '%indexer%' OR
+    LOWER(COALESCE(ua,'')) LIKE '%registry%' OR
+    LOWER(COALESCE(ua,'')) LIKE '%censys%' OR
+    LOWER(COALESCE(ua,'')) LIKE '%shodan%' OR
+    LOWER(COALESCE(ua,'')) LIKE '%nuclei%' OR
+    LOWER(COALESCE(ua,'')) LIKE '%zgrab%' OR
+    LOWER(COALESCE(ua,'')) LIKE '%headless%' OR
+    LOWER(COALESCE(ua,'')) LIKE '%playwright%' OR
+    LOWER(COALESCE(ua,'')) LIKE '%puppeteer%' OR
+    LOWER(COALESCE(ua,'')) LIKE '%selenium%' OR
+    LOWER(COALESCE(ua,'')) LIKE '%scrapy%' OR
+    LOWER(COALESCE(ua,'')) LIKE '%heritrix%' OR
+    LOWER(COALESCE(ua,'')) LIKE '%zerobot%'
+)"""
+
+
+def _demand_ua_ok(ua: str) -> bool:
+    """Barreira semântica usada nos caminhos que já têm o UA isolado."""
+    try:
+        return _ua_class(ua or "") not in ("scanner", "generic_bot")
+    except Exception:
+        low = (ua or "").lower()
+        return not any(x in low for x in ("spider", "crawler", "scanner", "bot",
+                                          "monitor", "indexer", "headless"))
 
 def _route_now_live(path: str) -> bool:
     """v44.1.0: a rota pedida EXISTE hoje? O radar é janela de 7 dias — um
@@ -18238,12 +18697,14 @@ _FC_FEEDS = {  # simbolo: (pyth feed id, coingecko id)
     "LINK": ("8ac0c70fff57e9aefdf5edf44b51d62c2d433653cbb2cf5cc06bb115af04d221", "chainlink")  # v48.17.3: id estava errado (o endpoint novo rejeita o lote inteiro por causa de 1 id),
 }
 _FC_SKIP_FILE = HOME_DIR / "fc_skip.json"   # v48.17.4-FEEDCLEAN
-_FC_SKIP: set = set()
+# Produção (30/out): este feed XRP responde 403 "Not entitled" a cada batch.
+# Começa excluído para não repetir o erro após o deploy; CoinGecko mantém XRP.
+_FC_SKIP: set = {"ec5d399846a9209f3fe5881d70aae9268c94339ff9817e8d18ff19fa05eea1c8"}
 try:
     if _FC_SKIP_FILE.exists():
-        _FC_SKIP = set(json.loads(_FC_SKIP_FILE.read_text()))
+        _FC_SKIP |= set(json.loads(_FC_SKIP_FILE.read_text()))
 except Exception:
-    _FC_SKIP = set()
+    pass
 
 
 def _fc_skip_note(feed_ids_bad):
@@ -18261,7 +18722,7 @@ def _fc_skip_note(feed_ids_bad):
     except Exception:
         pass
     syms = [s for s, (fid, _cg) in _FC_FEEDS.items() if fid in _FC_SKIP]
-    log.info(f"🧠 feeds Pyth excluídos (aposentados/inválidos): {syms} — CoinGecko cobre")
+    log.info(f"🧠 feeds Pyth excluídos (aposentados/inválidos/não autorizados): {syms} — CoinGecko cobre")
 
 
 _FC_HORIZONS = {"6h": 6, "24h": 24, "3d": 72, "7d": 168}
@@ -18394,6 +18855,15 @@ def _pyth_latest(feed_ids):
     r = requests.get(f"{_PYTH_BASE}/v2/updates/price/latest?{ids}",
                      headers={"Authorization": f"Bearer {PYTH_API_KEY}"}, timeout=6)
     if not r.ok:
+        body = r.text[:240]
+        if r.status_code in (400, 403):
+            # Registra no ponto mais baixo também: mesmo um chamador fora do
+            # coletor passa a excluir o feed negado nos próximos ciclos.
+            bad = re.findall(
+                r"(?:(?:not valid|not found):\s*|not entitled: feed )([0-9a-f]{64})",
+                body.lower())
+            if bad:
+                _fc_skip_note(bad)
         raise RuntimeError(f"pyth HTTP {r.status_code}: {r.text[:160]}")
     out = {}
     for p in r.json().get("parsed", []):
@@ -18894,8 +19364,8 @@ def _ml_cluster_demand():
         corte = int(time.time()) - 7 * 86400
         with LEDGER._conn() as c:
             rows = c.execute("SELECT endpoint, COUNT(DISTINCT ip) ips FROM requests "
-                             "WHERE ts>? AND kind='notfound' GROUP BY endpoint "
-                             "HAVING ips>=2 ORDER BY ips DESC LIMIT 120",
+                             "WHERE ts>? AND kind='notfound' AND " + _DEMAND_UA_SQL +
+                             " GROUP BY endpoint HAVING ips>=2 ORDER BY ips DESC LIMIT 120",
                              (corte,)).fetchall()
         ips_map = {r[0]: int(r[1]) for r in rows}
         paths = [r[0] for r in rows
@@ -19130,8 +19600,9 @@ def demand_watch_loop():
             with LEDGER._conn() as c:
                 linhas = c.execute(
                     "SELECT endpoint, COUNT(*) n, COUNT(DISTINCT ip) ips "
-                    "FROM requests WHERE ts>? AND kind='notfound' "
-                    "GROUP BY endpoint HAVING ips >= ? ORDER BY ips DESC LIMIT 5",
+                    "FROM requests WHERE ts>? AND kind='notfound' AND " +
+                    _DEMAND_UA_SQL +
+                    " GROUP BY endpoint HAVING ips >= ? ORDER BY ips DESC LIMIT 5",
                     (int(time.time()) - 7 * 86400, limiar)).fetchall()
             for path, n, ips in linhas:
                 if path in avisados:
@@ -19264,11 +19735,12 @@ def _capture_demand(e):
     path = (request.path or "")[:120]
     try:
         if not _is_scan_noise(path):
+            ua = request.headers.get("User-Agent", "")
             LEDGER.log_request(path, False, 0,
                                request.headers.get("X-Forwarded-For", request.remote_addr) or "",
-                               kind="notfound",
-                               ua=request.headers.get("User-Agent", ""),
-                               params=_clean_params())
+                               kind=("notfound" if _demand_ua_ok(ua)
+                                     else "notfound_scanner"),
+                               ua=ua, params=_clean_params())
     except Exception:
         pass
     base = _public_base()
@@ -24040,8 +24512,7 @@ def reconcile_tx():
             if ok:
                 payer = info.get("payer", "") if isinstance(info, dict) else ""
                 amount = round(float(info.get("delta", 0.01)), 6) if isinstance(info, dict) else 0.01
-                h = hashlib.sha256(sig.encode()).hexdigest()
-                if LEDGER.replay_check(h):
+                if LEDGER.tx_recorded(sig):
                     results.append({"sig": sig[:32] + "...", "status": "already_recorded"})
                     continue
                 LEDGER.add_revenue(endpoint, amount, sig, payer, source="reconcile", chain="solana")
@@ -24197,9 +24668,13 @@ def force_register_tx():
     payer = body.get("payer") or "manual"
     if not sig or amount <= 0:
         return jsonify({"error": "signature and amount_usdc required"}), 400
-    h = hashlib.sha256(sig.encode()).hexdigest()
-    LEDGER.replay_delete(h)
-    LEDGER.add_revenue(endpoint, amount, sig, payer, source="manual-force", chain="solana")
+    ok, info = SOL.verify_payment(sig, amount, RECEIVE_ADDRESS, max_age=86400 * 30)
+    if not ok:
+        return jsonify({"error": "on-chain proof failed", "reason": str(info)}), 400
+    amount = round(float(info.get("delta", 0)), 6)
+    payer = (info.get("payer") or payer) if isinstance(info, dict) else payer
+    if not LEDGER.add_revenue(endpoint, amount, sig, payer, source="manual-force", chain="solana"):
+        return jsonify({"success": True, "already_recorded": True, "tx": sig[:32] + "..."})
     return jsonify({
         "success": True,
         "tx": sig[:32] + "...",
@@ -24215,6 +24690,9 @@ def force_register_tx():
 # ============================================================================
 @app.route("/verify-signature-manual", methods=["POST"])
 def verify_signature_manual():
+    tok = request.headers.get("X-Dash-Token") or request.args.get("token") or ""
+    if not _dash_token_ok(tok):
+        return jsonify({"error": "forbidden"}), 403
     body = request.get_json(silent=True) or {}
     sig = (body.get("signature") or body.get("sig") or "").strip()
     endpoint = body.get("endpoint") or "/bootstrap-trust"
@@ -24245,8 +24723,8 @@ def verify_signature_manual():
     # 3. Registra
     payer = info.get("payer", "") if isinstance(info, dict) else ""
     amount = round(float(info.get("delta", 0.01)), 6) if isinstance(info, dict) else 0.01
-    LEDGER.replay_delete(h)
-    LEDGER.add_revenue(endpoint, amount, sig, payer, source="manual-verify", chain="solana")
+    if not LEDGER.add_revenue(endpoint, amount, sig, payer, source="manual-verify", chain="solana"):
+        return jsonify({"success": True, "already_recorded": True, "tx": sig[:32] + "..."})
     _notify_telegram(f"💰 Manual verify: ${amount} USDC em {endpoint}\nTX: {sig[:32]}...")
     return jsonify({
         "success": True,
@@ -30957,9 +31435,27 @@ _RADAR_AUTO_IPS     = int(os.environ.get("RADAR_AUTO_IPS", "3"))
 _RADAR_MAX_ALIASES  = int(os.environ.get("RADAR_MAX_ALIASES", "60"))
 # Alvos permitidos: produto pago do catálogo OU endpoint gratuito conhecido.
 _RADAR_FREE_OK = ("/welcome", "/try", "/sample", "/health", "/ip",
-                  "/receipts", "/agent-directory.json", "/losbeto-alpha")
+                  "/receipts", "/agent-directory.json", "/losbeto-alpha",
+                  "/get-pricing", "/api/v1", "/llms.txt", "/openapi.json")
 _AUTO_ALIASES: dict = {}
 _AUTO_ALIASES_MTIME: float = 0.0   # v48.9.4: sync entre workers (gunicorn roda 4)
+
+
+def _radar_alias_valid_map(data) -> dict:
+    """Revalida aliases persistidos: regras antigas não podem manter vivos
+    caminhos de scanner, rotas já atendidas ou alvos que deixaram de existir."""
+    out = {}
+    if not isinstance(data, dict):
+        return out
+    for path, rec in data.items():
+        try:
+            target = str((rec or {}).get("target") or "")
+            if (_radar_safe_path(path) and not _route_now_live(path)
+                    and _radar_safe_target(target)):
+                out[path] = rec
+        except Exception:
+            continue
+    return out
 
 
 def _radar_alias_reload_if_changed():
@@ -30980,7 +31476,9 @@ def _radar_alias_reload_if_changed():
         with open(_RADAR_ALIASES_FILE) as f:
             d = json.load(f)
         if isinstance(d, dict):
-            _AUTO_ALIASES.update(d)
+            valid = _radar_alias_valid_map(d)
+            _AUTO_ALIASES.clear()
+            _AUTO_ALIASES.update(valid)
             _AUTO_ALIASES_MTIME = st.st_mtime
     except Exception:
         pass
@@ -30992,10 +31490,16 @@ def _radar_alias_load():
         with open(_RADAR_ALIASES_FILE) as f:
             d = json.load(f)
         if isinstance(d, dict):
-            _AUTO_ALIASES.update(d)
+            valid = _radar_alias_valid_map(d)
+            dropped = sorted(set(d) - set(valid))
+            _AUTO_ALIASES.clear()
+            _AUTO_ALIASES.update(valid)
             _AUTO_ALIASES_MTIME = os.stat(_RADAR_ALIASES_FILE).st_mtime
-            if d:
-                log.info(f"🍒 radar: {len(d)} aliases auto-criados restaurados de /data")
+            if valid:
+                log.info(f"🍒 radar: {len(valid)} aliases auto-criados restaurados de /data")
+            if dropped:
+                log.warning(f"🧹 radar: {len(dropped)} aliases obsoletos/scanners removidos: {dropped[:12]}")
+                _radar_alias_save()
     except Exception:
         pass
 
@@ -31032,8 +31536,9 @@ def _radar_autofulfill_cycle() -> list:
         with LEDGER._conn() as c:
             linhas = c.execute(
                 "SELECT endpoint, COUNT(*) n, COUNT(DISTINCT ip) ips "
-                "FROM requests WHERE ts>? AND kind='notfound' "
-                "GROUP BY endpoint HAVING ips >= ? "
+                "FROM requests WHERE ts>? AND kind='notfound' AND " +
+                _DEMAND_UA_SQL +
+                " GROUP BY endpoint HAVING ips >= ? "
                 "ORDER BY ips DESC LIMIT 10",
                 (int(time.time()) - 7 * 86400, _RADAR_AUTO_IPS)).fetchall()
     except Exception as e:
@@ -33298,13 +33803,16 @@ def _cortex_backlog(days: int = 7, min_ips: int = 3, limit: int = 12) -> list:
         with LEDGER._conn() as c:
             rows = c.execute(
                 "SELECT endpoint, COUNT(*) n, COUNT(DISTINCT ip) ips "
-                "FROM requests WHERE ts>? AND kind='notfound' "
-                "GROUP BY endpoint HAVING ips>=? ORDER BY n DESC LIMIT 40",
+                "FROM requests WHERE ts>? AND kind='notfound' AND " +
+                _DEMAND_UA_SQL +
+                " GROUP BY endpoint HAVING ips>=? ORDER BY n DESC LIMIT 40",
                 (d, min_ips)).fetchall()
     except Exception as e:
         return [{"error": str(e)[:80]}]
     out = []
     for path, hits, ips in rows:
+        if path in _AUTO_ALIASES or _route_now_live(path):
+            continue  # alias/rota já atende; histórico antigo não é backlog
         try:
             cls = _demand_classify_ml(path)
             label = (cls or {}).get("kind", "")
@@ -34033,6 +34541,14 @@ def _ops_apply(action, actor):
     k = action.get("action")
     if k == "create_alias":
         path, target = str(action["path"]), str(action["target"])
+        # Revalida no momento da aplicação: uma proposta pendente pode ter
+        # ficado obsoleta ou sido criada antes de uma regra anti-scanner.
+        if not _radar_safe_path(path) or _route_now_live(path):
+            return False, "path inseguro, scanner ou rota já atendida"
+        if path in _AUTO_ALIASES:
+            return False, "alias já existe"
+        if not _radar_safe_target(target):
+            return False, "alvo não vendável"
         _AUTO_ALIASES[path] = {"target": target, "ts": int(time.time()),
                                "hits": int(action.get("hits", 0)),
                                "ips": int(action.get("ips", 0))}
@@ -34053,8 +34569,15 @@ def _ops_apply(action, actor):
     if k == "resume_endpoint":
         return _ops_resume(str(action["endpoint"]), actor, probe=True)
     if k == "queue_product":
+        path = str(action["path"])
+        if (not _radar_safe_path(path) or _route_now_live(path)
+                or path in _AUTO_ALIASES):
+            return False, "scanner, well-known, alias ou rota já atendida"
+        cls = _demand_classify_ml(path)
+        if cls.get("kind") != "new_product":
+            return False, f"não é produto novo: {cls.get('kind')}"
         q = _ops_read_json(_OPS_PRODUCT_QUEUE, [])
-        q.append({"path": str(action["path"]),
+        q.append({"path": path,
                   "note": str(action.get("reason", ""))[:200],
                   "ts": int(time.time()), "by": str(actor)[:24]})
         _ops_write_json(_OPS_PRODUCT_QUEUE, q[-50:])
@@ -34131,6 +34654,12 @@ def _ops_validate(action, candidates):
         path = str(action.get("path", ""))
         if path not in (candidates.get("backlog") or {}):
             return False, "path fora do backlog real"
+        if (not _radar_safe_path(path) or _route_now_live(path)
+                or path in _AUTO_ALIASES):
+            return False, "scanner, well-known, alias ou rota já atendida"
+        cls = _demand_classify_ml(path)
+        if cls.get("kind") != "new_product":
+            return False, f"não é produto novo: {cls.get('kind')}"
         return True, "approval"
     return False, "ação fora da whitelist"
 
@@ -34961,10 +35490,11 @@ def _ops_proposals_expire():
                 continue
             a = rec.get("action") or {}
             tgt = _ops_target(a)
-            if (a.get("action") in ("queue_product", "create_alias")
-                    and tgt and _route_now_live(tgt)):
+            if (a.get("action") in ("queue_product", "create_alias", "factory_product")
+                    and tgt and (_route_now_live(tgt) or tgt in _AUTO_ALIASES
+                                 or _is_scan_noise(tgt))):
                 rec["status"] = "superseded"
-                rec["result"] = "route already live — nothing to build"
+                rec["result"] = "route/alias already live or non-demand scanner path"
                 superseded.append(tgt)
                 _ops_audit("ops-agent", "supersede", tgt, {"id": k},
                            "superseded")
@@ -35791,8 +36321,10 @@ def _ops_validate(action, candidates):
             return False, "path fora do backlog real (anti-alucinação)"
         if not _FACTORY_PATH_RE.match(path):
             return False, "path inseguro (1 segmento, a-z0-9-)"
-        if _route_now_live(path) or path in BASE_PRICES:
-            return False, "rota já existe"
+        if _route_now_live(path) or path in BASE_PRICES or path in _AUTO_ALIASES:
+            return False, "rota ou alias já existe"
+        if _is_scan_noise(path):
+            return False, "scanner/descoberta não é demanda de produto"
         items = _ops_read_json(_FACTORY_FILE, {})
         if path in items:
             return False, "já existe na fábrica"
@@ -35833,6 +36365,9 @@ _OPS_APPLY_48301 = _ops_apply
 def _ops_apply(action, actor):
     if action.get("action") == "factory_product":
         path = str(action["path"])
+        if (not _FACTORY_PATH_RE.match(path) or _is_scan_noise(path)
+                or _route_now_live(path) or path in _AUTO_ALIASES):
+            return False, "produto obsoleto, scanner ou caminho já atendido"
         spec = {"price": round(float(action["price"]), 4),
                 "desc": str(action["desc"]).strip()[:280],
                 "upstream": str(action["upstream"]).strip()[:300],
@@ -36690,8 +37225,9 @@ def _ops_decision_suppress(action):
     now = int(time.time())
     try:
         if k in ("queue_product", "factory_product", "create_alias") \
-                and _route_now_live(tgt):
-            return True, "a rota já está no ar"
+                and (_route_now_live(tgt) or tgt in _AUTO_ALIASES
+                     or _is_scan_noise(tgt)):
+            return True, "rota/alias já atende ou caminho é scanner"
     except Exception:
         pass
     if k == "queue_product":
@@ -37714,8 +38250,8 @@ def _lead_scan_once() -> None:
         if len(eps) < LEAD_ALERT_MIN_EPS:
             continue
         low = ua.lower()
-        if any(b in low for b in _LEAD_UA_BLOCK):
-            continue
+        if any(b in low for b in _LEAD_UA_BLOCK) or not _demand_ua_ok(ua):
+            continue  # SQLSpider/crawlers/monitores nunca viram lead
         last = max(float(_LEAD_SEEN.get(ua, 0)),
                    float(seen.get(ua, 0) or 0))
         if now - last < LEAD_ALERT_GAP_S:
@@ -38045,7 +38581,7 @@ def _sym_price(symbol):  # noqa: F811 — camada 48.33.2
     (<24h, rotulado last-good). Rótulo de fonte SEMPRE honesto."""
     sym = symbol.upper()
     fid, cg = _FC_FEEDS[sym]
-    for tentativa in range(2):
+    for tentativa in range(2 if fid not in _FC_SKIP else 0):
         try:
             p = _pyth_latest([fid])[fid.lower().lstrip("0x")]
             pd2 = p.get("price", {})
@@ -38303,6 +38839,7 @@ _FUZZ_CREDENTIALS = (
 _STATIC_EXT_48336 = _STATIC_EXT + (
     ".json", ".yaml", ".yml", ".toml", ".ini", ".cfg", ".conf", ".log",
     ".sql", ".db", ".sqlite", ".pem", ".key", ".p12", ".jks", ".env",
+    ".properties",
 )
 
 
@@ -38980,7 +39517,7 @@ def ops_farmed_keys():
                  "Compras Pix e reembolsos nunca são tocados."),
         "keys": rows})
 
-VERSION = "48.39.0-PREVIEWSEAL"
+VERSION = "48.40.0-PAYPROOF"
 
 
 # v48.37.0-CONVERGE: cache de 300s no agentic manifest. O manifest era
