@@ -39600,3 +39600,1019 @@ try:
         app.view_functions["agentic_market_manifest"] = _agentic_cached_view
 except Exception:
     pass
+
+
+# ============================================================================
+# v48.42.0-RECONCILE — SETTLE, PROVA E ENTREGA SÃO UMA SÓ OPERAÇÃO
+# ============================================================================
+# Uma resposta 2xx do facilitator não é recibo; um hash não é entrega; e um
+# pagamento confirmado não pode virar replay-blocked. O schema 26 preserva a
+# operação ORIGINAL (payload + requirements + facilitator + request) e cria um
+# grant durável para retry idempotente. Nenhum segredo novo é exigido.
+
+_V4842_PENDING_COLUMNS = {
+    "payload_json": "TEXT NOT NULL DEFAULT ''",
+    "facilitator": "TEXT NOT NULL DEFAULT ''",
+    "facilitator_url": "TEXT NOT NULL DEFAULT ''",
+    "state": "TEXT NOT NULL DEFAULT 'pending'",
+    "attempts": "INTEGER NOT NULL DEFAULT 0",
+    "last_attempt": "INTEGER NOT NULL DEFAULT 0",
+    "next_attempt": "INTEGER NOT NULL DEFAULT 0",
+    "last_error": "TEXT NOT NULL DEFAULT ''",
+    "request_fp": "TEXT NOT NULL DEFAULT ''",
+    "rid": "TEXT NOT NULL DEFAULT ''",
+    "header_hash": "TEXT NOT NULL DEFAULT ''",
+    "lease_until": "INTEGER NOT NULL DEFAULT 0",
+    "lease_owner": "TEXT NOT NULL DEFAULT ''",
+}
+
+
+def _v4842_migrate_ledger():
+    with LEDGER.lock, LEDGER._conn() as c:
+        c.execute("BEGIN IMMEDIATE")
+        have = {r[1] for r in c.execute("PRAGMA table_info(pending_settlements)")}
+        for name, ddl in _V4842_PENDING_COLUMNS.items():
+            if name not in have:
+                c.execute(f"ALTER TABLE pending_settlements ADD COLUMN {name} {ddl}")
+        c.execute("""CREATE TABLE IF NOT EXISTS payment_grants(
+            fingerprint TEXT PRIMARY KEY,
+            endpoint TEXT NOT NULL,
+            tx_sig TEXT NOT NULL,
+            payer TEXT NOT NULL DEFAULT '',
+            amount REAL NOT NULL,
+            chain TEXT NOT NULL,
+            request_fp TEXT NOT NULL DEFAULT '',
+            ts INTEGER NOT NULL
+        )""")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_payment_grants_tx ON payment_grants(tx_sig)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_pending_due ON pending_settlements(state,next_attempt,lease_until)")
+        c.execute("INSERT OR REPLACE INTO meta(k,v) VALUES('schema_version','26')")
+        c.commit()
+    LedgerV10.SCHEMA_VERSION = 26
+
+
+_v4842_migrate_ledger()
+
+
+def _v4842_current_request_fp():
+    try:
+        return _deliver_fp()
+    except Exception:
+        return ""
+
+
+def _v4842_json(value):
+    if not isinstance(value, dict) or not value:
+        return ""
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+
+
+def _v4842_pending_save(self, fingerprint: str, endpoint: str, tx_sig: str,
+                        requirement: dict, payer: str = "", payload: dict = None,
+                        facilitator: str = "", facilitator_url: str = "",
+                        request_fp: str = "", rid: str = "", header_hash: str = "",
+                        state: str = "") -> None:
+    """Faz merge, nunca Replace: um retry sem payload não apaga a operação."""
+    if not fingerprint:
+        return
+    now = int(time.time())
+    req_json = _v4842_json(requirement) or "{}"
+    payload_json = _v4842_json(payload)
+    tx_new = str(tx_sig or "")
+    with self.lock:
+        c = self._conn()
+        try:
+            c.execute("BEGIN IMMEDIATE")
+            old = c.execute("""SELECT tx_sig,requirement_json,payload_json,facilitator,
+                facilitator_url,payer,request_fp,rid,header_hash,state,ts
+                FROM pending_settlements WHERE fingerprint=?""", (fingerprint,)).fetchone()
+            if old:
+                tx_old = str(old[0] or "")
+                if tx_old and tx_new and tx_old.lower() != tx_new.lower():
+                    log.error(f"🚨 pending {fingerprint[:12]} tentou trocar TX; original preservada")
+                tx_final = tx_old or tx_new
+                # Uma operação já identificada nunca muda de requirements nem de
+                # facilitator. O único upgrade permitido é enriquecer uma row legada.
+                req_final = (req_json if (not old[2] and payload_json) else (old[1] or req_json))
+                payload_final = old[2] or payload_json
+                fac_final = old[3] or facilitator
+                fac_url_final = old[4] or facilitator_url
+                payer_final = old[5] or payer or ""
+                request_final = old[6] or request_fp or ""
+                rid_final = old[7] or rid or ""
+                header_final = old[8] or header_hash or ""
+                state_final = state or old[9] or ("awaiting_delivery" if tx_final else "pending")
+                c.execute("""UPDATE pending_settlements SET endpoint=?,tx_sig=?,
+                    requirement_json=?,payer=?,payload_json=?,facilitator=?,facilitator_url=?,
+                    state=?,last_error='',request_fp=?,rid=?,header_hash=?
+                    WHERE fingerprint=?""",
+                    (endpoint, tx_final, req_final, payer_final, payload_final,
+                     fac_final, fac_url_final, state_final, request_final, rid_final,
+                     header_final, fingerprint))
+            else:
+                state_final = state or ("awaiting_delivery" if tx_new else "pending")
+                c.execute("""INSERT INTO pending_settlements(
+                    fingerprint,endpoint,tx_sig,requirement_json,payer,ts,payload_json,
+                    facilitator,facilitator_url,state,request_fp,rid,header_hash,next_attempt)
+                    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    (fingerprint, endpoint, tx_new, req_json, payer or "", now,
+                     payload_json, facilitator or "", facilitator_url or "", state_final,
+                     request_fp or "", rid or "", header_hash or "", now))
+            c.commit()
+        except Exception:
+            c.rollback()
+            raise
+
+
+def _v4842_pending_get(self, fingerprint: str):
+    if not fingerprint:
+        return None
+    with self._conn() as c:
+        r = c.execute("""SELECT endpoint,tx_sig,requirement_json,payer,ts,payload_json,
+            facilitator,facilitator_url,state,attempts,last_attempt,next_attempt,last_error,
+            request_fp,rid,header_hash,lease_until,lease_owner
+            FROM pending_settlements WHERE fingerprint=?""", (fingerprint,)).fetchone()
+    if not r:
+        return None
+    try:
+        req = json.loads(r[2] or "{}")
+    except Exception:
+        req = {}
+    try:
+        payload = json.loads(r[5] or "{}")
+    except Exception:
+        payload = {}
+    return {"endpoint": r[0], "tx": r[1] or "", "requirement": req,
+            "payer": r[3] or "", "ts": int(r[4] or 0), "payload": payload,
+            "facilitator": r[6] or "", "facilitator_url": r[7] or "",
+            "state": r[8] or "pending", "attempts": int(r[9] or 0),
+            "last_attempt": int(r[10] or 0), "next_attempt": int(r[11] or 0),
+            "last_error": r[12] or "", "request_fp": r[13] or "",
+            "rid": r[14] or "", "header_hash": r[15] or "",
+            "lease_until": int(r[16] or 0), "lease_owner": r[17] or "",
+            "fingerprint": fingerprint}
+
+
+def _v4842_pending_due(self, limit=12):
+    now = int(time.time())
+    with self._conn() as c:
+        rows = c.execute("""SELECT fingerprint FROM pending_settlements
+            WHERE next_attempt<=? AND lease_until<? AND state NOT IN ('needs_review','resolved')
+            ORDER BY ts LIMIT ?""", (now, now, int(limit))).fetchall()
+    return [r[0] for r in rows]
+
+
+def _v4842_pending_claim(self, fingerprint, owner, lease_s=60):
+    now = int(time.time())
+    with self.lock:
+        c = self._conn()
+        try:
+            c.execute("BEGIN IMMEDIATE")
+            cur = c.execute("""UPDATE pending_settlements
+                SET lease_until=?,lease_owner=?,attempts=attempts+1,last_attempt=?
+                WHERE fingerprint=? AND lease_until<? AND state NOT IN ('needs_review','resolved')""",
+                (now + int(lease_s), owner, now, fingerprint, now))
+            c.commit()
+            return cur.rowcount == 1
+        except Exception:
+            c.rollback()
+            raise
+
+
+def _v4842_pending_release(self, fingerprint, reason="", state="pending",
+                           retry_s=None, clear_lease=True):
+    now = int(time.time())
+    row = self.pending_get(fingerprint)
+    attempts = int((row or {}).get("attempts", 0))
+    if retry_s is None:
+        retry_s = min(300, max(2, 2 ** min(max(attempts, 1), 8)))
+    with self.lock, self._conn() as c:
+        c.execute("""UPDATE pending_settlements SET state=?,last_error=?,next_attempt=?,
+            lease_until=?,lease_owner=? WHERE fingerprint=?""",
+            (state, str(reason or "")[:240], now + int(retry_s),
+             0 if clear_lease else now + 60, "" if clear_lease else "reconcile", fingerprint))
+
+
+def _v4842_grant_get(self, fingerprint):
+    if not fingerprint:
+        return None
+    with self._conn() as c:
+        r = c.execute("""SELECT endpoint,tx_sig,payer,amount,chain,request_fp,ts
+            FROM payment_grants WHERE fingerprint=?""", (fingerprint,)).fetchone()
+    if not r:
+        return None
+    return {"fingerprint": fingerprint, "endpoint": r[0], "tx": r[1],
+            "payer": r[2] or "", "amount": float(r[3]), "chain": r[4],
+            "request_fp": r[5] or "", "ts": int(r[6] or 0)}
+
+
+def _v4842_grant_bind(self, fingerprint, request_fp):
+    if not fingerprint or not request_fp:
+        return
+    with self.lock, self._conn() as c:
+        c.execute("UPDATE payment_grants SET request_fp=? WHERE fingerprint=? AND request_fp=''",
+                  (request_fp, fingerprint))
+
+
+def _v4842_commit_payment(self, endpoint: str, amount: float, tx_sig: str,
+                          payer: str, source: str, chain: str, fingerprint: str,
+                          header_hash: str):
+    """Receita + anti-replay + grant de entrega, atomicamente entre workers."""
+    if not tx_sig:
+        return False, "missing-transaction"
+    if tx_sig.startswith("0x"):
+        tx_sig = tx_sig.lower()
+    request_fp = _v4842_current_request_fp()
+    new_buyer = False
+    with self.lock:
+        c = self._conn()
+        try:
+            c.execute("BEGIN IMMEDIATE")
+            if not request_fp and fingerprint:
+                rr = c.execute("SELECT request_fp FROM pending_settlements WHERE fingerprint=?",
+                               (fingerprint,)).fetchone()
+                request_fp = str((rr[0] if rr else "") or "")
+            old_rev = c.execute("SELECT endpoint,amount,payer,chain FROM revenue WHERE tx_sig=?",
+                                (tx_sig,)).fetchone()
+            if old_rev:
+                if fingerprint and old_rev[0] == endpoint:
+                    c.execute("""INSERT OR IGNORE INTO payment_grants(
+                        fingerprint,endpoint,tx_sig,payer,amount,chain,request_fp,ts)
+                        VALUES(?,?,?,?,?,?,?,?)""",
+                        (fingerprint, endpoint, tx_sig, old_rev[2] or payer or "",
+                         float(old_rev[1]), old_rev[3] or chain, request_fp, int(time.time())))
+                    c.commit()
+                else:
+                    c.rollback()
+                return False, "transaction-already-recorded"
+            tx_key = "tx:" + chain + ":" + tx_sig
+            if c.execute("SELECT 1 FROM replay WHERE hash=?", (tx_key,)).fetchone():
+                c.rollback()
+                return False, "transaction-already-claimed"
+            if fingerprint and c.execute("SELECT 1 FROM payment_fingerprints WHERE fingerprint=?",
+                                         (fingerprint,)).fetchone():
+                c.rollback()
+                return False, "payment-already-recorded"
+            if payer:
+                new_buyer = c.execute("SELECT 1 FROM revenue WHERE payer=? LIMIT 1",
+                                      (payer,)).fetchone() is None
+            now = int(time.time())
+            c.execute("INSERT INTO revenue(ts,endpoint,amount,tx_sig,payer,source,chain) VALUES(?,?,?,?,?,?,?)",
+                      (now, endpoint, amount, tx_sig, payer, source, chain))
+            c.execute("INSERT INTO replay(hash,ts) VALUES(?,?)", (tx_key, now))
+            if header_hash:
+                c.execute("INSERT OR IGNORE INTO replay(hash,ts) VALUES(?,?)", (header_hash, now))
+            if fingerprint:
+                c.execute("INSERT INTO payment_fingerprints(fingerprint,endpoint,tx_sig,payer,ts) VALUES(?,?,?,?,?)",
+                          (fingerprint, endpoint, tx_sig, payer, now))
+                c.execute("""INSERT INTO payment_grants(
+                    fingerprint,endpoint,tx_sig,payer,amount,chain,request_fp,ts)
+                    VALUES(?,?,?,?,?,?,?,?)""",
+                    (fingerprint, endpoint, tx_sig, payer or "", float(amount), chain,
+                     request_fp, now))
+                c.execute("DELETE FROM pending_settlements WHERE fingerprint=?", (fingerprint,))
+            c.commit()
+        except sqlite3.IntegrityError:
+            c.rollback()
+            return False, "payment-replay"
+        except Exception as e:
+            c.rollback()
+            log.error(f"commit_payment {endpoint} tx={tx_sig}: {e}")
+            return False, "ledger-error"
+    if new_buyer and payer and source != "bootstrap":
+        try:
+            if payer.lower() not in OPERATOR_WALLETS:
+                _notify_telegram(f"🆕 NOVO COMPRADOR ORGÂNICO\nCarteira: {payer[:24]}...\n"
+                                 f"Primeira compra: {endpoint} — ${amount:.4f} ({chain})")
+        except Exception:
+            pass
+    return True, "ok"
+
+
+LedgerV10.pending_save = _v4842_pending_save
+LedgerV10.pending_get = _v4842_pending_get
+LedgerV10.pending_due = _v4842_pending_due
+LedgerV10.pending_claim = _v4842_pending_claim
+LedgerV10.pending_release = _v4842_pending_release
+LedgerV10.grant_get = _v4842_grant_get
+LedgerV10.grant_bind = _v4842_grant_bind
+LedgerV10.commit_payment = _v4842_commit_payment
+
+_V4842_REQ_CTX = threading.local()
+_V4842_FAC_CTX = threading.local()
+
+
+_V4842_FAC_SETTLE_ORIG = FacilitatorClient.settle
+
+
+def _v4842_fac_settle(self, payment_payload: dict, requirements: dict,
+                      bazaar=None, resource=None):
+    """Uma resposta incerta NUNCA libera fallback para outro facilitator."""
+    try:
+        pp = payment_payload
+        if self.is_cdp and (bazaar or (resource and CDP_SEND_RESOURCE)):
+            pp = dict(payment_payload)
+            if bazaar:
+                ext = dict(pp.get("extensions") or {})
+                ext["bazaar"] = bazaar
+                pp["extensions"] = ext
+            if resource and CDP_SEND_RESOURCE:
+                pp["resource"] = resource
+        payload_saved = json.loads(json.dumps(pp))
+        req_saved = json.loads(json.dumps(requirements))
+        _V4842_FAC_CTX.op = {"payload": payload_saved, "requirement": req_saved,
+                             "facilitator": self.tag, "facilitator_url": self.url.rstrip("/")}
+        r = requests.post(f"{self.url}/settle", json={
+            "x402Version": pp.get("x402Version", 2),
+            "paymentPayload": pp,
+            "paymentRequirements": requirements,
+        }, headers=self._headers("POST", "/settle"), timeout=FAC_SETTLE_TIMEOUT)
+        try:
+            data = r.json() if r.text else {}
+        except Exception:
+            data = {"error": "invalid-json", "body": r.text[:300]}
+        if not isinstance(data, dict):
+            data = {"error": "invalid-settle-response"}
+        data["_http"] = r.status_code
+        reason = str(data.get("errorReason") or data.get("error") or "")
+        reason_l = reason.lower()
+        uncertain_http = r.status_code >= 500 or r.status_code in (408, 409, 425, 429)
+        if (reason_l in ("settlement_pending", "duplicate_settlement")
+                or "settlement_pending" in reason_l or "duplicate_settlement" in reason_l):
+            data.update({"pending": True, "error": reason_l or "settlement_pending"})
+            log.warning(f"⏳ {self.tag} {reason_l} tx={str(data.get('transaction') or '')[:24]}")
+            return False, data
+        if uncertain_http or data.get("error") in ("invalid-json", "invalid-settle-response"):
+            # O servidor pode ter liquidado e a resposta se perdeu. Reenviar a
+            # mesma operação é permitido; trocar de facilitator não é.
+            data.update({"pending": True, "uncertain": True,
+                         "error": reason or f"settle-transport-http-{r.status_code}"})
+            log.warning(f"⏳ {self.tag} settle incerto HTTP {r.status_code}; operação preservada")
+            return False, data
+        if not r.ok:
+            data.setdefault("error", f"facilitator-{r.status_code}")
+            return False, data
+        if data.get("success") is not True:
+            data.setdefault("error", reason or "success-not-true")
+            return False, data
+        returned_network = str(data.get("network") or "")
+        tx = _clean_tx(data)
+        if not _network_matches(requirements.get("network", ""), returned_network):
+            data.update({"pending": True, "uncertain": True,
+                         "error": "settlement-network-mismatch",
+                         "expectedNetwork": requirements.get("network", "")})
+            return False, data
+        if not tx:
+            data.update({"pending": True, "uncertain": True,
+                         "error": "missing-facilitator-transaction"})
+            return False, data
+        data["_clean_tx"] = tx
+        if self.is_cdp:
+            ext = r.headers.get("EXTENSION-RESPONSES") or r.headers.get("extension-responses")
+            log.info(f"🏪 settle CDP ok | EXTENSION-RESPONSES: {ext or 'AUSENTE'}")
+            _bazaar_ext_note(ext, bool(pp.get("resource")))
+        return True, data
+    except Exception as e:
+        # Timeout/DNS/socket/JSON local depois do POST são incertos por definição.
+        log.warning(f"⏳ {getattr(self, 'tag', 'Facilitator')} settle sem resposta confiável: {str(e)[:140]}")
+        return False, {"pending": True, "uncertain": True,
+                       "error": "settle-transport-uncertain", "detail": str(e)[:160]}
+
+
+FacilitatorClient.settle = _v4842_fac_settle
+
+
+def _v4842_chain_verify(tx_sig, requirement, max_age):
+    chain = _chain_for_network(requirement.get("network", ""))
+    expected = _requirement_amount_atomic(requirement) / 1_000_000
+    if chain in ("base", "polygon", "arbitrum"):
+        return _evm_receipt_verify(tx_sig, requirement, min_confirmations=0, max_age=max_age)
+    if chain == "solana":
+        # A API Solana histórica deste monólito retorna (ok, info), não 3-tupla.
+        out = SOL.verify_payment(tx_sig, expected, str(requirement.get("payTo") or ""),
+                                 max_age=(10 * 365 * 86400 if not max_age else max_age))
+        if isinstance(out, tuple) and len(out) == 2:
+            ok, info = out
+            if ok:
+                return True, "ok", info if isinstance(info, dict) else {"delta": expected}
+            return False, info if isinstance(info, str) else "verify-failed", {}
+        return out
+    if chain == "algorand":
+        return _algorand_receipt_verify(tx_sig, requirement, max_age=max_age)
+    return False, "unknown-chain", {"settlement_seen": True}
+
+
+def _v4842_verify_poll(tx_sig, requirement, max_age=None):
+    if max_age is None:
+        max_age = max(900, CHALLENGE_TTL + 300)
+    delays = (0, 0.8, 1.2, 1.8)
+    last = (False, "tx-not-found", {})
+    started = time.monotonic()
+    for i, delay in enumerate(delays):
+        # Nunca empilhar várias chamadas RPC lentas no worker sync de 45s.
+        if i and time.monotonic() - started > 6:
+            break
+        if delay:
+            time.sleep(delay)
+        last = _v4842_chain_verify(tx_sig, requirement, max_age)
+        if last[0] or not _settlement_transient(last[1]):
+            return last
+    return last
+
+
+def _v4842_verify_settlement_onchain(tx_sig: str, requirement: dict):
+    # Poll curto cobre a corrida settle→bloco→receipt sem estourar o worker sync.
+    return _v4842_verify_poll(tx_sig, requirement)
+
+
+_verify_settlement_onchain = _v4842_verify_settlement_onchain
+
+
+def _v4842_pending_payment(endpoint: str, fingerprint: str, requirement: dict,
+                           tx_sig: str, payer: str, reason: str):
+    ctx = getattr(_V4842_REQ_CTX, "value", {}) or {}
+    op = getattr(_V4842_FAC_CTX, "op", {}) or {}
+    use_op = bool(op and fingerprint and
+                  _payment_fingerprint(op.get("payload") or {}) == fingerprint)
+    saved_req = (op.get("requirement") if use_op else None) or requirement or {}
+    payload = (op.get("payload") if use_op else None) or ctx.get("payload") or {}
+    facilitator = (op.get("facilitator") if use_op else "") or ""
+    facilitator_url = (op.get("facilitator_url") if use_op else "") or ""
+    request_fp = ctx.get("request_fp") or _v4842_current_request_fp()
+    rid = ctx.get("rid") or ""
+    if not rid:
+        try:
+            rid = str((((payload.get("accepted") or {}).get("extra") or {}).get("requestId")) or "")
+        except Exception:
+            rid = ""
+    header_hash = ctx.get("header_hash") or ""
+    try:
+        LEDGER.pending_save(fingerprint, endpoint, tx_sig, saved_req, payer,
+                            payload=payload, facilitator=facilitator,
+                            facilitator_url=facilitator_url, request_fp=request_fp,
+                            rid=rid, header_hash=header_hash)
+        log.warning(f"⏳ pending criado/atualizado {endpoint} fp={fingerprint[:12]} "
+                    f"fac={facilitator or 'legacy'} tx={str(tx_sig or '')[:18]} reason={reason}")
+    except Exception as e:
+        log.error(f"pending_save {endpoint}: {e}")
+        _notify_telegram(f"🚨 FALHA AO PRESERVAR PAGAMENTO PENDENTE {endpoint} tx={tx_sig}: {e}")
+    return False, "settlement-pending:" + reason, {
+        "settlement_pending": True, "settlement_seen": True, "tx": tx_sig,
+        "network": saved_req.get("network", ""), "payer": payer,
+        "operation_preserved": bool(payload and facilitator),
+        "retry": "Retry the same payment payload and the same request; do not create another payment."}
+
+
+_pending_payment = _v4842_pending_payment
+
+
+def _v4842_receipt_info(endpoint, requirement, tx_sig, payer, amount,
+                        idempotent=True, settlement=None):
+    return {"payer": payer or "", "tx": tx_sig,
+            "settlement": settlement or {"success": True, "transaction": tx_sig,
+                                          "reconciled": True},
+            "payment_verified": True, "amount_usd": round(float(amount), 6),
+            "required_usd": round(float(amount), 6),
+            "network": requirement.get("network", ""),
+            "asset": requirement.get("asset", ""),
+            "payTo": requirement.get("payTo", ""), "idempotent": idempotent}
+
+
+def _v4842_finalize_pending(pending, proof, header_hash=""):
+    endpoint = pending["endpoint"]
+    req = pending.get("requirement") or {}
+    tx_sig = pending.get("tx") or ""
+    fingerprint = pending["fingerprint"]
+    payer = str(proof.get("payer") or pending.get("payer") or "")
+    if payer.startswith("0x"):
+        payer = payer.lower()
+    amount = round(float(proof.get("received_usd", proof.get("delta", 0)) or 0), 6)
+    chain = _chain_for_network(req.get("network", ""))
+    committed, why = LEDGER.commit_payment(endpoint, amount, tx_sig, payer,
+                                           "facilitator", chain, fingerprint,
+                                           header_hash or pending.get("header_hash") or "")
+    receipt = LEDGER.revenue_by_tx(tx_sig)
+    if not committed and (not receipt or receipt.get("endpoint") != endpoint):
+        if why == "ledger-error":
+            LEDGER.pending_release(fingerprint, why, "awaiting_delivery", retry_s=5)
+            return _v4842_pending_payment(endpoint, fingerprint, req, tx_sig, payer, why)
+        log.error(f"🚨 pending {fingerprint[:12]} não pôde virar grant: {why}")
+        return False, "payment-replay:" + why, {"settlement_seen": True, "tx": tx_sig}
+    request_fp = _v4842_current_request_fp()
+    if request_fp:
+        LEDGER.grant_bind(fingerprint, request_fp)
+    if committed:
+        try:
+            rid = pending.get("rid") or ""
+            if rid and LEDGER.funnel_settle(rid, payer, chain):
+                log.info(f"🔗 funil reconciliado: 402→settle rid={rid} {endpoint} ({chain})")
+        except Exception:
+            pass
+        log.warning(f"✅ PAGAMENTO RECONCILIADO {endpoint} tx={tx_sig} amount=${amount:.6f}")
+        _notify_telegram(f"💰✅ Reconciliação: ${amount:.6f} USDC em {endpoint} ({chain})\nTX: {tx_sig}")
+    return True, ("ok-reconciled" if committed else "idempotent-payment"), _v4842_receipt_info(
+        endpoint, req, tx_sig, payer or (receipt or {}).get("payer", ""),
+        (receipt or {}).get("amount", amount), idempotent=not committed)
+
+
+def _v4842_pending_response(pending, reason):
+    return False, "settlement-pending:" + reason, {
+        "settlement_pending": True, "settlement_seen": True,
+        "tx": pending.get("tx", ""), "network": (pending.get("requirement") or {}).get("network", ""),
+        "payer": pending.get("payer", ""), "operation_preserved": bool(
+            pending.get("payload") and pending.get("facilitator")),
+        "retry": "Retry the same payment payload and the same request; do not create another payment."}
+
+
+def _v4842_reconcile_known(pending, allow_plan_delivery):
+    endpoint = pending["endpoint"]
+    req = pending.get("requirement") or {}
+    tx_sig = pending.get("tx") or ""
+    fp = pending["fingerprint"]
+    ok, why, proof = _v4842_verify_poll(tx_sig, req, max_age=0)
+    if not ok:
+        if _settlement_transient(why):
+            LEDGER.pending_release(fp, why, "awaiting_delivery")
+            log.info(f"⏳ reconcile {endpoint} fp={fp[:12]} tx={tx_sig[:18]}: {why}")
+            return _v4842_pending_response(pending, why)
+        LEDGER.pending_release(fp, why, "needs_review", retry_s=3600)
+        log.error(f"🚨 SETTLE DIVERGENTE {endpoint} tx={tx_sig}: {why} {proof}")
+        _notify_telegram(f"🚨 SETTLE SEM ENTREGA: {endpoint} tx={tx_sig} — {why}")
+        mismatch = proof if isinstance(proof, dict) else {"detail": str(proof)}
+        return False, "settlement-mismatch:" + why, dict(mismatch, **{
+            "settlement_seen": True, "tx": tx_sig})
+    if endpoint in CREDIT_PLANS and not allow_plan_delivery:
+        LEDGER.pending_release(fp, "plan awaiting buyer delivery", "awaiting_delivery", retry_s=30)
+        log.info(f"💳 plano liquidado aguarda retry para criar/recuperar key {endpoint} tx={tx_sig[:18]}")
+        return _v4842_pending_response(pending, "awaiting-plan-delivery")
+    return _v4842_finalize_pending(pending, proof)
+
+
+def _v4842_facilitator_for(pending):
+    name = pending.get("facilitator") or ""
+    url = str(pending.get("facilitator_url") or "").rstrip("/")
+    for fac in (CDP_FAC, FACILITATOR, GO_FAC):
+        if not fac or getattr(fac, "tag", "") != name:
+            continue
+        if url and str(fac.url).rstrip("/") != url:
+            log.error(f"🚨 facilitator mudou durante pending fp={pending['fingerprint'][:12]}; sem fallback")
+            return None
+        return fac
+    return None
+
+
+def _v4842_retry_original_settle(pending, allow_plan_delivery):
+    fp = pending["fingerprint"]
+    owner = f"{os.getpid()}:{threading.get_ident()}:{secrets.token_hex(4)}"
+    try:
+        if not LEDGER.pending_claim(fp, owner, lease_s=max(60, int(FAC_SETTLE_TIMEOUT) + 20)):
+            current = LEDGER.pending_get(fp) or pending
+            return _v4842_pending_response(current, "operation-in-flight")
+    except Exception as e:
+        return _v4842_pending_response(pending, "claim-error")
+    pending = LEDGER.pending_get(fp) or pending
+    fac = _v4842_facilitator_for(pending)
+    payload = pending.get("payload") or {}
+    req = pending.get("requirement") or {}
+    if not fac or not payload or not req:
+        LEDGER.pending_release(fp, "original facilitator/payload unavailable", "legacy_incomplete", retry_s=3600)
+        return _v4842_pending_response(pending, "legacy-operation-incomplete")
+    _V4842_FAC_CTX.op = {"payload": payload, "requirement": req,
+                         "facilitator": pending.get("facilitator"),
+                         "facilitator_url": pending.get("facilitator_url")}
+    log.info(f"🔁 reenviando settlement ORIGINAL {pending['endpoint']} fp={fp[:12]} fac={fac.tag}")
+    settled, sdata = fac.settle(payload, req)
+    tx_sig = str(sdata.get("_clean_tx") or _clean_tx(sdata) or pending.get("tx") or "")
+    if tx_sig and tx_sig != pending.get("tx"):
+        LEDGER.pending_save(fp, pending["endpoint"], tx_sig, req,
+                            pending.get("payer", ""),
+                            payload=payload, facilitator=pending.get("facilitator"),
+                            facilitator_url=pending.get("facilitator_url"),
+                            request_fp=pending.get("request_fp"), rid=pending.get("rid"),
+                            header_hash=pending.get("header_hash"), state="awaiting_delivery")
+        pending = LEDGER.pending_get(fp) or pending
+    if not settled and not tx_sig:
+        reason = str(sdata.get("error") or sdata.get("errorReason") or "settle-rejected")
+        if sdata.get("pending") or sdata.get("uncertain"):
+            LEDGER.pending_release(fp, reason, "pending")
+            return _v4842_pending_response(pending, reason)
+        LEDGER.pending_release(fp, reason, "needs_review", retry_s=3600)
+        _notify_telegram(f"🚨 Settlement pendente exige revisão {pending['endpoint']} fp={fp[:12]}: {reason}")
+        return False, "settlement-review:" + reason, {"settlement_seen": True,
+                                                       "new_payment_required": False}
+    if not settled and tx_sig:
+        log.info(f"🔎 pending sem sucesso explícito, mas hash presente {pending['endpoint']} tx={tx_sig[:18]}")
+    if settled:
+        if fac.tag == "CDP":
+            _cdp_note_success()
+        elif fac.tag == "PayAI":
+            _payai_note_success()
+    return _v4842_reconcile_known(pending, allow_plan_delivery)
+
+
+_V4842_VERIFY_PAYMENT_ORIG = _verify_payment
+
+
+def _v4842_verify_payment(endpoint: str, payment_header: str):
+    if not payment_header:
+        return False, "missing-header", {}
+    payment_header = payment_header.strip()
+    header_hash = hashlib.sha256(payment_header.encode()).hexdigest()
+    payload = {}
+    try:
+        candidate = json.loads(base64.b64decode(payment_header).decode())
+        if isinstance(candidate, dict):
+            payload = candidate
+    except Exception:
+        payload = {}
+    fingerprint = _payment_fingerprint(payload) if payload else ""
+    rid = ""
+    try:
+        candidate_rid = (((payload.get("accepted") or {}).get("extra") or {}).get("requestId"))
+        if isinstance(candidate_rid, str) and 6 <= len(candidate_rid) <= 32:
+            rid = candidate_rid
+    except Exception:
+        pass
+    request_fp = _v4842_current_request_fp()
+    _V4842_REQ_CTX.value = {"endpoint": endpoint, "fingerprint": fingerprint,
+                            "payload": payload, "request_fp": request_fp,
+                            "rid": rid, "header_hash": header_hash}
+    if fingerprint:
+        grant = LEDGER.grant_get(fingerprint)
+        if grant:
+            if grant.get("endpoint") != endpoint:
+                return False, "replay-blocked:endpoint-mismatch", {
+                    "settlement_seen": True, "tx": grant.get("tx", "")}
+            bound = grant.get("request_fp") or ""
+            if not bound and request_fp:
+                LEDGER.grant_bind(fingerprint, request_fp)
+                bound = request_fp
+            if bound and request_fp and bound != request_fp:
+                log.warning(f"⛔ grant retry com request diferente {endpoint} fp={fingerprint[:12]}")
+                return False, "replay-blocked:request-mismatch", {
+                    "settlement_seen": True, "tx": grant.get("tx", "")}
+            receipt = LEDGER.revenue_by_tx(grant.get("tx", ""))
+            if receipt and receipt.get("endpoint") == endpoint:
+                req = {"network": receipt.get("chain", ""),
+                       "amount": str(int(round(float(receipt["amount"]) * 1_000_000)))}
+                log.info(f"♻️ grant idempotente {endpoint} fp={fingerprint[:12]} — sem novo settle")
+                return True, "idempotent-payment", _v4842_receipt_info(
+                    endpoint, req, grant.get("tx", ""),
+                    receipt.get("payer") or grant.get("payer", ""), receipt["amount"], True)
+        pending = LEDGER.pending_get(fingerprint)
+        if pending:
+            if pending.get("endpoint") != endpoint or not pending.get("requirement"):
+                return False, "pending-endpoint-mismatch", {"settlement_seen": True}
+            if not pending.get("request_fp") and request_fp:
+                LEDGER.pending_save(fingerprint, endpoint, pending.get("tx", ""),
+                                    pending.get("requirement"), pending.get("payer", ""),
+                                    payload=pending.get("payload") or payload,
+                                    facilitator=pending.get("facilitator", ""),
+                                    facilitator_url=pending.get("facilitator_url", ""),
+                                    request_fp=request_fp, rid=rid,
+                                    header_hash=header_hash, state=pending.get("state", ""))
+                pending = LEDGER.pending_get(fingerprint) or pending
+            if pending.get("state") == "needs_review":
+                return False, "settlement-review:" + (pending.get("last_error") or "manual-review"), {
+                    "settlement_seen": True, "tx": pending.get("tx", ""),
+                    "new_payment_required": False}
+            if pending.get("tx"):
+                return _v4842_reconcile_known(pending, allow_plan_delivery=True)
+            if pending.get("payload") and pending.get("facilitator"):
+                return _v4842_retry_original_settle(pending, allow_plan_delivery=True)
+            # Rows da 48.41 sem hash não contêm facilitator: é impossível provar
+            # qual operação foi enviada. Não adivinhar nem trocar de rail.
+            return _v4842_pending_response(pending, "legacy-operation-incomplete")
+    return _V4842_VERIFY_PAYMENT_ORIG(endpoint, payment_header)
+
+
+_verify_payment = _v4842_verify_payment
+
+
+def _v4842_reconcile_cycle():
+    processed = 0
+    for fp in LEDGER.pending_due(limit=12):
+        pending = LEDGER.pending_get(fp)
+        if not pending:
+            continue
+        processed += 1
+        try:
+            if pending.get("tx"):
+                _v4842_reconcile_known(pending, allow_plan_delivery=False)
+            elif pending.get("payload") and pending.get("facilitator"):
+                _v4842_retry_original_settle(pending, allow_plan_delivery=False)
+            else:
+                LEDGER.pending_release(fp, "legacy operation lacks facilitator/payload",
+                                       "legacy_incomplete", retry_s=3600)
+        except Exception as e:
+            log.error(f"reconcile {pending.get('endpoint')} fp={fp[:12]}: {str(e)[:160]}")
+            try:
+                LEDGER.pending_release(fp, f"reconcile-error:{e}", "pending")
+            except Exception:
+                pass
+    return processed
+
+
+def _v4842_reconcile_loop():
+    log.warning("💳 reconciliador v48.42 ativo — hash on-chain + retry da operação original")
+    while True:
+        try:
+            _v4842_reconcile_cycle()
+        except Exception as e:
+            log.error(f"reconcile cycle: {str(e)[:160]}")
+        time.sleep(5)
+
+
+_START_BG_4842 = _start_background_once
+
+
+def _start_background_once():
+    owned = _START_BG_4842()
+    try:
+        if owned:
+            threading.Thread(target=_v4842_reconcile_loop, daemon=True,
+                             name="v4842-payment-reconcile").start()
+            log.info("💳 payment reconcile ativo no dono do flock (5s; schema 26)")
+    except Exception as e:
+        log.error(f"payment reconcile start: {e}")
+    return owned
+
+
+_start_background_once = _start_background_once
+
+
+# ---------------------------------------------------------------------------
+# PYTH — AUTENTICAÇÃO NÃO É FEED APOSENTADO; LISTA VAZIA NÃO FAZ HTTP
+# ---------------------------------------------------------------------------
+_FC_SKIP_LEGACY = set(_FC_SKIP)
+try:
+    if _FC_SKIP_FILE.exists():
+        _old_skip = json.loads(_FC_SKIP_FILE.read_text())
+        if isinstance(_old_skip, list):
+            _FC_SKIP_LEGACY |= {str(x) for x in _old_skip}
+        elif isinstance(_old_skip, dict):
+            for fid, rec in (_old_skip.get("invalid_feeds") or {}).items():
+                if isinstance(rec, dict) and rec.get("reason") == "http400_invalid_feed":
+                    _FC_SKIP_LEGACY.add(str(fid))
+except Exception:
+    pass
+
+_FC_SKIP = set()
+try:
+    if _FC_SKIP_FILE.exists():
+        _dskip = json.loads(_FC_SKIP_FILE.read_text())
+        if isinstance(_dskip, dict) and int(_dskip.get("version", 0)) >= 2:
+            for fid, rec in (_dskip.get("invalid_feeds") or {}).items():
+                if (re.fullmatch(r"[0-9a-fA-F]{64}", str(fid))
+                        and isinstance(rec, dict) and rec.get("reason") == "http400_invalid_feed"):
+                    _FC_SKIP.add(str(fid).lower())
+except Exception:
+    _FC_SKIP = set()
+
+
+def _v4842_fc_skip_write():
+    rec = {"version": 2, "updated_ts": int(time.time()),
+           "invalid_feeds": {fid: {"reason": "http400_invalid_feed", "ts": int(time.time())}
+                             for fid in sorted(_FC_SKIP)},
+           "note": "Only explicit Hermes HTTP 400 invalid-feed responses are persisted."}
+    if _FC_SKIP_LEGACY:
+        rec["ignored_legacy_unproven"] = sorted(_FC_SKIP_LEGACY - _FC_SKIP)
+    _FC_SKIP_FILE.write_text(json.dumps(rec, indent=2, sort_keys=True))
+
+
+try:
+    _v4842_fc_skip_write()
+    if _FC_SKIP_LEGACY:
+        log.warning(f"🧠 Pyth skip legacy resetado: {len(_FC_SKIP_LEGACY)} exclusão(ões) "
+                    "sem prova HTTP 400 não serão preservadas; CoinGecko segue fallback")
+except Exception as e:
+    log.warning(f"Pyth skip migration: {e}")
+
+
+def _v4842_fc_skip_note(feed_ids_bad, reason=""):
+    # Callers antigos chamam sem reason (inclusive após 403/Not entitled): são
+    # deliberadamente ignorados. Só o parser HTTP 400 abaixo pode persistir.
+    if reason != "http400_invalid_feed":
+        return
+    global _FC_SKIP
+    known = {fid for fid, _cg in _FC_FEEDS.values()}
+    novos = {str(f).lower().lstrip("0x") for f in feed_ids_bad
+             if re.fullmatch(r"(?:0x)?[0-9a-fA-F]{64}", str(f))}
+    novos = {f for f in novos if f in known and f not in _FC_SKIP}
+    if not novos:
+        return
+    _FC_SKIP |= novos
+    try:
+        _v4842_fc_skip_write()
+    except Exception as e:
+        log.warning(f"Pyth invalid-feed persist: {e}")
+    syms = [s for s, (fid, _cg) in _FC_FEEDS.items() if fid in novos]
+    log.warning(f"🧠 Pyth HTTP 400 invalid-feed confirmado; excluídos {syms} — CoinGecko cobre")
+
+
+_fc_skip_note = _v4842_fc_skip_note
+
+
+def _v4842_pyth_latest(feed_ids):
+    ids = []
+    seen = set()
+    for fid in feed_ids or []:
+        f = str(fid or "").strip()
+        if f and f not in seen:
+            ids.append(f)
+            seen.add(f)
+    if not ids:
+        log.info("🧠 Pyth: nenhum feed elegível; nenhuma chamada HTTP — fallback local/CoinGecko")
+        return {}
+    if not PYTH_API_KEY:
+        raise RuntimeError("pyth: PYTH_API_KEY ausente")
+    r = requests.get(f"{_PYTH_BASE}/v2/updates/price/latest",
+                     params=[("ids[]", f) for f in ids],
+                     headers={"Authorization": f"Bearer {PYTH_API_KEY}"}, timeout=6)
+    if not r.ok:
+        body = r.text[:300]
+        if r.status_code == 400:
+            # Não incluir 'Not entitled': isso é autorização/conta, nunca prova
+            # de que o feed deixou de existir.
+            bad = re.findall(r"(?:not valid/found|not valid|not found|invalid/found):\s*([0-9a-f]{64})",
+                             body.lower())
+            if bad:
+                _fc_skip_note(bad, reason="http400_invalid_feed")
+            log.warning(f"🧠 Pyth HTTP 400 ids={len(ids)} invalid_ids={len(bad)} body={body[:180]}")
+        elif r.status_code in (401, 403):
+            log.warning(f"🧠 Pyth auth/entitlement HTTP {r.status_code}; NENHUM feed excluído: {body[:180]}")
+        else:
+            log.warning(f"🧠 Pyth HTTP {r.status_code} ids={len(ids)}: {body[:180]}")
+        raise RuntimeError(f"pyth HTTP {r.status_code}: {body[:160]}")
+    out = {}
+    for p in r.json().get("parsed", []):
+        out[str(p.get("id", "")).lower().lstrip("0x")] = p
+    return out
+
+
+_pyth_latest = _v4842_pyth_latest
+
+# ---------------------------------------------------------------------------
+# GOVERNANÇA — scanner não é backlog; quarentena alcança o que já estava live
+# ---------------------------------------------------------------------------
+_V4842_SCAN_ORIG = _is_scan_noise
+_V4842_SCAN_NEW = re.compile(r"(?:^|/)\.ds_store$|(?:^|/)graphql/?$", re.I)
+
+
+def _v4842_is_scan_noise(path):
+    p = str(path or "")
+    return bool(_V4842_SCAN_ORIG(p) or _V4842_SCAN_NEW.search(p))
+
+
+_is_scan_noise = _v4842_is_scan_noise
+
+
+def _v4842_factory_file_sweep():
+    items = _ops_read_json(_FACTORY_FILE, {})
+    if not isinstance(items, dict):
+        return {}
+    changed = False
+    for p, spec in list(items.items()):
+        if _is_scan_noise(p) and isinstance(spec, dict) and spec.get("status") != "quarantined":
+            spec["status"] = "quarantined"
+            spec["quarantine_reason"] = "scanner/generic protocol path is not a product"
+            spec["quarantined_ts"] = int(time.time())
+            changed = True
+            log.warning(f"🧹 FACTORY QUARANTINE: {p} removido do catálogo")
+    if changed:
+        _ops_write_json(_FACTORY_FILE, items)
+    return items
+
+
+def _v4842_factory_memory_sweep():
+    for p in list(_FACTORY.get("owned", set())):
+        if _is_scan_noise(p):
+            for d in (BASE_PRICES, ENDPOINT_DESC, ENDPOINT_HANDLERS, ENDPOINT_PARAM_HINTS):
+                d.pop(p, None)
+            _FACTORY["owned"].discard(p)
+    items = _FACTORY.get("items") or {}
+    for p, spec in list(items.items()):
+        if _is_scan_noise(p) and isinstance(spec, dict):
+            spec["status"] = "quarantined"
+
+
+_V4842_FACTORY_RELOAD_ORIG = _factory_reload
+
+
+def _v4842_factory_reload(force=False):
+    _v4842_factory_file_sweep()
+    _V4842_FACTORY_RELOAD_ORIG(force=force)
+    _v4842_factory_memory_sweep()
+
+
+_factory_reload = _v4842_factory_reload
+
+_V4842_OPS_VALIDATE_ORIG = _ops_validate
+_V4842_OPS_APPLY_ORIG = _ops_apply
+
+
+def _v4842_ops_path_guard(action):
+    if not isinstance(action, dict):
+        return None
+    k = action.get("action")
+    p = str(action.get("path") or "")
+    if k in ("queue_product", "factory_product", "create_alias") and p and _is_scan_noise(p):
+        return "scanner/generic protocol path is not product demand"
+    if k == "create_alias" and p == "/api/pricing" and action.get("target") != "/get-pricing":
+        return "/api/pricing is pinned to the free pricing catalog"
+    return None
+
+
+def _v4842_ops_validate(action, candidates):
+    why = _v4842_ops_path_guard(action)
+    if why:
+        return False, why
+    return _V4842_OPS_VALIDATE_ORIG(action, candidates)
+
+
+def _v4842_ops_apply(action, actor):
+    why = _v4842_ops_path_guard(action)
+    if why:
+        _ops_audit(actor, "quarantine_reject", _ops_target(action), {"why": why}, "rejected")
+        return False, why
+    return _V4842_OPS_APPLY_ORIG(action, actor)
+
+
+_ops_validate = _v4842_ops_validate
+_ops_apply = _v4842_ops_apply
+
+
+def _v4842_sanitize_governance():
+    changed_paths = []
+    items = _v4842_factory_file_sweep()
+    _V4842_FACTORY_RELOAD_ORIG(force=True)
+    _v4842_factory_memory_sweep()
+
+    q = _ops_read_json(_OPS_PRODUCT_QUEUE, [])
+    if isinstance(q, list):
+        keep = []
+        for it in q:
+            p = str((it or {}).get("path") or "")
+            if p and _is_scan_noise(p):
+                changed_paths.append(p)
+                try:
+                    _ops_decision_record({"action": "queue_product", "path": p},
+                                         "rejected", "v48.42-scanner-quarantine")
+                except Exception:
+                    pass
+            else:
+                keep.append(it)
+        if len(keep) != len(q):
+            _ops_write_json(_OPS_PRODUCT_QUEUE, keep)
+
+    props = _ops_read_json(_OPS_PROPOSALS_FILE, {})
+    props_changed = False
+    for pid, rec in (props.get("items") or {}).items():
+        action = (rec or {}).get("action") or {}
+        p = str(action.get("path") or "")
+        if not p or not _is_scan_noise(p):
+            continue
+        desired = "quarantined" if action.get("action") == "factory_product" else "rejected"
+        if rec.get("status") != desired:
+            rec["status"] = desired
+            rec["result"] = "v48.42: scanner/generic protocol path; not organic product demand"
+            rec["quarantined_ts"] = int(time.time())
+            props_changed = True
+        changed_paths.append(p)
+    if props_changed:
+        _ops_write_json(_OPS_PROPOSALS_FILE, props)
+
+    aliases_changed = False
+    for p in list(_AUTO_ALIASES):
+        if _is_scan_noise(p):
+            _AUTO_ALIASES.pop(p, None)
+            changed_paths.append(p)
+            aliases_changed = True
+    if not _route_now_live("/api/pricing"):
+        old = _AUTO_ALIASES.get("/api/pricing") or {}
+        if old.get("target") != "/get-pricing":
+            rec = dict(old)
+            rec.update({"target": "/get-pricing", "ts": int(time.time()),
+                        "by": "v48.42-semantic-fix"})
+            _AUTO_ALIASES["/api/pricing"] = rec
+            aliases_changed = True
+            changed_paths.append("/api/pricing")
+    if aliases_changed:
+        _radar_alias_save()
+
+    for p in sorted(set(changed_paths)):
+        log.warning(f"🧹 governança v48.42: {p} rejeitado/quarentenado/corrigido")
+    if changed_paths:
+        try:
+            _ops_audit("v48.42", "scanner_quarantine", ",".join(sorted(set(changed_paths))),
+                       {"paths": sorted(set(changed_paths))}, "applied")
+        except Exception:
+            pass
+
+
+_v4842_sanitize_governance()
+
+VERSION = "48.42.0-RECONCILE"
+log.warning("💳 v48.42.0-RECONCILE ativa — operação original persistida · poll pós-settle · "
+            "reconcile com/sem hash · grant idempotente por request · planos com key · "
+            "Pyth sem poison por 403 · quarentena /graphql + /.DS_Store · /api/pricing grátis")
