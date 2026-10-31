@@ -8069,12 +8069,8 @@ def _ml_price_advisor():
         previews = dict(c.execute(
             "SELECT endpoint, COUNT(*) FROM requests WHERE ts>? AND kind='preview' AND "
             + _DEMAND_UA_SQL + " GROUP BY endpoint", (d7,)).fetchall())
-        sales = dict(c.execute(
-            "SELECT endpoint, COUNT(*) FROM revenue WHERE ts>? GROUP BY endpoint",
-            (d7,)).fetchall())
-        rev = dict(c.execute(
-            "SELECT endpoint, ROUND(SUM(amount),4) FROM revenue WHERE ts>? "
-            "GROUP BY endpoint", (d7,)).fetchall())
+        # Receita de teste não pode ensinar elasticidade nem disparar preço.
+        sales, rev = _v4843_organic_sales_by_endpoint(7)
     sugg = []
     for ep in sorted(BASE_PRICES, key=lambda e: -(probes.get(e, 0) + sales.get(e, 0))):
         p, pv, s = probes.get(ep, 0), previews.get(ep, 0), sales.get(ep, 0)
@@ -18336,8 +18332,10 @@ def _ml_hourly_aggregates(days=30) -> list:
             ips = dict(c.execute(
                 "SELECT ts/3600 h, COUNT(DISTINCT ip) FROM requests WHERE ts>? GROUP BY h",
                 (corte,)).fetchall())
+            # Vendas e receita precisam vir da MESMA fonte temporal. Reconciliações
+            # criam receita sem criar um novo request kind='paid' na hora do boot.
             paid = dict(c.execute(
-                "SELECT ts/3600 h, COUNT(*) FROM requests WHERE ts>? AND kind='paid' GROUP BY h",
+                "SELECT ts/3600 h, COUNT(*) FROM revenue WHERE ts>? GROUP BY h",
                 (corte,)).fetchall())
             rev = dict(c.execute(
                 "SELECT ts/3600 h, COALESCE(SUM(amount),0) FROM revenue WHERE ts>? GROUP BY h",
@@ -33779,9 +33777,9 @@ def _cortex_conversion(days: int = 7, limit: int = 15) -> dict:
                 "SELECT endpoint, COUNT(*) FROM requests WHERE ts>? "
                 "AND kind='preview' AND " + _DEMAND_UA_SQL +
                 " GROUP BY endpoint", (d,)).fetchall())
-            sales = dict(c.execute(
-                "SELECT endpoint, COUNT(*) FROM revenue WHERE ts>? "
-                "GROUP BY endpoint", (d,)).fetchall())
+            # Somente clientes externos: testes do operador e sweeps não são
+            # evidência de conversão para o Cortex nem para o planner.
+            sales, _organic_rev = _v4843_organic_sales_by_endpoint(days)
     except Exception as e:
         return {"error": str(e)[:80]}
     rows = []
@@ -33795,15 +33793,15 @@ def _cortex_conversion(days: int = 7, limit: int = 15) -> dict:
             "price_usdc": get_dynamic_price(ep),
             "conversion_score": round(_wilson_lower(s, max(1, p)), 4),
             "signal": ("high-demand-zero-conversion — candidate for price cut"
-                       if p >= 100 and s == 0 else
+                       if p >= 200 and pv >= 5 and s == 0 else
                        "converting" if s >= 3 else "watching"),
         })
     rows.sort(key=lambda r: -(r["probes"] + r["sales"] * 50))
     return {"window_days": days, "by_endpoint": rows[:limit],
             "note": ("conversion_score = Wilson lower bound of sales/probes. "
-                     "high-demand-zero-conversion = many paying-capable "
-                     "probes, zero settlements — the price or the teaser is "
-                     "the bottleneck, not the demand.")}
+                     "high-demand-zero-conversion = many eligible probes, at "
+                     "least five previews and zero ORGANIC settlements. Bare "
+                     "scanner traffic and operator-funded tests are excluded.")}
 
 
 def _cortex_demand_trend(days: int = 14, top: int = 8) -> list:
@@ -33998,8 +33996,9 @@ def _cortex_digest_loop():
                       for t in (prev.get("demand_trend") or [])}
             for t in (brain.get("demand_trend") or []):
                 if t.get("trend") == "rising" and old_tr.get(t.get("endpoint")) != "rising":
-                    mudancas.append(f"📈 demanda subindo: `{t['endpoint']}` "
-                                    f"({t['probes_14d']} sondagens/14d)")
+                    mudancas.append(
+                        f"📈 avaliações subindo: `{t['endpoint']}` "
+                        f"({t.get('evaluations_14d', t.get('probes_14d', 0))} previews elegíveis/14d)")
             if mudancas:
                 _notify_telegram(
                     "🧠 *CORTEX — digest diário*\n\n"
@@ -34865,7 +34864,8 @@ def _ops_llm_planner():
         ep = r.get("endpoint")
         if ep in BASE_PRICES:
             conv[ep] = {"price": r.get("price_usdc"), "signal": r.get("signal"),
-                        "probes": r.get("probes"), "sales": r.get("sales")}
+                        "probes": r.get("probes"), "previews": r.get("previews"),
+                        "sales": r.get("sales")}
     paused = _ops_paused()
     if not backlog and not conv and not paused:
         return
@@ -34900,7 +34900,8 @@ def _ops_llm_planner():
         "sales means LOWER the price, not raise; factory_product ONLY with a "
         "real, well-known, KEYLESS public JSON upstream you are confident "
         "exists — the apply step probe-tests it and the product dies if the "
-        "probe fails; output the JSON and nothing "
+        "probe fails; notes must be strictly entailed by the telemetry and "
+        "must never call an endpoint unpriced when price_usdc is present; "
         "else.\n" + _ops_planner_memory_text() + "\nTelemetry: "
         + json.dumps(state, ensure_ascii=False)[:3500])
     txt = LLM.ask(prompt, max_tokens=700, temperature=0.2, cache=False)
@@ -40616,3 +40617,363 @@ VERSION = "48.42.0-RECONCILE"
 log.warning("💳 v48.42.0-RECONCILE ativa — operação original persistida · poll pós-settle · "
             "reconcile com/sem hash · grant idempotente por request · planos com key · "
             "Pyth sem poison por 403 · quarentena /graphql + /.DS_Store · /api/pricing grátis")
+
+
+
+# ============================================================================
+# v48.43.0-SIGNALFIX — pós-deploy: fontes de ML e sinais orgânicos
+# ============================================================================
+# Pagamento/schema 26 permanecem os da 48.42. Este bloco corrige apenas os
+# defeitos observados em produção: feed DOGE inválido, tempestade 401/403,
+# probes tratados como demanda, receita do operador no aprendizado de preço,
+# anomalia com duas fontes de "vendas" e recomendação obsoleta /api/pricing.
+
+
+def _v4843_organic_sales_by_endpoint(days: int = 7):
+    """(n_vendas, receita) somente de clientes externos, por endpoint.
+
+    classify_payer é a mesma verdade de /receipts e revenue_split: operator,
+    self-sweep e pagamento sem pagador não ensinam conversão nem elasticidade.
+    """
+    cutoff = int(time.time()) - int(days) * 86400
+    sales, revenue = defaultdict(int), defaultdict(float)
+    try:
+        with LEDGER._conn() as c:
+            rows = c.execute(
+                "SELECT endpoint, payer, source, tx_sig, amount FROM revenue "
+                "WHERE ts>?", (cutoff,)).fetchall()
+    except Exception as e:
+        log.debug(f"organic sales by endpoint: {e}")
+        return {}, {}
+    for ep, payer, source, tx_sig, amount in rows:
+        if classify_payer(payer or "", source or "", tx_sig or "") != "organic":
+            continue
+        sales[ep] += 1
+        revenue[ep] += float(amount or 0.0)
+    return dict(sales), {ep: round(v, 4) for ep, v in revenue.items()}
+
+
+# ---------------------------------------------------------------------------
+# PYTH — ID oficial DOGE, invalidade 400/404 e backoff temporário 401/403
+# ---------------------------------------------------------------------------
+_V4843_DOGE_OLD = "dcef50dd0a4cd2dcc17e45df6476d336a4cba99c1a925a7f7a1db6f42335ccba"
+_V4843_DOGE_OFFICIAL = "dcef50dd0a4cd2dcc17e45df1676dcb336a11a61c69df7a0299b0150c672d25c"
+_FC_FEEDS["DOGE"] = (_V4843_DOGE_OFFICIAL, "dogecoin")
+
+_V4843_SKIP_REASONS = {}
+try:
+    if _FC_SKIP_FILE.exists():
+        _d = json.loads(_FC_SKIP_FILE.read_text())
+        if isinstance(_d, dict):
+            for fid, rec in (_d.get("invalid_feeds") or {}).items():
+                reason = str((rec or {}).get("reason") or "")
+                if (re.fullmatch(r"[0-9a-fA-F]{64}", str(fid))
+                        and reason in ("http400_invalid_feed", "http404_invalid_feed")):
+                    _fid = str(fid).lower()
+                    _FC_SKIP.add(_fid)
+                    _V4843_SKIP_REASONS[_fid] = reason
+except Exception:
+    pass
+# Um ID que deixou de ser referenciado não precisa permanecer no skip ativo.
+_FC_SKIP.discard(_V4843_DOGE_OLD)
+_V4843_SKIP_REASONS.pop(_V4843_DOGE_OLD, None)
+for _fid in _FC_SKIP:
+    _V4843_SKIP_REASONS.setdefault(_fid, "http400_invalid_feed")
+
+
+def _v4843_fc_skip_write():
+    rec = {
+        "version": 2,
+        "updated_ts": int(time.time()),
+        "invalid_feeds": {
+            fid: {"reason": _V4843_SKIP_REASONS.get(fid, "http400_invalid_feed"),
+                  "ts": int(time.time())}
+            for fid in sorted(_FC_SKIP)
+        },
+        "note": "Only explicit Hermes HTTP 400/404 invalid-feed responses are persisted.",
+    }
+    if _FC_SKIP_LEGACY:
+        rec["ignored_legacy_unproven"] = sorted(_FC_SKIP_LEGACY - _FC_SKIP)
+    _FC_SKIP_FILE.write_text(json.dumps(rec, indent=2, sort_keys=True))
+
+
+_v4842_fc_skip_write = _v4843_fc_skip_write
+
+
+def _v4843_fc_skip_note(feed_ids_bad, reason=""):
+    if reason not in ("http400_invalid_feed", "http404_invalid_feed"):
+        return
+    global _FC_SKIP
+    known = {fid for fid, _cg in _FC_FEEDS.values()}
+    novos = set()
+    for value in feed_ids_bad or []:
+        f = str(value or "").lower()
+        if f.startswith("0x"):
+            f = f[2:]
+        if re.fullmatch(r"[0-9a-f]{64}", f) and f in known and f not in _FC_SKIP:
+            novos.add(f)
+    if not novos:
+        return
+    _FC_SKIP |= novos
+    for fid in novos:
+        _V4843_SKIP_REASONS[fid] = reason
+    try:
+        _v4843_fc_skip_write()
+    except Exception as e:
+        log.warning(f"Pyth invalid-feed persist: {e}")
+    syms = [s for s, (fid, _cg) in _FC_FEEDS.items() if fid in novos]
+    log.warning(f"🧠 Pyth {reason} confirmado; excluídos {syms} — CoinGecko cobre")
+
+
+_fc_skip_note = _v4843_fc_skip_note
+
+_PYTH_ENTITLEMENT_BACKOFF = {}
+_PYTH_ENTITLEMENT_LOCK = threading.Lock()
+PYTH_ENTITLEMENT_BACKOFF_S = max(
+    300, min(86400, int(os.environ.get("PYTH_ENTITLEMENT_BACKOFF_S", "21600"))))
+
+
+def _v4843_fid(value):
+    f = str(value or "").strip().lower()
+    return f[2:] if f.startswith("0x") else f
+
+
+def _v4843_pyth_latest(feed_ids):
+    ids, seen = [], set()
+    for value in feed_ids or []:
+        fid = _v4843_fid(value)
+        if fid and fid not in seen:
+            ids.append(fid)
+            seen.add(fid)
+    now = time.time()
+    with _PYTH_ENTITLEMENT_LOCK:
+        for fid in list(_PYTH_ENTITLEMENT_BACKOFF):
+            if _PYTH_ENTITLEMENT_BACKOFF[fid] <= now:
+                _PYTH_ENTITLEMENT_BACKOFF.pop(fid, None)
+        blocked = {fid for fid in ids
+                   if _PYTH_ENTITLEMENT_BACKOFF.get(fid, 0) > now}
+    permanent = {fid for fid in ids if fid in _FC_SKIP}
+    eligible = [fid for fid in ids if fid not in blocked and fid not in permanent]
+    if not eligible:
+        log.info(f"🧠 Pyth: nenhum feed elegível; nenhuma chamada HTTP — "
+                 f"fallback CoinGecko (backoff={len(blocked)}, invalid={len(permanent)})")
+        return {}
+    if not PYTH_API_KEY:
+        raise RuntimeError("pyth: PYTH_API_KEY ausente")
+    r = requests.get(f"{_PYTH_BASE}/v2/updates/price/latest",
+                     params=[("ids[]", fid) for fid in eligible],
+                     headers={"Authorization": f"Bearer {PYTH_API_KEY}"}, timeout=6)
+    if not r.ok:
+        body = r.text[:300]
+        body_l = body.lower()
+        if r.status_code in (400, 404):
+            bad = []
+            if re.search(r"price ids (?:not valid/found|not valid|not found)|invalid/found",
+                         body_l):
+                bad = [fid for fid in re.findall(
+                    r"(?<![0-9a-f])[0-9a-f]{64}(?![0-9a-f])", body_l)
+                    if fid in eligible]
+            if bad:
+                _fc_skip_note(bad, reason=f"http{r.status_code}_invalid_feed")
+            log.warning(f"🧠 Pyth HTTP {r.status_code} ids={len(eligible)} "
+                        f"invalid_ids={len(bad)} body={body[:180]}")
+        elif r.status_code in (401, 403):
+            named = []
+            if "not entitled" in body_l:
+                named = [fid for fid in re.findall(
+                    r"(?<![0-9a-f])[0-9a-f]{64}(?![0-9a-f])", body_l)
+                    if fid in eligible]
+            targets = named or eligible
+            until = time.time() + PYTH_ENTITLEMENT_BACKOFF_S
+            with _PYTH_ENTITLEMENT_LOCK:
+                for fid in targets:
+                    _PYTH_ENTITLEMENT_BACKOFF[fid] = until
+            log.warning(f"🧠 Pyth auth/entitlement HTTP {r.status_code}; "
+                        f"backoff temporário para {len(targets)} feed(s), "
+                        f"NENHUM feed excluído: {body[:160]}")
+        else:
+            log.warning(f"🧠 Pyth HTTP {r.status_code} ids={len(eligible)}: {body[:180]}")
+        raise RuntimeError(f"pyth HTTP {r.status_code}: {body[:160]}")
+    with _PYTH_ENTITLEMENT_LOCK:
+        for fid in eligible:
+            _PYTH_ENTITLEMENT_BACKOFF.pop(fid, None)
+    out = {}
+    for p in r.json().get("parsed", []):
+        out[_v4843_fid(p.get("id", ""))] = p
+    return out
+
+
+_pyth_latest = _v4843_pyth_latest
+try:
+    _v4843_fc_skip_write()
+except Exception as e:
+    log.warning(f"Pyth skip v48.43 migration: {e}")
+
+
+# ---------------------------------------------------------------------------
+# DESCOBERTA — scanner não é produto; alias existente não é nova demanda
+# ---------------------------------------------------------------------------
+_V4843_SCAN_ORIG = _is_scan_noise
+_V4843_SCAN_AXD = re.compile(r"(?:^|/)[a-z0-9_-]+\.axd$", re.I)
+
+
+def _v4843_is_scan_noise(path):
+    p = str(path or "")
+    return bool(_V4843_SCAN_ORIG(p) or _V4843_SCAN_AXD.search(p))
+
+
+_is_scan_noise = _v4843_is_scan_noise
+_V4843_DEMAND_CLASSIFY_ORIG = _demand_classify
+
+
+def _v4843_demand_classify(path):
+    p = str(path or "")
+    if p == "/api/pricing":
+        target = str((_AUTO_ALIASES.get(p) or {}).get("target") or "")
+        if target == "/get-pricing":
+            return {"kind": "resolved",
+                    "action": "Já atendido — alias gratuito para /get-pricing",
+                    "closest": [], "target": target}
+        return {"kind": "alias_candidate",
+                "action": "Apelido deve levar ao catálogo de preços gratuito",
+                "closest": [_public_base() + "/get-pricing"]}
+    rec = _AUTO_ALIASES.get(p) or {}
+    if rec.get("target"):
+        return {"kind": "resolved",
+                "action": f"Já atendido — alias existente para {rec['target']}",
+                "closest": [], "target": rec["target"]}
+    return _V4843_DEMAND_CLASSIFY_ORIG(p)
+
+
+_demand_classify = _v4843_demand_classify
+
+
+def _v4843_ml_train_demand():
+    """Treina com a MESMA classificação soberana usada nas ações."""
+    if not _ML_SK:
+        return {"trained": False, "reason": "sklearn ausente"}
+    try:
+        with LEDGER._conn() as c:
+            rows = c.execute(
+                "SELECT endpoint, COUNT(*) FROM requests "
+                "WHERE kind='notfound' GROUP BY endpoint").fetchall()
+        if len(rows) < 60:
+            return {"trained": False, "reason": f"amostras insuficientes ({len(rows)})"}
+        X, y = [], []
+        for path, _n in rows:
+            cls = _demand_classify(path)
+            lbl = cls.get("kind") if cls else "new_product"
+            if lbl not in _ML_LABELS:
+                lbl = "new_product"
+            X.append(_ml_path_features(path))
+            y.append(_ML_LABELS.index(lbl))
+        if len(set(y)) < 2:
+            return {"trained": False, "reason": "uma so classe no historico"}
+        clf = GradientBoostingClassifier(n_estimators=120, max_depth=3,
+                                         learning_rate=0.08, random_state=42)
+        clf.fit(X, y)
+        _joblib.dump(clf, _ML_CLF_FILE)
+        _ML_CLF.update({"model": clf, "trained_at": int(time.time()), "n": len(X)})
+        dist = {_ML_LABELS[i]: y.count(i) for i in sorted(set(y))}
+        log.info(f"🧠 ML demanda: treinado com {len(X)} caminhos {dist}")
+        return {"trained": True, "n": len(X), "dist": dist}
+    except Exception as e:
+        log.warning(f"🧠 ML demanda treino: {e}")
+        return {"trained": False, "reason": str(e)[:120]}
+
+
+_ml_train_demand = _v4843_ml_train_demand
+
+
+def _v4843_cortex_demand_trend(days: int = 14, top: int = 8) -> list:
+    """Tendência de AVALIAÇÃO elegível; probes/402 e scanners não viram demanda."""
+    now = int(time.time())
+    d = now - days * 86400
+    try:
+        with LEDGER._conn() as c:
+            rows = c.execute(
+                "SELECT endpoint, (ts/86400) AS day, COUNT(*) FROM requests "
+                "WHERE ts>? AND kind='preview' AND " + _DEMAND_UA_SQL +
+                " GROUP BY endpoint, day", (d,)).fetchall()
+    except Exception as e:
+        return [{"error": str(e)[:80]}]
+    per = defaultdict(lambda: defaultdict(int))
+    for ep, day, n in rows:
+        per[ep][int(day)] += n
+    out = []
+    for ep, days_map in per.items():
+        tot = sum(days_map.values())
+        if tot < 20:
+            continue
+        xs = sorted(days_map)
+        x0 = xs[0]
+        X = [x - x0 for x in xs]
+        Y = [days_map[x] for x in xs]
+        n_ = len(X)
+        sx, sy = sum(X), sum(Y)
+        sxx = sum(x * x for x in X)
+        sxy = sum(x * y for x, y in zip(X, Y))
+        den = n_ * sxx - sx * sx
+        slope = (n_ * sxy - sx * sy) / den if den else 0.0
+        mean = sy / n_ if n_ else 0.0
+        rel = slope / mean if mean > 0 else 0.0
+        out.append({"endpoint": ep, "evaluations_14d": tot,
+                    "trend": ("rising" if rel > 0.08 else
+                              "falling" if rel < -0.08 else "flat"),
+                    "slope_rel_per_day": round(rel, 3),
+                    "basis": "eligible previews only; bare probes and scanners excluded"})
+    out.sort(key=lambda r: -r["evaluations_14d"])
+    return out[:top]
+
+
+_cortex_demand_trend = _v4843_cortex_demand_trend
+
+
+# ---------------------------------------------------------------------------
+# PLANNER — evidência orgânica para preço e notas incompatíveis com o catálogo
+# ---------------------------------------------------------------------------
+_V4843_OPS_VALIDATE_ORIG = _ops_validate
+
+
+def _v4843_ops_validate(action, candidates):
+    ok, mode = _V4843_OPS_VALIDATE_ORIG(action, candidates)
+    if not ok:
+        return ok, mode
+    kind = action.get("action")
+    if kind == "note":
+        txt = str(action.get("text") or "")
+        if re.search(r"(?:lack|missing|without|no)\s+(?:a\s+)?(?:configured\s+)?price|unpriced",
+                     txt, re.I):
+            mentioned = re.findall(r"/[A-Za-z0-9][A-Za-z0-9._~/-]{0,59}", txt)
+            for ep in mentioned:
+                if ep in BASE_PRICES and get_dynamic_price(ep) > 0:
+                    return False, f"nota contradiz preço vivo de {ep}"
+    if kind == "adjust_price":
+        ep = str(action.get("endpoint") or "")
+        info = ((candidates or {}).get("endpoints") or {}).get(ep) or {}
+        probes = int(info.get("probes") or 0)
+        previews = int(info.get("previews") or 0)
+        organic_sales = int(info.get("sales") or 0)
+        cur = get_dynamic_price(ep)
+        try:
+            newp = float(action.get("new_price"))
+        except Exception:
+            return False, "preço inválido"
+        if newp < cur and not (probes >= 200 and previews >= 5 and organic_sales == 0):
+            return False, "redução exige >=200 probes elegíveis, >=5 previews e zero venda orgânica"
+        if newp > cur and not (organic_sales >= 5 and previews >= 3
+                               and organic_sales / max(1, previews) >= 0.25):
+            return False, "aumento exige conversão orgânica >=25%, >=5 vendas e >=3 previews"
+    return ok, mode
+
+
+_ops_validate = _v4843_ops_validate
+
+# Reprocessa filas/propostas já persistidas com a nova família .axd. Nenhuma
+# transferência ou receita é alterada; somente governança de descoberta.
+_v4842_sanitize_governance()
+
+VERSION = "48.43.0-SIGNALFIX"
+log.warning("🧠 v48.43.0-SIGNALFIX ativa — DOGE oficial · Pyth 400/404 sem loop · "
+            "401/403 com backoff temporário · demanda por previews · vendas orgânicas "
+            "no advisor/Cortex · anomalia coerente · /api/pricing resolvido")
