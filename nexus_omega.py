@@ -1398,8 +1398,12 @@ class LedgerV10:
             ).fetchall())
             # v24.5: separa avaliadores (preview) de sondagens de scanner
             try:
-                previews = c.execute("SELECT COUNT(*) FROM requests WHERE ts>? AND kind='preview'",
-                                     (now - 86400,)).fetchone()[0]
+                preview_counts = c.execute(
+                    "SELECT COALESCE(NULLIF(ua,''),'(sem user-agent)') u, COUNT(*) n, "
+                    "COUNT(DISTINCT ip) ips FROM requests WHERE ts>? AND kind='preview' "
+                    "GROUP BY u", (now - 86400,)).fetchall()
+                previews = sum(int(n) for ua, n, ips in preview_counts
+                               if _preview_group_ok(ua, n, ips))
                 probes = c.execute(
                     "SELECT COUNT(*) FROM requests WHERE ts>? AND (kind='probe' OR kind='' "
                     "OR kind='challenge402')", (now - 86400,)).fetchone()[0]
@@ -1427,9 +1431,10 @@ class LedgerV10:
                     "SELECT COALESCE(NULLIF(ua,''),'(sem user-agent)') u, COUNT(*) n, "
                     "COUNT(DISTINCT ip) ips FROM requests "
                     "WHERE ts>? AND kind='preview' "
-                    "GROUP BY u ORDER BY n DESC LIMIT 8", (now - 86400,)).fetchall()
-                preview_uas = [{"ua": r[0][:60], "hits": r[1], "ips": r[2]}
-                               for r in preview_uas]
+                    "GROUP BY u ORDER BY n DESC LIMIT 80", (now - 86400,)).fetchall()
+                preview_uas = [{"ua": ua[:60], "hits": int(n), "ips": int(ips)}
+                               for ua, n, ips in preview_uas
+                               if _preview_group_ok(ua, n, ips)][:8]
             except Exception:
                 preview_uas = []
             try:  # v37: quantas avaliações foram recusadas pelo experimento
@@ -1453,8 +1458,8 @@ class LedgerV10:
                 demand_params = [{"endpoint": r[0], "params": r[1], "hits": r[2],
                                   "ips": r[3]} for r in c.execute(
                     "SELECT endpoint, params, COUNT(*) n, COUNT(DISTINCT ip) "
-                    "FROM requests WHERE ts>? AND params<>'' "
-                    "GROUP BY endpoint, params ORDER BY n DESC LIMIT 12",
+                    "FROM requests WHERE ts>? AND params<>'' AND " + _DEMAND_UA_SQL +
+                    " GROUP BY endpoint, params ORDER BY n DESC LIMIT 12",
                     (now - 604800,)).fetchall()]
             except Exception:
                 demand_params = []
@@ -1494,6 +1499,7 @@ class LedgerV10:
             "probe_targets":  probe_targets,
             "paid_total":     paid_total,
             "avg_ticket":     round((total / paid_total) if paid_total else 0, 4),
+            "avg_ticket_24h": round((today / paid) if paid else 0, 4),
             "conv_evaluators": round((paid / (paid + previews) * 100)
                                      if (paid + previews) else 0, 1),
         }
@@ -8061,8 +8067,8 @@ def _ml_price_advisor():
             "AND kind IN ('probe','challenge402') AND " + _DEMAND_UA_SQL +
             " GROUP BY endpoint", (d7,)).fetchall())
         previews = dict(c.execute(
-            "SELECT endpoint, COUNT(*) FROM requests WHERE ts>? AND kind='preview' "
-            "GROUP BY endpoint", (d7,)).fetchall())
+            "SELECT endpoint, COUNT(*) FROM requests WHERE ts>? AND kind='preview' AND "
+            + _DEMAND_UA_SQL + " GROUP BY endpoint", (d7,)).fetchall())
         sales = dict(c.execute(
             "SELECT endpoint, COUNT(*) FROM revenue WHERE ts>? GROUP BY endpoint",
             (d7,)).fetchall())
@@ -8433,11 +8439,24 @@ def _verify_payment(endpoint: str, payment_header: str):
                 tag = getattr(fac, "tag", "Facilitator")
                 ok, reason, vdata = False, "", {}
                 req_ok = req
+                payload_ok = payload
                 best = None
                 for candidate_req in _reqs:
-                    ok, reason, vdata = fac.verify(payload, candidate_req)
+                    candidate_payload = payload
+                    # x402 v1 usa nomes curtos ("base"/"solana") no envelope;
+                    # v2 usa CAIP-2. A autorização EIP-3009 não assina esse campo
+                    # externo. Só depois de casar o payload com a oferta oficial,
+                    # alinhamos a representação de transporte ao requirement v1.
+                    # Preço, ativo, payTo, assinatura e fingerprint não mudam.
+                    if _is_v1_pay and candidate_req.get("network") in ("base", "solana"):
+                        candidate_payload = json.loads(json.dumps(payload))
+                        candidate_payload["network"] = candidate_req["network"]
+                        if isinstance(candidate_payload.get("accepted"), dict):
+                            candidate_payload["accepted"]["network"] = candidate_req["network"]
+                    ok, reason, vdata = fac.verify(candidate_payload, candidate_req)
                     if ok:
                         req_ok = candidate_req
+                        payload_ok = candidate_payload
                         break
                     if (vdata or {}).get("_http") == 200:
                         best = reason
@@ -8455,7 +8474,7 @@ def _verify_payment(endpoint: str, payment_header: str):
                              "description": _cap500(ENDPOINT_DESC.get(endpoint, endpoint)),
                              "mimeType": "application/json"}
                             if getattr(fac, "is_cdp", False) else None)
-                settled_ok, sdata = fac.settle(payload, req_ok, bazaar=bz, resource=resource)
+                settled_ok, sdata = fac.settle(payload_ok, req_ok, bazaar=bz, resource=resource)
                 if not settled_ok:
                     if sdata.get("pending"):
                         tx_pending = _clean_tx(sdata)
@@ -18035,7 +18054,15 @@ _SCAN_NOISE_EXTRA = re.compile(
     # catálogo não são intenção de compra. Em especial, /.well-known/x402/*
     # chegava ao planner como produto embora aliases well-known já fossem
     # proibidos; /sentry.properties virava proposta de credential-hunting.
-    r"(^|/)[^/]*\.properties$|(^|/)\.well-known/",
+    r"(^|/)[^/]*\.properties$|(^|/)\.well-known/|"
+    # v48.41.0: scanners de identidade, configuração e APIs genéricas não
+    # representam intenção de compra nem podem virar aliases auto-atendidos.
+    r"(^|/)\.(?:vscode|idea|git|svn|hg|aws|ssh)(/|$)|"
+    r"(^|/)(?:manifest|keys?|wallet|sftp|config|secrets?|credentials?)\.json$|"
+    r"(^|/)(?:auth|login|signin|logout|register)(/|$)|"
+    r"(^|/)mcp/sse/?$|(^|/)li/?$|(^|/)(?:private|logs?)(/|$)|"
+    r"(^|/)api(?:/v\d+)?/(?:me|profile|session|tokens?|keys?)(/|$)|"
+    r"(^|/)api(?:/v\d+)?/(?:transactions?|profiles?|users?|accounts?|orders?)(?:/\d+)?/?$",
     re.I)
 
 
@@ -18068,7 +18095,17 @@ _DEMAND_UA_SQL = """NOT (
     LOWER(COALESCE(ua,'')) LIKE '%selenium%' OR
     LOWER(COALESCE(ua,'')) LIKE '%scrapy%' OR
     LOWER(COALESCE(ua,'')) LIKE '%heritrix%' OR
-    LOWER(COALESCE(ua,'')) LIKE '%zerobot%'
+    LOWER(COALESCE(ua,'')) LIKE '%zerobot%' OR
+    LOWER(COALESCE(ua,'')) LIKE '%conformance%' OR
+    LOWER(COALESCE(ua,'')) LIKE '%probe%' OR
+    LOWER(COALESCE(ua,'')) LIKE '%mekler%' OR
+    LOWER(COALESCE(ua,'')) LIKE '%ibou-search%' OR
+    LOWER(COALESCE(ua,'')) LIKE '%barkrowler%' OR
+    LOWER(COALESCE(ua,'')) LIKE '%clueweb%' OR
+    LOWER(COALESCE(ua,'')) LIKE '%agent402%' OR
+    LOWER(COALESCE(ua,'')) LIKE '%x402station%' OR
+    LOWER(COALESCE(ua,'')) LIKE '%agentrank%' OR
+    LOWER(COALESCE(ua,'')) LIKE '%losbeto-x402-watch%'
 )"""
 
 
@@ -18079,7 +18116,22 @@ def _demand_ua_ok(ua: str) -> bool:
     except Exception:
         low = (ua or "").lower()
         return not any(x in low for x in ("spider", "crawler", "scanner", "bot",
-                                          "monitor", "indexer", "headless"))
+                                          "monitor", "indexer", "headless", "conformance",
+                                          "probe", "ibou-search", "barkrowler", "agent402"))
+
+
+def _preview_group_ok(ua: str, hits: int, ips: int) -> bool:
+    """Elegibilidade de agregados de preview; não restringe clientes HTTP.
+    Um UA de navegador idêntico distribuído por muitos IPs, com uma única
+    avaliação por IP, é automação de catálogo — não vários prospectos humanos."""
+    if not _demand_ua_ok(ua):
+        return False
+    try:
+        if _ua_class(ua or "") == "browser" and int(ips) >= 4 and int(hits) >= int(ips):
+            return False
+    except Exception:
+        pass
+    return True
 
 def _route_now_live(path: str) -> bool:
     """v44.1.0: a rota pedida EXISTE hoje? O radar é janela de 7 dias — um
@@ -18851,8 +18903,11 @@ def _pyth_latest(feed_ids):
     na hora — o caller cai no fallback CoinGecko."""
     if not PYTH_API_KEY:
         raise RuntimeError("pyth: PYTH_API_KEY ausente (Hermes exige chave desde 26/ago/2026)")
-    ids = "&".join(f"ids[]={f}" for f in feed_ids)
-    r = requests.get(f"{_PYTH_BASE}/v2/updates/price/latest?{ids}",
+    # Query construída por params: os colchetes de ids[] são percent-encoded
+    # pela requests. A interpolação manual chegava ao Hermes/proxy como query
+    # sem o campo reconhecido e derrubava todo batch a cada 10 minutos.
+    r = requests.get(f"{_PYTH_BASE}/v2/updates/price/latest",
+                     params=[("ids[]", f) for f in feed_ids],
                      headers={"Authorization": f"Bearer {PYTH_API_KEY}"}, timeout=6)
     if not r.ok:
         body = r.text[:240]
@@ -21895,7 +21950,7 @@ def _chat_greet_message(ip: str, ua: str) -> dict:
     else:
         if visto:
             msg = (f"Welcome back 🤖 You evaluated {visto} last time — it's "
-                   f"${BASE_PRICES[visto]:.3f}, under a cent, and checkout takes 10 seconds: "
+                   f"${BASE_PRICES[visto]:.3f}, and checkout takes 10 seconds: "
                    f"{base}/pay{visto}. Want to see a free live sample of the output first?")
             chips = ["Free sample first", "Take me to checkout", "Plans with bonus credit"]
         else:
@@ -22407,7 +22462,7 @@ def _live_api_build():
         st = {}
     publico = {k: st.get(k) for k in
                ("paid_24h", "revenue_24h", "previews_24h", "probes_24h",
-                "buyers", "conv_evaluators", "avg_ticket")}
+                "buyers", "conv_evaluators", "avg_ticket", "avg_ticket_24h")}
     publico["preview_uas"] = (st.get("preview_uas") or [])[:8]
     # v46.0.1: a página pública não pode chamar receita do operador de
     # "revenue". O split honesto (v45) vai junto, e o KPI usa ele.
@@ -23498,7 +23553,9 @@ _UA_NAMED_SCANNER = re.compile(
     # ZeroBot (zero.xyz, 872 hits/dia), heritrix (crawler do Internet
     # Archive, 9 previews/dia) e hermes-contact-discovery. Métrica honesta
     # vale mais do que funil inflado: eles nunca pagam.
-    r"betteruptime|hetrixtools|zerobot|heritrix|hermes-contact|semrushbot)", re.I)
+    r"betteruptime|hetrixtools|zerobot|heritrix|hermes-contact|semrushbot|"
+    r"conformance|agentrank|mekler|ibou-search|barkrowler|clueweb|agent402|"
+    r"x402station|losbeto-x402-watch)", re.I)
 
 # Genéricos: bibliotecas HTTP e bots sem identidade. Podem ser qualquer coisa,
 # mas na prática são automação de catálogo.
@@ -25059,7 +25116,7 @@ async function reload(){
   document.getElementById("base_bootstrap_alert").classList.toggle("show", !baseBootstrapActive);
   document.getElementById("base_bootstrap_ok").classList.toggle("show", baseBootstrapActive);
 
-  const avgTicket = (j.stats.avg_ticket!==undefined) ? j.stats.avg_ticket : 0;
+  const avgTicket = (j.stats.avg_ticket_24h!==undefined) ? j.stats.avg_ticket_24h : 0;
 
   // v48.18.0: 563 settles/24h eram quase todos do operador (scripts de indexação).
   // A manchete passa a ser o que veio de carteira EXTERNA; o bruto fica rotulado.
@@ -25080,13 +25137,13 @@ async function reload(){
        j.dynamic_pricing===false ? "preço fixo (DYNAMIC_PRICING=false)"
                                  : `preço dinâmico · calc ${j.stats.poi_multiplier.toFixed(2)}x`,""],
     ["🔍 Avaliadores (24h)",j.stats.previews_24h!==undefined?j.stats.previews_24h:0,
-       "previews servidos — prospectos reais",(j.stats.previews_24h>0)?"green":""],
+       "previews elegíveis · bots removidos",(j.stats.previews_24h>0)?"green":""],
     ["🤖 Sondagens (24h)",j.stats.probes_24h!==undefined?j.stats.probes_24h:j.stats.requests_24h,
        "scanners/catálogos — não compram",""],
     ["📊 Conversão orgânica",`${convOrg.toFixed(1)}%`,
        "vendas externas ÷ (vendas externas + avaliações)",""],
     ["👥 Compradores",j.stats.buyers,"únicos",""],
-    ["💵 Ticket médio",`$${avgTicket.toFixed(4)}`,"por venda liquidada",""],
+    ["💵 Ticket médio",`$${avgTicket.toFixed(4)}`,"24h · por settlement",""],
     ["⛓️ Chains",(j.chains||["solana"]).map(c=>({"eip155:8453":"Base","eip155:137":"Polygon","eip155:42161":"Arbitrum"}[c])||c.split(":")[0].replace(/^./,x=>x.toUpperCase())).join(" · "),"ativas",""],
     ["📈 Trust Score",trustActive ? "ATIVO" : "BOOTSTRAP", j.stats.paid_24h+" tx (24h)",trustActive?"green":"amber"],
     ["🌐 Endpoints",j.endpoints,"monetizados",""],
@@ -33716,11 +33773,12 @@ def _cortex_conversion(days: int = 7, limit: int = 15) -> dict:
         with LEDGER._conn() as c:
             probes = dict(c.execute(
                 "SELECT endpoint, COUNT(*) FROM requests WHERE ts>? "
-                "AND kind IN ('probe','challenge402') GROUP BY endpoint",
-                (d,)).fetchall())
+                "AND kind IN ('probe','challenge402') AND " + _DEMAND_UA_SQL +
+                " GROUP BY endpoint", (d,)).fetchall())
             previews = dict(c.execute(
                 "SELECT endpoint, COUNT(*) FROM requests WHERE ts>? "
-                "AND kind='preview' GROUP BY endpoint", (d,)).fetchall())
+                "AND kind='preview' AND " + _DEMAND_UA_SQL +
+                " GROUP BY endpoint", (d,)).fetchall())
             sales = dict(c.execute(
                 "SELECT endpoint, COUNT(*) FROM revenue WHERE ts>? "
                 "GROUP BY endpoint", (d,)).fetchall())
@@ -38224,36 +38282,34 @@ def _lead_seen_save(d: dict) -> None:
 
 
 def _lead_scan_once() -> None:
-    """Quem está AVALIANDO de verdade: previews de ≥N endpoints distintos em
-    2h. Scanner conhecido nunca vira lead. Alerta no máx. 1x/dia/UA, com
-    rate-limit persistido (cross-worker) — o Telegram não vira spam."""
+    """Lead por ator (IP + UA), nunca pela soma global de um User-Agent.
+    O agrupamento anterior unia vários IPs com o mesmo Safari até formar um
+    lead falso. Scanners conhecidos e automação distribuída não geram alerta."""
     if not (TG_BOT and TG_CHAT):
         return
     lim = int(time.time()) - 7200
     with LEDGER._conn() as c:  # leitura WAL sem lock (padrão v48.3.2)
         rows = c.execute(
-            "SELECT COALESCE(NULLIF(ua,''),'(no user-agent)') u, endpoint, "
-            "COUNT(*) n FROM requests WHERE ts>? AND kind='preview' "
-            "GROUP BY u, endpoint", (lim,)).fetchall()
-        ips_q = {r[0]: r[1] for r in c.execute(
-            "SELECT COALESCE(NULLIF(ua,''),'(no user-agent)') u, "
-            "COUNT(DISTINCT ip) FROM requests WHERE ts>? AND kind='preview' "
-            "GROUP BY u", (lim,)).fetchall()}
-    by_ua = {}
-    for ua, ep, n in rows:
-        by_ua.setdefault(ua, {})[ep] = int(n)
+            "SELECT COALESCE(NULLIF(ip,''),'?') actor_ip, "
+            "COALESCE(NULLIF(ua,''),'(no user-agent)') u, endpoint, COUNT(*) n "
+            "FROM requests WHERE ts>? AND kind='preview' "
+            "GROUP BY actor_ip, u, endpoint", (lim,)).fetchall()
+    by_actor = {}
+    for ip, ua, ep, n in rows:
+        by_actor.setdefault((ip, ua), {})[ep] = int(n)
     seen = _lead_seen_load()
     now = time.time()
     dirty = False
-    for ua, eps in sorted(by_ua.items(),
-                          key=lambda kv: -len(kv[1]))[:12]:
-        if len(eps) < LEAD_ALERT_MIN_EPS:
+    for (ip, ua), eps in sorted(by_actor.items(),
+                                key=lambda kv: -len(kv[1]))[:24]:
+        if len(eps) < LEAD_ALERT_MIN_EPS or not _demand_ua_ok(ua):
             continue
         low = ua.lower()
-        if any(b in low for b in _LEAD_UA_BLOCK) or not _demand_ua_ok(ua):
-            continue  # SQLSpider/crawlers/monitores nunca viram lead
-        last = max(float(_LEAD_SEEN.get(ua, 0)),
-                   float(seen.get(ua, 0) or 0))
+        if any(b in low for b in _LEAD_UA_BLOCK):
+            continue
+        actor = hashlib.sha256((ip + "|" + ua).encode()).hexdigest()[:24]
+        last = max(float(_LEAD_SEEN.get(actor, 0)),
+                   float(seen.get(actor, 0) or 0))
         if now - last < LEAD_ALERT_GAP_S:
             continue
         top = sorted(eps.items(), key=lambda kv: -kv[1])[:5]
@@ -38262,15 +38318,14 @@ def _lead_scan_once() -> None:
             TG_CHAT,
             f"🔥 *LEAD QUENTE* — avaliador provando o catálogo\n\n"
             f"UA: `{TelegramBot.esc(ua[:70])}`\n"
-            f"{len(eps)} endpoints distintos em 2h · "
-            f"{ips_q.get(ua, 1)} ip(s)\n"
+            f"{len(eps)} endpoints distintos em 2h · 1 ator\n"
             f"Top: {TelegramBot.esc(lista[:180])}\n\n"
             f"_Janela de conversão: agora. O savings-tip automático fala no "
             f"primeiro pagamento._")
-        _LEAD_SEEN[ua] = now
-        seen[ua] = now
+        _LEAD_SEEN[actor] = now
+        seen[actor] = now
         dirty = True
-        log.info(f"🔥 lead-alert: {ua[:40]} provou {len(eps)} endpoints/2h")
+        log.info(f"🔥 lead-alert: ator {actor[:8]} ({ua[:28]}) provou {len(eps)} endpoints/2h")
     if dirty:
         _lead_seen_save(seen)
 
@@ -39517,7 +39572,7 @@ def ops_farmed_keys():
                  "Compras Pix e reembolsos nunca são tocados."),
         "keys": rows})
 
-VERSION = "48.40.0-PAYPROOF"
+VERSION = "48.41.0-V1RAILFIX"
 
 
 # v48.37.0-CONVERGE: cache de 300s no agentic manifest. O manifest era
