@@ -129,16 +129,9 @@ from pathlib import Path
 from collections import defaultdict, deque, Counter
 from typing import Any, Optional, Dict, List, Tuple
 
-# ============================================================================
-# 0. CONFIGURAÇÃO E AUTO-SETUP
-# ============================================================================
 
 VERSION = "47.9.4-TOKENFILE"  # v47.0.3: workers sync auto-recuperáveis + socket 25s + aliases A2A | v47.0.2: setdefaulttimeout anti-travamento | v47.0.1: PIX ascii-safe + ETag/304 na spec
 BRAND_NAME = "Losbeto"
-# v44.4.0: reposicionamento Brasil-primeiro. "Cross-asset market data" compete
-# com CoinGecko e cem nós iguais; "BCB + B3 normalizado em inglês" não compete
-# com ninguém — é o único fosso estrutural do nó (e o resto do catálogo global
-# continua aqui, como cauda longa de captura).
 BRAND_TAGLINE = ("Brazilian macro, B3 equities & global market data for AI "
                  "agents — BCB/B3-normalized, x402-native")
 BRAND_EMOJI = "🧠"
@@ -156,14 +149,12 @@ CONFIG_PATH     = HOME_DIR / "config_v24.json"
 RAG_DB_PATH     = HOME_DIR / "rag_v24.db"
 STAKE_DB        = HOME_DIR / "stakes.db"
 
-# Portas
 X402_PORT      = int(os.environ.get("PORT", os.environ.get("OMEGA_X402_PORT", "8402")))
 GOSSIP_PORT    = int(os.environ.get("OMEGA_GOSSIP_PORT", "8403"))
 MCAST_PORT     = int(os.environ.get("OMEGA_MCAST_PORT", "8404"))
 DASHBOARD_PORT = X402_PORT
 MCAST_GRP      = "239.42.42.42"
 
-# URL pública
 _rw_domain  = os.environ.get("RAILWAY_PUBLIC_DOMAIN", "").strip()
 _rw_static  = os.environ.get("RAILWAY_STATIC_URL", "").strip()
 _rw_service = os.environ.get("RAILWAY_SERVICE_URL", "").strip()
@@ -181,13 +172,10 @@ PUBLIC_URL = (
 ).rstrip("/")
 
 DASH_TOKEN = os.environ.get("DASH_TOKEN", secrets.token_urlsafe(16))
-# v44.9.3: chave de parceiro B2B (storefronts que revendem nosso dado, ex.:
-# Actor na Apify Store). Só em Railway Variables — nunca em código/GitHub.
 PARTNER_KEY = os.environ.get("PARTNER_KEY", "").strip()
 JWT_SECRET = os.environ.get("JWT_SECRET", secrets.token_urlsafe(32))
 JWT_TTL    = int(os.environ.get("JWT_TTL_SECONDS", "300"))
 
-# Solana
 SOLANA_RPCS = [
     os.environ.get("SOLANA_RPC", "https://api.mainnet-beta.solana.com"),
     "https://solana-rpc.publicnode.com",
@@ -201,51 +189,25 @@ WSOL_MINT     = "So11111111111111111111111111111111111111112"
 USDC_DECIMALS = 6
 SOL_GENESIS   = "5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp"
 
-# Base (EVM)
 BASE_RPC          = os.environ.get("BASE_RPC", "https://mainnet.base.org")
 BASE_USDC         = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"
 BASE_PAYTO_EVM    = os.environ.get("BASE_PAYTO_EVM", "").strip()
 BASE_CAIP2        = "eip155:8453"
-# v48.11.0-GLOBAL: Polygon (eip155:137) e Arbitrum (eip155:42161) settle pelo
-# MESMO facilitador CDP (docs oficiais: exact/upto nas duas) — so entram nos
-# accepts quando o operador confirmar na Binance que deposito USDC-Polygon e
-# USDC-Arbitrum credita no mesmo endereco EVM. Default OFF = risco zero.
 X402_POLYGON      = os.environ.get("X402_POLYGON", "") == "1"
 X402_ARBITRUM     = os.environ.get("X402_ARBITRUM", "") == "1"
 ENABLE_BASE       = bool(BASE_PAYTO_EVM)
-# v25.1: Base como 1ª opção de pagamento -> settles vão pela CDP -> indexação
-# automática no Bazaar (a camada de descoberta que os agentes consultam).
 PREFER_BASE       = os.environ.get("PREFER_BASE", "1") != "0"
 
-# Algorand (AVM) — v44.7.0-ALGORAND: 3ª chain de pagamento, via GoPlausible.
-# Regras oficiais do Global x402 Challenge que este bloco obedece:
-#  - MESMO payTo durante TODA a competição (o leaderboard agrega por endereço;
-#    trocar de endereço = perder o volume acumulado). Grave o segredo OFFLINE.
-#  - Facilitator obrigatório: GoPlausible (gasless p/ o merchant).
-#  - Campo 'tag': 'x402-global-challenge' dentro do extra do accept.
-#  - USDC na Algorand mainnet = ASA 31566704 (6 casas, igual Base/Solana).
-#  - Composite Entry: todos os endpoints com o mesmo payTo somam volume sob
-#    UM merchant — o catálogo inteiro compete como uma única entrada forte.
 ALGO_PAYTO         = os.environ.get("ALGORAND_WALLET_ADDRESS", "").strip()
 ALGO_USDC_ASA      = "31566704"
 ALGO_CAIP2         = "algorand:wGHE2Pwdvd7S12BL5FaOP20EGYesN73k"
+ALGO_CAIP2_FULL    = "algorand:wGHE2Pwdvd7S12BL5FaOP20EGYesN73ktiC1qzkkit8="
 ALGO_FEEPAYER      = "ZMFK2OI7ZBD2U27ISERZC4S6LKM6WMFJPZQ4MYNJDZ2VNBNMBA67RA22AA"
 GO_FACILITATOR_URL = os.environ.get("GOPLAUSIBLE_FACILITATOR",
                                     "https://facilitator.goplausible.xyz").strip()
 ENABLE_ALGO        = bool(ALGO_PAYTO)
 
-# ---------------------------------------------------------------------------
-# v48.26.2-LANDING: UMA VERDADE SÓ PARA AS CHAINS — todo texto público
-# (landing, llms.txt, terms, well-knowns, chat) deriva DESTAS funções, que
-# derivam das MESMAS flags que montam os accepts do 402. Ligou/desligou uma
-# flag nas Variables, o site inteiro se reescreve sozinho — nunca mais a
-# copy promete um rail que o 402 não oferece (ou omite um que oferece).
-# Definidas AQUI (import time, junto às flags) porque vários consumidores
-# são strings montadas no import (ENDPOINT_DESC, _INTEGRATE_SYSTEM, terms).
-# ---------------------------------------------------------------------------
 def _chains_list():
-    # mesmas portas dos accepts do 402: Base só entra se houver payTo EVM
-    # configurado (em produção sempre há; em sandbox/teste, não mentir).
     chains = (["Base"] if ENABLE_BASE else []) + ["Solana"]
     if ENABLE_ALGO:
         chains.append("Algorand")
@@ -294,9 +256,6 @@ def _chains_networks():
         nets.append("eip155:42161 (Arbitrum)")
     return " · ".join(nets)
 
-# Facilitator (padrão: PayAI – produção)
-# v21.15: wallets do operador — compras destas carteiras são marcadas como
-# "teste do operador" no /receipts e na landing (transparência > prova social falsa)
 _OW_DEFAULT = ("0xcc83159a6513e56778da45a2981f55f44ef8e9e2,6Q1Sx7tWBKPF1aHBSGMyKi8m8EpxtoCvQykwSn5bX99h,"
                "mrva6oabpqjnj2wfuhfy57fmjxhbv37iu665mxrjx4jybiwgacp3lsduf4,"
                "ifcmom5dnbqoafxi664j6jzhfffo5suucn7m6mrb2bwnepy3xbjwcoietq")
@@ -307,79 +266,31 @@ CDP_API_KEY_SECRET = os.environ.get("CDP_API_KEY_SECRET", "").strip()
 FACILITATOR_URL = os.environ.get("X402_FACILITATOR", "https://facilitator.payai.network").strip()
 USE_FACILITATOR = bool(FACILITATOR_URL)
 
-# TON
 TON_API       = "https://toncenter.com/api/v2"
 TON_API_KEY   = os.environ.get("TON_API_KEY", "").strip()
 TON_TESTNET   = False
 
-# APIs externas
 GROQ_KEY     = os.environ.get("GROQ_API_KEY", "").strip()
 GEMINI_KEY   = os.environ.get("GEMINI_API_KEY", "").strip()
-# v24.11: provedores de mercado tradicional (qualquer UMA resolve; free tier)
 FINNHUB_KEY     = os.environ.get("FINNHUB_API_KEY", "").strip()      # 60 req/min
 TWELVEDATA_KEY  = os.environ.get("TWELVEDATA_API_KEY", "").strip()   # 800 req/dia
 ALPHAVANTAGE_KEY= os.environ.get("ALPHAVANTAGE_API_KEY", "").strip() # 25 req/dia
-# v44.4.0: Google real via Serper (google.serper.dev — ~$0.001/consulta, free
-# tier 2.500 consultas). É o movimento StableEnrich: revender por chamada um
-# dado NÃO-gratuito. Busca é a categoria nº1 de demanda x402 comprovada e o
-# nosso sinal orgânico mais forte (radar: /web-search?q=btc de 15 IPs).
 SERPER_KEY      = os.environ.get("SERPER_API_KEY", "").strip()
 DEEPSEEK_KEY = os.environ.get("DEEPSEEK_API_KEY", "").strip()
 CLAUDE_KEY   = (os.environ.get("CLAUDE_API_KEY", "").strip() or
-                # v44.0.5: aceita também o nome oficial da Anthropic — o
-                # Railway já tinha ANTHROPIC_API_KEY e a chave não era lida.
                 os.environ.get("ANTHROPIC_API_KEY", "").strip())
 
-# v48.11.0-GLOBAL: provedores premium dormem ate o operador ativar.
-# Sem chave = zero custo, zero chamada, codigo inerte. Ativar = setar a env
-# no Railway (MOONSHOT_API_KEY / OPENROUTER_API_KEY) — nada no codigo/repo.
 MOONSHOT_KEY   = os.environ.get("MOONSHOT_API_KEY", "").strip()
 OPENROUTER_KEY = os.environ.get("OPENROUTER_API_KEY", "").strip()
 OLLAMA_URL   = os.environ.get("OLLAMA_URL", "http://127.0.0.1:11434")
-# v39: o default acima é conveniente para rodar local, mas fazia o Ollama
-# contar como "provedor configurado" mesmo sem nada escutando na porta —
-# llm_healthy() devolvia True para sempre e o gate de pré-pagamento nunca
-# disparava. Só conta como provedor se explicitamente habilitado.
 OLLAMA_ENABLED = os.environ.get("OLLAMA_ENABLED", "").strip() not in ("", "0", "false")
 OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "qwen2.5:3b")
-# v41 — IDIOMA DOS PRODUTOS DE IA.
-# Evidência (2026-07-31, GET /try ao vivo): o brief do /launch-risk — produto
-# flagship de $0.10 — saía em PORTUGUÊS porque o prompt é escrito em PT e o
-# Gemini segue o idioma do prompt. O comprador deste mercado é um agente
-# operando em inglês: amostra em PT = produto "quebrado". O sufixo abaixo é
-# anexado a TODOS os prompts (desliga com LLM_FORCE_ENGLISH=0).
 LLM_FORCE_ENGLISH = os.environ.get("LLM_FORCE_ENGLISH", "1") != "0"
 
-# v41.1: campo experimental no settle CDP. Ver comentário em Facilitator.settle.
-# Padrão DESLIGADO — não arriscamos a liquidação em Base por uma hipótese.
 CDP_SEND_RESOURCE = os.environ.get("CDP_SEND_RESOURCE", "").strip() in ("1", "true")
 
-# v44.2.1 — CONTINGÊNCIA DE LIQUIDAÇÃO EM BASE.
-# Em 04-05/ago/2026 a CDP passou a recusar TODOS os verify de Base no nó
-# ("facilitator-verify-failed" em toda chamada, com carteira do pagador
-# assinando certo e com saldo — provado contra o facilitador PayAI, que
-# aceitou o mesmo payload e só recusou saldo zerado de carteira de teste).
-# Resultado: loja fechada — zero liquidações desde 04/ago ~15:00 UTC.
-# Com esta flag (padrão LIGADA), um pagamento EVM recusado pela CDP é tentado
-# de novo no facilitador principal (PayAI) antes de desistir da venda.
-# PayAI não indexa no Bazaar — mas venda liquidada sem catálogo > venda
-# perdida com catálogo. A tentativa CDP continua primeiro: quando a CDP
-# volta ao normal, o Bazaar segue indexando e o fallback nem é usado.
-#   CDP_FALLBACK_PAYAI=0  → comportamento antigo (só CDP em Base)
-# Seguro contra dupla liquidação: a autorização EIP-3009 é de uso único
-# (nonce) — se dois facilitadores tentassem liquidar, o segundo falharia
-# on-chain. E settle só roda depois de verify OK naquele facilitador.
 CDP_FALLBACK_PAYAI = os.environ.get("CDP_FALLBACK_PAYAI", "1").strip() not in ("0", "false")
 
-# v42 — MPP (Machine Payments Protocol, IETF draft-httpauth-payment-00, da
-# Stripe/Tempo) e UCP (Universal Commerce Protocol, do Google).
-# Evidência: o registrador da agentic.market/x402scan/MPPScan marcou TODOS os
-# 74 endpoints com "WWW-Authenticate header contains no Payment challenges" —
-# o header existia, mas com auth-scheme "x402", que os validadores MPP não
-# reconhecem. E 3 IPs distintos pediram /.well-known/ucp em 7 dias (Google
-# UCP virou o ponto de descoberta de agentes de compra em 2026).
-# O node continua 100% x402 na liquidação — agora ele também FALA MPP no
-# desafio e PUBLICA um perfil UCP. Desliga com MPP_CHALLENGE=0 / UCP_PROFILE=0.
 MPP_CHALLENGE = os.environ.get("MPP_CHALLENGE", "1") != "0"
 UCP_PROFILE   = os.environ.get("UCP_PROFILE", "1") != "0"
 LLM_ENGLISH_SUFFIX = (
@@ -393,11 +304,9 @@ TWITTER_API_SECRET = os.environ.get("TWITTER_API_SECRET", "").strip()
 TWITTER_ACCESS_TOKEN = os.environ.get("TWITTER_ACCESS_TOKEN", "").strip()
 TWITTER_ACCESS_TOKEN_SECRET = os.environ.get("TWITTER_ACCESS_TOKEN_SECRET", "").strip()
 
-# Telegram
 TG_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
 TG_CHAT  = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
 
-# Binance sweep
 _raw_binance = os.environ.get("BINANCE_SOLANA_ADDRESS", "").strip()
 _legacy_binance = os.environ.get("BINANCE_WALLET_ADDRESS", "").strip()
 if not _raw_binance and _legacy_binance:
@@ -408,38 +317,19 @@ BINANCE_ADDRESS = _raw_binance
 SWEEP_THRESHOLD  = float(os.environ.get("SWEEP_THRESHOLD_USDC", "0.5"))
 SWEEP_INTERVAL   = int(os.environ.get("SWEEP_INTERVAL_S", "3600"))
 
-# Bootstrap P2P
 BOOTSTRAP_SEEDS = [s.strip() for s in os.environ.get("OMEGA_SEEDS", "").split(",") if s.strip()]
 
-# Dynamic Pricing
 PREDICTIVE_PRICING = os.environ.get("DYNAMIC_PRICING",
     os.environ.get("PREDICTIVE_PRICING", "true")).lower() == "true"
 DYNAMIC_PRICING = PREDICTIVE_PRICING  # alias backward compat
 BASE_WIN_RATE   = 55.0
 
-# GeoIP
 GEOIP_ENABLED         = os.environ.get("GEOIP_ENABLED", "false").lower() == "true"
 GEO_BLOCKED_COUNTRIES = set(os.environ.get("GEO_BLOCKED", "").split(",")) - {""}
 
-# v24: Revenue targets
 REVENUE_TARGET_DAILY = float(os.environ.get("REVENUE_TARGET_DAILY", "50.0"))
-# ============================================================================
-# v22: NOVOS SISTEMAS — SUBSCRIPTION, GAMIFICATION, AFFILIATE
-# ============================================================================
 
-# v23: PLANOS DE CRÉDITO — o motor de conversão.
-# Modelo provado no ecossistema (laevitas.ch): 1 tx on-chain → N chamadas
-# servidas do ledger em ~1ms, sem latência de settlement por request.
-# balance_usd = -1 → ilimitado dentro da janela ttl_days.
-# v39: pitches em inglês — quem lê isto num 402 ou no Bazaar é um agente.
 CREDIT_PLANS = {
-    # v48.9.10-PLANS: MICRO-BUNDLE — a porta de entrada das máquinas.
-    # Diagnóstico (22/09): o client x402-fetch stock (legacy) nasce com teto
-    # de gasto default de 0.1 USDC; qualquer desafio acima disso é recusado
-    # ANTES do X-PAYMENT — invisível nos nossos logs. É o padrão que o MapMap
-    # documentou: "the $0.10 micro-bundle clears stock client spend caps".
-    # $0.10 → $0.11 de saldo: a 1ª compra autônoma custa o mínimo que a rede
-    # inteira aceita sem configuração.
     "/buy-credits-micro": {"plan": "credits", "balance_usd": 0.11, "ttl_days": 14,
                            "bonus": "+10%",
                            "pitch": "Pay $0.10 once, get $0.11 of call credit — the machine starter bundle",
@@ -448,9 +338,6 @@ CREDIT_PLANS = {
                           "bonus": "+25%",
                           "pitch": "Pay $0.99 once, get $1.25 of call credit",
                           "anchor_price": 0.99, "display_price": "$0.99"},
-    # v48.3-PLANS: degraus intermediários — a escada saltava 10× de $0.99 p/
-    # $9.99 e perdia o cliente que queria mais saldo sem assinar. Bônus em
-    # SALDO: o preço unitário público dos endpoints nunca muda.
     "/buy-credits-5":    {"plan": "credits",  "balance_usd": 6.00,  "ttl_days": 60,
                           "bonus": "+20%",
                           "pitch": "Pay $4.99 once, get $6.00 of call credit",
@@ -475,11 +362,6 @@ CREDIT_PLANS = {
                           "bonus": "unlimited 30d",
                           "pitch": "Unlimited for 30 days with maximum priority",
                           "anchor_price": 19.99, "display_price": "$19.99/mo"},
-    # v44.0.7: FOUNDING AGENT — a edição de lançamento do node.
-    # Um pagamento, $75 de saldo (bônus de +50%, o maior do catálogo),
-    # janela de 180 dias (a mais longa de qualquer plano de saldo) e a key
-    # carrega o badge "founding" verificável publicamente em /credits-status.
-    # É plano de SALDO (não ilimitado) — fica fora da escada _assert_plan_ladder.
     "/founding-agent":   {"plan": "founding", "balance_usd": 75.00, "ttl_days": 180,
                           "bonus": "+50% · founding badge",
                           "pitch": ("Founding Agent launch edition: $75 of call credit "
@@ -496,9 +378,7 @@ CREDIT_PLANS = {
 }
 
 
-# Preços base (USDC) – 42 endpoints
 BASE_PRICES = {
-    # --- DISCOVERY ($0.01–0.03): commodities — preço de mercado, volume e trust ---
     "/fear-greed":       0.010,   # v48.10.3: piso $0.01 — taxa facilitator 33%→10%
     "/pyth-price":       0.010,   # v48.10.3: idem (CoinGecko cobra flat $0.01 — referência)
     "/weather":          0.010,   # v48.17.0-RADAR: 8 IPs/7d pediam — produto novo
@@ -516,7 +396,6 @@ BASE_PRICES = {
     "/forex-rate":       0.012,
     "/commodity-price":  0.012,
     "/stock-quote":      0.015,
-    # --- CORE ($0.04–0.12): dados trabalhados ---
     "/jupiter-swap":     0.020,
     "/rugcheck":         0.025,
     "/pump-monitor":     0.025,
@@ -532,10 +411,6 @@ BASE_PRICES = {
     "/onchain-credit":   0.060,
     "/macro-calendar":   0.070,
     "/earnings-whisper": 0.080,
-    # --- PRO ($0.15–0.35): inteligência composta ---
-    # --- v43: INTELIGÊNCIA SOB DEMANDA (categoria comprovada no leaderboard:
-    #     enriquecimento de wallet e relatório de token são o que agentes
-    #     orquestradores mais recompram — ver análise v43) ---
     "/token-intel":      0.080,
     "/research-brief":   0.050,   # v44: síntese com fontes — a demanda orgânica nº1
     "/deep-think":       0.100,
@@ -557,13 +432,11 @@ BASE_PRICES = {
     "/portfolio-copilot": 0.200,
     "/launch-risk":      0.200,
     "/forex-arbitrage":  0.220,   # FLAGSHIP acessível — preview grátis em /launch-risk-preview
-    # --- FLAGSHIP ($0.49–1.00): produtos únicos ---
     "/council":          0.490,   # EXCLUSIVO: Conselho dos Cinco
     "/launch-sniper":    0.490,
     "/whale-dossier":    0.590,
     "/thesis-engine":    0.690,
     "/starter-pack":     1.000,   # âncora de $1 — primeira compra humana
-    # --- CREDIT PLANS (1 tx on-chain → N chamadas via X-API-Key) ---
     "/buy-credits-micro": 0.100,   # v48.9.10: degrau $0.10 — teto default do x402-fetch stock
     "/buy-credits":      0.990,
     "/buy-credits-5":    4.990,
@@ -572,16 +445,11 @@ BASE_PRICES = {
     "/week-pass":        9.990,
     "/subscribe-pro":    9.990,
     "/subscribe-whale":  19.990,
-    # --- v44.0.7: FOUNDING AGENT — plano de lançamento, ticket alto honesto.
-    #     Chainalysis (jun/2026): transações de $1+ são 95% do valor movimentado
-    #     no x402. Um comprador real de verdade quase sempre prefere 1 tx maior
-    #     a 50 micro-compras. Balance-based (fora da escada ilimitada). ---
     "/founding-agent":   49.990,
     "/enterprise":       99.990,
 }
 
 FEATURED_ENDPOINTS = [
-    # v44.4.0: vitrine Brasil-primeira — o fosso na frente, o global atrás.
     "/br-equity", "/br-agro", "/br-curve",
     "/buy-credits", "/day-pass", "/launch-risk", "/council",
     "/agent-composable", "/multi-chain-arbitrage", "/win-rate-verified",
@@ -593,9 +461,6 @@ FEATURED_ENDPOINTS = [
     "/forex-rate", "/commodity-price", "/stock-quote",
 ]
 
-# ============================================================================
-# 1. LOGGING
-# ============================================================================
 
 logging.basicConfig(
     level=logging.INFO,
@@ -620,7 +485,6 @@ def _load_price_overrides() -> dict:
             val = float(raw)
             if val <= 0:
                 continue
-            # Removido o limite mínimo de 60% – você pode definir qualquer preço
             overrides[ep] = round(val, 4)
         except Exception:
             log.warning(f"price override inválido para {ep}: {raw}")
@@ -629,22 +493,7 @@ def _load_price_overrides() -> dict:
 PRICE_OVERRIDES = _load_price_overrides()
 
 ENDPOINT_DESC = {
-    # v39 — CATÁLOGO REESCRITO EM INGLÊS.
-    #
-    # Motivo: 33 das 63 descrições estavam em português, incluindo TODOS os
-    # planos de crédito e todos os bundles premium. O comprador deste mercado
-    # é um LLM fazendo busca semântica em inglês no Bazaar/x402scan — uma
-    # descrição como "Fluxo de bundles Jito, tip floor e sinais de MEV" não
-    # casa com a consulta "MEV bundle flow Solana". Além disso, as chaves
-    # /cross-chain, /smart-money, /sanctions e /agent-market apareciam DUAS
-    # vezes com valores diferentes (a segunda vencia em silêncio), e
-    # /week-pass e /enterprise não existiam aqui — os dois produtos de maior
-    # ticket iam ao Bazaar com a descrição literal "/week-pass".
-    #
-    # Regra de escrita: dizer o que retorna, de qual fonte, e por que não dá
-    # para obter de graça. Sem superlativo sem lastro.
 
-    # ---- Discovery / commodities de dado ---------------------------------
     "/pyth-price":      "Real-time SOL/USD from the Pyth Network oracle with its confidence interval and publish slot. Sub-second freshness, straight from the on-chain price account.",
     "/weather":         "Live weather for any city or lat/lon on Earth: WMO-decoded current conditions, next 24h hourly and 7-day daily forecast with precipitation probability, sunrise/sunset and wind — from Open-Meteo's fused national-model grid (ECMWF/NOAA/DWD), no API key on your side.",
     "/fear-greed":      "Is the crowd greedy or fearful right now? The Fear & Greed Index (0-100) at this exact instant, with classification — a point-in-time reading your model's training data cannot contain.",
@@ -664,7 +513,6 @@ ENDPOINT_DESC = {
     "/stock-quote":     "What is AAPL trading at this second? Live quote with daily change and open/high/low, multi-source with the provider named in every response — the number no trained model knows.",
     "/global-macro":    "One-shot global macro snapshot: market regime, forex and crypto sentiment combined for cross-asset agents.",
 
-    # ---- Core: dado trabalhado -------------------------------------------
     "/jupiter-swap":    "Jupiter swap quote with the best DEX route and expected slippage for a given pair and size, so an agent can price execution before committing.",
     "/rugcheck":        "Solana token rug-pull screening: mint and freeze authority, liquidity lock, holder concentration and the specific red flags found.",
     "/pump-monitor":    "Freshest token launches across DEXs with initial triage. Memecoin radar for sniper agents.",
@@ -684,7 +532,6 @@ ENDPOINT_DESC = {
     "/macro-calendar":  "When is the next decision that moves every market? Official published schedule only — FOMC, BLS payrolls and Brazil's Copom — no forecasts, no invented figures. Dates your model's cutoff does not know.",
     "/earnings-whisper": "Next earnings date, EPS/revenue estimates and whisper number for a given stock (?symbol=AAPL).",
 
-    # ---- Pro: inteligência composta ---------------------------------------
     "/deep-think":      "Structured reasoning on a thesis: the setup, the scenario tree, what would invalidate it, and the level where the thesis is simply wrong.",
     "/agent-call":      "One call, any task: describe what you need in plain English (?task=) and this node routes it — local semantic search (MiniLM ONNX, cross-encoder rerank) over its own live catalog — to the best in-budget endpoint, EXECUTES it in-process and returns the real data plus a routing receipt. Extra params (?symbol=, ?wallet=, ?token=…) flow straight to the chosen endpoint; ?endpoint=/name skips routing. If nothing in-budget can deliver, the payment is auto-refunded as credit — you never pay for a non-delivery.",
     "/whale-alert":     "Large on-chain USDC/SOL movements watchlist with the wallets involved. Follow smart money flow as it settles.",
@@ -704,14 +551,12 @@ ENDPOINT_DESC = {
     "/launch-risk":     "FLAGSHIP: real-time token launch risk brief — on-chain checks (mint authority, holder concentration), DEX liquidity and an AI verdict (AVOID / WATCH / SIZE).",
     "/forex-arbitrage": "Triangular FX arbitrage scanner across major crosses, flagging spreads above 0.01% with the exact leg sequence to execute.",
 
-    # ---- Flagship ---------------------------------------------------------
     "/council":         "Council of Five: five specialised AI agents (risk, regime, launches, liquidity, contrarian) vote in parallel, then a chairman synthesises the consensus. Multi-agent market view in one call.",
     "/launch-sniper":   "Premium bundle for new launches: fresh listings, rug screening, insider entries and a tactical execution note, in one request.",
     "/whale-dossier":   "Premium bundle on large holders: whale movements, smart-money directory, institutional flow and the alerts that fired, assembled into one dossier.",
     "/thesis-engine":   "Premium product: an operational thesis with stated conviction, entry and invalidation triggers, and the hedge that pairs with it.",
     "/starter-pack":    "Entry bundle designed for a first purchase: several flagship products in one $1 call, Phantom-friendly, so an agent can evaluate the top of the catalog in a single transaction.",
 
-    # ---- Planos de crédito ------------------------------------------------
     "/buy-credits-micro": "CREDITS MICRO-BUNDLE: pay $0.10 once and receive $0.11 of call balance (+10%), valid 14 days, spent via X-API-Key on every endpoint. Sized to clear the default 0.1 USDC spend cap of unconfigured stock x402 clients — the recommended autonomous first purchase.",
     "/buy-credits":     "CREDITS: pay $0.99 once and receive $1.25 of call balance (+25% bonus), spent via the X-API-Key header. One on-chain transaction, then zero settlement latency per request.",
     "/buy-credits-5":   "CREDITS: pay $4.99 once and receive $6.00 of call balance (+20% bonus), valid 60 days, spent via the X-API-Key header. One on-chain transaction, then zero settlement latency per request.",
@@ -794,9 +639,6 @@ ENDPOINT_TAGS = {
     "/enterprise":       ["Credits", "Subscription"],
 }
 
-# ============================================================================
-# 2. AUTO-INSTALAÇÃO DE DEPENDÊNCIAS
-# ============================================================================
 
 REQUIRED = {
     "flask":        "flask",
@@ -822,16 +664,6 @@ def _ensure_deps():
 
 _ensure_deps()
 
-# v47.0.2: todo socket sem timeout explícito morre em 60s. Uma fonte pendurada
-# (BCB/Yahoo/Finnhub que não responde) segurava a thread para sempre; com 16
-# threads no pool (2 workers × 8) bastavam 16 chamadas assim para o nó INTEIRO
-# parar de responder — TLS abre e zero bytes voltam, derrubando até /ip e
-# /ready. Padrão observado em produção em 13/08.
-# v47.0.3: 60s → 25s. Com workers SYNC e --timeout 45 (railway.toml), o socket
-# TEM que desistir antes do worker ser morto: a requisição falha graciosamente
-# (dado "indisponível") em vez de derrubar o processo. E o que o socket não
-# cobre (ex.: getaddrinfo/DNS travado) o gunicorn cobre: passou de 45s, o
-# master mata o worker e forja outro na hora — fim do travamento permanente.
 import socket as _socket
 _socket.setdefaulttimeout(25)
 
@@ -842,9 +674,6 @@ from nacl.signing import SigningKey, VerifyKey
 from nacl.exceptions import BadSignatureError
 from flask import Flask, request, jsonify, redirect, Response
 
-# ============================================================================
-# 3. WALLET SOLANA + TON
-# ============================================================================
 
 class SolanaWallet:
     def __init__(self, secret_b58: Optional[str] = None):
@@ -998,8 +827,6 @@ def _check_wallet_consistency():
         chains.append("base")
     if ENABLE_ALGO:
         chains.append("algorand")
-    # v48.26.3: o log omitia Polygon/Arbitrum com as flags ON — a omissão já
-    # causou diagnóstico errado ("Polygon fora do ar" com eip155:137 no 402).
     if X402_POLYGON:
         chains.append("polygon")
     if X402_ARBITRUM:
@@ -1020,9 +847,6 @@ if TON_WALLET:
     log.info(f"🔑 TON:    {TON_WALLET.address}")
 log.info(f"🆔 Node:   {WALLET.node_id}")
 
-# ============================================================================
-# 4. LEDGER v10 — SQLite com migração automática (adicionado referral e stake)
-# ============================================================================
 
 class LedgerV10:
     SCHEMA_VERSION = 25
@@ -1082,9 +906,6 @@ class LedgerV10:
             CREATE INDEX IF NOT EXISTS idx_rev_ts ON revenue(ts);
             CREATE INDEX IF NOT EXISTS idx_rev_endpoint ON revenue(endpoint);
             CREATE INDEX IF NOT EXISTS idx_rev_payer ON revenue(payer);""")
-            # v44.8.2: migracao unica — settles AVM eram gravados como "solana"
-            # (deteccao de chain caia no else). Txid Algorand = 52 chars, tudo
-            # maiusculo; assinaturas Solana base58 tem ~88 chars com minusculas.
             try:
                 _fixed = c.execute(
                     "UPDATE revenue SET chain='algorand' "
@@ -1278,7 +1099,6 @@ class LedgerV10:
             except Exception as e:
                 log.warning(f"   ⚠️  migração {src.name}: {e}")
 
-    # ---------- REVENUE ----------
     def add_revenue(self, endpoint: str, amount: float, tx_sig: str,
                     payer: str = "", source: str = "direct",
                     chain: str = "solana", jwt_session: str = "",
@@ -1314,7 +1134,6 @@ class LedgerV10:
                     pass
         return _inserted
 
-    # ---------- FUNNEL (v48.17.10) ----------
     _FUNNEL_GC_EVERY = 200
 
     def funnel_challenge(self, rid: str, endpoint: str) -> None:
@@ -1326,7 +1145,6 @@ class LedgerV10:
             with self.lock, self._conn() as c:
                 c.execute("INSERT OR IGNORE INTO funnel(rid,ts,endpoint) VALUES(?,?,?)",
                           (rid, int(time.time()), endpoint))
-                # coleta de lixo oportunista: retém 30 dias (~cobre a janela do Bazaar)
                 self._funnel_gc_n = getattr(self, "_funnel_gc_n", 0) + 1
                 if self._funnel_gc_n >= self._FUNNEL_GC_EVERY:
                     self._funnel_gc_n = 0
@@ -1396,7 +1214,6 @@ class LedgerV10:
                 "SELECT endpoint, COUNT(*) FROM revenue WHERE ts > ? GROUP BY endpoint",
                 (now - 86400,)
             ).fetchall())
-            # v24.5: separa avaliadores (preview) de sondagens de scanner
             try:
                 preview_counts = c.execute(
                     "SELECT COALESCE(NULLIF(ua,''),'(sem user-agent)') u, COUNT(*) n, "
@@ -1413,7 +1230,6 @@ class LedgerV10:
             except Exception:
                 previews, probes, challenges = 0, reqs, 0
             paid_total = c.execute("SELECT COUNT(*) FROM revenue").fetchone()[0]
-            # v24.5: QUEM está sondando — separa scanner conhecido de cliente novo
             try:
                 top_uas = c.execute(
                     "SELECT COALESCE(NULLIF(ua,''),'(sem user-agent)') u, COUNT(*) n, "
@@ -1422,10 +1238,6 @@ class LedgerV10:
                 top_uas = [{"ua": r[0][:60], "hits": r[1], "ips": r[2]} for r in top_uas]
             except Exception:
                 top_uas = []
-            # v28.2: QUEM são os "avaliadores"? Sem isto não dá para saber se os
-            # previews vêm de agentes de verdade avaliando antes de comprar, ou
-            # do mesmo poller que já domina as sondagens. É a diferença entre
-            # "temos prospectos" e "temos um robô curioso".
             try:
                 preview_uas = c.execute(
                     "SELECT COALESCE(NULLIF(ua,''),'(sem user-agent)') u, COUNT(*) n, "
@@ -1443,7 +1255,6 @@ class LedgerV10:
                     (now - 86400,)).fetchone()[0]
             except Exception:
                 preview_blocked = 0
-            # v29: O QUE AS MÁQUINAS PEDEM ------------------------------------
             try:  # caminhos inexistentes = pedidos de produto
                 demand_404 = [{"path": r[0], "hits": r[1], "ips": r[2], "ua": (r[3] or "")[:40],
                                **_demand_classify_ml(r[0])}
@@ -1475,8 +1286,6 @@ class LedgerV10:
         return {
             "total_usdc":     round(total, 6),
             "today_usdc":     round(today, 6),
-            # v42.1 FIX: /live/api lia a chave "revenue_24h", que nunca existiu
-            # — a página pública mostrava "$0.0000" com 32 settlements no ar.
             "revenue_24h":    round(today, 6),
             "hour_usdc":      round(hour, 6),
             "requests_24h":   reqs,
@@ -1507,17 +1316,10 @@ class LedgerV10:
     _req_kind_ready = False
     def log_request(self, endpoint: str, ok: bool, latency_ms: int, ip: str,
                     kind: str = "probe", ua: str = "", params: str = ""):
-        # v24.5: kind classifica o tráfego — 'probe' (scanner/402), 'preview'
-        # (avaliador usando ?preview=1) ou 'paid' (venda liquidada/créditos/JWT).
-        # ua identifica QUEM sonda (scanner conhecido × cliente novo).
         with self.lock, self._conn() as c:
             if not LedgerV10._req_kind_ready:
                 for ddl in ("ALTER TABLE requests ADD COLUMN kind TEXT DEFAULT ''",
                             "ALTER TABLE requests ADD COLUMN ua TEXT DEFAULT ''",
-                            # v29: o QUE a máquina pediu — parâmetros e caminhos
-                            # inexistentes. Sem isto sabíamos QUEM sondava, mas
-                            # não o que procurava. É a diferença entre contar
-                            # visitantes e entender demanda.
                             "ALTER TABLE requests ADD COLUMN params TEXT DEFAULT ''"):
                     try:
                         c.execute(ddl)
@@ -1543,7 +1345,6 @@ class LedgerV10:
             c.execute("DELETE FROM replay WHERE hash=?", (h,))
             return c.rowcount > 0
 
-    # ---------- SIGNALS ----------
     def add_signal(self, symbol: str, action: str, confidence: float, price: float):
         with self.lock, self._conn() as c:
             c.execute("INSERT INTO signals(ts,symbol,action,confidence,price_at) "
@@ -1589,7 +1390,6 @@ class LedgerV10:
         if win >= 40: return 0.8
         return 0.5
 
-    # ---------- CACHE ----------
     def cache_get(self, key: str, ttl: int):
         with self._conn() as c:
             r = c.execute("SELECT value, ts FROM cache WHERE key=?", (key,)).fetchone()
@@ -1608,7 +1408,6 @@ class LedgerV10:
             c.execute("INSERT OR REPLACE INTO cache(key,value,ts) VALUES(?,?,?)",
                       (key, json.dumps(value, default=str), int(time.time())))
 
-    # ---------- JWT SESSIONS ----------
     def jwt_save(self, jti: str, payer: str, endpoint: str, tx_sig: str, ttl: int):
         with self.lock, self._conn() as c:
             now = int(time.time())
@@ -1633,7 +1432,6 @@ class LedgerV10:
                 (jti, endpoint)).fetchone()
         return {"payer": r[0] or "", "tx": r[1] or ""} if r else {}
 
-    # ---------- PEERS ----------
     def upsert_peer(self, node_id: str, url: str, public_key: str, win_rate: float = 50.0):
         with self.lock, self._conn() as c:
             c.execute(
@@ -1655,7 +1453,6 @@ class LedgerV10:
             c.execute("INSERT INTO sweeps(ts,amount,tx_sig,dest) VALUES(?,?,?,?)",
                       (int(time.time()), amount, tx_sig, dest))
 
-    # ---------- REFERRAL ----------
     def create_referral(self, code: str, owner: str) -> bool:
         with self.lock, self._conn() as c:
             try:
@@ -1679,7 +1476,6 @@ class LedgerV10:
             c.execute("UPDATE referrals SET total_commission = total_commission + ? WHERE code=?",
                       (commission, code))
 
-    # ---------- STAKE ----------
     def add_stake(self, staker: str, amount: float, tx_sig: str):
         with self.lock, self._conn() as c:
             c.execute("INSERT INTO stakes(staker, amount, ts, tx_sig) VALUES(?,?,?,?)",
@@ -1692,7 +1488,6 @@ class LedgerV10:
             return c.execute("SELECT * FROM stakes WHERE status='active'").fetchall()
 
 
-    # --- v23: replay SEGURO (marca só após settle — não bloqueia retry legítimo) ---
     def replay_seen(self, h: str) -> bool:
         with self._conn() as c:
             return c.execute("SELECT 1 FROM replay WHERE hash=?", (h,)).fetchone() is not None
@@ -1862,7 +1657,6 @@ class LedgerV10:
                 pass
         return True, "ok"
 
-    # --- v23: CRÉDITOS / PASSES ---
     def api_key_create(self, key: str, payer: str, plan: str, balance_usd: float,
                        ttl_seconds: int, tx_sig: str = ""):
         with self.lock, self._conn() as c:
@@ -1956,9 +1750,6 @@ class LedgerV10:
 
 LEDGER = LedgerV10(DB_PATH)
 
-# ============================================================================
-# 5. SOLANA CLIENT
-# ============================================================================
 
 class SolanaClientV10:
     def __init__(self):
@@ -2122,47 +1913,14 @@ class SolanaClientV10:
 
 SOL = SolanaClientV10()
 
-# ============================================================================
-# 5b. FACILITATOR CLIENT
-# ============================================================================
 
-# v24.9: timeouts curtos — cada request pendurado segura uma thread do
-# gunicorn (2 workers x 6 threads). Um facilitator lento derrubava a
-# latência do nó inteiro (manifests chegaram a 25s nos logs).
 FAC_VERIFY_TIMEOUT = int(os.environ.get("FAC_VERIFY_TIMEOUT", "8"))
 FAC_SETTLE_TIMEOUT = int(os.environ.get("FAC_SETTLE_TIMEOUT", "15"))
 
-# ---------------------------------------------------------------------------
-# v48.17.7-KEYLANE — AUTENTICAÇÃO MERCHANT PAYAI (JWT Ed25519)
-#
-# A auditoria de 03/10 provou (diff forense 48.16.6↔48.17.6: zero linhas do
-# caminho de pagamento alteradas) que o 403 do Phantom NÃO era regressão de
-# código: é o free tier do PayAI, que a doc oficial confirma ser LIFETIME —
-# 1.000 créditos por receiving wallet, SEM reset diário/mensal, e hosts
-# compartilhados (o egresso da Railway) drenam um pool coletivo que esgota
-# antes. Ou seja: sem credencial, o rail PayAI não volta sozinho NUNCA.
-#
-# A saída documentada (docs.payai.network/x402/facilitators/authentication):
-# credencial = key id + secret (Ed25519 PKCS#8/DER base64, prefixo opcional
-# "payai_sk_"); cada request leva Authorization: Bearer <JWT> com
-# {alg:EdDSA, kid}, {sub, iss:"payai-merchant", iat, exp=iat+120, jti:uuid4}.
-# Autenticado, o settle debita os créditos DA CONTA (~$0.00152 Solana /
-# ~$0.00231 Base por settle, tabela viva em facilitator.payai.network/pricing)
-# em vez do pool do host — imune ao free_tier_exhausted de terceiros.
-# Compra: merchant.payai.network (humano) ou vending x402 pelo próprio agente
-# (a partir de $1; a carteira que PAGA vira a dona da conta — o payTo do nó
-# NÃO precisa assinar nada). Créditos nunca expiram.
-#
-# Falha de credencial NÃO pode derrubar o nó nem trocar o erro: a chave é
-# validada UMA vez no boot; se inválida/parcial, a auth desliga com log claro
-# e o nó segue anônimo (pool). JWT cacheado 90s (refresh 30s antes do exp).
-# Zero dependências novas — `cryptography` já assina o JWT da CDP aqui.
-# ---------------------------------------------------------------------------
 PAYAI_API_KEY_ID     = os.environ.get("PAYAI_API_KEY_ID", "").strip()
 PAYAI_API_KEY_SECRET = os.environ.get("PAYAI_API_KEY_SECRET", "").strip()
 _PAYAI_JWT_CACHE = {"token": None, "exp": 0.0}
 _PAYAI_KEY_OBJ   = {"key": None, "tried": False}
-# estado público p/ /health/providers e para o log do disjuntor
 PAYAI_AUTH = {"configured": bool(PAYAI_API_KEY_ID and PAYAI_API_KEY_SECRET),
               "ok": False}
 
@@ -2232,7 +1990,6 @@ class FacilitatorClient:
         self.url = url.rstrip("/")
         self.is_cdp = "cdp.coinbase.com" in self.url
         self.is_payai = "payai" in self.url   # v48.17.7: lane autenticada
-        # v44.7.0: rótulo por facilitador (log e 402 carimbam quem recusou)
         self.tag = ("CDP" if self.is_cdp else
                     "GoPlausible" if "goplausible" in self.url else "PayAI")
 
@@ -2291,8 +2048,6 @@ class FacilitatorClient:
             if tok:
                 h["Authorization"] = f"Bearer {tok}"
         elif self.is_payai:
-            # v48.17.7-KEYLANE: com key+secret configuradas, verify/settle saem
-            # pela lane autenticada (créditos da conta) em vez do pool grátis.
             tok = _payai_jwt()
             if tok:
                 h["Authorization"] = f"Bearer {tok}"
@@ -2307,17 +2062,11 @@ class FacilitatorClient:
         try:
             hdrs = self._headers("POST", "/verify")
             r = requests.post(f"{self.url}/verify", json=body, headers=hdrs, timeout=FAC_VERIFY_TIMEOUT)
-            # v21.5: retry único para 5xx transitório do facilitator
             if r.status_code >= 500:
                 time.sleep(1.5)
                 hdrs = self._headers("POST", "/verify")
                 r = requests.post(f"{self.url}/verify", json=body, headers=hdrs, timeout=FAC_VERIFY_TIMEOUT)
             if not r.ok:
-                # v48.9.28-HYGIENE: o log levava o paymentPayload INTEIRO
-                # (600 chars) — inclui a assinatura EIP-3009 do comprador.
-                # Assinatura em log público de plataforma é material de
-                # replay se o settle ainda não aconteceu. Agora: só o hash
-                # do payload (rastreável) + metadados não sensíveis.
                 try:
                     _ph = hashlib.sha256(json.dumps(body, sort_keys=True,
                                          default=str).encode()).hexdigest()[:16]
@@ -2330,9 +2079,6 @@ class FacilitatorClient:
                 return False, f"facilitator-{r.status_code}:{r.text[:300]}", {}
             data = r.json() if r.text else {}
             _ok = bool(data.get("isValid") or data.get("valid"))
-            # v48.9.13-V1FIX: 200 com isValid=false também carrega o motivo
-            # real (ex.: insufficient_funds) — sem este log o attempt v1
-            # falhava invisível e só se via o erro do attempt de fallback.
             if not _ok:
                 log.info(f"ℹ️ facilitator /verify 200 isValid=false: "
                          f"reason={data.get('invalidReason') or data.get('reason')} "
@@ -2444,14 +2190,6 @@ class FacilitatorClient:
 
 FACILITATOR = FacilitatorClient(FACILITATOR_URL) if USE_FACILITATOR else None
 
-# ---------------------------------------------------------------------------
-# v48.9.19-CATALOG — veredito do Bazaar, persistido.
-# A CDP devolve o header EXTENSION-RESPONSES em verify/settle dizendo se o
-# metadata de discovery foi "processing" ou "rejected" (docs oficiais
-# x402/bazaar, 24/set/2026). Guardamos o último em disco para o operador ver
-# em /bazaar-status em vez de garimpar logs. Falha de escrita nunca derruba
-# um settle — por isso o try/except total.
-# ---------------------------------------------------------------------------
 _BAZAAR_EXT_PATH = HOME_DIR / "bazaar_ext_last.json"
 
 def _bazaar_ext_note(header_value: Optional[str], sent_resource: bool) -> None:
@@ -2472,8 +2210,6 @@ def _bazaar_ext_last() -> dict:
     except Exception:
         return {"extension_responses": None, "note": "nenhum settle CDP desde o boot desta versão"}
 
-# v21.13: facilitator CDP dedicado para a rail Base — settles via CDP indexam
-# o endpoint automaticamente no x402 Bazaar da Coinbase (descoberta de agentes).
 CDP_FACILITATOR_URL = os.environ.get(
     "CDP_FACILITATOR_URL", "https://api.cdp.coinbase.com/platform/v2/x402").strip()
 CDP_FAC = (FacilitatorClient(CDP_FACILITATOR_URL)
@@ -2484,8 +2220,6 @@ else:
     _cdp_reason = ("CDP_API_KEY_ID ausente" if not CDP_API_KEY_ID
                    else "CDP_API_KEY_SECRET ausente")
     log.info(f"🏪 CDP/Bazaar desabilitado: {_cdp_reason}")
-# v44.7.0: GoPlausible — rail Algorand (obrigatório p/ o Global x402 Challenge;
-# settles por ele alimentam o leaderboard da competição).
 GO_FAC = FacilitatorClient(GO_FACILITATOR_URL) if ENABLE_ALGO else None
 if GO_FAC:
     log.info(f"🟣 GoPlausible habilitado p/ Algorand: {GO_FACILITATOR_URL} "
@@ -2495,21 +2229,9 @@ elif not ALGO_PAYTO:
 if FACILITATOR:
     log.info(f"🤝 Facilitator habilitado: {FACILITATOR_URL}")
 
-# v44.3.3 — DISJUNTOR DA CDP (circuit breaker).
-# Enquanto a conta CDP estiver sem método de pagamento (payment_method_required
-# desde 04/ago) ou com chave inválida, TODA venda Base gastava ~1s chamando a
-# CDP condenada antes de cair no PayAI, e o log enchia de WARNINGs idênticos.
-# Agora: falhas DE CONTA (billing/auth — nunca falhas do PAGADOR, tipo saldo
-# insuficiente) alimentam um contador; em N seguidas o disjuntor ABRE por um
-# cooldown e as vendas Base vão direto ao PayAI. Ao fim do cooldown a CDP é
-# sondada de novo — no instante em que a conta for regularizada, o probe
-# passa, o disjuntor fecha sozinho e o Bazaar volta a indexar. Zero deploy.
 _CDP_BREAKER = {"fails": 0, "open_until": 0.0, "broken": False}
 CDP_BREAKER_THRESHOLD = int(os.environ.get("CDP_BREAKER_THRESHOLD", "3"))
 CDP_BREAKER_COOLDOWN  = int(os.environ.get("CDP_BREAKER_COOLDOWN", "3600"))
-# v48.17.2-WATCHDOG: disjuntor COMPARTILHADO entre os 4 workers do gunicorn via
-# arquivo no volume. Antes cada processo tinha o seu: 3 falhas × 4 workers = até
-# 12 vendas Base condenadas por cooldown. Agora um worker abre, todos respeitam.
 _CDP_BREAKER_FILE = HOME_DIR / "cdp_breaker.json"
 _CDP_BREAKER_SYNC = {"ts": 0.0}   # cache local do arquivo (10s)
 
@@ -2572,24 +2294,6 @@ def _cdp_note_success():
     except Exception:
         pass
 
-# ---------------------------------------------------------------------------
-# v48.17.6-RAILGUARD — DISJUNTOR PAYAI (espelho do da CDP)
-#
-# Produção 03/10 03:04 UTC: o PayAI passou a devolver 403 em TODO settle —
-# "free_tier_exhausted: This resource host or client IP has exhausted its
-# pooled free-credit allowance" (o pool de créditos grátis é compartilhado
-# entre os merchants atrás do mesmo host/IP — o egresso compartilhado do
-# Railway esgota rápido). Com a CDP já em disjuntor (payment-method-required),
-# os DOIS rails ficaram mortos: 177 vendas perdidas em 8,5h, cada uma pagando
-# ~2 round-trips de facilitator antes de falhar.
-#
-# Igual ao da CDP: falha de CONTA (free_tier_exhausted / 401 / 403) abre o
-# disjuntor compartilhado (/data/payai_breaker.json — os 4 workers respeitam),
-# settle seguinte nem tenta (comprador não espera falha certa) e, com os dois
-# rails abertos, o 402 passa a carregar o rail manual (ver _with_manual_rail).
-# Cooldown menor que o da CDP (30min): a cadência de reset do free tier é
-# desconhecida — sondar mais cedo custa 1 request e pode salvar a hora.
-# ---------------------------------------------------------------------------
 _PAYAI_BREAKER = {"fails": 0, "open_until": 0.0, "broken": False}
 PAYAI_BREAKER_THRESHOLD = int(os.environ.get("PAYAI_BREAKER_THRESHOLD", "3"))
 PAYAI_BREAKER_COOLDOWN  = int(os.environ.get("PAYAI_BREAKER_COOLDOWN", "1800"))
@@ -2618,9 +2322,6 @@ def _payai_breaker_write_shared():
         pass
 
 def _payai_failure_is_account_level(reason) -> bool:
-    # free_tier_exhausted = pool de créditos do host esgotado (conta/host, não
-    # do pagador). 401/403 do PayAI também são de conta. Saldo do comprador e
-    # assinatura inválida voltam como 200 isValid=false ou 400 — NUNCA 403.
     r = str(reason or "").lower()
     return ("free_tier_exhausted" in r or "free-credit" in r
             or "facilitator-401" in r or "facilitator-403" in r)
@@ -2638,8 +2339,6 @@ def _payai_note_failure(reason):
         _PAYAI_BREAKER["broken"] = True
         _PAYAI_BREAKER["fails"] = 0
         _payai_breaker_write_shared()
-        # v48.17.7: a ação correta depende de haver lane autenticada — sem key
-        # o free tier é LIFETIME e não volta; com key, é a conta que zerou.
         _fix = ("créditos da CONTA zerados — recarregue em "
                 "merchant.payai.network (ou vending x402 pelo agente)." if PAYAI_AUTH["ok"]
                 else "pool grátis LIFETIME esgotado (não reseta) — crie key+créditos: "
@@ -2707,9 +2406,6 @@ def _with_manual_rail(resp, endpoint: str):
     except Exception:
         return resp
 
-# ============================================================================
-# 6. MARKET DATA
-# ============================================================================
 
 class Market:
     @staticmethod
@@ -2752,16 +2448,6 @@ class Market:
     @classmethod
     def binance_24h(cls):
         def f():
-            # v44.3.1 — FONTE MORTA NÃO PODE VIRAR PRODUTO VAZIO.
-            # api.binance.com responde 451 (região restrita) para vários IPs de
-            # cloud — inclusive o do Railway. Com r.ok=False o código devolvia
-            # [] e /anomalias, /arbitrage e /forex-arbitrage serviam listas
-            # vazias PAGAS. Agora: 5 hosts Binance e, se todos falharem,
-            # CoinGecko /coins/markets normalizado para o MESMO shape
-            # (symbol *USDT, priceChangePercent, quoteVolume, lastPrice).
-            # v44.6.0: data-api.binance.vision é o espelho PÚBLICO de market
-            # data da própria Binance (só /api/v3/*, sem conta/saque) e não
-            # sofre o 451 geo-regulatório do host principal — vai primeiro.
             for host in ("https://data-api.binance.vision",
                          "https://api.binance.com", "https://api1.binance.com",
                          "https://api2.binance.com", "https://api3.binance.com",
@@ -2910,9 +2596,6 @@ class Market:
             return {}
         return cls._cached("jito_mev", f, 30) or {}
 
-# ============================================================================
-# 7. GEOIP
-# ============================================================================
 
 _GEO_CACHE: Dict[str, Tuple[str, int]] = {}
 
@@ -2936,32 +2619,18 @@ def is_geo_blocked(ip: str) -> bool:
     cc = geo_country(ip)
     return cc in GEO_BLOCKED_COUNTRIES
 
-# ============================================================================
-# 8. LLM (com DeepSeek e Claude)
-# ============================================================================
 
-# v39: modelos vêm de env. O motivo é operacional, não estético — a v38 tinha
-# "gemini-2.0-flash-exp" fixo no código; esse modelo foi RETIRADO pelo Google e
-# devolvia 404 em toda chamada. Com o Groq no teto de TPD ao mesmo tempo, a
-# cadeia inteira caía e os endpoints pagos entregavam texto vazio. Modelo em
-# env = troca sem redeploy quando um provedor descontinua algo.
 DEEPSEEK_MODEL = os.environ.get("DEEPSEEK_MODEL", "deepseek-chat")
 CLAUDE_MODEL   = os.environ.get("CLAUDE_MODEL",   "claude-sonnet-4-5")
 MOONSHOT_MODEL   = os.environ.get("MOONSHOT_MODEL",   "kimi-k2.5")
 OPENROUTER_MODEL = os.environ.get("OPENROUTER_MODEL", "deepseek/deepseek-chat")
 GROQ_MODEL     = os.environ.get("GROQ_MODEL",     "").strip()
-# v47.1.0: sem default fixo. Vazio = descoberta automatica via /models.
-# Registro: llama-3.3-70b-versatile foi DESCOMISSIONADO pela Groq em
-# 2026-08-16 e derrubou a sintese por 2 dias. Modelo fixo nunca mais.
-# v39.6: sem default. Vazio = descoberta automática via ListModels.
 GEMINI_MODEL   = os.environ.get("GEMINI_MODEL",   "").strip()
 
 LLM_CACHE_TTL  = int(os.environ.get("LLM_CACHE_TTL", "900"))
 _LLM_CACHE: Dict[str, tuple] = {}
 _LLM_CACHE_LOCK = threading.Lock()
 
-# Saúde por provedor: usado pelo gate de pré-pagamento. Um provedor entra em
-# quarentena após falhar e volta sozinho depois de _LLM_COOLDOWN segundos.
 _LLM_COOLDOWN  = int(os.environ.get("LLM_COOLDOWN", "300"))
 _LLM_DOWN_UNTIL: Dict[str, float] = {}
 _LLM_LAST_ERROR: Dict[str, str] = {}
@@ -2972,22 +2641,10 @@ class LLMUnavailable(Exception):
     """Nenhum provedor de LLM respondeu. Quem levanta isto NÃO deve cobrar."""
 
 
-# v39.4: HTTP 402/401 de um provedor não é falha transitória — é conta sem
-# saldo ou chave revogada. Observado em produção:
-#   LLM DeepSeek HTTP 402: {"error":{"message":"Insufficient Balance"}}
-# A quarentena de 300s fazia o node insistir a cada 5 minutos, indefinidamente,
-# numa conta que só volta quando ALGUÉM PAGA. Não é o node que resolve isso —
-# é o operador. Então: quarentena longa e alerta específico, uma vez.
 _BILLING_COOLDOWN = int(os.environ.get("LLM_BILLING_COOLDOWN", "21600"))  # 6 h
 _BILLING_ALERTED: Dict[str, float] = {}
 
 
-# v39.5: três tipos de falha, três tempos de espera. Num node de tier
-# gratuito essa distinção é o que separa "usa a cota inteira" de "queima a
-# cota em retries".
-#   transitória  — timeout, 500, rate limit POR MINUTO. Volta em minutos.
-#   cota diária  — TPD do Groq, RPD do Gemini. Só volta na virada do dia.
-#   cobrança     — 402/401. Só volta se um humano agir.
 _DAILY_COOLDOWN = int(os.environ.get("LLM_DAILY_COOLDOWN", "14400"))  # 4 h
 
 
@@ -3029,9 +2686,6 @@ def _llm_mark(provider: str, ok: bool, detail: str = "") -> None:
                       else _DAILY_COOLDOWN if diaria
                       else _LLM_COOLDOWN)
             if cobranca:
-                # v48.10.3: backoff persistente de billing — strikes em /data
-                # sobrevivem a redeploy; 6h→12h→18h→24h (cap 4 strikes).
-                # O 429 diário do free tier parava de gritar a cada boot.
                 try:
                     _bf = os.path.join(os.path.dirname(DB_PATH), "llm_billing_backoff.json")
                     _st = json.load(open(_bf)) if os.path.exists(_bf) else {}
@@ -3050,8 +2704,6 @@ def _llm_mark(provider: str, ok: bool, detail: str = "") -> None:
                     f"dia só gastaria requisições que já não existem.")
 
     if cobranca:
-        # Alerta uma vez por janela — o operador precisa saber, mas não a cada
-        # tentativa. Sem isto, a cadeia degrada em silêncio até cair inteira.
         agora = time.time()
         if agora - _BILLING_ALERTED.get(provider, 0) > _BILLING_COOLDOWN:
             _BILLING_ALERTED[provider] = agora
@@ -3114,54 +2766,10 @@ def llm_health_report() -> dict:
         }
 
 
-# ---------------------------------------------------------------------------
-# v39.5 — ROTEAMENTO PENSADO PARA TIER GRATUITO
-#
-# A cadeia da v39 era DeepSeek -> Claude -> Groq -> Gemini: ordem de quem PAGA
-# pelo melhor modelo. Este node roda em tier gratuito, e aí a lógica é outra —
-# a restrição não é qualidade, é COTA, e cada provedor tem uma cota diferente:
-#
-#   Groq   — rapidíssimo (~1s), mas o limite é TOKENS POR DIA. Os logs mostram
-#            429 de TPD repetidamente. Cada prompt longo come uma fatia enorme
-#            do orçamento diário.
-#   Gemini — 2.5 Flash tem cota diária folgada e aceita respostas longas; é
-#            mais lento, mas é o que aguenta volume.
-#
-# Então não faz sentido uma ordem fixa. Faz sentido rotear POR TAMANHO:
-# pedido curto vai no Groq (rápido e barato em tokens), pedido longo vai no
-# Gemini (onde o custo em tokens não derruba o dia inteiro). Assim o TPD do
-# Groq é gasto em dezenas de chamadas pequenas em vez de três relatórios.
-#
-# LLM_ORDER=gemini,groq força uma ordem fixa se você preferir.
-# ---------------------------------------------------------------------------
-# ---------------------------------------------------------------------------
-# v39.6 — DESCOBERTA DE MODELO GEMINI EM TEMPO DE EXECUÇÃO
-#
-# Terceira vez que um modelo Gemini fixo no código morre em produção:
-#   v38  gemini-2.0-flash-exp   -> 404, retirado
-#   v39  gemini-2.5-flash       -> 404 "no longer available to new users"
-# E não adianta olhar a documentação: o Google está aposentando modelos ANTES
-# da data publicada de shutdown — a página de ciclo de vida ainda listava o
-# 2.5 como disponível enquanto a API já recusava projetos novos.
-#
-# Chutar um quarto nome repetiria o erro. A própria mensagem de erro dá a
-# saída: "Call ModelService.ListModels". Então perguntamos à API quais
-# modelos ESTA chave pode usar, e escolhemos o melhor por preferência.
-# Resultado: quando o Google aposentar o próximo, o node se conserta sozinho
-# no próximo boot em vez de me esperar publicar um patch.
-# ---------------------------------------------------------------------------
 _GEMINI_RESOLVED: Optional[str] = None
 _GEMINI_RESOLVED_AT = 0.0
 _GEMINI_LOCK = threading.Lock()
 GEMINI_DISCOVERY_TTL = int(os.environ.get("GEMINI_DISCOVERY_TTL", "21600"))  # 6 h
-# v48.3.4: modelos que devolveram 404 "no longer available" ficam BANIDOS —
-# o ListModels da chave ainda os lista, então sem esta lista a redescoberta
-# re-escolhia o mesmo nome e o 404 voltava para sempre (loop silencioso).
-# v48.4.0 FIX: o set era só em memória — cada restart do Railway (todo
-# deploy) esquecia o banimento e repetia a MESMA falha 404 no primeiro
-# request pós-boot (foi exatamente o que aconteceu com 2.5-flash no log de
-# 18/set). Agora persiste em disco, então o node só erra uma vez na vida
-# de cada modelo aposentado, não uma vez por deploy.
 _GEMINI_BANNED_PATH = HOME_DIR / "gemini_banned.json"
 
 def _gemini_banned_load() -> set:
@@ -3180,12 +2788,6 @@ def _gemini_banned_add(nome: str) -> None:
 
 _GEMINI_BANNED: set = _gemini_banned_load()
 
-# Ordem de preferência por prefixo. Flash antes de Pro: cota gratuita maior e
-# latência menor; "lite" por último, é o degrau de qualidade mais baixo.
-# v48.4.0: 2.5-flash confirmado morto em produção (404 "no longer available
-# to new users" mesmo aparecendo no ListModels) — rebaixado na preferência
-# em vez de removido, porque uma chave mais antiga pode ainda ter acesso;
-# quem não tiver cai no banimento persistente acima e nunca mais tenta.
 _GEMINI_PREF = ("3.5-flash", "3.1-flash", "3-flash", "2.5-flash",
                 "flash", "flash-latest",
                 "3.1-pro", "3-pro", "2.5-pro", "pro-latest", "flash-lite")
@@ -3194,15 +2796,11 @@ _GEMINI_PREF = ("3.5-flash", "3.1-flash", "3-flash", "2.5-flash",
 def _gemini_pick(nomes: List[str]) -> Optional[str]:
     """Escolhe o melhor modelo disponível segundo a ordem de preferência."""
     limpos = [n.replace("models/", "") for n in nomes]
-    # v48.3.4: banidos por 404 neste processo nunca voltam a ser escolhidos.
     limpos = [n for n in limpos if n not in _GEMINI_BANNED]
-    # Descarta variantes que não servem para texto simples.
     limpos = [n for n in limpos if not any(
         t in n for t in ("embedding", "aqa", "imagen", "veo", "tts",
                          "image", "audio", "vision", "learnlm", "gemma"))]
     for pref in _GEMINI_PREF:
-        # v47.3.0: "lite" nunca casa por acidente com pref não-lite, e entre
-        # candidatos do mesmo pref a versão estável ganha da "-preview".
         candidatos = [n for n in limpos
                       if pref in n and ("lite" not in n or "lite" in pref)]
         estaveis = [n for n in candidatos if "preview" not in n]
@@ -3216,7 +2814,6 @@ def _gemini_pick(nomes: List[str]) -> Optional[str]:
 def gemini_model() -> str:
     """Modelo a usar agora. Descobre uma vez e cacheia por GEMINI_DISCOVERY_TTL."""
     global _GEMINI_RESOLVED, _GEMINI_RESOLVED_AT
-    # Override explícito ganha de tudo — para travar um modelo se preciso.
     fixo = os.environ.get("GEMINI_MODEL", "").strip()
     if fixo:
         return fixo
@@ -3243,27 +2840,14 @@ def gemini_model() -> str:
         log.warning(f"Gemini ListModels HTTP {r.status_code}: {r.text[:140]}")
     except Exception as e:
         log.warning(f"Gemini ListModels: {e}")
-    # Sem descoberta: o alias 'latest' é o que menos envelhece.
     return "gemini-flash-latest"
 
 
-# ---------------------------------------------------------------------------
-# v47.1.0 — DESCOBERTA DE MODELO GROQ EM TEMPO DE EXECUCAO
-#
-# Mesma licao do Gemini (v39.6), agora para o Groq: modelo fixo morre sem
-# aviso. A API /models devolve os modelos que ESTA chave pode usar; o node
-# escolhe o melhor por preferencia e cacheia. Quando a Groq aposentar o
-# proximo, o 400 de "decommissioned" limpa o cache e a proxima chamada ja
-# vai com o modelo novo (ver _try_groq). Zero deploy, zero madrugada caido.
-# ---------------------------------------------------------------------------
 _GROQ_RESOLVED: Optional[str] = None
 _GROQ_RESOLVED_AT = 0.0
 _GROQ_LOCK = threading.Lock()
 GROQ_DISCOVERY_TTL = int(os.environ.get("GROQ_DISCOVERY_TTL", "21600"))  # 6 h
 
-# Raciocinio forte primeiro (gpt-oss-120b e o substituto oficial do
-# llama-3.3-70b), depois alternativas rapidas/baratas. Filtra o que nao
-# serve para chat de texto (audio, visao, guardas, embeddings).
 _GROQ_PREF = ("gpt-oss-120b", "qwen3.6-27b", "qwen3-32b", "gpt-oss-20b",
               "llama-3.3", "llama-3.1", "llama", "qwen", "gpt-oss", "gemma")
 
@@ -3334,22 +2918,6 @@ def _groq_esquece():
 
 
 
-# ---------------------------------------------------------------------------
-# v48.15.0-BANDIT — ROTEADOR ADAPTATIVO ε-GREEDY (ML persistido em /data)
-#
-# A cadeia de provedores era uma heurística FIXA (tamanho do prompt decide
-# groq×gemini). Heurística fixa não aprende: se o Groq fica lento às 14h ou o
-# Gemini começa a devolver 503 intermitente, a fila continua a mesma. Agora
-# cada tentativa alimenta um bandit: recompensa = sucesso × fator de latência
-# (<2s=1.0, <8s=0.9, <20s=0.7, ≥20s=0.4; falha=0), EWMA α=0.15, persistido em
-# /data/llm_bandit.json (sobrevive a redeploy e é compartilhado por workers).
-# Na hora de rotear: com probabilidade ε (10%) embaralha — exploração, é como
-# o bandit descobre que um provedor se recuperou; senão ordena pela
-# recompensa aprendida. Provedor nunca visto entra com prior otimista (0.75)
-# para ser experimentado cedo. Quarentena (_LLM_DOWN_UNTIL) e LLM_ORDER
-# continuam mandando mais — o bandit só ordena quem está apto.
-# LLM_BANDIT=0 desliga; LLM_BANDIT_EPSILON ajusta a exploração.
-# ---------------------------------------------------------------------------
 _LLM_BANDIT: Dict[str, Dict[str, float]] = {}
 _LLM_BANDIT_LOCK = threading.Lock()
 _LLM_BANDIT_LAST_SAVE = {"ts": 0.0}
@@ -3357,12 +2925,6 @@ _LLM_BANDIT_ON = os.environ.get("LLM_BANDIT", "1") != "0"
 _LLM_BANDIT_EPS = float(os.environ.get("LLM_BANDIT_EPSILON", "0.10"))
 _LLM_BANDIT_ALPHA = float(os.environ.get("LLM_BANDIT_ALPHA", "0.15"))
 _LLM_BANDIT_PRIOR = 0.75
-# v48.27-CORTEX: QUARENTENA DE EXPLORAÇÃO. Provedor com evidência suficiente
-# (>= LLM_BANDIT_MIN_PULLS pulls) e recompensa >= DELTA abaixo do líder sai
-# da rota síncrona — o Gemini de 9,65s/reward 0,346 fabricava sozinho o
-# served_p95 de 8s do scorecard em ~2,8% das chamadas. A exploração ε segue
-# podendo testá-lo: se o provedor se recuperar, a recompensa sobe e ele
-# reabilita sozinho. LLM_BANDIT_QUARANTINE=0 restaura o comportamento antigo.
 _LLM_BANDIT_QUAR = os.environ.get("LLM_BANDIT_QUARANTINE", "1") != "0"
 _LLM_BANDIT_QUAR_DELTA = float(os.environ.get("LLM_BANDIT_QUAR_DELTA", "0.30"))
 LLM_BANDIT_MIN_PULLS = int(os.environ.get("LLM_BANDIT_MIN_PULLS", "8"))
@@ -3505,9 +3067,6 @@ _LLM_ORDER_ENV = [x.strip().lower() for x in
                   os.environ.get("LLM_ORDER", "").split(",") if x.strip()]
 
 
-# v48.11.0-GLOBAL: perfis de roteamento estilo ClawRouter. O comprador escolhe
-# o perfil por querystring (?profile=) ou pelo nome do modelo no body OpenAI —
-# a mesma feature que o BlockRun vende como produto, aqui embutida no /llm.
 _LLM_PROFILES = {
     "eco":     ["groq", "gemini", "ollama"],
     "fast":    ["groq", "gemini", "ollama"],
@@ -3526,9 +3085,6 @@ def _llm_chain(max_tokens: int) -> List[str]:
         gratis = ["groq", "gemini"]      # curto: Groq é mais rápido
     else:
         gratis = ["gemini", "groq"]      # longo: preserva o TPD do Groq
-    # Provedores pagos, se configurados, vêm antes — quem paga quer qualidade.
-    # v48.15.0-BANDIT: dentro de cada camada a ordem é APRENDIDA — o bandit
-    # põe primeiro quem vem respondendo rápido e sem falhar em produção.
     return _llm_bandit_order(pagos) + _llm_bandit_order(gratis) + ["ollama"]
 
 
@@ -3554,7 +3110,6 @@ class LLM:
         """Devolve texto do primeiro provedor que responder.
         String vazia significa 'nenhum provedor disponível' — nunca um
         placeholder que possa vazar para dentro de uma resposta paga."""
-        # v41: força inglês na saída (ver LLM_FORCE_ENGLISH no topo).
         if LLM_FORCE_ENGLISH and "Respond ONLY in" not in prompt:
             prompt += LLM_ENGLISH_SUFFIX
         ck = ""
@@ -3598,7 +3153,6 @@ class LLM:
             return None, f"HTTP {r.status_code}: {r.text[:160]}"
 
         def _try_moonshot():
-            # v48.11.0-GLOBAL: Moonshot/Kimi (api.moonshot.ai, OpenAI-compatible).
             r = requests.post("https://api.moonshot.ai/v1/chat/completions",
                 headers={"Authorization": f"Bearer {MOONSHOT_KEY}",
                          "Content-Type": "application/json"},
@@ -3611,8 +3165,6 @@ class LLM:
             return None, f"HTTP {r.status_code}: {r.text[:160]}"
 
         def _try_openrouter():
-            # v48.11.0-GLOBAL: OpenRouter — porta para 300+ modelos (DeepSeek,
-            # Qwen, GLM...) com UMA chave. Attribution headers sao exigidos.
             r = requests.post("https://openrouter.ai/api/v1/chat/completions",
                 headers={"Authorization": f"Bearer {OPENROUTER_KEY}",
                          "HTTP-Referer": _public_base(),
@@ -3627,9 +3179,6 @@ class LLM:
             return None, f"HTTP {r.status_code}: {r.text[:160]}"
 
         def _try_groq():
-            # v47.1.0: modelo descoberto em runtime + auto-recuperacao. Se a
-            # Groq disser que o modelo foi descomissionado, zera o cache e
-            # tenta UMA vez mais ja com o modelo recem-descoberto.
             for _tent in range(2):
                 _gm = groq_model()
                 r = requests.post("https://api.groq.com/openai/v1/chat/completions",
@@ -3638,9 +3187,6 @@ class LLM:
                     json=_groq_payload(_gm, prompt, max_tokens, temperature),
                     timeout=25)
                 if r.ok:
-                    # v47.2.0: reasoners podem devolver content vazio quando o
-                    # raciocinio come todo o orcamento. Se vier vazio, sobe o
-                    # teto e tenta de novo UMA vez antes de desistir.
                     _txt = r.json()["choices"][0]["message"].get("content") or ""
                     if not _txt.strip() and max_tokens < 1024:
                         log.warning(f"Groq '{_gm}': resposta vazia com max_tokens={max_tokens}; retentando com folga")
@@ -3658,26 +3204,12 @@ class LLM:
                     log.warning(f"Groq: modelo '{_gm}' descomissionado — redescobrindo")
                     _groq_esquece()
                     continue
-                # 429 aqui é quase sempre TPD (tokens por dia), não RPM.
                 return None, f"HTTP {r.status_code}: {r.text[:160]}"
             return None, "modelo descomissionado e redescoberta falhou"
 
         def _try_gemini():
-            # v48.14.2-RESILIENCE: a quota do Google e POR MODELO — a chave
-            # lista 44 modelos e o preferido pode estar billing-gated (429)
-            # enquanto outro flash responde normal. Em 404/429: bane o modelo
-            # (persistente), limpa o cache de descoberta e TROCA de modelo na
-            # mesma chamada, ate 3 tentativas. Erro so sobe ao _llm_mark quando
-            # os preferidos se esgotam — a mensagem final mantem "HTTP 429" +
-            # "billing" para a quarentena de provedor seguir valendo como
-            # ultimo recurso. GEMINI_MODEL fixo via env nao rotaciona.
             _gm = gemini_model()          # v39.6: descoberto, nao fixo
             for _rot in range(3):
-                # v47.2.0: os flash atuais "pensam" (thinking) antes de
-                # responder. Com maxOutputTokens baixo o thinking consome tudo
-                # e o texto vem vazio com HTTP 200 — mesma queda silenciosa do
-                # Groq. Piso de 512 e thinkingBudget=0 (flash) devolvem
-                # resposta direta.
                 _cfg = {"maxOutputTokens": max(int(max_tokens), 512),
                         "temperature": temperature}
                 if "flash" in _gm:
@@ -3690,9 +3222,6 @@ class LLM:
                               "generationConfig": _cfg},
                         timeout=25)
                 r = _gem_post()
-                # v48.10.1: 503 "high demand" aparece a cada ~8 min nos logs e
-                # e transitorio — 1 retry com jitter recupera a maioria sem
-                # descer a cadeia nem marcar o provedor. 500 idem.
                 if r.status_code in (500, 503):
                     time.sleep(0.7 + random.random() * 0.8)
                     r = _gem_post()
@@ -3703,14 +3232,9 @@ class LLM:
                         return None, f"no candidates: {str(j)[:120]}"
                     parts = (cands[0].get("content") or {}).get("parts") or []
                     if not parts:
-                        # v39.5: MAX_TOKENS ou filtro de seguranca devolvem
-                        # candidato sem parts. Antes isso estourava IndexError
-                        # e virava "excecao", escondendo a causa real.
                         return None, (f"empty parts, finishReason="
                                       f"{cands[0].get('finishReason')}")
                     return parts[0].get("text", ""), None
-                # Modelo retirado (404) ou sem quota (429): bane e troca na
-                # mesma chamada — o 429 deixa de derrubar o provedor inteiro.
                 if r.status_code in (404, 429):
                     global _GEMINI_RESOLVED
                     with _GEMINI_LOCK:
@@ -3743,9 +3267,6 @@ class LLM:
             return None, f"HTTP {r.status_code}"
 
         def _try_local():
-            # v48.13.0-INTEL: LLM LOCAL de ultimo recurso (Qwen3-0.6B GGUF via
-            # llama.cpp CPU, modelo em /data). Se TODOS os provedores externos
-            # falharem, o node ainda responde — degrade, nunca morra.
             _txt = _local_llm_complete(prompt, max_tokens=min(int(max_tokens), 220))
             return (_txt, None) if _txt else (None, "local llm indisponivel")
 
@@ -3776,16 +3297,9 @@ class LLM:
                 _llm_bandit_update(_prov, False, time.time() - _t0prov)
                 log.warning(f"LLM {_prov}: {e}")
 
-        # v39: nunca mais devolver um placeholder legível. A v38 devolvia
-        # "[LLM offline — configure ...]" e essa string ia PARA DENTRO da
-        # resposta paga de /analise e /relatorio. Vazio é honesto e o chamador
-        # decide se ainda há produto a entregar.
         log.error("🚨 LLM indisponível em todos os provedores configurados")
         return ""
 
-# ============================================================================
-# 9. RAG
-# ============================================================================
 
 class RAG:
     def __init__(self, path: Path):
@@ -3862,17 +3376,7 @@ class RAG:
 
 RAG_STORE = RAG(RAG_DB_PATH)
 
-# ============================================================================
-# 10. BRAIN — Todos os 42 endpoints monetizados
-# ============================================================================
 
-# --- v47.3.0: OFAC-SDN loader NUNCA bloqueia uma requisição paga ------------
-# Bug real de produção (ago/2026): a v47.2 baixava a lista síncrona com
-# timeout=40 DENTRO do request; quando o servidor da OFAC engatava, o
-# gunicorn matava o worker aos 45s (WORKER TIMEOUT no /whale-dossier).
-# Agora: responde imediatamente com o cache (memória ou disco) e o download
-# acontece em thread de fundo. Sem cache ainda? Responde "check-unavailable"
-# e a lista chega na próxima chamada — degradação honesta, worker vivo.
 _OFAC_CACHE = {"ts": 0, "text": ""}
 _OFAC_LOCK = threading.Lock()
 _OFAC_REFRESHING = {"on": False}
@@ -3923,11 +3427,6 @@ def _ofac_sdn_text() -> str:
     return ""
 
 
-# ---------------------------------------------------------------------------
-# v48.17.0-RADAR — helpers do /weather (produto pedido pelo radar de demanda:
-# 8 IPs/7d tomavam 404). WMO 4677 = tabela oficial de weather codes que a
-# Open-Meteo devolve; decodificar aqui evita que o cliente precise da tabela.
-# ---------------------------------------------------------------------------
 _WMO_CODES = {
     0: "clear sky", 1: "mainly clear", 2: "partly cloudy", 3: "overcast",
     45: "fog", 48: "depositing rime fog",
@@ -3959,7 +3458,6 @@ def _ig(lst, i):
 
 
 class Brain:
-    # ---------- CHEAP TIER ----------
     @staticmethod
     def fear_greed():
         d = Market.fear_greed()
@@ -4031,10 +3529,6 @@ class Brain:
             out.sort(key=lambda x: -abs(x["change_pct"]))
             return out
 
-        # v44.3.0: mercado quieto NÃO pode devolver vitrine vazia — era a
-        # amostra pública do endpoint e um count=0 parecia produto quebrado.
-        # Desce o limiar em degraus e sempre lista os maiores movimentos do
-        # dia, rotulados com o limiar de fato usado. Dado real, rótulo honesto.
         anomalies, limiar = [], 15
         for limiar in (15, 8, 3, 0):
             anomalies = _scan(limiar)
@@ -4064,7 +3558,6 @@ class Brain:
             "version": VERSION,
         }
 
-    # ---------- MID TIER ----------
     @staticmethod
     def analise():
         top = Market.top_coins(5)
@@ -4074,10 +3567,6 @@ class Brain:
                          for c in top])
         memory = RAG_STORE.retrieve("market analysis btc eth sol", k=3)
         memory_str = "\n".join([f"- {m[1][:120]}" for m in memory])
-        # v41.1: o prompt continuava em PT mesmo depois do patch v41. O sufixo
-        # LLM_FORCE_ENGLISH corrige o IDIOMA da saída, mas um prompt em PT com
-        # instrução em inglês no fim produz texto pior que um prompt nativo —
-        # o modelo gasta atenção reconciliando duas línguas em vez de analisar.
         prompt = (f"You are a crypto market analyst. Fear & Greed index: "
                   f"{fg.get('value')} ({fg.get('classification', 'n/a')}).\n"
                   f"Top 5 coins by market cap:\n{ctx}\n\n"
@@ -4087,9 +3576,6 @@ class Brain:
                   f"invalidate the read, then one line with the directional bias "
                   f"(bullish / neutral / bearish) and your confidence. "
                   f"No preamble. Not financial advice.")
-        # v39: era LLM.ask() cru. Quando a cadeia caía, a string
-        # "[LLM offline — configure ...]" ia direto para dentro da resposta
-        # PAGA e ainda era ingerida no RAG, envenenando as buscas seguintes.
         analysis = _ai_required(prompt, max_tokens=400)
         RAG_STORE.ingest("analise", analysis)
         return {"fear_greed": fg, "top_5": top, "analysis": analysis,
@@ -4113,8 +3599,6 @@ class Brain:
 
     @staticmethod
     def sentiment(symbol: str = None):
-        # v23: symbol parametrizável (market_brief chamava sem request ctx e
-        # devolvia o MESMO sentimento p/ BTC, ETH e SOL)
         if not symbol:
             try:
                 symbol = request.args.get("symbol", "BTC")
@@ -4139,8 +3623,6 @@ class Brain:
     @staticmethod
     def rugcheck():
         mint = request.args.get("mint", "").strip()
-        # v44.0.9: sem ?mint=, o default útil é o lançamento Solana mais fresco
-        # (o caso de uso real do produto) — nunca erro cru pago (v21.11).
         if not mint or len(mint) < 32:
             try:
                 _fresh = [t for t in (Market.pump_new() or [])
@@ -4227,7 +3709,6 @@ class Brain:
         return {"new_tokens": new[:25], "source": "dexscreener",
                 "version": VERSION}
 
-    # ---------- PREMIUM TIER ----------
     @staticmethod
     def arbitrage():
         b = {x["symbol"]: float(x.get("lastPrice", 0))
@@ -4277,7 +3758,6 @@ class Brain:
                          for c in top])
         memory = RAG_STORE.retrieve("crypto market trend", k=4)
         memory_str = "\n".join([f"- {m[1][:150]}" for m in memory])
-        # v41: prompt em inglês — o produto é vendido num mercado que compra em inglês.
         prompt = (f"Executive crypto report (5-minute read).\n"
                   f"Fear&Greed: {fg.get('value')} ({fg.get('classification')})\n"
                   f"Regime: {regime['regime']} (conf {regime['confidence']})\n"
@@ -4285,7 +3765,6 @@ class Brain:
                   f"Memory:\n{memory_str}\n\n"
                   f"Sections: 1) Macro summary, 2) Sectors in focus, 3) Risks, "
                   f"4) 3 trade ideas with clear triggers. In English.")
-        # v39: mesmo motivo de /analise — o relatório É o produto.
         report = _ai_required(prompt, max_tokens=1200)
         RAG_STORE.ingest("relatorio", report)
         return {"fear_greed": fg, "regime": regime, "anomalias_count": anom["count"],
@@ -4340,7 +3819,6 @@ class Brain:
         ?endpoint=/nome pula o roteamento (execução direta validada).
         ?target= preserva o caminho A2A externo para quando houver peer
         ativo (sem peer → erro com estorno, ensinando o modo task=)."""
-        # --- caminho legado: peer A2A externo explícito ---------------------
         target_peer = request.args.get("target", "").strip()
         if target_peer:
             peers = LEDGER.active_peers()
@@ -4364,7 +3842,6 @@ class Brain:
             except Exception as e:
                 return {"error": str(e), "version": VERSION}
 
-        # --- modo principal: roteamento semântico + EXECUÇÃO interna --------
         base = _public_base()
         task = (request.args.get("task") or request.args.get("skill")
                 or "").strip()[:300]
@@ -4372,8 +3849,6 @@ class Brain:
         if explicit and not explicit.startswith("/"):
             explicit = "/" + explicit
 
-        # Preços memoizados por request (get_dynamic_price consulta o ledger;
-        # 100+ leituras por chamada seriam desperdício).
         _price_memo = {}
         def _price_of(p):
             if p not in _price_memo:
@@ -4383,13 +3858,8 @@ class Brain:
                     _price_memo[p] = BASE_PRICES.get(p, 0.05)
             return _price_memo[p]
 
-        # Teto anti-arbitragem: só executamos endpoint cujo preço ≤ o pago
-        # nesta chamada — flagship nunca vaza com desconto via roteador.
         cap = _price_of("/agent-call")
 
-        # Nunca roteável: ele mesmo (recursão), o meta-concierge (passo
-        # anterior do funil), planos de crédito (billing, não produto), o
-        # POST-only OpenAI-compatible e o bootstrap (pago só no POST).
         _NOROUTE = {"/agent-call", "/api/v1/best",
                     "/v1/chat/completions", "/bootstrap-trust"}
         try:
@@ -4419,8 +3889,6 @@ class Brain:
         eligible_count = sum(1 for p in BASE_PRICES if _eligible(p))
 
         def _fail(reason, **extra):
-            # Qualquer falha AQUI volta como dict com "error" → o wrapper
-            # v48.10.2 converte em estorno-em-crédito automático pós-settle.
             body = {"error": reason, "routed": False,
                     "catalog_eligible": eligible_count,
                     "how_to_use": (f"GET {base}/agent-call?task=<plain English> "
@@ -4435,7 +3903,6 @@ class Brain:
                     "buy_direct": f"{base}{p}",
                     "human_checkout": f"{base}/pay{p}"}
 
-        # ---------- escolha do alvo ----------
         target, score, mode = None, None, "explicit"
         premium = None
         alts = []
@@ -4484,10 +3951,6 @@ class Brain:
                                            if p in BASE_PRICES],
                              tip=f"rephrase in plain English — or try free discovery: "
                                  f"{base}/discover?q={task[:80]}")
-            # anti-alucinação do roteador: match semântico fraco demais =
-            # executar um endpoint aleatório. Só se aplica ao cosseno puro —
-            # com rerank o cross-encoder já viu query+documento juntos, e no
-            # fallback keyword não há escala comparável.
             if (score is not None and isinstance(score, (int, float))
                     and mode.startswith("semantic") and "rerank" not in mode
                     and score < 0.28):
@@ -4496,7 +3959,6 @@ class Brain:
                              alternatives=[_alt_item(p) for p, _s in hits[:3]
                                            if p in BASE_PRICES])
 
-        # ---------- execução real ----------
         t0x = time.perf_counter()
         try:
             raw = ENDPOINT_HANDLERS[target]()
@@ -4506,7 +3968,6 @@ class Brain:
                          routed_to=target, detail=str(e)[:200])
         exec_ms = round((time.perf_counter() - t0x) * 1000, 1)
 
-        # Response cru (raríssimo) — passa como veio, com recibo no header.
         if isinstance(raw, Response):
             try:
                 raw.headers["X-Losbeto-Routed-To"] = target
@@ -4550,11 +4011,6 @@ class Brain:
     @staticmethod
     def onchain_credit():
         wallet = request.args.get("wallet", "").strip()
-        # v21.11 FIX: comprador pagou $0.12 e recebia {"error": "missing valid
-        # wallet"}. Índices de descoberta (B402 etc.) demovem sellers por fail
-        # rate — erro pago é veneno duplo. Sem ?wallet=, o default inteligente
-        # é pontuar a carteira do PRÓPRIO pagador (sabemos quem pagou!), com
-        # fallback para um exemplo documentado. Nunca mais erro cru pago.
         if not wallet or len(wallet) < 32:
             from flask import g as _g
             payer_ctx = str(getattr(_g, "losbeto_payer", "") or "").strip()
@@ -4606,7 +4062,6 @@ class Brain:
                             "direction": ("buy binance → sell ref"
                                           if spread > 0 else "buy ref → sell binance"),
                         })
-            # SOL DEX (Jupiter quote real) vs referência CoinGecko
             q = Market.jupiter_quote(USDC_MINT, WSOL_MINT, 100_000_000)  # 100 USDC → SOL
             sol_ref = cg.get("SOL")
             out_amt = (q or {}).get("outAmount")
@@ -4652,7 +4107,6 @@ class Brain:
                 "honesty": "diretório público de entidades conhecidas + on-chain real quando disponível",
                 "version": VERSION}
 
-    # ---------- ALPHA TIER ----------
     @staticmethod
     def copytrade():
         peers = LEDGER.active_peers()
@@ -4706,7 +4160,6 @@ class Brain:
             "version": VERSION,
         }
 
-    # --- Novos endpoints v12 (já incluídos) ---
     @staticmethod
     @staticmethod
     def _serper_search(q: str, num: int = 8):
@@ -4778,12 +4231,9 @@ class Brain:
         q = (request.args.get("q") or request.args.get("query") or "").strip()
         ts = int(time.time())
         if not q:
-            # v44.0.9: default = a pergunta mais pedida do radar (btc, 15 IPs
-            # distintos) — demonstra o produto em vez de erro cru pago.
             q = "bitcoin market today"
 
         sources, raw_bits = [], []
-        # Fonte 1: DuckDuckGo Instant Answer + tópicos relacionados
         try:
             r = requests.get("https://api.duckduckgo.com/",
                 params={"q": q, "format": "json", "no_html": 1, "skip_disambig": 1},
@@ -4800,14 +4250,11 @@ class Brain:
                                     "kind": "related"})
         except Exception as e:
             log.warning(f"research-brief ddg: {e}")
-        # v44.4.0 — Fonte 1.5: Google real via Serper enriquece a síntese
-        # (quando a chave existe). Snippets viram matéria-prima do brief.
         for s in (Brain._serper_search(q, num=5) or []):
             if s.get("snippet"):
                 raw_bits.append(s["snippet"])
                 sources.append({"title": (s.get("title") or "")[:90],
                                 "url": s.get("url"), "kind": "web"})
-        # Fonte 2: newswire de mercado quando a pergunta é de mercado/cripto
         _mk = any(k in q.lower() for k in ("bitcoin", "btc", "crypto", "market",
                   "ethereum", "solana", "stock", "token", "defi", "price"))
         if _mk:
@@ -4847,8 +4294,6 @@ class Brain:
         except Exception as e:
             log.debug(f"research-brief ai: {e}")
         if "brief" not in out:
-            # Degradação honesta: fontes organizadas valem o preço; síntese
-            # inventada, não.
             out["status"] = "sources_only"
             out["note"] = ("AI synthesis unavailable — returning the gathered "
                            "sources verbatim, organized. Nothing was invented.")
@@ -4930,8 +4375,6 @@ class Brain:
              or request.args.get("mint") or request.args.get("query") or "").strip()
         ts = int(time.time())
         if not q:
-            # v44.0.9: default = lançamento mais fresco (o caso de uso real) —
-            # nunca erro cru pago (v21.11).
             try:
                 _fresh = (Market.pump_new() or [])
                 q = _fresh[0].get("tokenAddress") or "SOL"
@@ -4948,8 +4391,6 @@ class Brain:
         except Exception as e:
             log.warning(f"token-intel upstream: {e}")
         if not pairs:
-            # Degradação honesta: sem dado não há relatório — e o gate v39 já
-            # impede cobrança quando isto vira padrão. Aqui, resposta clara.
             return {"token": q, "status": "no_data",
                     "note": ("No active DEX pair found for this token on the "
                              "tracked venues. Unknown or inactive asset."),
@@ -4966,7 +4407,6 @@ class Brain:
         age_days = round((ts - created / 1000) / 86400, 1) if created else None
         chg = (best.get("priceChange") or {})
 
-        # ---- núcleo determinístico: cada flag declara sua regra ------------
         flags, score = [], 100
         def _flag(flag, sev, penalty, detail):
             flags.append({"flag": flag, "severity": sev, "detail": detail})
@@ -5026,7 +4466,6 @@ class Brain:
             "source": "dexscreener (aggregated DEX data, live)",
             "ts": ts, "provider": "Losbeto/TokenIntel",
         }
-        # ---- veredito de IA (opcional, nunca bloqueia o produto) -----------
         try:
             verdict = _ai(
                 "You are a token risk analyst. Given this DEX data, write a "
@@ -5053,9 +4492,6 @@ class Brain:
         addr = (request.args.get("address") or request.args.get("wallet") or "").strip()
         ts = int(time.time())
         if not addr:
-            # v44.0.9 (padrão v21.11): default = a carteira do PRÓPRIO pagador
-            # (EVM ou Solana — o handler detecta a chain), com fallback para o
-            # exemplo documentado do nó. Nunca erro cru pago.
             from flask import g as _g
             _payer = str(getattr(_g, "losbeto_payer", "") or "").strip()
             addr = _payer if _payer else RECEIVE_ADDRESS
@@ -5204,10 +4640,6 @@ class Brain:
         O nome novo descreve o que o produto de fato faz.
         """
         ts = int(time.time())
-        # v21.10 FIX: comprador pagou e recebeu erro de parse — a API pública do
-        # Solscan devolve HTML/rate-limit sem aviso. Fonte primária agora é o
-        # Helius RPC (getTokenLargestAccounts), que é estável; Solscan vira
-        # fallback. Nunca mais entregar erro cru a quem pagou.
         usdc = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
         if HELIUS_KEY:
             try:
@@ -5242,7 +4674,6 @@ class Brain:
                             "provider": "Losbeto/SmartMoney"}
         except Exception as e:
             log.warning(f"holder_concentration solscan: {e}")
-        # Degradação honesta: nunca um traceback cru para quem pagou
         return {"top_usdc_holders": [], "token": "USDC",
                 "status": "upstream_degraded",
                 "note": "Fontes on-chain temporariamente indisponíveis — "
@@ -5304,8 +4735,6 @@ class Brain:
         name    = request.args.get("name", "").strip()
         ts = int(time.time())
         if not address and not name:
-            # v44.0.9 (padrão v21.11): default = a carteira do pagador,
-            # com fallback para o exemplo estável do nó. Nunca erro cru pago.
             from flask import g as _g
             _payer = str(getattr(_g, "losbeto_payer", "") or "").strip()
             address = _payer if _payer else RECEIVE_ADDRESS
@@ -5384,8 +4813,6 @@ class Brain:
         }
         feed_id = feeds.get(symbol, feeds["SOL"])
         try:
-            # v48.14.1: Hermes sem chave morreu — fonte primaria Pyth (com
-            # PYTH_API_KEY) ou fallback CoinGecko, rotulo honesto na resposta.
             px = _sym_price(symbol if symbol in feeds else "SOL")
             return {"symbol": symbol, "price_usd": round(px["price"], 6),
                     "confidence": px.get("conf"), "source": px["source"],
@@ -5393,7 +4820,6 @@ class Brain:
         except Exception as e:
             return {"symbol": symbol, "error": str(e), "ts": int(time.time())}
 
-    # ---------- v48.17.0-RADAR: WEATHER (demanda medida: 8 IPs/7d) ----------
     @staticmethod
     def weather():
         """GET /weather?city=São Paulo  |  ?lat=-23.55&lon=-46.63 — $0.01.
@@ -5510,7 +4936,6 @@ class Brain:
         except Exception as e:
             return {"error": str(e)[:120], "source": "open-meteo", "ts": ts}
 
-    # ---------- v24: GLOBAL MARKETS ----------
     @staticmethod
     def forex_rate():
         symbol = request.args.get("pair", "EUR/USD").upper()
@@ -5542,7 +4967,6 @@ class Brain:
     def commodity_price():
         symbol = request.args.get("symbol", "GOLD").upper()
         ts = int(time.time())
-        # v24.4: preços REAIS via futuros do Yahoo Finance (antes era tabela estática)
         futures = {"GOLD": ("GC=F", "Gold", "USD/oz"),
                    "SILVER": ("SI=F", "Silver", "USD/oz"),
                    "OIL_WTI": ("CL=F", "Crude Oil WTI", "USD/bbl"),
@@ -5566,8 +4990,6 @@ class Brain:
                                 "ts": ts, "provider": "Losbeto/Commodities", "version": VERSION}
                 except Exception as e:
                     log.debug(f"commodity {symbol}: {e}")
-        # v24.10: SEM tabela estática. Ouro 41% defasado (flagrado na auditoria do
-        # x402-list) é pior que admitir indisponibilidade honestamente.
         return {"symbol": symbol, "status": "unavailable",
                 "error": "No live commodity source reachable right now. Not charged for stale data.",
                 "ts": ts, "provider": "Losbeto/Commodities", "version": VERSION}
@@ -5578,7 +5000,6 @@ class Brain:
         a partir de data centers (Yahoo e Stooq bloqueiam IPs de nuvem, causa
         raiz da rejeição no x402-list). Basta UMA chave grátis configurada."""
         sym = symbol.upper()
-        # 1) Finnhub — free tier 60 req/min (finnhub.io/register)
         if FINNHUB_KEY:
             try:
                 r = requests.get("https://finnhub.io/api/v1/quote",
@@ -5593,8 +5014,6 @@ class Brain:
                                 "source": "Finnhub"}
             except Exception as e:
                 log.debug(f"finnhub {sym}: {e}")
-        # 2) Twelve Data — free tier 800 req/dia (twelvedata.com) — cobre ações,
-        #    forex e commodities (XAU/USD, WTI) no mesmo endpoint
         if TWELVEDATA_KEY:
             try:
                 r = requests.get("https://api.twelvedata.com/quote",
@@ -5610,7 +5029,6 @@ class Brain:
                                 "source": "Twelve Data"}
             except Exception as e:
                 log.debug(f"twelvedata {sym}: {e}")
-        # 3) Alpha Vantage — free tier 25 req/dia (alphavantage.co)
         if ALPHAVANTAGE_KEY:
             try:
                 r = requests.get("https://www.alphavantage.co/query",
@@ -5645,7 +5063,6 @@ class Brain:
                 if len(lines) < 2:
                     continue
                 cols = lines[1].split(",")
-                # SYMBOL,DATE,TIME,OPEN,HIGH,LOW,CLOSE,VOLUME
                 if len(cols) >= 7 and cols[6] not in ("N/D", "", "0"):
                     close = float(cols[6]); openp = float(cols[3]) if cols[3] not in ("N/D","") else close
                     chg = ((close - openp) / openp * 100) if openp else 0
@@ -5685,14 +5102,10 @@ class Brain:
             return {"symbol": symbol, "currency": q.get("currency", "USD"),
                     "exchange": q.get("exchange", ""), "ts": ts,
                     "provider": "Losbeto/Equities", "version": VERSION, **q}
-        # v24.10: honestidade — sem dado real, NÃO servimos zeros disfarçados.
         return {"symbol": symbol, "status": "unavailable",
                 "error": "No live quote source reachable right now. Not charged for stale data.",
                 "ts": ts, "provider": "Losbeto/Equities", "version": VERSION}
 
-    # v44.4.0 — ações SEM FRONTEIRA. (yahoo_suffix, stooq_suffix, nome da praça,
-    # carro-chefe default). Yahoo cobre todas; stooq onde tem suporte; o que
-    # faltar cai no "unavailable" honesto em vez de inventar número.
     WORLD_MARKETS = {
         "US": ("",    "us", "NYSE/Nasdaq",              "AAPL"),
         "BR": (".SA", None, "B3 (Sao Paulo)",           "PETR4"),
@@ -5741,7 +5154,6 @@ class Brain:
             mkt_label = market or "US"
 
         q = None
-        # chaveados só cobrem US com símbolo cru; fora de US vão direto às fontes
         if mkt_label == "US":
             q = Brain._keyed_quote(full)
         if not q:
@@ -5775,9 +5187,6 @@ class Brain:
         oficial normalizada — não por palpite disfarçado."""
         ts = int(time.time())
         today = datetime.fromtimestamp(ts, timezone.utc).strftime("%Y-%m-%d")
-        # (data, hora UTC, país, evento) — fontes oficiais:
-        # Fed: calendário FOMC 2026 publicado · BLS: Employment Situation,
-        # 1ª sexta do mês 12:30 UTC · BCB: calendário Copom 2026 publicado
         official = [
             ("2026-09-04", "12:30 UTC", "US", "BLS Employment Situation (Aug payrolls)"),
             ("2026-09-16", "18:00 UTC", "US", "FOMC Rate Decision"),
@@ -5859,7 +5268,6 @@ class Brain:
             except Exception as e:
                 log.warning(f"earnings_whisper AV: {e}")
 
-        # Sem provedor real: recusa a venda em vez de inventar.
         return ({"status": "unavailable", "charged": False,
                  "error": "Earnings data requires a live provider (Finnhub or "
                           "Alpha Vantage) and none is configured on this node. "
@@ -5900,14 +5308,11 @@ class Brain:
         fg = Market.fear_greed()
         regime = Brain.regime()
         forex = Brain.forex_rate()
-        # v41: era "Em português" — o produto é vendido em mercado inglês.
         prompt = (f"Executive global macro report (4 paragraphs). "
                   f"Fear&Greed: {fg.get('value')}. Regime: {regime.get('regime')}. "
                   f"Forex: EUR/USD {forex.get('rate', 0)}. "
                   f"Scenarios: Fed (hawkish/dovish), ECB, BoJ, PBOC. "
                   f"Geopolitical risks. Opportunities. In English.")
-        # v39: /global-macro não está em BASE_PRICES (não é vendido avulso),
-        # então degrada em vez de recusar — o snapshot já tem valor sozinho.
         report = _ai(prompt, max_tokens=800)
         return {"report": report or "AI report unavailable — snapshot below is complete.",
                 "ai_status": "ok" if report else "unavailable",
@@ -5916,7 +5321,6 @@ class Brain:
                 "disclaimer": "Heuristic analysis plus AI synthesis. Not financial advice."}
 
 
-    # --- Flagship bundles ---
     @staticmethod
     def market_brief():
         regime = Brain.regime()
@@ -5988,7 +5392,6 @@ class Brain:
         ts = int(time.time())
         target = request.args.get("token", "").strip()
 
-        # 1. Alvo: token informado, ou o launch mais recente com endereço Solana
         candidates = []
         if not target:
             for t in (Market.pump_new() or [])[:15]:
@@ -6004,7 +5407,6 @@ class Brain:
 
         checks, score = {}, 50  # 0 = seguro, 100 = fuja
 
-        # 2. On-chain (Helius): autoridade de mint, mutabilidade
         try:
             if HELIUS_KEY:
                 r = requests.post(
@@ -6021,7 +5423,6 @@ class Brain:
         except Exception as e:
             log.warning(f"launch_risk helius: {e}")
 
-        # 3. Concentração de holders (top-5)
         try:
             if HELIUS_KEY:
                 r = requests.post(
@@ -6038,7 +5439,6 @@ class Brain:
         except Exception as e:
             log.warning(f"launch_risk holders: {e}")
 
-        # 4. Liquidez + socials (DexScreener)
         pair_info = {}
         try:
             r = requests.get(
@@ -6073,10 +5473,8 @@ class Brain:
         verdict = ("EXTREME" if score >= 75 else "HIGH" if score >= 55
                    else "MEDIUM" if score >= 35 else "LOW")
 
-        # 5. Síntese LLM (com fallback determinístico honesto)
         brief, brief_source = "", "rule-based"
         try:
-            # v41: prompt em PT gerava brief em PT (visto na amostra do /try).
             prompt = (
                 "You are a memecoin risk analyst. Based on the data below, "
                 f"write a brief of AT MOST 4 sentences, direct and actionable, "
@@ -6160,9 +5558,6 @@ class Brain:
         votes = [r["vote"] for r in results.values()]
         tally = {v: votes.count(v) for v in ("BULLISH","NEUTRAL","BEARISH")}
         verdict = max(tally, key=tally.get)
-        # v39: o "chairman synthesis" é exatamente o que o catálogo vende em
-        # /council. Sem ele o produto vira uma contagem de votos heurísticos —
-        # então falha alto e o decorador estorna, em vez de entregar menos.
         chairman = _ai_required(
             f"You are the Chairman of a five-agent AI trading council. Votes on "
             f"{symbol}: {json.dumps(results, default=str)[:900]}. Synthesise the "
@@ -6179,11 +5574,6 @@ class Brain:
 
     @staticmethod
     def whale_dossier():
-        # v47.3.0: orçamento de tempo por request. A v47.2 chamava quatro
-        # subprodutos pesados em sequência e qualquer fonte externa lenta
-        # estourava os 45s do gunicorn — WORKER TIMEOUT real em produção
-        # (GET /whale-dossier, ago/2026). Agora cada etapa só roda se houver
-        # folga; sem folga, o cliente recebe nota honesta em vez de um 500.
         _t0 = time.time()
         _ORCAMENTO_S = 25.0
 
@@ -6272,9 +5662,6 @@ class Brain:
             "version": VERSION,
         }
 
-# ============================================================================
-# 11. PRICING DINÂMICO (PoI)
-# ============================================================================
 
 def get_dynamic_price(endpoint: str) -> float:
     base = PRICE_OVERRIDES.get(endpoint, BASE_PRICES.get(endpoint, 0.05))
@@ -6291,9 +5678,6 @@ def get_dynamic_price(endpoint: str) -> float:
     return round(base * max(0.5, min(3.0, poi)), 4)
 
 
-# ============================================================================
-# 12. JWT
-# ============================================================================
 
 def jwt_encode(payload: dict, secret: str = JWT_SECRET) -> str:
     header = base64.urlsafe_b64encode(b'{"alg":"HS256","typ":"JWT"}').decode().rstrip("=")
@@ -6319,12 +5703,8 @@ def jwt_decode(token: str, secret: str = JWT_SECRET) -> Optional[dict]:
         return None
 
 
-# ============================================================================
-# 13. SERVIDOR x402 v2 — SPEC COMPLIANT (com correção de headers)
-# ============================================================================
 
 app = Flask(__name__)
-# v21: habilita logs Flask para diagnóstico de deploy Railway
 if os.environ.get("OMEGA_QUIET", "").lower() == "true":
     app.logger.disabled = True
 
@@ -6333,16 +5713,9 @@ def _cors(resp):
     resp.headers["Access-Control-Allow-Origin"]   = "*"
     resp.headers["Access-Control-Allow-Headers"]  = (
         "X-PAYMENT,X-Payment,PAYMENT-SIGNATURE,Payment-Signature,"
-        # v48.9.10: X-API-Key/X-Welcome-Token — sem eles, um agente EM BROWSER
-        # compra a key e o preflight bloqueia o uso (CORS).
         "Authorization,Content-Type,X-Session-Token,X-API-Key,X-Welcome-Token"
     )
     resp.headers["Access-Control-Allow-Methods"]  = "GET,POST,OPTIONS,HEAD"
-    # v48.3.7 FIX: este hook global SOBRESCREVIA o Access-Control-Expose-Headers
-    # que cada caminho montou — o 402 perdia X-Plans/X-Cheapest-Plan, o pago
-    # perdia X-Next-Step/X-Savings-Tip, os créditos perdiam X-Plan-Expires-In/
-    # X-Plan-Renew/X-Credit-Low para qualquer agente em browser. Agora: UNIÃO
-    # da base global com o que a rota expôs (ordem preservada, sem duplicata).
     _base_expose = ["WWW-Authenticate", "X-PAYMENT-REQUIRED", "PAYMENT-REQUIRED",
                     "X-Session-Token", "X-Session-TTL", "X-402-Version"]
     _existing = [h.strip() for h in
@@ -6447,16 +5820,6 @@ def _cheapest_paid(base: str) -> dict:
     except Exception:
         return {"endpoint": f"{base}/pyth-price", "usd": "0.0030"}
 
-# ---------------------------------------------------------------------------
-# v44 — RECOMENDAÇÃO POR PAGADOR (personalização do lado da máquina).
-#
-# O comprador robô repete comportamento: quem comprou /br-curve tende a
-# querer /br-macro; quem comprou /token-intel tem uma carteira para perfilar.
-# Cada resposta paga agora carrega `recommended_next`: os próximos 2 produtos
-# MAIS PROVÁVEIS para ESTE pagador — histórico dele no ledger + afinidade de
-# tags + o que o mercado mais compra. Custo: um SELECT indexado por pagador.
-# É o cross-sell que um vendedor humano faria, embutido no JSON.
-# ---------------------------------------------------------------------------
 
 def _payer_bought(payer: str, limit: int = 60) -> set:
     if not payer:
@@ -6577,10 +5940,11 @@ def _canonical_network(value: str) -> str:
         "base": BASE_CAIP2,
         "solana": f"solana:{SOL_GENESIS}",
         "algorand": ALGO_CAIP2,
+        ALGO_CAIP2_FULL.lower(): ALGO_CAIP2,
         "polygon": "eip155:137",
         "arbitrum": "eip155:42161",
     }
-    return aliases.get(n.lower(), n.lower())
+    return str(aliases.get(n.lower(), n)).lower()
 
 
 def _network_matches(expected: str, actual: str) -> bool:
@@ -6666,9 +6030,6 @@ def _accepted_matches_requirement(payload: dict, requirement: dict) -> bool:
         return False
 
 ENDPOINT_PARAM_HINTS = {
-    # v34: o registro no x402scan avisou "Paid endpoint is missing an input
-    # schema" em /bootstrap-trust e /week-pass — os dois que não tinham nenhum
-    # parâmetro declarado. Todo endpoint pago precisa declarar algo.
     "/bootstrap-trust":   {"format": "json"},
     "/week-pass":         {"format": "json"},
     "/enterprise":        {"format": "json"},
@@ -6693,19 +6054,9 @@ ENDPOINT_PARAM_HINTS = {
     "/sec-filing":        {"query": "AAPL 10-K"},
     "/web-search":        {"q": "bitcoin macro outlook"},
     "/backtest":          {"symbol": "BTC", "strategy": "momentum"},
-    # v42: era o único pago sem schema declarado — o registrador da
-    # agentic.market marcava "Paid endpoint is missing an input schema".
     "/portfolio-stress":  {"positions": '[{"asset":"BTC","qty":1.5}]'},
 }
 
-# v48.18.3-PAYGUARD: parâmetros OBRIGATÓRIOS por endpoint. O checkout /pay
-# renderiza um cartão com estes campos PRÉ-PREENCHIDOS (exemplo funcional) e
-# o JS bloqueia a assinatura se algum obrigatório estiver vazio. Antes desta
-# versão, o caminho de carteira (EIP-3009/Solana) chamava o endpoint SEM
-# querystring: /br-doc respondia 400 DEPOIS do settle e o comprador recebia
-# estorno em crédito em vez do dado — aconteceu 2x em 07/out com o mesmo
-# comprador (dinheiro devolvido, venda perdida). Pré-preenchido, pagar sem
-# editar devolve 200 com o dado-exemplo — nunca estorno.
 ENDPOINT_REQUIRED_PARAMS = {
     "/br-doc":     {"doc": "00.000.000/0001-91"},
     "/br-cep":     {"cep": "01310100"},
@@ -6717,10 +6068,6 @@ ENDPOINT_REQUIRED_PARAMS = {
     "/agent-call": {"task": "fear and greed index"},
 }
 
-# v48.26.0-PREFLIGHT: paridade /pay ↔ API — o checkout pré-preenche (e o JS
-# bloqueia vazio) os mesmos obrigatórios que o preflight pré-402 agora valida
-# de graça. Todos os exemplos são FUNCIONAIS (pagou sem editar → 200): o BR
-# Code abaixo é o mesmo que os indexadores usam mensalmente com sucesso.
 ENDPOINT_REQUIRED_PARAMS.update({
     "/chain-tx":       {"hash": "0x694b13bd5dbe6a373272b4beebc10d434ebed396e335338ba9fc5e5ba5d0061e"},
     "/chain-balance":  {"address": "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045"},
@@ -6735,10 +6082,6 @@ ENDPOINT_REQUIRED_PARAMS.update({
                         "city": "PORTO ALEGRE", "amount": "0.10"},
 })
 
-# v48.18.4-VITRINE: endpoints com parâmetro FUNCIONAL que ainda caíam no
-# fallback {"format": "json"} — o Bazaar indexava um schema que não ensina o
-# agente a montar a chamada (CDP: "sem schemas explícitos, agentes descobrem
-# mas não conseguem chamar"). Exemplos = defaults reais dos handlers (200 ok).
 ENDPOINT_PARAM_HINTS.update({
     "/weather":           {"city": "Tokyo"},
     "/pyth-price":        {"symbol": "SOL"},
@@ -6769,7 +6112,6 @@ _PARAM_DESC = {
     "format": "Response format (json)",
 }
 
-# v44.4.0: nome de serviço alinhado ao fosso (<=32 chars, ASCII — regra Bazaar)
 SERVICE_NAME = os.environ.get("SERVICE_NAME", "Losbeto Market Intelligence")[:32]
 
 def _service_tags(endpoint: str) -> list:
@@ -6809,7 +6151,6 @@ def _bazaar_blob(endpoint: str) -> dict:
     params = dict(ENDPOINT_PARAM_HINTS.get(endpoint, {"format": "json"}))
 
 
-    # exemplo de saída: dado real que o warmer já mantém quente (custo zero)
     example_out = {}
     try:
         cached = (None if endpoint in _PREVIEW_REQUIRE_PAYMENT else
@@ -6831,10 +6172,6 @@ def _bazaar_blob(endpoint: str) -> dict:
     except Exception as e:
         log.debug(f"bazaar example {endpoint}: {e}")
 
-    # v44.9.1: endpoints POST com corpo JSON (ex.: /v1/chat/completions) — o
-    # blob padrão descreveria um GET com queryParams, e o x402scan avisava
-    # "Paid endpoint is missing an input schema". Aqui o método e o schema
-    # do corpo são declarados de verdade.
     _bs = ENDPOINT_BODY_SCHEMAS.get(endpoint) if "ENDPOINT_BODY_SCHEMAS" in globals() else None
     if _bs:
         return {
@@ -6864,14 +6201,6 @@ def _bazaar_blob(endpoint: str) -> dict:
         }
     props = {k: {"type": "string", "description": _PARAM_DESC.get(k, f"{k} parameter")}
              for k in params}
-    # v48.9.19-CATALOG: parâmetros FUNCIONAIS (tudo menos "format") são
-    # OBRIGATÓRIOS no schema. Docs CDP Bazaar (24/set/2026): "sem schemas
-    # explícitos, agentes descobrem o endpoint mas não conseguem montar uma
-    # chamada válida" — e o requisito de curadoria "agent-ready metadata"
-    # pede input schema completo. Com required=[], um agente chamava
-    # /research-brief sem ?q= e recebia 400 — chamada inválida construída a
-    # partir do NOSSO schema. O agente que segue o schema agora sempre monta
-    # uma chamada válida (pior caso: envia o exemplo — aceito e cobrado).
     _req_params = sorted(k for k in params if k != "format")
     return {
         "info": {
@@ -6881,7 +6210,6 @@ def _bazaar_blob(endpoint: str) -> dict:
         },
         "inputSchema": {"type": "object", "properties": props,
                         "required": _req_params},
-        # Shape legado exigido pelo validador @agentcash/discovery (extractSchemas2)
         "schema": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "type": "object",
@@ -6894,30 +6222,11 @@ def _bazaar_blob(endpoint: str) -> dict:
             },
             "required": ["input"]},
         "description": desc,
-        # v47.3.1: spec x402 v2 aceita title/tags/provider no bloco bazaar e
-        # buscas por tag só casam com quem declara (docs Kobaru/Bazaar). É
-        # aditivo — validadores antigos ignoram o que não conhecem.
         "title": endpoint.strip("/").replace("-", " ").title() + " — Losbeto",
         "tags": _service_tags(endpoint),
         "provider": {"name": SERVICE_NAME, "url": _public_base()},
     }
 
-# ---------------------------------------------------------------------------
-# v39 — CACHE DE DESAFIO (corrige uma venda perdida silenciosa)
-#
-# A v38 reconstruía o desafio no momento da liquidação:
-#     accepts = _build_402(endpoint).get_json()["accepts"]
-#     amount  = get_dynamic_price(endpoint)
-# Como get_dynamic_price() aplica o multiplicador PoI, que muda a cada venda
-# registrada, o preço podia MUDAR entre o 402 emitido e o pagamento chegar.
-# O cliente assinou uma autorização para o valor antigo; o facilitator recebia
-# requirements com o valor novo; verify() falhava e a venda se perdia sem
-# nenhum log que apontasse a causa.
-#
-# Agora o desafio emitido é guardado por endpoint com TTL igual ao
-# maxTimeoutSeconds do próprio desafio (300s). Na liquidação usamos o desafio
-# EMITIDO, não um recalculado.
-# ---------------------------------------------------------------------------
 _CHALLENGE_CACHE: Dict[str, tuple] = {}
 _CHALLENGE_LOCK = threading.Lock()
 CHALLENGE_TTL = int(os.environ.get("CHALLENGE_TTL", "300"))
@@ -6966,29 +6275,9 @@ def _challenge_recall(endpoint: str, rid: str = "") -> Optional[list]:
     return None
 
 
-# A implementação canônica de _challenge_recall é a anterior, vinculada a
-# endpoint + requestId e ao SQLite. Não redefinir aqui: uma versão legada por
-# endpoint anularia o isolamento entre compradores e quebraria a chamada v2.
 
 
-# ---------------------------------------------------------------------------
-# v39.7 — A OFERTA DE ASSINATURA VAI PARA DENTRO DO 402
-#
-# /pricing existe desde a v39.1 e nunca vendeu nada, por um motivo simples:
-# nenhum agente visita uma página. O momento em que a decisão de compra
-# acontece é EXATAMENTE quando o cliente recebe o 402 — ele está com a
-# carteira na mão, avaliando se aquele preço vale. É ali que a alternativa
-# precisa estar, não numa landing.
-#
-# Então todo desafio 402 passa a carregar um bloco "alternatives" dizendo, com
-# número: quantas chamadas deste mesmo endpoint pagam um passe, e onde comprar.
-# Um agente que planeja orçamento consegue decidir sem nenhuma chamada extra.
-# ---------------------------------------------------------------------------
 
-# v39.7 — GATILHO DE UPGRADE COM DADO REAL
-# Dizer "assine" para quem fez uma chamada é spam. Dizer, para quem já gastou
-# mais do que um passe custaria, exatamente quanto teria economizado, é
-# informação — e é o argumento mais forte que existe, porque é o dinheiro dele.
 _PAYER_SPEND: Dict[str, list] = {}
 _PAYER_LOCK = threading.Lock()
 UPSELL_WINDOW = int(os.environ.get("UPSELL_WINDOW", "604800"))  # v48.3: 7 dias
@@ -7034,9 +6323,6 @@ def _upsell_note(payer: str) -> Optional[dict]:
     2 chamadas, e nunca recomenda para as wallets do operador."""
     if not payer:
         return None
-    # v48.27-CORTEX: usava só OPERATOR_WALLETS — o payTo ALGORAND do próprio
-    # nó (MRVANO…) recebia "savings tip" 104×/dia. _self_pay_wallets cobre
-    # TODOS os endereços declarados do operador (recebedores + compradores).
     try:
         _own = _self_pay_wallets()
     except Exception:
@@ -7051,14 +6337,6 @@ def _upsell_note(payer: str) -> Optional[dict]:
         return None
     hist = [(0, gasto)] * 1  # compat: abaixo só len(hist)/soma importam
     agora = time.time()
-    # v39.7 — CORRIGIDO na verificação: a primeira versão recomendava o plano
-    # mais barato que o cliente já tinha ultrapassado, e isso dava conselho
-    # ERRADO. Quem gastou $3.15 ouvia "compre credits por $0.99" — mas credits
-    # dá $1.25 de saldo e não teria coberto nem metade. Um upsell que não se
-    # sustenta na conta do cliente é pior que nenhum upsell.
-    #
-    # Agora: o plano mais barato que REALMENTE teria coberto o gasto. Plano de
-    # saldo cobre até balance_usd; plano ilimitado cobre qualquer valor.
     candidatos = sorted(
         ((BASE_PRICES[ep], ep, cfg) for ep, cfg in CREDIT_PLANS.items()
          if ep in BASE_PRICES), key=lambda x: x[0])
@@ -7111,8 +6389,6 @@ def _subscription_offer(endpoint: str, unit_price: float) -> Optional[dict]:
             item["includes_mcp_live"] = True
         opcoes.append(item)
     opcoes.sort(key=lambda x: x["price_usdc"])
-    # v48.3.6-CONVERT: marca a opção de break-even mais cedo NESTE endpoint.
-    # Agente de orçamento não compara 8 planos — ele executa o recomendado.
     if opcoes:
         _best = min(opcoes, key=lambda x: x["breaks_even_after"])
         _best["recommended"] = True
@@ -7135,28 +6411,17 @@ def _subscription_offer(endpoint: str, unit_price: float) -> Optional[dict]:
 
 
 def _build_402(endpoint: str, price_override: float = None):
-    # v48.1: price_override serve UM desafio promocional (1ª compra reativa).
     amount_usdc = price_override if price_override else get_dynamic_price(endpoint)
     amount_atomic_sol = str(int(amount_usdc * 10 ** USDC_DECIMALS))
     amount_atomic_base = str(int(amount_usdc * 10 ** 6))
     base = _public_base()
     desc = _cap500(ENDPOINT_DESC.get(endpoint, f"Losbeto — {endpoint}"))
-    # v48.17.10-FUNNEL: um requestId por desafio, injetado no extra de TODOS os
-    # accepts. O cliente v2 copia o accept escolhido para accepted.extra do
-    # PaymentPayload — o elo probe→pagamento que faltava para medir conversão.
     _rid = secrets.token_hex(6)
 
-    # extra.feePayer é OBRIGATÓRIO no scheme "exact" da SVM (Solana) — sem isso,
-    # clientes x402 corretos (AgentCash, x402-fetch, etc.) rejeitam a payment requirement
-    # com "feePayer is required in paymentRequirements.extra for SVM transactions".
-    # v20: cadeia de fallback robusta.
     svm_extra = {}
     fee_payer = os.environ.get("SVM_FEE_PAYER_OVERRIDE", "").strip()
     if not fee_payer and FACILITATOR:
         fee_payer = FACILITATOR.get_svm_fee_payer()
-    # v20: Último recurso — usa o próprio signer do node como feePayer (o cliente
-    # ainda vai fechar a tx com um feePayer real do facilitator no momento do settle,
-    # mas o campo não pode faltar senão o AgentCash rejeita antes de tentar).
     if not fee_payer:
         fee_payer = WALLET.solana_address
     if fee_payer:
@@ -7174,11 +6439,6 @@ def _build_402(endpoint: str, price_override: float = None):
     }
     accepts = []
     if PREFER_BASE and ENABLE_BASE and BASE_PAYTO_EVM:
-        # v25.1: ordem dos accepts DECIDE a descoberta. Clientes x402 escolhem
-        # tipicamente accepts[0]; com Solana em 1º, os settles iam para o PayAI
-        # e NUNCA passavam pela CDP — e só a CDP cataloga no Bazaar (por isso
-        # apenas 5 dos 67 endpoints estavam indexados). Base primeiro = cada
-        # venda vira uma entrada de catálogo. Solana continua aceita em 2º.
         pass  # Base é inserida logo abaixo; Solana é anexada depois
     else:
         accepts.append(_sol_accept)
@@ -7190,36 +6450,24 @@ def _build_402(endpoint: str, price_override: float = None):
             "amount":            amount_atomic_base,
             "payTo":             BASE_PAYTO_EVM,
             "maxTimeoutSeconds": 300,
-            # v21.10 FIX: USDC em Base usa EIP-3009 (transferWithAuthorization);
-            # o cliente PRECISA do domínio EIP-712 (name/version do contrato)
-            # para assinar. Sem isso, TODO pagamento via Base falha no cliente:
-            # "EIP-712 domain parameters (name, version) are required".
             "extra":             {"name": "USD Coin", "version": "2",
                                   "requestId": _rid},
         })
     if PREFER_BASE and ENABLE_BASE and BASE_PAYTO_EVM:
         accepts.append(_sol_accept)      # Solana segue disponível, em 2ª opção
     if ENABLE_ALGO:
-        # v44.7.0-ALGORAND: 3ª opção de pagamento — USDC na Algorand mainnet
-        # (ASA 31566704, 6 casas decimais como Base/Solana) via GoPlausible.
-        # Requisito oficial do Global x402 Challenge: campo 'tag' dentro do
-        # extra. Posição 3 proposital: Base continua 1ª (indexação CDP/Bazaar)
-        # e Solana 2ª — Algorand soma, não canibaliza as rails que já rankeiam.
-        accepts.append({
-            "scheme":            "exact",
-            "network":           ALGO_CAIP2,
-            "asset":             ALGO_USDC_ASA,
-            "amount":            amount_atomic_base,
-            "payTo":             ALGO_PAYTO,
-            "maxTimeoutSeconds": 300,
-            "extra":             {"feePayer": ALGO_FEEPAYER,
-                                  "tag": "x402-global-challenge",
-                                  "requestId": _rid},
-        })
-    # v48.11.0-GLOBAL: 4a e 5a rails — USDC nativo na Polygon e na Arbitrum,
-    # EIP-3009 com o mesmo dominio do USDC de Base. amount reutiliza
-    # amount_atomic_base (USDC 6 decimais nas tres EVM). _accept_to_v1 devolve
-    # None para redes desconhecidas -> ficam v2-only no header, sem quebrar v1.
+        for algo_network in (ALGO_CAIP2, ALGO_CAIP2_FULL):
+            accepts.append({
+                "scheme":            "exact",
+                "network":           algo_network,
+                "asset":             ALGO_USDC_ASA,
+                "amount":            amount_atomic_base,
+                "payTo":             ALGO_PAYTO,
+                "maxTimeoutSeconds": 300,
+                "extra":             {"feePayer": ALGO_FEEPAYER,
+                                      "tag": "x402-global-challenge",
+                                      "requestId": _rid},
+            })
     if X402_POLYGON and BASE_PAYTO_EVM:
         accepts.append({
             "scheme":            "exact",
@@ -7242,53 +6490,23 @@ def _build_402(endpoint: str, price_override: float = None):
             "extra":             {"name": "USD Coin", "version": "2",
                                   "requestId": _rid},
         })
-    # v48.9.12-DUAL — O FIX DE COMPATIBILIDADE DECISIVO.
-    # Diagnóstico (23/09, teste com o client stock REAL, x402-fetch@1.2.0):
-    # o client v1 lê o CORPO do 402 e valida accepts[] contra o schema Zod v1
-    # (rede = nome curto "base"/"solana" + maxAmountRequired/resource/
-    # description/mimeType). Nosso corpo v2 (CAIP-2 "eip155:8453") lançava
-    # ZodError ANTES de qualquer lógica de pagamento — o desafio era
-    # ilegível para o client padrão da rede. O client v2 (@x402/fetch) lê o
-    # HEADER PAYMENT-REQUIRED primeiro e só aceita body com x402Version===1
-    # como fallback. Logo: header segue v2, corpo vira PaymentRequired v1
-    # puro, e acceptsV2 preserva o CAIP-2 para consumidores v2 de corpo.
     accepts_v1 = [x for x in (_accept_to_v1(a, endpoint) for a in accepts) if x]
-    # v48.32.0-ZEROWARN (x402lint P7): o linter lê o CORPO v1 do 402
-    # ("x402Version=1, accepts[2]" — evidência do scan 19/out) e marcava WARN
-    # "2 distinct payTos" (Base + Solana). Com Base ativa, o corpo v1 anuncia
-    # SÓ Base: um único payTo em toda superfície v1 = P7 fecha (100/100).
-    # NENHUM rail morre: Solana/Algorand/Polygon/Arbitrum seguem no header
-    # PAYMENT-REQUIRED (acceptsV2), na página /pay e no manual rail — e o
-    # verify/settle aceitam todas as chains independente do anúncio.
     if X402_V1_PRIMARY_ONLY and ENABLE_BASE and BASE_PAYTO_EVM:
         _v1_primary = [a for a in accepts_v1 if a.get("network") == "base"]
         if _v1_primary:
             accepts_v1 = _v1_primary
 
-    # v21 FIX: payload compatível com x402scan — campos da spec v2 + challenges
     payment_req = accepts[0] if accepts else {}
     _challenge_remember(endpoint, accepts)   # v39: usado na liquidação
-    # v48.17.10-FUNNEL: registra a emissão do desafio (INSERT OR IGNORE, GC de
-    # 30d a cada 200 inserções). Falha aqui JAMAIS pode derrubar um 402.
     try:
         LEDGER.funnel_challenge(_rid, endpoint)
     except Exception:
         pass
-    # v48.9.1 HOTFIX: o Railway roda Python 3.11 (imagem python:3.11-slim) e
-    # f-string NÃO aceita backslash dentro da expressão — SyntaxError no boot
-    # (o sandbox validava em 3.12, que aceita; o erro só aparecia no deploy).
-    # Por isso o pitch do anúncio é pré-computado aqui, fora da f-string.
-    # v48.9.11-PITCH HOTFIX: o corte era split(".") — qualquer descrição com
-    # decimal na 1ª frase ("pay $0.10…", "pay $0.99…") virava anúncio "pay $0"
-    # em TODO 402 de plano (a linha 'error' é nossa vitrine principal). Agora
-    # corta na fronteira de frase (". ") e nunca parte palavra no limite.
     _pitch = desc.split(". ")[0].strip()
     if len(_pitch) > 140:
         _pitch = _pitch[:140].rsplit(" ", 1)[0]
     _pitch = _pitch.replace("\u2014", "-").replace("\u2013", "-")
     _pitch = _pitch.encode("ascii", "ignore").decode()
-    # v48.9.23-BAZAARFIX: o blob é montado UMA vez aqui — além de ir ao campo
-    # extensions, ele alimenta o outputSchema V1 por accept (fix adiante).
     _bz_blob = _bazaar_blob(endpoint)
     if endpoint in _PREVIEW_REQUIRE_PAYMENT:
         _preview_ad = "On-chain payment required: no free execution on purchase endpoints"
@@ -7305,15 +6523,7 @@ def _build_402(endpoint: str, price_override: float = None):
         _try_free = [f"{base}{endpoint}?preview=1", f"{base}/try", f"{base}/sample",
                      f"{base}/losbeto-alpha", f"{base}/receipts"]
     payload = {
-        # v48.9.12-DUAL: o CORPO é um PaymentRequired v1 (o client stock v1 só
-        # lê o corpo; o client v2 lê o header PAYMENT-REQUIRED, que segue v2).
         "x402Version": 1,
-        # v48.8-ADCOPY: "error" é a string que TODO cliente x402 expõe ao agente
-        # comprador (x402-fetch loga, carteiras/aggregators exibem, a spec v1 a
-        # define como mensagem human-readable opcional). Macete systemprompt.io:
-        # "your 402 response IS your listing" — então esta linha é escrita como
-        # anúncio: preço, prova grátis, chamada grátis e planos. Quem não usa o
-        # campo simplesmente o ignora — custo zero de protocolo.
         "error": (
             f"Payment required: {endpoint} is ${amount_usdc:.4f}/call "
             f"(USDC on Base/Solana/Algorand). "
@@ -7326,10 +6536,6 @@ def _build_402(endpoint: str, price_override: float = None):
             "url":         f"{base}{endpoint}",
             "description": desc,
             "mimeType":    "application/json",
-            # v25: Service Metadata da spec oficial do Bazaar — facilitators usam
-            # estes campos para enriquecer os resultados de BUSCA com nome legível,
-            # tags temáticas e ícone. Regras: serviceName/tags só ASCII imprimível
-            # (<=32 chars cada, máx 5 tags); iconUrl absoluto https.
             "serviceName": SERVICE_NAME,
             "tags":        _service_tags(endpoint),
             "iconUrl":     f"{base}/favicon.png",
@@ -7337,11 +6543,7 @@ def _build_402(endpoint: str, price_override: float = None):
         "accepts":    accepts,         # v2 CAIP-2 (padrão da spec v2 no corpo)
         "acceptsV2":  accepts,        # alias redundante v2
         "acceptsV1":  accepts_v1,     # v1 explícito p/ quem precisar
-        # v39.7: a alternativa mais barata, no momento exato da decisão.
         "alternatives": _subscription_offer(endpoint, amount_usdc),
-        # v47.6.3 (parceria stipend.sh): agente SEM carteira recebe o caminho
-        # para se equipar sozinho. JSON estático — nada chama casa, nenhum
-        # beacon. A 3ª linha é deliberada: qualquer carteira EIP-3009 serve.
         "no_wallet": {
             "install": "npx -y stipend",
             "docs":    "https://stipend.sh/skill.md",
@@ -7349,9 +6551,7 @@ def _build_402(endpoint: str, price_override: float = None):
                                 "can sign an EIP-3009 authorisation on Base "
                                 "works here.",
         },
-        # v1 backward compat: alguns scanners (x402scan legacy) esperam paymentRequirements
         "paymentRequirements": accepts_v1[0] if accepts_v1 else None,
-        # challenges: formato alternativo que alguns scanners esperam (v1)
         "challenges": [{
             "scheme": acc.get("scheme", "exact"),
             "network": acc.get("network", "solana"),
@@ -7360,25 +6560,11 @@ def _build_402(endpoint: str, price_override: float = None):
             "payTo": acc.get("payTo", RECEIVE_ADDRESS),
             "maxTimeoutSeconds": acc.get("maxTimeoutSeconds", 300),
         } for acc in accepts_v1],
-        # v21.4 FIX: extensions DEVE ser objeto ({}), nunca null — o PayAI rejeita
-        # com "extensions: Invalid input: expected record, received null" porque o
-        # cliente (AgentCash) ecoa esse campo no PaymentPayload que envia de volta.
         "extensions": {"bazaar": _bz_blob},
-        # v23.2: todo 402 é uma vitrine — agente sem saldo sai com um caminho
         "upsell": {
-            # v24.6: AMOSTRA EMBUTIDA — o achado da telemetria: 6.000 sondagens/dia
-            # e ZERO usos do ?preview=1. Scanners não fazem segunda chamada. Então
-            # a amostra agora viaja DENTRO do 402: o agente vê a forma real do dado
-            # na mesma resposta em que descobre o preço. Zero requests extras.
             "sample": _inline_sample(endpoint),
             "free_preview": _free_preview,
             "try_free": _try_free,
-            # v41: A PONTE QUE FALTAVA ENTRE AVALIAR E PAGAR.
-            # O funil real mostra ~10-20 avaliações/dia (python-requests) que
-            # veem a amostra ATRASADA e somem. Amostra atrasada prova que o
-            # node está vivo, mas não prova o valor do real-time. Uma chamada
-            # REAL de graça (custo marginal ~$0 nos endpoints de dados) é o
-            # trial que todo SaaS de API tem — e o x402 não tinha.
             "first_call_free": {
                 "endpoint": f"{base}/welcome",
                 "cost": "0.00",
@@ -7405,9 +6591,6 @@ def _build_402(endpoint: str, price_override: float = None):
                             "note": ("Flagship: pay-per-call LLM inference — change "
                                      "base_url in any OpenAI SDK. The same wallet "
                                      "buys every data primitive in this catalog.")},
-            # v48.6.0-REGISTER: 42 pedidos/7d batendo em /register·/signup·
-            # /auth/callback (radar). A porta existe agora — e todo 402 aponta
-            # para ela em JSON puro, no momento exato da decisão de compra.
             "registration": {"needed": False,
                              "docs_get": f"{base}/register",
                              "buy_key_post": f"{base}/register",
@@ -7418,31 +6601,12 @@ def _build_402(endpoint: str, price_override: float = None):
                                       "your key pre-loaded with $1.25 of call credit.")},
             "docs": f"{base}/llms.txt"},
     }
-    # v21 FIX: base64 padrão (não URL-safe) — scanners usam b64decode padrão.
-    # v25 FIX CRÍTICO: NÃO remover o padding "=". A spec x402 v2 exige o payload
-    # PaymentRequired em base64 canônico no header PAYMENT-REQUIRED; sem padding,
-    # b64decode() estrito falha com "Incorrect padding" em ~75% dos endpoints
-    # (todo payload cujo tamanho não é múltiplo de 3). Isso quebrava a leitura
-    # do desafio por clientes/facilitators que seguem a spec à risca — e explica
-    # a extensão bazaar chegar VAZIA ({}) no catálogo da CDP.
-    # v28.1 FIX CRÍTICO: o CORPO leva tudo; o HEADER leva uma versão enxuta.
-    # Diagnóstico: a resposta 402 chegou a 19.627 bytes de cabeçalhos
-    # (WWW-Authenticate 6.2k + PAYMENT-REQUIRED 6k + X-PAYMENT-REQUIRED 6k
-    # duplicado). Node.js aborta acima de 16 KB e proxies cortam em 8 KB —
-    # por isso clientes Node (AgentCash) recebiam NETWORK_ERROR em TODO
-    # endpoint pago, enquanto os gratuitos funcionavam. Zero pagamentos em 24h.
-    # Solução: amostra embutida e exemplos do bazaar ficam só no corpo.
     def _slim(p: dict) -> dict:
         """Versão do desafio para o CABEÇALHO: só o que um cliente precisa
         para pagar. Marketing, amostras e duplicatas ficam no corpo."""
         import copy
         ext = copy.deepcopy((p.get("extensions") or {}).get("bazaar") or {})
         info_out = (ext.get("info") or {}).get("output") or {}
-        # v48.9.23-BAZAARFIX: o extrator V2 do Bazaar (ValidateAndExtract, ver
-        # pkg.go.dev coinbase/x402 go/extensions/bazaar) exige info+schema
-        # JUNTOS — sem `schema` a extensão inteira do header era descartada.
-        # O schema é pequeno (~300 B) e fica. O EXEMPLO de saída (pesado) só
-        # fica se couber folgado no orçamento de cabeçalho.
         _ex = info_out.get("example")
         if _ex is not None:
             try:
@@ -7450,10 +6614,6 @@ def _build_402(endpoint: str, price_override: float = None):
                     info_out.pop("example", None)
             except Exception:
                 info_out.pop("example", None)
-        # v34: descrição TRUNCADA no cabeçalho. O pior caso chegou a 7.373 bytes
-        # (90% do limite de 8 KB) por causa de descrições longas. O texto integral
-        # continua no corpo e nos manifests; no header basta o suficiente para o
-        # cliente saber o que está comprando.
         _res = dict(p.get("resource") or {})
         if isinstance(_res.get("description"), str) and len(_res["description"]) > 220:
             _res["description"] = _res["description"][:217].rstrip() + "..."
@@ -7461,26 +6621,16 @@ def _build_402(endpoint: str, price_override: float = None):
         if isinstance(_ext_desc, str) and len(_ext_desc) > 220:
             ext["description"] = _ext_desc[:217].rstrip() + "..."
         return {
-            # v48.9.12-DUAL: o CABEÇALHO é sempre o payload v2 (o corpo virou
-            # v1). O client @x402/fetch lê este header primeiro.
             "x402Version": 2,
             "resource":    _res,
             "accepts":     p.get("acceptsV2") or p.get("accepts"),
             "extensions":  {"bazaar": ext},
-            # "challenges" (cópia de accepts) e "upsell" (amostra, try_free,
-            # créditos, docs) permanecem apenas no CORPO — não são necessários
-            # para executar o pagamento e custavam ~2 KB de cabeçalho.
         }
-    # v39.1: o registro no x402scan avisou "Paid endpoint is missing an input
-    # schema" em todos os endpoints com parâmetro. O schema alimenta a busca
-    # semântica dos diretórios e diz ao agente COMO chamar sem tentativa e erro.
     _hints = ENDPOINT_PARAM_HINTS.get(endpoint, {})
     _props = {k: {"type": "string",
                   "description": _PARAM_DESC.get(k, f"{k} parameter"),
                   "example": v}
               for k, v in _hints.items() if k != "format"}
-    # v44.9.1: endpoints POST declaram o schema do CORPO (não queryParams) —
-    # era o warning "missing an input schema" do registro no x402scan.
     _bs402 = ENDPOINT_BODY_SCHEMAS.get(endpoint) if "ENDPOINT_BODY_SCHEMAS" in globals() else None
     if _bs402:
         payload["inputSchema"] = _bs402["schema"]
@@ -7491,21 +6641,11 @@ def _build_402(endpoint: str, price_override: float = None):
         payload["inputSchema"] = {
             "type": "object",
             "properties": _props,
-            # v48.9.19-CATALOG: _props já exclui "format"; o que sobra é
-            # parâmetro funcional = obrigatório (mesma regra do bazaar blob).
             "required": sorted(_props.keys()),
             "additionalProperties": False,
         }
     payload["outputSchema"] = {"type": "object", "mimeType": "application/json"}
 
-    # v48.9.10-PLANS: o 402 de um PLANO passa a ser o manual de operação da
-    # máquina. Diagnóstico (22/09): os planos já estavam no manifesto e o
-    # fluxo de compra já funcionava — mas o corpo não dizia O QUE o pagamento
-    # entrega nem COMO operar depois, e o agente autônomo abortava na dúvida
-    # (os policy engines recusam em silêncio, sem X-PAYMENT nos logs).
-    # Padrão que converte (MapMap): o 402 do topup carrega extra.bundles +
-    # instrução de poll; e o bundle de $0.10 passa no teto default de
-    # 0.1 USDC dos clients x402 stock.
     if endpoint in CREDIT_PLANS:
         _cp = CREDIT_PLANS[endpoint]
         _bundles = [
@@ -7564,20 +6704,6 @@ def _build_402(endpoint: str, price_override: float = None):
             "required": ["api_key", "balance_usd", "expires_iso"],
         }
 
-    # ------------------------------------------------------------------
-    # v48.9.23-BAZAARFIX — A PORTA DE ENTRADA DO ÍNDICE V1 DO BAZAAR.
-    # Evidência: x402-foundation/x402 issue #2844 (confirmado lendo o SDK,
-    # extensions/bazaar/v1 extract_discovery_info_v1): em payload V1 o
-    # extrator do Bazaar lê `outputSchema` EM CADA entrada accepts[], no
-    # shape {input:{type:"http",method,discoverable,...}, output:<exemplo
-    # DIRETO, sem envelope "example">}. extensions.bazaar é o caminho V2 e
-    # NÃO é lido pelo extrator V1; o outputSchema do topo do payload também
-    # não. Sem este campo o recurso LIQUIDA normalmente mas fica
-    # silenciosamente fora do índice — o nosso sintoma (extension_responses
-    # "processing" eterno). O schema Zod v1 do client stock não é strict:
-    # campos extras passam sem erro (comprovado pelo campo "amount" que já
-    # vai nos accepts v1 e é aceito por PayAI e clientes).
-    # ------------------------------------------------------------------
     try:
         _bz_info = (_bz_blob.get("info") or {}) if isinstance(_bz_blob, dict) else {}
         _os_in = dict(_bz_info.get("input") or {})
@@ -7585,26 +6711,20 @@ def _build_402(endpoint: str, price_override: float = None):
             _os_in = {"type": "http", "method": "GET"}
         _os_in["discoverable"] = True
         if str(_os_in.get("method", "GET")).upper() != "GET":
-            # POST: o extrator V1 espera bodyType/body — espelha o exemplo
             _os_in.setdefault("bodyType", "json")
             if "bodyParams" in _os_in and "body" not in _os_in:
                 _os_in["body"] = _os_in["bodyParams"]
         _os_out = (_bz_info.get("output") or {}).get("example")
         if not isinstance(_os_out, dict) or not _os_out:
-            # Sem amostra quente no cache: declara a FORMA mínima que toda
-            # resposta paga deste nó carrega de fato (ts + version).
             _os_out = {"ts": 1759000000, "version": VERSION}
         _os_v1 = {"input": _os_in, "output": _os_out}
         for _a in accepts_v1:
             _a["outputSchema"] = _os_v1
-        # O espelho legacy (scanners que leem paymentRequirements) acompanha.
         if isinstance(payload.get("paymentRequirements"), dict):
             payload["paymentRequirements"]["outputSchema"] = _os_v1
     except Exception as _e:
         log.debug(f"v48.9.23 outputSchema v1 {endpoint}: {_e}")
 
-    # v48.13.0-INTEL: cross-sell dentro do proprio 402 — a recomendacao
-    # aparece no instante exato em que o agente ja decidiu pagar. Custo: zero.
     try:
         _ab = _also_bought(endpoint)
         if _ab:
@@ -7617,20 +6737,7 @@ def _build_402(endpoint: str, price_override: float = None):
     ).decode()
     resp = jsonify(payload)            # corpo: payload COMPLETO
     resp.status_code = 402
-    # v21.1 FIX: além do blob base64 opaco (challenge="..."), expõe os campos reais
-    # do desafio de pagamento como auth-params legíveis (RFC 9110 §11.3), no formato
-    # que scanners como o x402scan procuram ("no Payment challenges" era esse warning).
     primary = accepts[0] if accepts else {}
-    # v28.1: o challenge base64 NÃO vai aqui — ele já está em PAYMENT-REQUIRED.
-    # Repetir o blob triplicava o tamanho dos cabeçalhos.
-    # v34 FIX — REGRESSÃO INTRODUZIDA NA v28.1.
-    # Ao enxugar os cabeçalhos de 19,6 KB, removi o `challenge="<b64>"` do
-    # WWW-Authenticate. Resultado: o registro no x402scan passou a avisar
-    # "WWW-Authenticate header contains no Payment challenges" em 70 dos 79
-    # recursos — exatamente o aviso que a v21.1 havia eliminado.
-    # Correção: challenge volta, mas COMPACTO. O blob completo (~4,8 KB) fica
-    # só em PAYMENT-REQUIRED; aqui vai o mínimo que um cliente precisa para
-    # pagar: versão + accepts essenciais. ~500 bytes em vez de 6 KB.
     _min_accepts = [{k: a[k] for k in
                      ("scheme", "network", "asset", "amount", "payTo", "maxTimeoutSeconds")
                      if k in a} for a in accepts]
@@ -7644,16 +6751,8 @@ def _build_402(endpoint: str, price_override: float = None):
             if v is not None:
                 auth_params.append(f'{k}="{v}"')
     resp.headers["WWW-Authenticate"] = "x402 " + ", ".join(auth_params)
-    # v42 — SEGUNDO challenge, no shape MPP (RFC 7235 permite N challenges).
-    # O validador da agentic.market/x402scan/MPPScan procura um auth-scheme
-    # "Payment"; sem ele, TODOS os 74 endpoints apareciam com warning no
-    # registro. O desafio x402 continua primeiro (compat total); este apenas
-    # descreve o MESMO pagamento no vocabulário MPP (charge intent mapeia
-    # direto o fluxo "exact" do x402 — é o que a spec chama de backward-compat).
     if MPP_CHALLENGE:
         resp.headers.add("WWW-Authenticate", _mpp_challenge(endpoint, primary))
-    # v48.14.0-MONETIZE: challenges MPP REAIS (method="tempo") — um por
-    # moeda aceita; o agente escolhe a que tem saldo. Settlement push mode.
     if MPP_TEMPO:
         for _cur in MPP_TEMPO_CURRENCIES:
             try:
@@ -7662,18 +6761,11 @@ def _build_402(endpoint: str, price_override: float = None):
             except Exception:
                 pass
     resp.headers["PAYMENT-REQUIRED"]   = b64
-    # v28.1: era uma cópia byte a byte de PAYMENT-REQUIRED (+6 KB à toa).
-    # Mantido só se couber no orçamento total de cabeçalhos.
     if len(b64) <= 2048:
         resp.headers["X-PAYMENT-REQUIRED"] = b64
     else:
         resp.headers["X-Payment-Required-Ref"] = "see PAYMENT-REQUIRED header"
-    # v24.5: cliente que só lê headers (muitos agentes) também descobre o preview
     resp.headers["X-Free-Preview"] = f"{base}{endpoint}?preview=1"
-    # v48.3.6-CONVERT: SDKs e crawlers de diretório que só leem HEADERS nunca
-    # viam o bloco alternatives.plans (só existe no corpo). A matemática do
-    # plano mais barato agora viaja em header puro, calculada no preço DESTE
-    # endpoint — a máquina decide sem parsear o corpo.
     resp.headers["X-Plans"] = f"{base}/plans"
     if endpoint not in CREDIT_PLANS and amount_usdc > 0:
         _cheap = min(((BASE_PRICES[ep], ep) for ep in CREDIT_PLANS
@@ -7686,14 +6778,9 @@ def _build_402(endpoint: str, price_override: float = None):
     resp.headers["X-402-Version"]      = "1,2"
     resp.headers["X-Node-Id"]          = WALLET.node_id
     resp.headers["X-Accept-Chains"]    = ",".join([a["network"] for a in accepts])
-    # Link header para discovery legacy (Web Monetization / ILP compat)
     resp.headers["Link"] = (f'<{base}{endpoint}?preview=1>; rel="preview"; type="application/json", '
                             f'<{base}/.well-known/x402.json>; rel="payment"')
-    # Accept-Payment header para compatibilidade com draft specs
     resp.headers["Accept-Payment"] = f'x402; networks={",".join(a["network"] for a in accepts)}'
-    # v41: agentes que rodam em browser (fetch/XHR) não conseguem LER o
-    # PAYMENT-REQUIRED sem CORS expose — o desafio existia mas era invisível
-    # para clientes web (metade das avaliações diárias são navegadores).
     resp.headers["Access-Control-Expose-Headers"] = (
         "PAYMENT-REQUIRED,X-PAYMENT-REQUIRED,WWW-Authenticate,X-Free-Preview,"
         "X-402-Version,X-Accept-Chains,X-Plans,X-Cheapest-Plan")
@@ -7748,30 +6835,6 @@ def _mpp_challenge(endpoint: str, primary: dict) -> str:
     return (f'Payment id="{cid}", realm="{_mpp_realm()}", method="x402", intent="charge", '
             f'request="{blob}", expires="{exp}", description="{desc}"')
 
-# ============================================================================
-# v48.14.0-MONETIZE — TRILHO MPP/TEMPO REAL + INTELIGENCIA DE RECEITA
-#
-# 1) MPP tempo/charge (IETF draft-httpauth-payment + draft-tempo-charge-00),
-#    modo PUSH: o cliente liquida TIP-20 na Tempo (chainId 4217) e volta com
-#    Authorization: Payment <credential> carregando o hash da tx. O node
-#    verifica o receipt on-chain (evento Transfer do token = valor, destino,
-#    moeda), faz anti-replay atomico e devolve Payment-Receipt. Dois desafios
-#    sao emitidos por 402 (USDC.e + pathUSD) — o agente escolhe a moeda que
-#    tem. SEM Stripe, SEM chave privada no servidor (push mode nao co-assina:
-#    quem transmite a tx e o cliente). Captura a onda de saldos AgentCash que
-#    nascem na rede Tempo — o node passa a falar o protocolo deles DE VERDADE.
-# 2) /ecosystem-pulse ($0.05): o node VENDE a inteligencia que os 64k probes
-#    geram — demanda por endpoint, IPs-agente unicos, tendencias 7d vs 7d
-#    (z-score) e clusters de demanda emergente. O trafego de scanner vira
-#    produto em vez de custo puro.
-# 3) Price-elasticity advisor: funil probes→previews→vendas por endpoint,
-#    sugestao de preco GLOBAL (nunca por carteira) via Telegram; PRICE_AUTO=1
-#    aplica com trava de +-30%/semana e persiste em /data. Padrao: so avisa.
-# 4) Radar auto-atendimento ganha fallback SEMANTICO: quando a similaridade
-#    lexical falha, embeddings (multilingue se preciso) casam o 404 pelo
-#    SIGNIFICADO — /cotacao-bitcoin encontra /pyth-price. Mesmas travas de
-#    seguranca (so aliasa para rota real, limiar conservador, cap semanal).
-# ============================================================================
 MPP_TEMPO = os.environ.get("MPP_TEMPO", "1") != "0"
 MPP_TEMPO_RECIPIENT = (os.environ.get("MPP_TEMPO_RECIPIENT")
                        or "0xcC83159a6513E56778dA45A2981f55F44eF8e9E2").strip()
@@ -7864,7 +6927,6 @@ def _mpp_verify_credential(endpoint: str, cred_b64: str):
             return False, "wrong-chain", {}
     except Exception:
         return False, "wrong-chain", {}
-    # O HMAC prova que o servidor emitiu o valor; não há desconto no rail manual.
     cur_atomic = int(round(get_dynamic_price(endpoint) * 1_000_000))
     if want_amt != cur_atomic:
         return False, "insufficient-amount", {}
@@ -7932,7 +6994,6 @@ def _mpp_verify_credential(endpoint: str, cred_b64: str):
                          "mpp_receipt": receipt}
 
 
-# ---- /ecosystem-pulse — a inteligencia dos 64k probes/dia, como produto ----
 _PULSE_CACHE = {"ts": 0, "data": None}
 _PULSE_MONITORS = ("losbeto-x402", "carbonmonitor", "x402-list-monitor", "lumiere",
                    "x402station", "agentrankprobe", "canarybot",
@@ -8027,7 +7088,6 @@ def _h_ecosystem_pulse():
     return data
 
 
-# ---- price-elasticity advisor — ML de preco com governanca -----------------
 PRICE_AUTO = os.environ.get("PRICE_AUTO", "") == "1"
 _ML_PRICE_FILE = "/data/ml_price_overrides.json"
 _PRICE_ADV_STATE = {"last_run": 0}
@@ -8042,8 +7102,6 @@ def _ml_price_overrides_load():
         saved = json.loads(open(_ML_PRICE_FILE).read())
         n = 0
         for ep, rec in (saved or {}).items():
-            # sem exigir ep in BASE_PRICES: o bloco roda ANTES do registro
-            # dos produtos v47 — o get_dynamic_price consulta por endpoint.
             if _price_env_key(ep) not in os.environ:
                 PRICE_OVERRIDES[ep] = float(rec["price"])
                 n += 1
@@ -8069,7 +7127,6 @@ def _ml_price_advisor():
         previews = dict(c.execute(
             "SELECT endpoint, COUNT(*) FROM requests WHERE ts>? AND kind='preview' AND "
             + _DEMAND_UA_SQL + " GROUP BY endpoint", (d7,)).fetchall())
-        # Receita de teste não pode ensinar elasticidade nem disparar preço.
         sales, rev = _v4843_organic_sales_by_endpoint(7)
     sugg = []
     for ep in sorted(BASE_PRICES, key=lambda e: -(probes.get(e, 0) + sales.get(e, 0))):
@@ -8139,7 +7196,6 @@ def _ml_price_advisor():
     return {"suggestions": len(sugg), "applied": len(applied)}
 
 
-# ---- radar semantico — o 404 encontra o catalogo pelo SIGNIFICADO ----------
 _RADAR_SEM_MIN = float(os.environ.get("RADAR_SEM_MIN", "0.72"))
 
 
@@ -8212,19 +7268,11 @@ def _payload_shape_ok(pdata: dict) -> bool:
                 return True
             if any(inner.get(k) for k in ("stxn", "signedTransaction", "signedTxn", "txn")):
                 return True
-            # v48.17.8-AVMFIX: o esquema oficial @x402/avm v2 manda o grupo
-            # atomico em paymentGroup ([base64 signed txn, ...]) + paymentIndex.
-            # Sem esta chave o shape-check barrava pagamento AVM LEGITIMO aqui
-            # (rejeicao local, sem chegar ao GoPlausible) — causa do 0/91 de
-            # 05/out com cliente e rail saudaveis (diagnosticado e reproduzido
-            # em sandbox: payload oficial -> "invalid-payload-shape" em ~600ms,
-            # verify direto no GoPlausible com o MESMO payload -> simulacao OK).
             pg = inner.get("paymentGroup")
             if (isinstance(pg, list) and pg
                     and all(isinstance(x, str) and len(x) > 100 for x in pg)):
                 return True
             return False
-        # envelope sem "payload": formato achatado (signature no topo)
         if pdata.get("signature") and (pdata.get("authorization")
                                        or pdata.get("network") or pdata.get("scheme")):
             return True
@@ -8233,14 +7281,6 @@ def _payload_shape_ok(pdata: dict) -> bool:
         return False
 
 
-# v48.16.2 — uma assinatura Solana (txid) é base58 de ~87-88 chars; um BLOB
-# base64 de transação (payload v2 do cliente) tem centenas de chars e
-# caracteres fora do alfabeto base58. O fallback on-chain SÓ faz sentido com
-# assinatura de uma tx JÁ propagada — para o blob v2 a tx nem existe on-chain
-# ainda (quem propaga é o facilitator, no settle) e o txid dela (1ª assinatura
-# = feePayer patrocinado) vem zerado. Sem este guard, um verify recusado fazia
-# getTransaction(blob) → tx-not-found → 15s de retries à toa, e o comprador
-# lia um erro enganoso em vez do motivo real (log Railway 01/10 21:43:56).
 _B58_SIG_RE = re.compile(r"^[1-9A-HJ-NP-Za-km-z]{80,90}$")
 
 def _looks_like_sol_sig(s) -> bool:
@@ -8281,7 +7321,6 @@ def _finalize_facilitator_payment(endpoint: str, requirement: dict, tx_sig: str,
     if not committed:
         if why == "ledger-error":
             return _pending_payment(endpoint, fingerprint, requirement, tx_sig, payer, why)
-        # Retry de plano pode recuperar a MESMA key, sem nova receita.
         receipt = LEDGER.revenue_by_tx(tx_sig)
         existing = LEDGER.api_key_by_tx(tx_sig) if endpoint in CREDIT_PLANS else None
         if receipt and receipt.get("endpoint") == endpoint and existing:
@@ -8376,7 +7415,6 @@ def _verify_payment(endpoint: str, payment_header: str):
     if payload and not _payload_shape_ok(payload):
         return False, "invalid-payload-shape", {}
 
-    # OFAC antes de qualquer settle; dados de log nunca incluem a assinatura.
     if payload:
         try:
             candidates = {payer or ""}
@@ -8395,7 +7433,6 @@ def _verify_payment(endpoint: str, payment_header: str):
         if rid and accepts is None:
             return False, "unknown-or-expired-challenge", {}
         if accepts is None:
-            # v1 não ecoa accepted/requestId: reconstrói SOMENTE a oferta do servidor.
             try:
                 challenge = _build_402(endpoint).get_json() or {}
                 accepts = challenge.get("acceptsV2") or challenge.get("accepts") or []
@@ -8439,11 +7476,6 @@ def _verify_payment(endpoint: str, payment_header: str):
                 best = None
                 for candidate_req in _reqs:
                     candidate_payload = payload
-                    # x402 v1 usa nomes curtos ("base"/"solana") no envelope;
-                    # v2 usa CAIP-2. A autorização EIP-3009 não assina esse campo
-                    # externo. Só depois de casar o payload com a oferta oficial,
-                    # alinhamos a representação de transporte ao requirement v1.
-                    # Preço, ativo, payTo, assinatura e fingerprint não mudam.
                     if _is_v1_pay and candidate_req.get("network") in ("base", "solana"):
                         candidate_payload = json.loads(json.dumps(payload))
                         candidate_payload["network"] = candidate_req["network"]
@@ -8571,43 +7603,22 @@ def _notify_telegram(text: str):
 
 _PREVIEW_CACHE: dict = {}  # v24.1: última resposta paga por endpoint (modelo delayed)
 
-# v24.3 AUTOPILOT — o cache de preview era um dict em memória: morria a cada
-# deploy/restart e NÃO era compartilhado entre os 2 workers do gunicorn. Na
-# prática, um agente que testava ?preview=1 num node frio recebia "warming_up"
-# — exatamente a fricção que o preview prometia matar. Agora o cache persiste
-# em SQLite (compartilhado entre workers, sobrevive a restart) e um warmer
-# autônomo o mantém sempre quente (ver seção 15. AUTOPILOT).
 PREVIEW_DB_PATH = HOME_DIR / "preview_cache.db"
 PREVIEW_MAX_AGE = int(os.environ.get("PREVIEW_MAX_AGE_SECS", "7200"))  # 2h
 
-# v28 — ATRASO MÍNIMO DA AMOSTRA GRÁTIS, proporcional à volatilidade do dado.
-# Diagnóstico: o preview vinha entregando dado com 0s de idade, ou seja,
-# IDÊNTICO ao pago. Para um índice diário (fear-greed) ou um calendário macro,
-# "15 minutos de atraso" não vale nada — o agente avalia de graça, obtém
-# exatamente o que precisa e nunca paga. Era o funil furado: 77 avaliadores,
-# 0 conversões. O modelo Bloomberg só funciona quando o atraso DÓI: 15 min num
-# preço que muda por segundo dói; 15 min num índice diário não dói nada.
 PREVIEW_MIN_AGE = {
-    # dado rápido (segundos/minutos importam) -> 15 min já cria valor no pago
     "/pyth-price": 900, "/forex-rate": 900, "/stock-quote": 900,
     "/commodity-price": 900, "/dex-screen": 900, "/jupiter-swap": 900,
     "/token-intel": 900, "/wallet-scan": 900,
     "/mempool": 900, "/whale-flow": 900, "/arbitrage": 900,
-    # dado diário/lento -> a amostra grátis deve ser a de ONTEM
     "/fear-greed": 86400, "/regime": 86400, "/global-macro": 86400,
     "/macro-calendar": 86400, "/earnings-whisper": 86400,
     "/sector-rotation": 86400, "/correlation-matrix": 86400,
-    # sinais e scores -> meio dia
     "/alpha-signal": 43200, "/sinais": 43200, "/analise": 43200,
     "/launch-risk": 43200, "/rugcheck": 43200, "/onchain-credit": 43200,
 }
 DEFAULT_PREVIEW_MIN_AGE = int(os.environ.get("PREVIEW_MIN_AGE_SECS", "1800"))  # 30 min
 
-# v28.3 — CONVITE À CONVERSA. Telemetria mostrou ~57 IPs distintos avaliando
-# previews em 24h (curl de 7 origens, axios de 15, navegadores de 3 plataformas,
-# Slackbot expandindo links) e ZERO deles vira conversa: olham e somem. Este
-# bloco converte avaliação anônima em contato. Não é marketing — é a pergunta
-# que o operador não consegue fazer de outro jeito.
 FEEDBACK_GITHUB = os.environ.get(
     "FEEDBACK_GITHUB", "https://github.com/rmartins1451/losbeto/issues")
 FEEDBACK_SLACK = os.environ.get("FEEDBACK_SLACK", "")   # ex.: link do perfil no Slack x402
@@ -8627,28 +7638,14 @@ def _building_block() -> dict:
         out["slack"] = FEEDBACK_SLACK
     return out
 
-# v37 EXPERIMENTO A/B DO PREVIEW — hipótese testável, não palpite.
-# Hipótese: a amostra grátis satisfaz o avaliador e remove a razão de pagar.
-# Teste: suspender o preview APENAS nos endpoints mais sondados, por 7 dias,
-# e comparar a razão avaliação->compra. Se as sondagens virarem receita, a
-# hipótese se confirma; se nada mudar, ela morre e paramos de especular.
-# Liga e desliga por variável de ambiente, sem deploy.
 PREVIEW_PAYWALL = {e.strip() for e in os.environ.get(
     "PREVIEW_PAYWALL", "").split(",") if e.strip()}
 
-# v44.3.0 — O EXPERIMENTO A/B DO PREVIEW ENCERROU. Veredito nos dados de
-# produção: com a amostra suspensa, o funil de avaliação morreu (5 avaliadores
-# em 24h, funil real = 2 IPs externos) E o nó quebrava a promessa de "free
-# preview" feita em 6 lugares públicos (header x-free-preview, link rel=preview,
-# sampleQueries do Bazaar, /try, docs). Loja não suspende a degustação para
-# medir se a degustação vende. A env PREVIEW_PAYWALL agora é ignorada — remova-a
-# das variáveis do Railway quando puder.
 if PREVIEW_PAYWALL:
     log.warning("⚠️ PREVIEW_PAYWALL definido mas IGNORADO desde a v44.3.0 — "
                 "amostra grátis é o funil de avaliação. Remova a env.")
 
 def _preview_blocked(path: str) -> bool:
-    # v44.3.0: preview é SEMPRE livre. O funil de avaliação é sagrado.
     return False
 
 def _preview_paywall_body(path: str) -> dict:
@@ -8668,17 +7665,6 @@ def _preview_paywall_body(path: str) -> dict:
             "talk_to_us": _building_block(),
             "ts": int(time.time()), "version": VERSION}
 
-# ---------------------------------------------------------------------------
-# v39.1 — UMA AMOSTRA DEFEITUOSA NUNCA VIRA VITRINE
-#
-# Observado em produção: o preview de /equity-dossier ficou 4.600s servindo
-#   "ai_verdict": "AI synthesis unavailable — raw components above."
-# e o de /global-morning-brief servia {"status":"warming"}. São os DOIS
-# produtos mais caros do catálogo, e a amostra grátis é todo o funil de
-# avaliação. O warmer da v39 preservava a amostra antiga quando a IA falhava —
-# prudente na intenção, desastroso no efeito: congelou um cartão de visitas
-# quebrado. Agora o cache rejeita explicitamente o que não presta.
-# ---------------------------------------------------------------------------
 _BAD_SAMPLE_MARKERS = (
     "unavailable", "synthesis unavailable", "warming", "llm offline",
     "not live data", "illustrative", "error", "no data",
@@ -8693,7 +7679,6 @@ def _sample_is_good(data) -> bool:
         return False
     if data.get("error"):
         return False
-    # Campos de síntese vazios ou com texto de falha invalidam a amostra.
     for k, v in data.items():
         if not isinstance(v, str):
             continue
@@ -8752,8 +7737,6 @@ _PREVIEW_SERVED = Counter()  # métricas p/ auto-relatório diário
 _PREVIEW_GEN_AT: dict = {}   # v24.5: throttle da geração sob demanda
 PREVIEW_GEN_COOLDOWN = int(os.environ.get("PREVIEW_GEN_COOLDOWN", "60"))
 
-# v24.4: produtos premium mostram um TEASER no preview (estrutura + resumo),
-# nunca o produto inteiro — preview atrai o curioso sem canibalizar a venda.
 PREMIUM_TEASER_PATHS: set = set()   # preenchido na seção 16 (Premium Suite)
 
 def _premium_teaser(result: dict) -> dict:
@@ -8807,23 +7790,7 @@ def _clean_params() -> str:
     except Exception:
         return ""
 
-# ---------------------------------------------------------------------------
-# v39 — GATE DE PRÉ-PAGAMENTO
-#
-# A v38 tinha _premium_needs() com o comentário "503 faz o cliente NÃO ser
-# cobrado". Isso era FALSO: em paid_endpoint o _verify_payment() (que liquida
-# on-chain) roda ANTES do handler. Um 503 vindo do handler chegava com o
-# dinheiro já capturado. Duas correções:
-#   1. gate ANTES da verificação de pagamento — se o insumo essencial está
-#      fora, devolvemos 503 e o agente nunca chega a assinar nada;
-#   2. estorno em crédito se a falha acontecer depois do settle (corrida).
-# ---------------------------------------------------------------------------
 
-# Endpoints em que a síntese de IA É o produto: sem LLM não sobra nada que
-# justifique o preço, então não vendemos. Separados dos que DEGRADAM bem
-# (/correlation-matrix devolve a matriz inteira, /sector-rotation a tabela de
-# performance, /event-playbook a grade de cenários) — esses continuam à venda
-# e apenas declaram ai_status="unavailable" no corpo.
 AI_REQUIRED_ENDPOINTS = {
     "/analise", "/relatorio", "/deep-think", "/thesis-engine",
     "/council", "/council-deep",
@@ -8831,7 +7798,6 @@ AI_REQUIRED_ENDPOINTS = {
     "/equity-dossier", "/portfolio-copilot",
 }
 
-# Estes seguem vendáveis sem IA, mas precisam dizer isso na resposta.
 AI_OPTIONAL_ENDPOINTS = {
     "/correlation-matrix", "/sector-rotation",
     "/event-playbook", "/portfolio-stress",
@@ -8870,27 +7836,16 @@ def _is_error_result(result) -> bool:
     return False
 
 
-# v39.1: endpoints que dependem de um provedor externo pago. Sem chave, o
-# produto não existe — e a v39 vendia números inventados no lugar.
 PROVIDER_REQUIRED_ENDPOINTS = {
     "/earnings-whisper": lambda: bool(FINNHUB_KEY or ALPHAVANTAGE_KEY),
 }
 
-# v44.0.9 — VALIDAÇÃO DE PARÂMETRO ANTES DO 402. Parâmetro inválido é erro do
-# CLIENTE: responde 400 didático e GRATUITO (valores válidos + exemplo de
-# chamada + preview grátis) — nunca um erro pago pós-settle, que os índices
-# de descoberta punem como fail rate e o agente pune não voltando. O radar de
-# demanda flagrou agentes chamando /br-equity?symbol=br-brief (nome do
-# endpoint no lugar do ticker); ausência de parâmetro NÃO é rejeitada aqui —
-# o handler aplica o default inteligente (padrão v21.11).
 _PARAM_RULES = {
     "/br-equity": {
         "param": "symbol",
         "pattern": r"^(IBOV|[A-Z]{4}[0-9]{1,2})$",
         "examples": ["PETR4", "VALE3", "ITUB4", "BBAS3", "WEGE3", "IBOV"],
     },
-    # v44.4.0: market inválido é erro do CLIENTE — 400 didático grátis,
-    # nunca erro pago pós-settle.
     "/world-quote": {
         "param": "market",
         "pattern": r"^(US|BR|JP|CN|SZ|HK|UK|DE|FR|NL|IT|ES|CH|CA|AU|IN)$",
@@ -8898,17 +7853,6 @@ _PARAM_RULES = {
     },
 }
 
-# v48.26.0-PREFLIGHT — parâmetro obrigatório AUSENTE é erro do CLIENTE:
-# 400 didático e GRATUITO antes de qualquer 402, nunca erro pago pós-settle.
-# A classe "pagou → handler 400 → estorno em crédito" nasceu aqui — prova em
-# produção: /chain-tx sem ?hash= pago 3× em 10/out ($0.006 estornado em
-# crédito; o checkout /pay já era coberto pelo PAYGUARD v48.18.3, a API crua
-# não). Cada entrada é uma lista de GRUPOS any-of: o grupo passa quando PELO
-# MENOS um alias vem presente e válido (regex, ou simplesmente não-vazio);
-# TODOS os grupos precisam passar. Só entram endpoints SEM default
-# inteligente — quem tem default (padrão v21.11, ex.: /wallet-scan usa a
-# carteira do pagador) segue servindo o exemplo. POST/JSON-body (/classify,
-# /summarize) ficam fora de propósito: request.args é vazio neles.
 _PARAM_REQUIRED = {
     "/chain-tx": [[("hash", r"^0x[0-9a-fA-F]{64}$",
                     "0x694b13bd5dbe6a373272b4beebc10d434ebed396e335338ba9fc5e5ba5d0061e")]],
@@ -8952,7 +7896,6 @@ def _preflight_param_check(path: str, check_required: bool = False):
     rule = _PARAM_RULES.get(path)
     if rule:
         raw = request.args.get(rule["param"])
-        # ausente → handler aplica o default; presente → valida o formato
         if not (raw is None or raw == ""):
             if not re.match(rule["pattern"], raw.strip().upper()):
                 return ({"error": "invalid_param",
@@ -8966,24 +7909,8 @@ def _preflight_param_check(path: str, check_required: bool = False):
                                   f"retry — this call costs ${get_dynamic_price(path):.3f} "
                                   "once the parameter is valid."),
                          "ts": int(time.time())}, 400)
-    # v48.26.0-PREFLIGHT: obrigatórios ausentes/malformados → 400 grátis.
-    # v48.26.1-DISCOVERY: a barreira de obrigatórios NÃO vale para probe nu.
-    # Sem payment header, a ausência de parâmetro cai no 402 normal — é o
-    # contrato de descoberta do ecossistema (Bazaar, 402radar, x402scan
-    # probeiam sem params e esperam o challenge; a 48.26.0 devolvia 400 e
-    # 12 endpoints foram recusados no registro do diretório em 11/out).
-    # Com pagamento x402 anexado (check_required), o 400 grátis sai ANTES do
-    # settle — o dinheiro nem se move, nem precisa de estorno. MPP/JWT/
-    # créditos não passam aqui: já capturados → delivery-or-refund v48.10.2.
     if not check_required:
         return None
-    # v48.26.5-LINTP5: HEAD nunca recebe o 400 didático — o x402lint (P5
-    # "head-no-settle") probeia HEAD + X-PAYMENT lixo e exige 402/405:
-    # "HEAD is how facilitators check liveness; a 400 here reads as a broken
-    # settle path". HEAD não entrega corpo didático de qualquer forma, então
-    # nada se perde: retornamos None e o gate segue o fluxo normal (pagamento
-    # lixo falha na verificação local e o cliente recebe o challenge 402 —
-    # o dinheiro continua intocado). O 400 didático fica restrito a GET/POST.
     if request.method == "HEAD":
         return None
     groups = _PARAM_REQUIRED.get(path)
@@ -9081,24 +8008,10 @@ def _refund_as_credit(payer: str, amount: float, endpoint: str, tx: str = "") ->
         return None
 
 
-# ---------------------------------------------------------------------------
-# v41 — FIRST-CALL-FREE ("o trial do x402")
-#
-# O funil medido: ~56 previews/24h, metade o próprio operador em navegador;
-# o resto (~10-20/dia, python-requests de ~8 IPs) avalia e some sem pagar.
-# Hipótese: a amostra atrasada não converte porque não demonstra o valor do
-# real-time — e o primeiro pagamento x402 tem fricção psicológica alta para
-# um agente com orçamento rígido. Solução clássica de API: trial gratuito.
-# /welcome emite UM cupom (JWT) válido para UMA chamada real em endpoints
-# baratos de dados. Anti-abuso: 1 por IP/dia, teto global/dia, replay-block.
-# Custo marginal: ~$0 (são endpoints de dados cacheados, sem LLM).
-# ---------------------------------------------------------------------------
 
 WELCOME_ENABLED   = os.environ.get("WELCOME_FREE_CALL", "1") != "0"
 WELCOME_DAILY_CAP = int(os.environ.get("WELCOME_DAILY_CAP", "40"))
 WELCOME_TTL       = int(os.environ.get("WELCOME_TTL_S", "3600"))
-# whitelist por PREÇO: dados baratos. Flagships com LLM ficam de fora —
-# o grátis prova o motor; o pago prova o valor.
 WELCOME_ENDPOINTS = {e for e, p in BASE_PRICES.items()
                      if p <= 0.03 and e not in CREDIT_PLANS}
 
@@ -9118,14 +8031,6 @@ def _welcome_redeem(token: str, path: str, handler, t0: float, ip: str):
                      "price_usd": f"{get_dynamic_price(path):.4f}"})
         r.status_code = 403
         return r
-    # v41.1 — CORRIDA FECHADA.
-    # O v41 checava replay_seen(), rodava o handler, e SÓ ENTÃO marcava o jti.
-    # Entre a checagem e a marcação havia uma janela aberta: com
-    # --threads 8 no gunicorn, N requisições simultâneas com o mesmo cupom
-    # passavam todas pela verificação antes de qualquer uma marcar. Um cliente
-    # com um único token conseguia N chamadas reais grátis, em paralelo.
-    # Agora marcamos ANTES de executar. Se o handler falhar por culpa nossa,
-    # devolvemos o cupom — o cliente não perde a chance por erro do servidor.
     if not LEDGER.replay_claim("welcome:" + jti):   # reserva atômica
         r = jsonify({"error": "welcome-token already used",
                      "buy": f"{base}{path}",
@@ -9164,15 +8069,6 @@ def _welcome_redeem(token: str, path: str, handler, t0: float, ip: str):
     return resp
 
 
-# ---------------------------------------------------------------------------
-# v48.1.0-REACTIVE — ESCADA DE DESCONTO EM TEMPO REAL (o "não perder vendas").
-# Telemetria própria (11/set): ~5-8 avaliadores externos/dia batem no 402,
-# veem o preço e SOMEM — conversão avaliador→pagante = 0%. O nó agora reage
-# sozinho: na 3ª visualização do MESMO endpoint pelo MESMO IP em 24h, serve
-# UM desafio com 50% de desconto (piso $0.001), uma vez por (IP,endpoint)/dia.
-# O desafio com desconto é o que fica no _challenge_remember → _verify_payment
-# cota o valor cotado (v39) e o settle fecha no preço promocional. Custo
-# máximo: 50% de UMA primeira compra por endpoint por IP por dia.
 _RLADDER_FRACTION  = float(os.environ.get("PROMO_FIRST_BUYER_FRACTION", "0.5"))
 _RLADDER_MIN_VIEWS = int(os.environ.get("PROMO_MIN_402_VIEWS", "3"))
 _RLADDER_FLOOR     = 0.001
@@ -9253,18 +8149,6 @@ def _sellable_now(path: str) -> bool:
 
 
 def _reactive_402(path, ip):
-    # v48.2-SMART — o PREÇO PÚBLICO NUNCA VARIA no 402.
-    # A v48.1 servia desafio com 50% off na 3ª sondagem do mesmo IP — mas os
-    # scanners de catálogo (x402-list-monitor: 7.380 hits/dia de 1 IP;
-    # x402-observer: 1.732/dia) atingem o threshold em minutos e INDEXAM o
-    # preço cortado como nosso preço oficial nos marketplaces (OpenSea Bazaar,
-    # x402list, LavoLoop): desvalorização automática e permanente da marca.
-    # Preço que oscila também quebra a confiança de agentes programados para
-    # verificar preço antes de pagar.
-    # O incentivo de 1ª compra agora é BÔNUS PÓS-PAGAMENTO (First-Call Bonus):
-    # paga-se o preço de tabela e ganha-se 1 chamada grátis (crédito atrelado
-    # ao X-Session-Token, 7 dias). Valor agregado, não corte de preço — os
-    # catálogos seguem indexando o preço cheio e o comprador recebe mais.
     r = _build_402(path)
     views, _already = _rladder_state(ip, path)
     if views >= 2:
@@ -9300,12 +8184,8 @@ def paid_endpoint(path):
             if is_geo_blocked(ip):
                 return jsonify({"error": "geo-blocked", "country": geo_country(ip)}), 403
 
-            # v24.1 PREVIEW UNIVERSAL — mata a "fricção de avaliação": agente vê
-            # a estrutura REAL com dados atrasados de graça, e paga pelo fresco.
             if (request.args.get("preview") == "1"
                     and path not in _PREVIEW_REQUIRE_PAYMENT):
-                # v37: endpoint sob experimento — registra como avaliação
-                # bloqueada, para medirmos o efeito depois.
                 if _preview_blocked(path):
                     try:
                         LEDGER.log_request(path, True, int((time.time() - t0) * 1000), ip,
@@ -9329,7 +8209,6 @@ def paid_endpoint(path):
                                             request.remote_addr or ""), kind="preview", ua=request.headers.get("User-Agent",""), params=_clean_params())
                     except Exception:
                         pass
-                    # v48.13.0-INTEL: lead scoring semantico do avaliador
                     try:
                         _ml_lead_score(path,
                                        request.headers.get("X-Forwarded-For",
@@ -9339,8 +8218,6 @@ def paid_endpoint(path):
                     except Exception:
                         pass
                     age = int(time.time() - cached["ts"])
-                    # v40: 80% de quem avalia é humano em navegador. Máquina
-                    # continua recebendo o mesmo JSON; humano recebe página.
                     if _wants_html() and isinstance(cached.get("data"), dict):
                         return app.response_class(
                             _render_preview_html(path, cached["data"], age),
@@ -9356,9 +8233,6 @@ def paid_endpoint(path):
                             "price_usd": f"{get_dynamic_price(path):.3f}",
                             "how": "same URL without preview=1, pay via x402"},
                         "note": "Delayed sample (Bloomberg model). Pay for real-time.", "pay_ready": _preview_payready(path, ip)})
-                # v24.5: NUNCA devolver "warming_up" para um avaliador — era a
-                # própria fricção que o preview existe para matar. Se não há
-                # cache, gera agora (sem pagamento), serve e guarda.
                 try:
                     LEDGER.log_request(path, True, int((time.time() - t0) * 1000), ip,
                                        kind="preview",
@@ -9366,15 +8240,12 @@ def paid_endpoint(path):
                                        params=_clean_params())
                 except Exception:
                     pass
-                # v48.13.0-INTEL: lead scoring semantico do avaliador
                 try:
                     _ml_lead_score(path, ip,
                                    request.headers.get("User-Agent", ""),
                                    request.args)
                 except Exception:
                     pass
-                # blindagem: um scanner não pode forçar geração repetida (os
-                # produtos premium custam chamadas de LLM). 1 geração/60s por path.
                 _last = _PREVIEW_GEN_AT.get(path, 0)
                 if time.time() - _last < PREVIEW_GEN_COOLDOWN:
                     return jsonify({"preview": True, "status": "warming_up",
@@ -9385,9 +8256,6 @@ def paid_endpoint(path):
                     fresh = handler()
                     if isinstance(fresh, dict) and "error" not in fresh:
                         _PREVIEW_SERVED[path] += 1
-                        # v28: sem histórico ainda. Se o dado é LENTO, servir a
-                        # versão fresca completa entregaria o produto de graça —
-                        # então serve teaser até existir uma amostra envelhecida.
                         _slow = _preview_min_age(path) >= 3600
                         payload = (_premium_teaser(fresh)
                                    if (path in PREMIUM_TEASER_PATHS or _slow) else fresh)
@@ -9406,19 +8274,12 @@ def paid_endpoint(path):
                     "note": "Sample being generated — retry in a few seconds.",
                     "price_usd": f"{get_dynamic_price(path):.3f}"}), 200
 
-            # v41: FIRST-CALL-FREE — cupom do /welcome vale UMA chamada real.
             _wtok = (request.headers.get("X-Welcome-Token") or "").strip()
             if _wtok:
                 _wresp = _welcome_redeem(_wtok, path, handler, t0, ip)
                 if _wresp is not None:
                     return _wresp
 
-            # v44.9.3: PARTNER KEY — storefronts parceiras (ex.: nosso Actor na
-            # Apify Store) usam o próprio nó como motor de dados. A receita
-            # entra em FIAT pela plataforma parceira, então aqui NÃO vira
-            # revenue nem leaderboard: logado como kind="partner" (telemetria
-            # honesta). Chave errada cai no fluxo normal (402) sem revelar
-            # que o recurso existe.
             _pk = (request.headers.get("X-Partner-Key") or "").strip()
             if _pk and PARTNER_KEY and hmac.compare_digest(_pk, PARTNER_KEY) and path not in CREDIT_PLANS:
                 try:
@@ -9444,17 +8305,9 @@ def paid_endpoint(path):
                     log.error(f"handler {path} (partner): {e}")
                     return jsonify({"error": str(e)}), 500
 
-            # v23: CRÉDITOS PRÉ-PAGOS — header X-API-Key pula o fluxo 402 por
-            # completo. Settlement on-chain por chamada tem 2-5s de latência;
-            # crédito é servido do ledger em ~1ms (modelo validado no mercado).
             api_key = (request.headers.get("X-API-Key")
                        or request.headers.get("X-Credit-Token")
                        or request.args.get("api_key", "")).strip()
-            # v48.36.1-SEAL: PLANOS NUNCA são pagos com X-API-Key/saldo.
-            # Antes: uma key UNLIMITED (balance=-1) passava em api_key_use sem
-            # debitar nada e COMPRAVA outros planos (enterprise/founding/whale)
-            # de graça — notificava "plano vendido" sem USDC on-chain entrar.
-            # Plano é receita NOVA: exige o fluxo 402 on-chain abaixo.
             if api_key and path not in CREDIT_PLANS:
                 cost = get_dynamic_price(path)
                 used = LEDGER.api_key_use(api_key, cost)
@@ -9464,8 +8317,6 @@ def paid_endpoint(path):
                         _g.losbeto_payer = "apikey:" + api_key[:12]
                         _g.losbeto_payment = {"payer": "credits", "tx": "", "via": "credits"}
                         result = handler()
-                        # v48.10.2-REFUND: handler falhou no caminho de
-                        # créditos — o débito volta ao saldo da chave.
                         if _is_error_result(result):
                             _rc = LEDGER.api_key_credit(api_key, cost)
                             LEDGER.log_request(path, False, int((time.time() - t0) * 1000), ip,
@@ -9495,10 +8346,6 @@ def paid_endpoint(path):
                         resp.headers["X-Credits-Remaining"] = (
                             "unlimited" if used.get("unlimited") else f"{used['remaining']:.6f}")
                         resp.headers["X-Credits-Cost"] = f"{cost:.6f}"
-                        # v48.3.5-RETENTION: a máquina fica sabendo NO
-                        # PROTOCOLO quando o plano expira ou o saldo acaba,
-                        # com o link de renovação — policy engines renovam
-                        # sozinhas, sem humano no loop.
                         try:
                             _base = _public_base()
                             _exp = used.get("expires")
@@ -9515,9 +8362,6 @@ def paid_endpoint(path):
                                         f"top_up={_base}/buy-credits")
                         except Exception:
                             pass
-                        # v48.3.6 FIX: os headers de retenção (v48.3.5) e de
-                        # saldo iam ao ar SEM Access-Control-Expose-Headers —
-                        # invisíveis para qualquer agente rodando em browser.
                         resp.headers["Access-Control-Expose-Headers"] = (
                             "X-Credits-Remaining,X-Credits-Cost,"
                             "X-Plan-Expires-In,X-Plan-Renew,X-Credit-Low")
@@ -9552,9 +8396,6 @@ def paid_endpoint(path):
                                 "amount_usd": _retry_receipt.get("amount", 0),
                                 "required_usd": _retry_receipt.get("amount", 0)}
                             result = handler()
-                            # v24.10: produto indisponível (tupla ,503) — não
-                            # entrega dado vazio. O day-pass/JWT segue válido para
-                            # nova tentativa; nada a estornar por chamada.
                             if isinstance(result, tuple) and len(result) > 1 and result[1] == 503:
                                 LEDGER.log_request(path, False,
                                                     int((time.time() - t0) * 1000), ip,
@@ -9568,16 +8409,11 @@ def paid_endpoint(path):
                             log.error(f"handler {path}: {e}")
                             return jsonify({"error": str(e)}), 500
 
-            # v21: aceita headers v1 (X-PAYMENT) e v2 (PAYMENT-SIGNATURE, Payment-Signature)
             sig = (request.headers.get("X-PAYMENT")
                    or request.headers.get("X-Payment")
                    or request.headers.get("PAYMENT-SIGNATURE")
                    or request.headers.get("Payment-Signature"))
 
-            # v48.14.0-MONETIZE: credential MPP chega em Authorization: Payment.
-            # Verifica ANTES do fluxo x402; em sucesso, sig vira marcador e o
-            # verify abaixo e substituido pelo resultado MPP (mesmo pipeline:
-            # JWT, entrega, refund-on-failure, FCB — nada muda para o cliente).
             _mpp_info = None
             _auth_pay = auth[8:].strip() if auth.startswith("Payment ") else ""
             if _auth_pay and MPP_TEMPO and not sig:
@@ -9598,8 +8434,6 @@ def paid_endpoint(path):
             if sig and not _rl_check(ip):
                 return jsonify({"error": "rate-limit", "limit_rpm": RL_RPM_IP}), 429
 
-            # v39: gate ANTES do 402. Se não temos como entregar o produto,
-            # não emitimos cobrança — nem desafio, nem verificação.
             _pre = _preflight_unavailable(path)
             if _pre is not None:
                 LEDGER.log_request(path, False, int((time.time() - t0) * 1000), ip,
@@ -9612,10 +8446,6 @@ def paid_endpoint(path):
                 _r.headers["Retry-After"] = str(_body["retry_after_seconds"])
                 return _r
 
-            # v44.0.9: parâmetro inválido → 400 didático e GRATUITO, antes do 402.
-            # v48.26.1-DISCOVERY: formato inválido vale sempre; AUSÊNCIA de
-            # obrigatório só barra com pagamento x402 anexado e não liquidado
-            # (sig real — nunca "mpp-tempo", que já capturou on-chain).
             _pbad = _preflight_param_check(
                 path, check_required=bool(sig) and sig != "mpp-tempo")
             if _pbad is not None:
@@ -9628,22 +8458,12 @@ def paid_endpoint(path):
                 _r.status_code = _c
                 return _r
 
-            # v48.2-SMART FCB (consumo): sessão com bônus de 1ª compra serve
-            # sem cobrar. Fica DEPOIS do JWT de retry (300s) e dos gates de
-            # preflight — o crédito só é gasto quando seria chamada paga real.
             if not sig:
                 _fcb_tok = (request.headers.get("X-Session-Token") or "")[:40]
                 if _fcb_tok:
                     try:
                         _fcb = LEDGER.cache_get(f"fcb:{_fcb_tok}", 7 * 86400)
-                        # v48.36.3-SEAL: o bônus de 1ª compra NÃO vale para PLANOS.
-                        # Um bot comprava um endpoint de $0.001, ganhava o bônus e
-                        # "comprava" enterprise/founding de GRAÇA (sem settle, sem
-                        # USDC). Bônus vale para ENDPOINTS; plano exige on-chain.
                         if _fcb and int(_fcb.get("n", 0)) > 0 and path not in CREDIT_PLANS:
-                            # v48.26.1: obrigatório faltando → 400 didático
-                            # grátis SEM queimar o bônus (a chamada não seria
-                            # entregue de qualquer forma).
                             _fcb_bad = _preflight_param_check(path, check_required=True)
                             if _fcb_bad is not None:
                                 LEDGER.log_request(path, False, int((time.time() - t0) * 1000), ip,
@@ -9655,8 +8475,6 @@ def paid_endpoint(path):
                                 _fr.status_code = _fc
                                 return _fr
                             _r = handler()
-                            # fonte morreu entre o gate e o handler → 503 grátis,
-                            # crédito NÃO é queimado.
                             if (isinstance(_r, tuple) and len(_r) >= 2
                                     and isinstance(_r[0], dict)
                                     and _r[0].get("status") == "unavailable"
@@ -9684,8 +8502,6 @@ def paid_endpoint(path):
                             return _resp
                     except Exception:
                         pass
-                # v48.17.11-SELLABLE: dependência estrutural vazia → 503 grátis
-                # ANTES do 402. Nunca cobrar pelo que não pode ser entregue.
                 _nb = _sellability_block(path)
                 if _nb is not None:
                     LEDGER.log_request(path, False, int((time.time() - t0) * 1000), ip,
@@ -9700,7 +8516,6 @@ def paid_endpoint(path):
                                     kind="challenge402", ua=request.headers.get("User-Agent",""), params=_clean_params())
                 return _reactive_402(path, ip)   # v48.2: preço fixo + bônus pós-compra
 
-            # ====== CORREÇÃO APLICADA (HEADERS PRESERVADOS) ======
             if _mpp_info is not None:
                 ok, reason, info = True, "mpp", _mpp_info
             else:
@@ -9732,7 +8547,6 @@ def paid_endpoint(path):
                 body["error"] = f"Payment invalid: {reason}"
                 r.set_data(json.dumps(body))
                 return r
-            # ====================================================
 
             jti = secrets.token_urlsafe(12)
             payer = info.get("payer", "")
@@ -9749,14 +8563,6 @@ def paid_endpoint(path):
                 _refunded_here = False
                 try:
                     result = handler()
-                    # v48.10.2-REFUND: DELIVERY-OR-REFUND universal. Antes só
-                    # "unavailable"+5xx virava crédito; o scout da
-                    # nohumans.directory pagou /pyth-price, /ai-news e
-                    # /br-pix-parse e recebeu corpo de ERRO sem reembolso
-                    # (dict {"error": ...} com 200 e tuple 400 passavam
-                    # direto). Agora QUALQUER falha sinalizada pelo handler
-                    # após o settle vira crédito — a regra do LLMUnavailable,
-                    # estendida a todo resultado de falha. Nunca mais erro pago.
                     if _is_error_result(result):
                         if not isinstance(result, tuple):
                             result = (result, 502)
@@ -9774,8 +8580,6 @@ def paid_endpoint(path):
                             "deliver. A credit equal to the amount paid has been issued — "
                             "send it as the X-API-Key header on any endpoint, valid 30 days.")
                         _refunded_here = True
-                        # v48.10.3: cross-sell também na falha — o crédito volta
-                        # com um destino sugerido; falha vira retenção.
                         try:
                             _recs = _recommended_next(path, payer)
                             if _recs and "recommended_next" not in result[0]:
@@ -9783,9 +8587,6 @@ def paid_endpoint(path):
                         except Exception:
                             pass
                 except LLMUnavailable:
-                    # Corrida: o gate passou, mas o provedor caiu entre o
-                    # settle e a geração. O pagamento já é on-chain e não pode
-                    # ser desfeito — devolvemos crédito equivalente.
                     _amt = get_dynamic_price(path)
                     _key = _refund_as_credit(payer, _amt, path, info.get("tx", ""))
                     LEDGER.log_request(path, False, int((time.time() - t0) * 1000), ip,
@@ -9807,8 +8608,6 @@ def paid_endpoint(path):
                     return _rr
                 try:
                     if isinstance(result, dict):
-                        # v44: cross-sell personalizado — os próximos produtos
-                        # prováveis DESTE pagador viajam na resposta paga.
                         try:
                             _recs = _recommended_next(path, payer)
                             if _recs and "recommended_next" not in result:
@@ -9817,27 +8616,17 @@ def paid_endpoint(path):
                             pass
                         prev_data = (_premium_teaser(result)
                                      if path in PREMIUM_TEASER_PATHS else result)
-                        # v28: não sobrescreve uma amostra que ainda não atingiu
-                        # a idade mínima — é o envelhecimento que dá valor ao pago.
                         _cur = _PREVIEW_CACHE.get(path) or _preview_db_get(path)
                         _age = (time.time() - _cur["ts"]) if _cur else 1e9
-                        # v39.1: só promove a amostra se ela for apresentável.
                         if (path not in _PREVIEW_REQUIRE_PAYMENT
                                 and _age >= _preview_min_age(path)
                                 and _sample_is_good(prev_data)):
                             _PREVIEW_CACHE[path] = {"ts": time.time(), "data": prev_data}
                             _preview_db_put(path, prev_data)
                 except Exception: pass
-                # v48.10.3: após refund NÃO loga "paid" — o request já entrou
-                # como kind="refunded"; o double-log inflava calls pagas e
-                # distorcia a telemetria que /receipts e o Agent402 leem.
                 if not _refunded_here:
                     LEDGER.log_request(path, True, int((time.time() - t0) * 1000), ip,
                                         kind="paid", ua=request.headers.get("User-Agent",""), params=_clean_params())
-                # v21.12 FIX: handlers que retornam flask.Response (jsonify
-                # interno) quebravam aqui com "Response is not JSON serializable"
-                # — 500 pago em /win-rate-verified. Response passa direto;
-                # tuplas (body, status) são normalizadas; dict/list vira jsonify.
                 from flask import Response as _FlaskResp
                 if isinstance(result, _FlaskResp):
                     resp = result
@@ -9851,10 +8640,6 @@ def paid_endpoint(path):
                         resp.status_code = result[1]
                 else:
                     resp = jsonify(result)
-                # v21.7 FIX: o header de settlement DEVE seguir a spec (SettleResponse
-                # do facilitator, amounts como string atômica). O objeto caseiro com
-                # "amount": 0.01 (float) crashava o cliente AgentCash APÓS o pagamento
-                # bem-sucedido (BigInt(0.01) → RangeError).
                 settlement = info.get("settlement") or {
                     "success":     True,
                     "transaction": info.get("tx", ""),
@@ -9865,34 +8650,21 @@ def paid_endpoint(path):
                 ).decode()
                 resp.headers["PAYMENT-RESPONSE"]   = settle_b64
                 resp.headers["X-PAYMENT-RESPONSE"] = settle_b64
-                # v48.14.0: receipt MPP no header canonico da spec (b64url).
                 if isinstance(info, dict) and info.get("mpp_receipt"):
                     resp.headers["Payment-Receipt"] = _b64url(json.dumps(
                         info["mpp_receipt"], separators=(",", ":")).encode())
-                # v48.2-SMART FCB (emissão): 1ª compra deste pagador → o
-                # session token passa a carregar 1 chamada grátis (7 dias).
-                # Preço de tabela intacto; o bônus é valor agregado.
                 try:
                     _payer = (info.get("payer") or "")[:64]
                     if _payer and not LEDGER.cache_get(f"fcbp:{_payer}", 400 * 86400):
                         LEDGER.cache_set(f"fcbp:{_payer}", {"t": int(time.time())})
                         LEDGER.cache_set(f"fcb:{token[:40]}", {"n": 1})
                         resp.headers["X-First-Call-Bonus"] = "1-free-call-7d"
-                        # v48.3.6-CONVERT: a janela de atenção máxima de um
-                        # comprador novo é a primeira entrega. O próximo passo
-                        # viaja NO PROTOCOLO: reusar a sessão agora, e o link
-                        # da escada de planos para quando o volume justificar.
                         resp.headers["X-Next-Step"] = (
                             f"session_reuse=X-Session-Token;"
                             f"plans={_public_base()}/plans")
                         log.info(f"🎁 FCB emitido p/ payer {_payer[:16]}… ({path})")
                 except Exception:
                     pass
-                # v48.3-PLANS: o motor de economia existia desde a v39.7 mas
-                # NUNCA era invocado — definido, corrigido e desligado. Agora
-                # fala no momento exato da entrega, com o gasto real do ledger:
-                # "você já gastou $X — o plano Y teria custado menos". Nunca
-                # corta preço; mostra a matemática do próprio cliente.
                 try:
                     _tip = _upsell_note(payer)
                     if _tip:
@@ -9920,7 +8692,6 @@ def paid_endpoint(path):
         return wrapped
     return deco
 
-# Registra todos os endpoints monetizados
 ENDPOINT_HANDLERS = {
     "/fear-greed":      Brain.fear_greed,
     "/regime":          Brain.regime,
@@ -9970,7 +8741,6 @@ ENDPOINT_HANDLERS = {
     "/whale-dossier":   Brain.whale_dossier,
     "/thesis-engine":   Brain.thesis_engine,
     "/starter-pack":    Brain.starter_pack,
-    # v24: Global markets
     "/forex-rate":      Brain.forex_rate,
     "/commodity-price": Brain.commodity_price,
     "/stock-quote":     Brain.stock_quote,
@@ -9980,15 +8750,6 @@ ENDPOINT_HANDLERS = {
     "/global-macro":    Brain.global_macro,
 }
 
-# v48.18.4-VITRINE: /ping402 — a chamada paga MAIS BARATA do nó ($0.001).
-# Análise do CDP Bazaar (07/out/2026): os líderes de ranking têm 500-700
-# PAGADORES ÚNICOS/30d num endpoint de $0.001-0.003 que todo agente usa para
-# testar o loop de pagamento (OneSource block-number: 777 chamadas/666
-# pagadores). O ranking do Bazaar = relevância × volume × PAGADORES ÚNICOS ×
-# completude de metadata — e os nossos 95 recursos tinham uniquePayers=1 (só
-# a carteira do operador). /ping402 é o nosso "hello world" de pipeline: o
-# agente valida 402→assinatura→facilitator→settle→entrega contra um merchant
-# real pelo menor preço possível, e de quebra recebe o mapa do catálogo.
 def _h_ping402():
     import hashlib as _hl
     ts = int(time.time())
@@ -10019,17 +8780,6 @@ ENDPOINT_DESC["/ping402"] = (
 ENDPOINT_TAGS["/ping402"] = ["Utility", "SmokeTest", "Trust", "ZeroUpstream"]
 ENDPOINT_PARAM_HINTS["/ping402"] = {"format": "json"}
 
-# ============================================================================
-# v48.19.0-AGUA — 7 endpoints de dados de chain + inteligencia embutida.
-# Tese (teardown CDP 08/out/2026): o volume real do x402 esta em leituras
-# basicas de blockchain ($0.001-0.005; lider com 460-700 pagadores unicos/30d
-# POR endpoint) e o Losbeto nao tinha NENHUMA. Estes endpoints copiam a
-# demanda provada e somam o que o lider nao tem: classe da carteira
-# (heuristica), forecast de gas (mini-Holt auto-alimentado), explicacao LLM
-# (bandit groq/gemini) e reputacao ERC-8004 on-chain (padrao lancado ha
-# semanas — primeiro-mover no x402). Upstream = RPC publico ($0) com cache
-# curto + failover → margem ~100%. Zero deps novas: keccak-256 embutido.
-# ============================================================================
 import json as _json4819  # defensivo: ja importado no topo do arquivo
 import requests as _requests4819  # defensivo: idem (linha ~774)
 try:
@@ -10099,7 +8849,6 @@ def _namehash(name: str) -> bytes:
             node = _keccak256(node + _keccak256(label.encode()))
     return node
 
-# ── RPC com failover + cache curto ──────────────────────────────────────────
 _EVM_RPCS = [u.strip() for u in os.environ.get(
     "EVM_RPC_URLS", "https://mainnet.base.org,https://base-rpc.publicnode.com").split(",") if u.strip()]
 _ETH_RPCS = [u.strip() for u in os.environ.get(
@@ -10150,7 +8899,6 @@ def _abi_dec_str(raw: bytes) -> str:
     except Exception:
         return ""
 
-# ── /chain-block ────────────────────────────────────────────────────────────
 def _h_chain_block():
     up = [0]
     bn = _evm_rpc("eth_blockNumber", [], ttl=10, upstream=up)
@@ -10168,7 +8916,6 @@ def _h_chain_block():
             "source": "base rpc", "upstream_calls": up[0],
             "provider": "Losbeto/Chain", "version": VERSION, "ts": int(time.time())}
 
-# ── /gas-price — com forecast ML auto-alimentado ────────────────────────────
 _GAS_FILE = str(HOME_DIR / "gas_series.json")
 
 def _gas_series_append(gwei: float) -> list:
@@ -10225,7 +8972,6 @@ def _h_gas_price():
         out["ml_forecast"] = {"model": "warming_up", "need_samples": 8, "have": len(series)}
     return out
 
-# ── /chain-balance — ETH + ERC20 batch + classe da carteira ─────────────────
 _CHAIN_DEFAULT_TOKENS = {
     "USDC": "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
     "WETH": "0x4200000000000000000000000000000000000006",
@@ -10300,7 +9046,6 @@ def _h_chain_balance():
         out["ens_name"] = ens
     return out
 
-# ── ENS (Ethereum mainnet) — forward + reverse, keccak embutido ─────────────
 _ENS_REGISTRY = "0x00000000000C2E074eC69A0dFb2997BA6C7d2e1e"
 
 def _ens_resolver(node_hex: str, up) -> str:
@@ -10358,7 +9103,6 @@ def _h_chain_ens():
     out["upstream_calls"] = up[0]
     return out
 
-# ── /chain-tx — receipt + explicacao LLM opcional ───────────────────────────
 def _h_chain_tx():
     up = [0]
     h = (request.args.get("hash") or "").strip()
@@ -10407,7 +9151,6 @@ def _h_chain_tx():
         out["explainer"] = "llm-bandit" if txt.strip() else "deterministic-fallback"
     return out
 
-# ── /agent-reputation — ERC-8004 on-chain (primeiro-mover x402) ─────────────
 _8004_ID = "0x8004A169FB4a3325136EB29fA0ceB6D2e539a432"    # Identity (Base)
 _8004_REP = "0x8004BAa17C55a88189AE136b182e5fdA19dE9b63"   # Reputation (Base)
 _LOSBETO_AGENT_ID = 87048
@@ -10458,10 +9201,6 @@ def _h_agent_reputation():
     out["upstream_calls"] = up[0]
     return out
 
-# ── /wallet-verdict — o endpoint viral (veredito + roast + card OG) ─────────
-# Mecanica provada pelo lider AX1 (385K calls / 4.749 pagadores unicos/30d no
-# CDP): veredito + roast curto + card compartilhavel + requestKey idempotente.
-# O nosso julga CARTEIRAS — todo agente EVM tem uma; o TAM e maior que tokens.
 _VERDICT_FILE = str(HOME_DIR / "verdict_cache.json")
 _VERDICTS = {
     "WHALE": ["Moves size and probably front-runs your thesis.",
@@ -10598,7 +9337,6 @@ def wallet_verdict_card():
     return Response(svg, mimetype="image/svg+xml",
                     headers={"Cache-Control": "public, max-age=300"})
 
-# ── registro central — entra no despacho pago padrao (402 + preview + ML) ───
 _AGUA_META = {
     "/chain-block": (0.001,
         "Current Base block number, timestamp, age and gas usage — the cheapest real "
@@ -10615,7 +9353,7 @@ _AGUA_META = {
         "Native ETH balance + ERC-20 balances (batched eth_call, up to 20 tokens; "
         "defaults to USDC/WETH/cbBTC) for any address on Base, plus tx-count nonce, "
         "a heuristic wallet_class (ghost/newcomer/steady/degen/whale) and reverse "
-        "ENS when set. OneSource-level data, with the intelligence layer they lack.",
+        "ENS when set. Heuristic labels are explained in the response.",
         ["ChainData", "Crypto", "Wallet", "Intelligence"],
         {"address": "0xd8dA6BF26964aF9E7eEd9e03E53415D37aA96045",
          "tokens": "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913 (CSV, optional, up to 20)"}),
@@ -10633,10 +9371,9 @@ _AGUA_META = {
         ["ChainData", "Utility", "LLM"],
         {"hash": "0x… (64 hex)", "explain": "1 for a plain-English explanation"}),
     "/agent-reputation": (0.010,
-        "On-chain trust for AI agents (ERC-8004, weeks-old standard): identity "
-        "(owner, agentURI) plus reputation aggregation (getSummary) over caller-"
-        "supplied client addresses on the Base registries. First x402 endpoint "
-        "of its kind. Defaults to this node's own agentId 87048 as a live demo.",
+        "On-chain trust for AI agents using ERC-8004: identity (owner, agentURI) "
+        "plus reputation aggregation (getSummary) over caller-supplied client "
+        "addresses on the Base registries. Defaults to agentId 87048 as a live demo.",
         ["ChainData", "Trust", "ERC8004", "AgentIntel"],
         {"agentId": "87048", "clients": "0x…,0x… (optional, up to 25)"}),
     "/wallet-verdict": (0.020,
@@ -10669,12 +9406,6 @@ for _path, _handler in ENDPOINT_HANDLERS.items():
     app.add_url_rule(_path, _rule_name, paid_endpoint(_path)(_handler))
 
 
-# ============================================================================
-# 16. PREMIUM SUITE v24.4 — onde está 95% do volume x402 ($1+ por chamada).
-#     5 produtos de síntese: uma chamada = inteligência pronta, não dado bruto.
-#     Todos compostos dos 60 endpoints existentes + LLM (fallback determinístico
-#     se nenhum LLM estiver configurado — o produto NUNCA quebra).
-# ============================================================================
 
 def _safe_call(fn, default=None):
     try:
@@ -10741,7 +9472,6 @@ def _premium_db_get(key: str, max_age: int = 90000):
 class Premium:
     """Flagships $1+ — o formato que efetivamente vende no x402 em 2026."""
 
-    # ------------------------------------------------------------------ 1
     @staticmethod
     def _brief_is_good(b) -> bool:
         """v25.5: um brief só pode ser servido (pago OU como preview) se foi
@@ -10767,10 +9497,8 @@ class Premium:
             eq_present, eq_ok = _layer(eq, "price")
             cm_present, cm_ok = _layer(cm, "price")
             fx_present, fx_ok = _layer(fx, "rate")
-            # nenhuma camada declarada pode estar zerada
             if not (eq_ok and cm_ok and fx_ok):
                 return False
-            # e ao menos 2 camadas tradicionais precisam existir de fato
             return sum([eq_present, cm_present, fx_present]) >= 2
         except Exception:
             return False
@@ -10785,7 +9513,6 @@ class Premium:
         if cached and Premium._brief_is_good(cached):
             cached["served_from"] = "daily-cache"
             return cached
-        # cache ausente, velho ou de baixa qualidade -> regenera agora
         return Premium._generate_brief(today)
 
     @staticmethod
@@ -10802,9 +9529,6 @@ class Premium:
         cal = _safe_call(Brain.macro_calendar).get("events", [])
         cal_today = [e for e in cal if e.get("date", "") >= day][:4]
 
-        # v24.10: não montar um brief cross-asset com tudo zerado. Exige ao menos
-        # forex OU commodities OU equities reais (crypto/regime sempre existem,
-        # mas o produto se vende como CROSS-ASSET — precisa de mercados tradicionais).
         trad_ok = (any(_quote_ok(v) for v in fx.values())
                    or any(_quote_ok(v) for v in cmd.values())
                    or any(_quote_ok(v) for v in eq.values()))
@@ -10848,7 +9572,6 @@ class Premium:
         _premium_db_put(f"brief:{day}", brief)
         return brief
 
-    # ------------------------------------------------------------------ 2
     @staticmethod
     def equity_dossier():
         """O 'financial report' canônico do agentic commerce, como produto:
@@ -10859,10 +9582,6 @@ class Premium:
         need, resp = _premium_needs(quote)
         if need:
             return resp   # 503, sem cobrança — não vende dossiê de uma ação a $0
-        # v39.1: earnings_whisper agora devolve (dict, 503) quando não há
-        # provedor real. O dossiê segue sendo vendável (cotação + macro + AI
-        # verdict têm valor), mas declara honestamente o que faltou em vez de
-        # embutir números inventados como fazia a v39.
         earn = _safe_call(Brain.earnings_whisper)
         if isinstance(earn, tuple):
             earn = {"status": "unavailable",
@@ -10891,7 +9610,6 @@ class Premium:
                 "provider": "Losbeto/Premium", "version": VERSION,
                 "disclaimer": "Research, not financial advice."}
 
-    # ------------------------------------------------------------------ 3
     @staticmethod
     def event_playbook():
         """Playbook de cenários para um evento macro (FOMC/NFP/CPI/ECB):
@@ -10935,7 +9653,6 @@ class Premium:
                 "provider": "Losbeto/Premium", "version": VERSION,
                 "disclaimer": "Research, not financial advice."}
 
-    # ------------------------------------------------------------------ 4
     @staticmethod
     def portfolio_stress():
         """Stress test agente-para-agente: envie posições (POST JSON ou
@@ -10980,7 +9697,6 @@ class Premium:
             exposure[_cls(p.get("asset", "?"))] = round(
                 exposure.get(_cls(p.get("asset", "?")), 0) + w, 4)
 
-        # sensibilidade heurística por classe (Δ% do portfólio por choque)
         SHOCKS = {
             "usd_up_2pct":   {"crypto": -3.0, "equity": -1.0, "commodity": -1.5, "fx": -2.0, "stable": 0.0},
             "oil_up_10pct":  {"crypto": -0.5, "equity": -1.5, "commodity": +4.0, "fx": 0.0, "stable": 0.0},
@@ -11009,7 +9725,6 @@ class Premium:
                 "provider": "Losbeto/Premium", "version": VERSION,
                 "disclaimer": "Research, not financial advice."}
 
-    # ------------------------------------------------------------------ 5
     @staticmethod
     def council_deep():
         """Council of Five em versão dossiê: votos completos + síntese profunda
@@ -11035,7 +9750,6 @@ class Premium:
                 "disclaimer": "Research, not financial advice."}
 
 
-    # ------------------------------------------------------------------ 6
     _YF_CACHE: dict = {}
     _YF_TTL = int(os.environ.get("YAHOO_SERIES_TTL", "3600"))  # 1h
 
@@ -11102,9 +9816,6 @@ class Premium:
         if hit and (time.time() - hit[0]) < Premium._YF_TTL:
             return hit[1]
         out = []
-        # v25.2: circuit breaker — os logs de rede mostram NO_SOCKET no Yahoo a
-        # partir do Railway (bloqueio de data center). Insistir custa ~10s de
-        # timeout por ticker × 22 tickers. Após 3 falhas, vai direto ao Stooq.
         if not Premium._yahoo_down():
             try:
                 r = requests.get(
@@ -11119,7 +9830,6 @@ class Premium:
             except Exception as e:
                 Premium._yahoo_mark(False)
                 log.debug(f"yahoo_series {ticker}: {e}")
-        # v25: Yahoo bloqueia data centers -> cai para Stooq (CSV livre)
         if not out:
             out = Premium._stooq_series(ticker)
         if out:
@@ -11142,8 +9852,6 @@ class Premium:
             if len(s) >= 25:
                 series[name] = s
         keys = list(series)
-        # v24.10: precisa de ao menos 4 ativos com série real p/ uma matriz útil.
-        # Antes retornava matrix {} / assets [] e cobrava $2.49 (rejeição x402-list).
         if len(keys) < 4:
             return {"status": "unavailable", "product": "Cross-Asset Correlation Matrix",
                     "error": "Market data sources temporarily unreachable — cannot build "
@@ -11194,7 +9902,6 @@ class Premium:
                 "provider": "Losbeto/Premium", "version": VERSION,
                 "disclaimer": "Research, not financial advice."}
 
-    # ------------------------------------------------------------------ 7
     @staticmethod
     def sector_rotation():
         """Rotação setorial global (11 setores S&P + cripto + ouro): quem lidera,
@@ -11214,8 +9921,6 @@ class Premium:
                     "ret_1m_pct": round((s[-1] / s[-22] - 1) * 100, 2),
                     "ret_3m_pct": round((s[-1] / s[0] - 1) * 100, 2),
                     "last": round(s[-1], 2)}
-        # v24.10: precisa de ao menos 6 setores reais p/ um sinal de rotação
-        # confiável. Antes retornava leaders/laggards vazios e cobrava $1.99.
         if len(perf) < 6:
             return {"status": "unavailable", "product": "Global Sector Rotation",
                     "error": "Sector ETF data temporarily unreachable — cannot compute a "
@@ -11260,7 +9965,6 @@ def _brain_with_args(handler, args: dict):
         return handler()
 
 
-# ---- Registro integral dos produtos premium -------------------------------
 PREMIUM_SUITE = {
     "/global-morning-brief": (Premium.global_morning_brief, 1.24,
         "Daily cross-asset morning brief — forex + commodities + equities + crypto + macro, closed by an AI strategist synthesis. The only one on x402. Generated daily, served instantly.",
@@ -11294,12 +9998,9 @@ for _p, (_h, _price, _desc, _tags) in PREMIUM_SUITE.items():
     app.add_url_rule(_p, _p.strip("/").replace("-", "_"),
                      paid_endpoint(_p)(_h), methods=_methods)
 
-# Previews premium são teasers (exceto o brief, cujo preview é o de ONTEM
-# — valor decaído no tempo é a degustação perfeita de um produto diário)
 PREMIUM_TEASER_PATHS.update(p for p in PREMIUM_SUITE if p != "/global-morning-brief")
 PREMIUM_TEASER_PATHS.add("/forecast")  # v48.13.0-INTEL
 
-# Premium na frente da vitrine — é onde está o dinheiro ($1+ = ~95% do volume)
 for _p in reversed(list(PREMIUM_SUITE)):
     if _p in FEATURED_ENDPOINTS:
         FEATURED_ENDPOINTS.remove(_p)
@@ -11308,9 +10009,6 @@ for _p in reversed(list(PREMIUM_SUITE)):
 log.info(f"💎 Premium Suite: {len(PREMIUM_SUITE)} produtos registrados")
 
 
-# ============================================================================
-# 12b. MOTOR DE CRÉDITOS v23 — 1 tx on-chain → N chamadas via X-API-Key
-# ============================================================================
 def _credits_purchase_handler(endpoint: str):
     def _h():
         from flask import g as _g
@@ -11365,8 +10063,6 @@ def _credits_payload(endpoint, plan, key, balance_usd, expires, idempotent=False
         "top_up": f"{base}/buy-credits",
         "provider": "Losbeto", "version": VERSION,
     }
-    # v44.0.7: planos podem declarar perks extras (ex.: /founding-agent) —
-    # entram no payload pago para o comprador ver o que a key dele carrega.
     if plan.get("perks"):
         payload["perks"] = plan["perks"]
         payload["badge"] = plan["plan"]
@@ -11397,8 +10093,6 @@ def plans_json():
                        else f"${cfg['balance_usd']:.2f} of call credit"),
             "bonus": cfg.get("bonus", ""), "pitch": cfg.get("pitch", ""),
             "break_even_calls_at_avg_price": int(preco / avg) + 1,
-            # v48.3.6-CONVERT: para planos de saldo, quanto de serviço cada
-            # dólar compra (1.26 = +26%). Ilimitados não têm razão finita.
             "value_ratio": (None if ilimitado
                             else round(cfg["balance_usd"] / preco, 3)),
             "how_to_use": ("Pay once via x402; the returned key goes in the "
@@ -11437,26 +10131,18 @@ def credits_status():
     })
 
 
-# ============================================================================
-# 12c. v24: AI SALES AGENT — converte browsers em compradores
-# ============================================================================
 
 @app.route("/sales-agent")
 def sales_agent():
     """🤖 AI Sales Agent — conversa com o cliente e recomenda o produto certo."""
     ts = int(time.time())
     base = _public_base()
-    # Social proof dinâmico
     stats = LEDGER.stats()
     recent_paid = stats.get("paid_24h", 0)
     social_msg = (f"{recent_paid} paid calls settled in the last 24h"
                   if recent_paid > 0 else
                   "No paid calls in the last 24h — free samples are open at /try")
 
-    # v39: preços derivados do catálogo. A v38 trazia strings fixas que já
-    # divergiam do real ("$0.99" para /starter-pack, que custa $1.00) e
-    # recomendava /global-macro a "$0.69" — um endpoint que nem está em
-    # BASE_PRICES, ou seja, o agente era mandado comprar algo inexistente.
     def _opt(ep, emoji, label, value, why):
         if ep not in BASE_PRICES:
             return None
@@ -11528,9 +10214,6 @@ def leaderboard():
         "ts": ts, "version": VERSION,
     })
 
-# ============================================================================
-# 13b. LOSBETO ALPHA SCORE (FREE TIER)
-# ============================================================================
 
 @app.route("/losbeto-alpha")
 def losbeto_alpha_free():
@@ -11606,7 +10289,6 @@ def losbeto_alpha_free():
             "_agent_metadata": {
                 "provider":     "Losbeto",
                 "node_id":      WALLET.node_id,
-                # v41: win_rate fora da vitrine (ver /sample).
                 "unique_value": "Losbeto Alpha Score — índice composto proprietário disponível apenas aqui",
             },
         })
@@ -11618,9 +10300,6 @@ def losbeto_alpha_free():
             "fallback_url": f"{base}/fear-greed",
         })
 
-# ============================================================================
-# 13b. CEREJA DO BOLO v21 — 4 endpoints exclusivos + discovery boosters
-# ============================================================================
 
 @app.route("/losbeto-alpha-score")
 def losbeto_alpha_score_free():
@@ -11644,7 +10323,6 @@ def multi_chain_arbitrage():
         "_agent_metadata": {
             "provider":  "Losbeto",
             "unique":    "Multi-chain simultâneo — um dos poucos no x402",
-            # v41: win_rate fora da vitrine (ver /sample).
         },
     }))()
 
@@ -11681,7 +10359,6 @@ def _win_rate_signed():
         "poi_multiplier": stats["poi_multiplier"],
         "buyers":         stats["buyers"],
     }
-    # Assina o payload canonicalizado — verificável com Ed25519
     canonical = json.dumps(payload, separators=(",", ":"), sort_keys=True)
     sig = base64.b64encode(WALLET.sign(canonical.encode())).decode()
     return jsonify({
@@ -11791,17 +10468,6 @@ def robots_txt():
         f"User-agent: PerplexityBot\nAllow: /\n",
         mimetype="text/plain")
 
-# ---------------------------------------------------------------------------
-# v48.15.0-BANDIT — SALDO+BLOCKHASH SOLANA SERVER-SIDE para o checkout /pay.
-# O browser do comprador às vezes não alcança NENHUM RPC público (rede
-# corporativa, DNS, extensão de privacidade) e o checkout morria com
-# "Could not reach the Solana network" mesmo com saldo na carteira. O
-# Railway enxerga a Solana muito melhor: esta rota gratuita consulta o
-# saldo de USDC (ATA passada pelo cliente; se vazia, varre TODAS as token
-# accounts do mint via dataSlice de 8 bytes) e devolve também um blockhash
-# fresco — o browser deixa de depender de RPC próprio. Cache 8s/carteira,
-# 30 req/min/IP. Nunca expõe nada além do que a própria chain expõe.
-# ---------------------------------------------------------------------------
 _SOL_BAL_CACHE: Dict[str, dict] = {}
 _SOL_BAL_RL: Dict[str, list] = {}
 _SOL_BAL_RPCS = [u for u in [
@@ -11822,19 +10488,6 @@ def _sol_rpc_call(url: str, method: str, params: list, timeout: int = 6):
     return j.get("result")
 
 
-# ---------------------------------------------------------------------------
-# v48.16.6-EXACT3 — VIGIA DA CAMADA 7: a verificação estática dos
-# facilitadores EXIGE que a ATA de USDC do payTo já exista on-chain (e proíbe
-# criar ATA dentro da tx de pagamento — seria "instrução extra" e cairia no
-# mesmo erro enganoso smart_wallet_program_not_allowed MESMO com a tx perfeita
-# de 3 instruções). Se a ATA faltar, a correção é UMA transferência comum de
-# USDC (qualquer valor) para o RECEIVE_ADDRESS — transação separada, fora do
-# fluxo x402. Este vigia deriva a ATA (mesmo algoritmo do getAssociatedToken
-# Address do web3.js), consulta getAccountInfo em background (TTL 6h) e expõe
-# o resultado em /health/providers ("sol_dest_ata") — a camada 7 deixa de ser
-# uma rejeição silenciosa e vira um sinal observável. NUNCA bloqueia request
-# e NUNCA derruba premium_ready (exists=None significa "RPC mudo", não "falta").
-# ---------------------------------------------------------------------------
 _ED_P = 2**255 - 19
 _ED_D = (-121665 * pow(121666, _ED_P - 2, _ED_P)) % _ED_P
 
@@ -12027,7 +10680,6 @@ def api_sol_usdc_balance():
                             best_amt, best_key = amt, a["pubkey"]
                     except Exception:
                         continue
-                # resposta VÁLIDA da rede: sem conta => saldo zero honesto
                 found = True
                 if best_key is not None:
                     have, src_addr = best_amt / 1e6, best_key
@@ -12049,13 +10701,6 @@ def api_sol_usdc_balance():
     return jsonify(out)
 
 
-# ---------------------------------------------------------------------------
-# v48.15.0 — RSL (Really Simple Licensing): padrão aberto (set/2025, RSS
-# co-author + Reddit/Yahoo/Medium/Fastly) para licenciar conteúdo a crawlers
-# de IA de forma machine-readable. O robots.txt aponta para este documento;
-# aqui dizemos: uso permitido mediante pagamento por uso, e o "caixa" é o
-# nosso catálogo x402. Custo zero, alinhamento com para onde a indústria vai.
-# ---------------------------------------------------------------------------
 @app.route("/.well-known/rsl.xml")
 def rsl_xml():
     base = _public_base()
@@ -12074,16 +10719,6 @@ def rsl_xml():
     return app.response_class(body, mimetype="application/xml")
 
 
-# ---------------------------------------------------------------------------
-# v48.16.0-SETTLE — PAGAMENTO POR TRANSFERÊNCIA DIRETA (USDC na Base).
-# Smart wallets (Coinbase Smart Wallet, passkey, Binance Web3) NÃO conseguem
-# produzir assinaturas que os facilitadores aceitem (x402#623) — mas fazem
-# transfer() comum sem problema. Aqui a venda fecha sem facilitador e sem
-# assinatura: o cliente envia USDC na Base para o payTo, cola o hash, e o
-# node verifica on-chain (status 0x1, contrato USDC, evento Transfer→payTo,
-# valor ≥ 97% do preço de tabela, ≥2 confirmações, anti-replay atômico com
-# devolução da reserva em falha transitória) e entrega o conteúdo na hora.
-# ---------------------------------------------------------------------------
 _BASE_USDC = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"
 _BASE_TRANSFER_TOPIC0 = ("0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a"
                          "11628f55a4df523b3ef")
@@ -12321,8 +10956,6 @@ def _sol_direct_verify(endpoint: str, sig: str):
 def api_claim_transfer():
     body = request.get_json(silent=True) or {}
     raw_ep = str(body.get("endpoint") or "").strip()
-    # v48.16.2: NÃO baixar caixa indiscriminado — assinatura Solana base58 é
-    # case-sensitive. Só o hash EVM pode descer (decidido após o regex).
     txh = str(body.get("tx") or "").strip()
     path = raw_ep.split("?", 1)[0] or "/"
     if path not in BASE_PRICES:
@@ -12392,9 +11025,6 @@ def sitemap_xml():
     body.append("</urlset>")
     return app.response_class("\n".join(body), mimetype="application/xml")
 
-# ============================================================================
-# 13c. VERIFY MANIFEST
-# ============================================================================
 
 @app.route("/.well-known/verify-manifest")
 def verify_manifest():
@@ -12418,16 +11048,12 @@ def verify_manifest():
             "message_fmt": "x402-domain-verify:{domain}:{ts}:{node_id}",
         },
         "trust_signals": {
-            # v41: idem — métricas heurísticas internas fora da vitrine pública.
             "tx_count_24h":   LEDGER.stats()["paid_24h"],
             "methodology":    "Heuristic signals; per-endpoint methodology in each response.",
             "chains":         [f"solana:{SOL_GENESIS}"] + ([BASE_CAIP2] if ENABLE_BASE else []),
         },
     })
 
-# ============================================================================
-# 13a. BOOTSTRAP TRUST (agora com 402 headers quando não pago)
-# ============================================================================
 
 @app.route("/bootstrap-trust", methods=["POST", "GET"])
 def bootstrap_trust():
@@ -12455,14 +11081,11 @@ def bootstrap_trust():
             "note":           "Este endpoint aceita pagamentos de QUALQUER wallet. Use para testar seu próprio flow de pagamento.",
         })
 
-    # POST — processa self-payment
-    # v21: aceita headers v1 e v2
     payment_header = (request.headers.get("X-PAYMENT")
                       or request.headers.get("X-Payment")
                       or request.headers.get("PAYMENT-SIGNATURE")
                       or request.headers.get("Payment-Signature"))
     if not payment_header:
-        # Retorna 402 com headers completos (scanner aprova)
         return _build_402("/bootstrap-trust")
 
     tx_sig = payment_header.strip()
@@ -12530,15 +11153,11 @@ def bootstrap_trust():
         ],
     })
 
-# ============================================================================
-# 13d. NOVOS ENDPOINTS: REFERRAL e STAKE
-# ============================================================================
 
 @app.route("/referral", methods=["POST", "GET"])
 def referral():
     """Sistema de afiliados."""
     if request.method == "GET":
-        # Gera um código de referência para o usuário (pode ser chamado pelo dashboard)
         code = request.args.get("code", "").strip()
         if code:
             ref = LEDGER.get_referral(code)
@@ -12547,7 +11166,6 @@ def referral():
             return jsonify({"error": "code not found"}), 404
         return jsonify({"instruction": "POST /referral com {code, owner} para criar um código"}), 200
 
-    # POST: criar código de referência
     data = request.get_json(silent=True) or {}
     code = data.get("code", "").strip()
     owner = data.get("owner", "").strip()
@@ -12566,7 +11184,6 @@ def stake():
     tx_sig = data.get("tx_sig", "").strip()
     if not staker or amount <= 0 or not tx_sig:
         return jsonify({"error": "staker, amount, and tx_sig required"}), 400
-    # Stake consome a mesma TX global de pagamento; sem reutilização em produtos.
     if LEDGER.tx_recorded(tx_sig):
         return jsonify({"error": "transaction already consumed"}), 409
     tx_key = "tx:solana:" + tx_sig
@@ -12589,26 +11206,17 @@ def stake():
         "message": "Stake registered. Your stake is now active and will earn rewards based on node performance."
     })
 
-# ============================================================================
-# 14. ENDPOINTS PÚBLICOS + MANIFESTS (com security: [] no OpenAPI)
-# ============================================================================
 
 TRY_MENU = [p.strip() for p in os.environ.get(
     "TRY_MENU",
     "/global-morning-brief,/equity-dossier,/forex-rate,/commodity-price,"
     "/fear-greed,/launch-risk").split(",") if p.strip()]
 
-# v42: evidência ao vivo (31/jul) — o /try chegou a mostrar "warming" em 4 dos
-# 6 cards (cache de preview local por worker + cadência do warmer de IA). Um
-# avaliador que recebe placeholder no cardápio vai embora achando que o node
-# está morto. Estes endpoints baratos e rápidos entram como RESERVA: se um
-# card do menu estiver frio, o reserva aquecido ocupa o lugar na hora.
 TRY_BACKFILL = [p.strip() for p in os.environ.get(
     "TRY_BACKFILL",
     "/pyth-price,/trust-hash,/regime,/anomalias,/sentiment,/mempool,"
     "/dex-screen,/br-equity").split(",") if p.strip()]
 
-# v44.8.0: cache do probe de IA do /health/providers (ver comentário na rota).
 AI_PROBE_TTL = int(os.environ.get("AI_PROBE_TTL", "900"))  # 15 min
 _AI_PROBE_CACHE = {"ts": 0.0, "probe": "", "live": False}
 
@@ -12634,13 +11242,6 @@ def health_providers():
     produtos cujas fontes estavam mudas. Agora qualquer um (inclusive um
     revisor) confere em 1 request se dado e IA estão realmente vivos."""
     out = {"version": VERSION, "ts": int(time.time())}
-    # 1) IA: os produtos premium prometem síntese — isto prova se ela funciona
-    # v44.8.0 FIX — O PRÓPRIO DIAGNÓSTICO SANGRAVA A COTA. Cada chamada a este
-    # endpoint disparava UM probe LLM ao vivo; monitores + operador batendo
-    # toda hora = centenas de chamadas/dia contra o tier gratuito do
-    # Gemini/Groq → os 429 recorrentes. Agora o probe tem cache de 15 min:
-    # o diagnóstico continua verdadeiro (15 min é fresco p/ auditoria) e a
-    # cota fica para quem PAGA.
     probe, ai_live = _ai_probe_cached()
     out["ai"] = {"live": ai_live,
                  "providers_configured": [n for n, k in
@@ -12661,7 +11262,6 @@ def health_providers():
                  "public_status": "/ml",
                  "mpp_tempo": ("on" if MPP_TEMPO else "off"),
                  "price_advisor": ("auto" if PRICE_AUTO else "advisory")}
-    # 2) mercados tradicionais: o que a auditoria reprovou
     checks = {}
     for path, fn in (("/stock-quote", Brain.stock_quote),
                      ("/commodity-price", Brain.commodity_price),
@@ -12669,10 +11269,6 @@ def health_providers():
         try:
             with app.test_request_context(path):
                 r = fn()
-            # v25.4 FIX: cada handler nomeia o valor de forma diferente
-            # (/forex-rate usa "rate", os demais "price"). A checagem anterior só
-            # olhava "price" e marcava o forex como morto mesmo com dado real —
-            # falso negativo que travava premium_ready.
             val = None
             if isinstance(r, dict):
                 val = r.get("price") if r.get("price") is not None else r.get("rate")
@@ -12685,23 +11281,14 @@ def health_providers():
             checks[path] = {"live": False, "source": f"error: {str(e)[:40]}"}
     out["market_data"] = checks
     out["premium_ready"] = ai_live and all(v["live"] for v in checks.values())
-    # v48.16.6-EXACT3: camada 7 vigiada — a ATA de USDC do payTo Solana precisa
-    # EXISTIR on-chain p/ o facilitador liquidar. exists=None = RPC mudo (nunca
-    # derruba premium_ready); exists=False = criar com 1 envio comum de USDC.
     try:
         out["sol_dest_ata"] = _sol_dest_ata_status()
     except Exception:
         out["sol_dest_ata"] = {"ata": None, "exists": None, "balance": None}
-    # v48.17.6-RAILGUARD: estado dos DOIS rails de facilitator, visível de
-    # fora. "available": false = disjuntor aberto (conta irregular / free
-    # tier esgotado) — settles daquele rail nem são tentados até o cooldown.
     try:
         out["facilitators"] = {
             "cdp": {"available": _cdp_available(),
                     "retry_in_s": max(0, int(_CDP_BREAKER["open_until"] - time.time()))},
-            # v48.17.7: "auth" = lane autenticada ativa (key válida no boot).
-            # auth=false + available=false = pool grátis esgotado SEM saída —
-            # criar key+créditos é a única restauração (free tier é lifetime).
             "payai": {"available": _payai_available(),
                       "retry_in_s": max(0, int(_PAYAI_BREAKER["open_until"] - time.time())),
                       "auth": bool(PAYAI_AUTH["ok"])},
@@ -12726,8 +11313,6 @@ def try_menu():
         if path not in BASE_PRICES:
             continue
         sample = _inline_sample(path)
-        # v42: card frio? tenta um reserva aquecido no lugar — o cardápio
-        # nunca mostra placeholder se houver QUALQUER dado real para mostrar.
         if sample.get("status") in ("warming", "unavailable"):
             for alt in TRY_BACKFILL:
                 if alt in BASE_PRICES and not any(i["endpoint"] == alt for i in items):
@@ -12831,10 +11416,6 @@ def sample_free():
             "_agent_metadata": {
                 "provider":    "Losbeto",
                 "node_id":     WALLET.node_id,
-                # v41: win_rate heurístico (36.8%) e PoI congelado saíram das
-                # superfícies públicas. Um comprador lia "36.8% win rate" como
-                # avaliação do produto inteiro — pior que um cara-ou-coroa.
-                # Continuam no dashboard interno (métrica operacional legítima).
                 "endpoints_count": len(BASE_PRICES),
                 "methodology": "Heuristic signals; methodology declared per response.",
             },
@@ -12892,8 +11473,6 @@ def api_for_you():
         if ep == fav or ep.startswith(("/subscribe", "/day-pass", "/week-pass",
                                        "/buy-credits", "/starter", "/enterprise",
                                        "/founding-agent")):
-            # v48.26.3: /founding-agent faltava na lista — é PLANO (bundle de
-            # crédito $49.99), não produto per-call; planos têm vitrine própria.
             continue
         if not _sellable_now(ep):   # v48.17.13: não recomendar o invendável
             continue
@@ -12902,9 +11481,6 @@ def api_for_you():
     recs.sort(key=lambda t: (-t[0], t[1]))
     out = []
     for shared, _p, ep in recs[:4]:
-        # v48.26.3-POLISH: o corte duro [:110] truncava a descrição no MEIO da
-        # palavra ("vali", "B3 b", "ri") e o :.4f exibia "$49.9900"/"$0.5000"
-        # na vitrine. Corte em fronteira de palavra + preço por magnitude.
         desc = (ENDPOINT_DESC.get(ep, ep) or "").strip()
         if len(desc) > 110:
             desc = desc[:110].rsplit(" ", 1)[0].rstrip(" ,;:—-(") + "…"
@@ -12913,8 +11489,6 @@ def api_for_you():
                     "price_usdc": f"{preco:.2f}" if preco >= 0.01 else f"{preco:.3f}",
                     "desc": desc,
                     "free_sample": f"{base}{ep}?preview=1"})
-    # contexto de pregão (horários UTC): B3 13:00-20:00, NYSE 13:30-20:00,
-    # cripto sempre. Sábado/domingo fechado para ações.
     now = datetime.now(timezone.utc)
     wd, hm = now.weekday(), now.hour * 60 + now.minute
     markets = {
@@ -12925,16 +11499,6 @@ def api_for_you():
     return jsonify({"recommendations": out, "markets": markets,
                     "ts": int(time.time())})
 
-# ---------------------------------------------------------------------------
-# v44 — /tasks.json: MANIFESTO ORIENTADO A INTENÇÃO.
-#
-# Agentes conversacionais (Poncho, GPTs, Claude com ferramentas) não buscam
-# "endpoints" — buscam TAREFAS: "verifique se este token é seguro", "me dê o
-# brief da manhã". A página tryponcho.com/m/api.losbeto.xyz existe mas nasceu
-# rasa porque nossos manifests descrevem recursos, não intenções. Este arquivo
-# é a ponte: linguagem de tarefa → chamada exata → preço vivo. Grátis, para
-# qualquer diretório ou LLM indexar.
-# ---------------------------------------------------------------------------
 _TASKS = [
     {"task": "Check if a crypto token is safe before buying it",
      "utterances": ["is this token a scam", "should I buy this token",
@@ -13066,13 +11630,6 @@ def owners_manifest():
     return resp
 
 
-# ============================================================================
-# v48.9.9-DISCO: identidade verificável + interoperabilidade. O radar de
-# demanda (7d) mostrou 4 artefatos que agentes PEDEM repetidamente e o nó
-# não servia — 11 IPs pedindo did.json, 10 brick-blue.json, 12 /api/mcp,
-# 12 /sse. Nenhum exige dado novo: são handshakes de confiança/descoberta.
-# Máquina não compra o que não consegue verificar nem conectar.
-# ============================================================================
 
 @app.route("/.well-known/did.json")
 def well_known_did():
@@ -13307,16 +11864,12 @@ def bazaar_manifest():
         },
         "trust": {
             "tx_count_24h": LEDGER.stats()["paid_24h"],
-            # v41: win_rate/poi fora da superfície pública — números internos
-            # que um comprador interpretava como avaliação negativa do produto.
             "methodology": "Heuristic signals; per-endpoint methodology in each response.",
             "chains_supported": [f"solana:{SOL_GENESIS}"] + ([BASE_CAIP2] if ENABLE_BASE else []),
         },
     }
     return jsonify(manifest)
 
-# v21: landing HTML comercial — humanos VEEM o valor antes de pagar.
-#      Agentes AI (User-Agent contendo bot/agent/curl/python) continuam recebendo JSON.
 LANDING_HTML = r"""<!DOCTYPE html>
 <html lang="pt-BR"><head>
 <meta charset="utf-8">
@@ -13714,15 +12267,13 @@ footer a{color:var(--dim)}
 .rails .rl{display:flex;align-items:center;gap:8px;color:var(--dim);font-size:13px}
 .rails svg{width:20px;height:20px;display:block}
 .rails .acc-lbl{color:var(--dim);font-size:11px;text-transform:uppercase;letter-spacing:.09em}
-.tickband{width:100vw;margin-left:calc(50% - 50vw);border-top:1px solid var(--line);
-          background:#0c0e11;overflow:hidden;padding:9px 0}
-.tick{display:flex;gap:38px;width:max-content;animation:tick 48s linear infinite;
-      font:12.5px var(--mono);color:#6b7280;white-space:nowrap}
+.tickband{width:100%;border-top:1px solid var(--line);border-bottom:1px solid var(--line);
+          background:#0c0e11;padding:12px 0}
+.tick{display:flex;gap:10px 24px;align-items:center;justify-content:center;flex-wrap:wrap;
+      max-width:1120px;margin:0 auto;padding:0 20px;
+      font:12.5px/1.6 var(--mono);color:#8b9199}
 .tick b{color:#9fd8ab;font-weight:600}
 .tick .sep{color:#2a2f36}
-.tickband:hover .tick{animation-play-state:paused}
-@keyframes tick{from{transform:translateX(0)}to{transform:translateX(-50%)}}
-@media(prefers-reduced-motion:reduce){.tick{animation:none}}
 /* v48.21-TRUSTSTACK — trust bar de listagens verificáveis. Cada selo é um
    link para a PROVA pública (nunca um badge inventado). */
 .seals{display:grid;grid-template-columns:repeat(auto-fit,minmax(215px,1fr));gap:12px;margin-top:18px}
@@ -13780,7 +12331,7 @@ settles a few cents in USDC per request and gets clean JSON back.</p>
   <div class="stat"><b>__P_MIN__</b><span>cheapest call</span></div>
   <div class="stat"><b>__NCHAINS__</b><span class="wide">chains · __CHAINS__</span></div>
   <div class="stat"><b>0</b><span>accounts to create</span></div>
-  <div class="stat"><b>Free</b><span>sample on every endpoint</span></div>
+  <div class="stat"><b>Free</b><span>live samples on selected endpoints</span></div>
   <div class="stat"><b class="sm"><a href="/welcome" style="color:inherit">1st call free</a></b><span>real-time, no wallet · /welcome</span></div>
 </div>
 <div class="rails">
@@ -13792,8 +12343,7 @@ settles a few cents in USDC per request and gets clean JSON back.</p>
   </div>
 </div></section>
 <div class="tickband"><div class="tick">
-<span>/chain-block <b>__P_CBLOCK__</b></span><span class="sep">·</span><span>/gas-price <b>__P_CGAS__</b> + ML forecast</span><span class="sep">·</span><span>/chain-ens <b>__P_CENS__</b></span><span class="sep">·</span><span>/chain-tx <b>__P_CTX__</b></span><span class="sep">·</span><span>/chain-balance <b>__P_CBAL__</b></span><span class="sep">·</span><span>/agent-reputation <b>__P_AREP__</b> · ERC-8004</span><span class="sep">·</span><span>/wallet-verdict <b>__P_WV__</b> + shareable card</span><span class="sep">·</span><span>free sample on every endpoint — /try · /welcome · ?preview=1</span><span class="sep">·</span>
-<span>/chain-block <b>__P_CBLOCK__</b></span><span class="sep">·</span><span>/gas-price <b>__P_CGAS__</b> + ML forecast</span><span class="sep">·</span><span>/chain-ens <b>__P_CENS__</b></span><span class="sep">·</span><span>/chain-tx <b>__P_CTX__</b></span><span class="sep">·</span><span>/chain-balance <b>__P_CBAL__</b></span><span class="sep">·</span><span>/agent-reputation <b>__P_AREP__</b> · ERC-8004</span><span class="sep">·</span><span>/wallet-verdict <b>__P_WV__</b> + shareable card</span><span class="sep">·</span><span>free sample on every endpoint — /try · /welcome · ?preview=1</span><span class="sep">·</span>
+<span>/chain-block <b>__P_CBLOCK__</b></span><span class="sep">·</span><span>/gas-price <b>__P_CGAS__</b> + ML forecast</span><span class="sep">·</span><span>/chain-ens <b>__P_CENS__</b></span><span class="sep">·</span><span>/chain-tx <b>__P_CTX__</b></span><span class="sep">·</span><span>/chain-balance <b>__P_CBAL__</b></span><span class="sep">·</span><span>/agent-reputation <b>__P_AREP__</b> · ERC-8004</span><span class="sep">·</span><span>/wallet-verdict <b>__P_WV__</b> + shareable card</span><span class="sep">·</span><span>free live samples — /try · /welcome</span>
 </div></div>
 
 <!-- v48.20: CHAIN INTELLIGENCE — a "água" que o mercado x402 compra em volume
@@ -13802,10 +12352,10 @@ settles a few cents in USDC per request and gets clean JSON back.</p>
      Visível nas DUAS abas (human/agent) — fora do #human de propósito. -->
 <section class="band alt"><div class="wrap">
 <h2>New — Base chain intelligence, priced for loops</h2>
-<p class="lede">Raw chain data at commodity prices, with the layer the raw-RPC
-sellers don't have: a self-trained gas forecaster, wallet classification,
-ENS resolution, LLM transaction explanations and the first ERC-8004
-reputation feed on x402. Zero upstream cost — built to be hammered by agents.</p>
+<p class="lede">Base chain reads with explicit schemas and pay-per-call settlement:
+gas forecasting, wallet classification, ENS resolution, LLM transaction
+explanations and ERC-8004 reputation lookups. Live availability and current
+prices are published in the machine-readable catalog.</p>
 <div class="grid">
   <a class="card" href="/chain-block?preview=1"><span class="p">__P_CBLOCK__</span>
     <h3>Chain Block</h3>
@@ -14503,8 +13053,6 @@ def root():
     wants_json = ("application/json" in request.headers.get("Accept", "").lower()
                   or _is_bot(ua)
                   or request.args.get("format") == "json")
-    # v32: landing limpa. O caminho JSON para máquinas continua idêntico;
-    # só a página humana foi trocada. ?legacy=1 mantém a antiga acessível.
     if not wants_json and request.args.get("legacy") != "1":
         return app.response_class(_render_clean_landing(), mimetype="text/html")
     if wants_json:
@@ -14519,15 +13067,7 @@ def root():
             "endpoints":        len(BASE_PRICES),
             "prices_usdc":      prices,
             "featured_endpoints": FEATURED_ENDPOINTS,
-            # v39: a v38 publicava aqui `"win_rate": 36.81...`. Um agente
-            # avaliando fornecedores lia um número abaixo de 50% como
-            # métrica de destaque — e o mesmo número era VENDIDO a $0.04 em
-            # /win-rate-verified. O produto pago se justifica pela assinatura
-            # Ed25519 e pela metodologia declarada, não pelo número solto.
             "performance_attestation": "/win-rate-verified",
-            # v41: poi_multiplier também sai da vitrine pública (mesma razão do
-            # win_rate na v39 — número interno lido como avaliação do produto).
-            # v39: o prefixo do token do dashboard não sai mais daqui.
             "dashboard":        "/dash (operator token required)",
             "exclusive_endpoints": [
                 "/losbeto-alpha-score", "/multi-chain-arbitrage",
@@ -14544,7 +13084,6 @@ def root():
                 "llms":    "/llms.txt",
             },
         })
-    # HTML para humanos
     tag_map = {
         "free": ["/losbeto-alpha-score"],
         "hot": ["/multi-chain-arbitrage", "/alpha-signal", "/mev-flow"],
@@ -14566,9 +13105,6 @@ def root():
         rows.append(f'<tr><td><code>{ep}</code> {_tag(ep)}</td><td>${price:.4f}</td><td>{tags}</td><td style="color:var(--muted)">{desc}</td></tr>')
     rows_html = "".join(rows)
     min_price = min(BASE_PRICES.values())
-    # v21.8: PROVA ON-CHAIN — recibos reais de vendas liquidadas via facilitator,
-    # com link Solscan verificável. Nenhum node novo tem isso; é o maior sinal
-    # de confiança possível para agentes e humanos avaliando o catálogo.
     receipt_rows = []
     try:
         with LEDGER.lock, LEDGER._conn() as _c:
@@ -14598,8 +13134,6 @@ def root():
         .replace("__V__", VERSION)
         .replace("__EPS__", str(len(BASE_PRICES)))
         .replace("__CHAINS_OR__", _chains_or())
-        # v48.26.2: __CHAINS__ existia no rodapé desde a v48.11.0 SEM replace
-        # aqui — a ?legacy=1 servia o placeholder cru em produção.
         .replace("__CHAINS__", _chains_text())
         .replace("__WR__", f"{LEDGER.win_rate():.0f}")
         .replace("__MIN__", f"{min_price:.3f}")
@@ -14691,13 +13225,6 @@ def info():
         "base_enabled":    ENABLE_BASE,
     })
 
-# v30.2 — DESCOBERTA CAPTURADA PELA TELEMETRIA.
-# O painel de demanda registrou um cliente real pedindo /x402-resources e
-# /.well-known/x402-resources. Não era pedido de produto: era uma convenção de
-# DESCOBERTA que não servíamos — provavelmente um crawler acostumado ao formato
-# paginado do CDP (GET /v2/x402/discovery/resources) procurando o equivalente
-# self-hosted. Quem pediu não conseguiu nos indexar e foi embora.
-# O dado já existia no /.well-known/x402.json; faltava o caminho.
 @app.route("/x402-resources")
 @app.route("/.well-known/x402-resources")
 @app.route("/x402/resources")
@@ -14727,12 +13254,6 @@ def x402_resources():
         "version": VERSION,
     })
 
-# ---------------------------------------------------------------------------
-# v41 — FIRST-CALL-FREE: rota /welcome (os aliases de demanda — /health/,
-# /status, /openapi.yaml, /.well-known/llms.txt, /.well-known/health,
-# /apis.json, /.well-known/api-catalog — já foram criados na seção v40 deste
-# arquivo; não duplicar rotas aqui).
-# ---------------------------------------------------------------------------
 
 @app.route("/welcome")
 def welcome():
@@ -14776,13 +13297,6 @@ def welcome():
         },
         "ts": int(time.time()), "version": VERSION})
 
-# ---------------------------------------------------------------------------
-# v44.0.8 FUNIL — /ip: endpoint-isca gratuito. O radar de demanda registrou
-# 10 IPs distintos pedindo /ip em 7d (a única demanda real não atendida).
-# Eco de IP estilo ipify + vitrine mínima do nó: é o degrau zero-fricção do
-# funil free→paid que os líderes do x402scan usam (BlockRun: 8 modelos free).
-# Não entra em BASE_PRICES — é gratuito por design, com rate limit leve.
-# ---------------------------------------------------------------------------
 
 @app.route("/ip")
 def ip_echo():
@@ -14814,7 +13328,7 @@ def ip_echo():
                      f"USDC on {_chains_text()} via x402."),
             "free": {"six_samples_one_call": f"{base}/try",
                      "first_realtime_call": f"{base}/welcome",
-                     "any_endpoint_delayed": f"{base}/<endpoint>?preview=1"},
+                     "selected_endpoint_previews": f"{base}/<endpoint>?preview=1"},
             "catalog": f"{base}/get-pricing",
             "agents": f"{base}/llms.txt",
             "buy_example": f"npx agentcash fetch {base}/fear-greed"}})
@@ -14839,33 +13353,25 @@ def _resource_entry(ep: str) -> dict:
          "extra": (({"feePayer": FACILITATOR.get_svm_fee_payer()}
                     if FACILITATOR and FACILITATOR.get_svm_fee_payer() else {}))},
     ]
-    # v44.7.0: o accept Algorand entra no manifesto também — o Bazaar do
-    # GoPlausible enriquece o merchant lendo os well-known do domínio, e a
-    # tag do challenge precisa estar visível aqui.
     if ENABLE_ALGO:
-        _accepts.append({
-            "scheme": "exact", "network": ALGO_CAIP2,
-            "asset": ALGO_USDC_ASA, "payTo": ALGO_PAYTO,
-            "amount": str(int(round(price * 1_000_000))),
-            "maxAmountRequired": str(int(round(price * 1_000_000))),
-            "maxTimeoutSeconds": 300,
-            "extra": {"feePayer": ALGO_FEEPAYER,
-                      "tag": "x402-global-challenge"}})
-    return {
+        for algo_network in (ALGO_CAIP2, ALGO_CAIP2_FULL):
+            _accepts.append({
+                "scheme": "exact", "network": algo_network,
+                "asset": ALGO_USDC_ASA, "payTo": ALGO_PAYTO,
+                "amount": str(int(round(price * 1_000_000))),
+                "maxAmountRequired": str(int(round(price * 1_000_000))),
+                "maxTimeoutSeconds": 300,
+                "extra": {"feePayer": ALGO_FEEPAYER,
+                          "tag": "x402-global-challenge"}})
+    entry = {
         "resource": f"{base}{ep}",
         "type": "http",
         "method": "GET",
         "description": ENDPOINT_DESC.get(ep, ep),
         "price_usdc": f"{price:.4f}",
         "amount_atomic": str(int(round(price * 1_000_000))),
-        # v41: o manifesto dizia "x402Version: 2" mas os accepts usavam só o
-        # campo v1 (maxAmountRequired) e omitiam os `extra` da spec v2 —
-        # feePayer (SVM) e domínio EIP-712 (Base). Catálogos que validam
-        # contra a spec marcavam as entradas como incompletas.
         "accepts": _accepts,
         "tags": _service_tags(ep),
-        # v48.9.8: campos padrão-de-catálogo (referência: manifesto Vybe) —
-        # x402scan/Agentic.Market leem siwx/supports*/metadata.provider.
         "siwx": False,
         "supportsVanillax402": True,
         "supportsCircleGateway": False,
@@ -14873,26 +13379,14 @@ def _resource_entry(ep: str) -> dict:
                                   "openApiUrl": f"{base}/openapi.json",
                                   "category": "FINANCIAL_ANALYSIS",
                                   "tags": _service_tags(ep)}},
-        "free_preview": f"{base}{ep}?preview=1",
         "lastUpdated": int(time.time()),
     }
+    if ep not in CREDIT_PLANS:
+        entry["free_preview"] = f"{base}{ep}?preview=1"
+    return entry
 
 @app.route("/.well-known/x402")
 def manifest_x402_alias():
-    # v48.9.24-LINTFIX: era um redirect 308 → /.well-known/x402.json. O
-    # x402lint (S6) NÃO segue redirect e marcava FAIL "not found or not
-    # valid JSON" — o único FAIL do scan 92/100 de 27/09. Serve direto.
-    #
-    # v48.9.26-WKSLIM: mesmo com 200 JSON + x402Version/kind (v48.9.25) o S6
-    # SEGUIU FAIL no scan fresco de 27/09 23:50 UTC. Referencia do formato
-    # que o proprio x402lint serve em api.x402lint.dev/.well-known/x402:
-    # 2.4KB, {x402Version, endpoints:[{resource,method,scheme,networks[],
-    # price:"$0.05",description}], asset, networks[], payTo, terms,
-    # instructions}. O nosso tinha 291KB e endpoints[] com url/accepts —
-    # fora do shape deles (e acima de qualquer cap de tamanho de scanner).
-    # O alias passa a servir o documento COMPACTO nesse formato; o catalogo
-    # completo (resources[] pesado, Bazaar) segue em /.well-known/x402.json
-    # e /x402.json — nada se perde.
     try:
         full = manifest_x402().get_json(silent=True) or {}
     except Exception as e:
@@ -14935,7 +13429,6 @@ def manifest_x402_alias():
         "instructions": ("Market data, Brazil point-in-time macro archive and "
                          "LLM inference for agents — USDC per call via x402 "
                          f"({_chains_text()}). Docs: {base}/llms.txt"),
-        # draft-hawkins-x402-dns-discovery: RECOMMENDED/OPTIONAL no topo
         "kind":         "resource-server",
         "name":         SERVICE_NAME,
         "description":  full.get("description"),
@@ -15013,15 +13506,9 @@ def manifest_x402():
     base = _public_base()
     resources = []
 
-    # /bootstrap-trust tem GET livre (instruções, 200) e POST pago. Declarar
-    # como GET no manifesto genérico contradiz o comportamento real e faz o
-    # x402scan recusar o registro do node inteiro — tratado à parte abaixo.
     MIXED_METHOD = {"/bootstrap-trust"}
 
     def _resource(path: str, method: str = "GET"):
-        # v47.9.7: silent=True + guarda — o manifesto NUNCA mais morre por
-        # content-type inesperado; no pior caso o endpoint é omitido, jamais
-        # o catálogo inteiro.
         ch = _build_402(path).get_json(silent=True)
         if not ch:
             return None
@@ -15031,9 +13518,6 @@ def manifest_x402():
         primary = accepts[0]
         desc = _cap500(ENDPOINT_DESC.get(path))
         if not desc:
-            # v39: o fallback da v38 era `ENDPOINT_DESC.get(p, p)`, que fazia
-            # /week-pass e /enterprise aparecerem no Bazaar com a descrição
-            # literal "/week-pass". Um produto de $9.99 sem descrição não vende.
             log.error(f"🚨 catálogo: {path} sem ENDPOINT_DESC — "
                       f"não será publicado no manifesto")
             return None
@@ -15050,15 +13534,11 @@ def manifest_x402():
             "description":       desc,
             "mimeType":          "application/json",
             "accepts":           accepts,
-            # Service Metadata da spec do Bazaar: nome legível, tags e ícone
-            # alimentam o ranking de qualidade e a busca semântica.
             "serviceName":       SERVICE_NAME,
             "tags":              _service_tags(path),
             "iconUrl":           f"{base}/favicon.png",
             "inputSchema":       ch.get("inputSchema"),
             "outputSchema":      ch.get("outputSchema"),
-            # v48.9.8: campos padrão-de-catálogo (referência: manifesto Vybe)
-            # — x402scan/Agentic.Market leem siwx/supports*/metadata.provider.
             "siwx":                  False,
             "supportsVanillax402":   True,
             "supportsCircleGateway": False,
@@ -15097,9 +13577,6 @@ def manifest_x402():
         chains.reverse()
 
     manifest = {
-        # v48.9.25-WKFIX (S6): draft-hawkins-x402-dns-discovery exige no topo
-        # "x402Version" (maior versao falada) e "kind". Sem eles o x402lint
-        # marca FAIL mesmo com 200 JSON valido. Aditivo — nada removido.
         "x402Version":     2,
         "kind":            "resource-server",
         "name":            SERVICE_NAME,
@@ -15111,10 +13588,6 @@ def manifest_x402():
         "version":         2,
         "ownershipProofs": [WALLET.solana_address],
         "resources":       resources,
-        # v48.9.20-LINT (S6): /.well-known/x402(.json) precisa de uma lista
-        # "endpoints[]" PARSEAVEL no topo — x402lint e afins nao leem
-        # "resources". Compacta: url+method+desc+accepts primarios, sem
-        # duplicar o payload pesado.
         "endpoints":       [{"url": r["url"], "method": r["method"],
                              "description": r["description"],
                              "accepts": [{"scheme": a.get("scheme"),
@@ -15142,39 +13615,9 @@ def manifest_x402():
         manifest["ownershipProofs"].append(BASE_PAYTO_EVM)
     return jsonify(manifest)
 
-# ============================================================================
-# 17. MCP STREAMABLE HTTP (v26) — servidor MCP de verdade, não só manifesto.
-#     Antes o /.well-known/mcp.json anunciava ferramentas mas NÃO havia endpoint
-#     MCP: clientes (Glama, Inspector) faziam POST na raiz e recebiam 405, o que
-#     marcava o servidor como "unhealthy" nos diretórios. Agora qualquer agente
-#     conecta direto por HTTP — sem npm, sem instalar nada.
-# ============================================================================
 
 MCP_PROTOCOL_VERSION = "2024-11-05"
 
-# ---------------------------------------------------------------------------
-# v39.1 — MCP REDESENHADO: WRAPPER PATTERN (73 tools -> 5)
-#
-# ACHADO QUE MOTIVOU A MUDANÇA
-# A v39 expunha UMA TOOL POR ENDPOINT: 73 definições. Cada definição de tool
-# custa ~100-500 tokens de contexto e fica no prompt A CADA TURNO. Nossos 73
-# consumiam ~20-25 mil tokens antes do agente ler a primeira mensagem do
-# usuário — mais de 10% de uma janela de 200k, gasta só em metadados.
-#
-# Pior que o custo: a PRECISÃO DE SELEÇÃO cai conforme o conjunto cresce. Com
-# 73 nomes parecidos (sentiment, sentiment_consensus, fear_greed, regime,
-# alpha_signal...), o planejador erra a escolha ou desiste. A orientação
-# consolidada em 2026 é 5-15 tools por servidor; o líder da categoria expõe 4
-# para um catálogo de 139 endpoints.
-#
-# SOLUÇÃO — Wrapper Pattern (o mesmo princípio do Tool Search da Anthropic):
-# o servidor esconde o catálogo e expõe um punhado de tools de descoberta. O
-# agente PERGUNTA o que existe, recebe só o que interessa, e então busca.
-#
-# Custo de contexto: ~25.000 -> ~1.500 tokens. Redução de ~94%.
-#
-# MCP_LEGACY_TOOLS=1 volta ao modo 73-tools se algum cliente antigo quebrar.
-# ---------------------------------------------------------------------------
 
 MCP_LEGACY_TOOLS = os.environ.get("MCP_LEGACY_TOOLS", "").strip() in ("1", "true")
 
@@ -15202,7 +13645,6 @@ def _mcp_legacy_tools_list() -> list:
     return tools
 
 
-# Agrupamento do catálogo por assunto — é o que search_market_data devolve.
 MCP_CATEGORIES = {
     "brazil": ("Brazil: BCB central-bank macro (Selic, CDI, IPCA, PTAX), B3 "
                "equities and Ibovespa, and a strategist brief. Not available "
@@ -15216,8 +13658,6 @@ MCP_CATEGORIES = {
     "infrastructure": "x402 endpoint auditing, proof-of-data hashes, node trust.",
 }
 
-# Palavras que mapeiam a consulta do agente para endpoints. Deliberadamente
-# amplo: é melhor devolver 8 candidatos com preço do que zero.
 _MCP_SEARCH_INDEX = None
 
 
@@ -15248,7 +13688,6 @@ def _mcp_category_of(path: str) -> str:
     return "crypto"
 
 
-# Termos ruidosos: aparecem em quase toda descrição e não discriminam nada.
 _MCP_STOPWORDS = {
     "the", "and", "for", "with", "from", "that", "this", "what", "how", "are",
     "was", "get", "give", "show", "tell", "need", "want", "find", "data",
@@ -15257,8 +13696,6 @@ _MCP_STOPWORDS = {
     "endpoint", "api", "please", "about", "into", "over", "per",
 }
 
-# Sinônimos do domínio: o agente pergunta em linguagem natural, o catálogo usa
-# termos técnicos. Sem esta ponte, "interest rate" não encontra "Selic".
 _MCP_SYNONYMS = {
     "brazil": ["brazil", "brazilian", "br", "selic", "ipca", "ibovespa", "b3",
                "bcb", "ptax", "real", "brl", "petr4", "vale3", "itub4"],
@@ -15325,11 +13762,8 @@ def _mcp_search(query: str, limit: int = 8) -> list:
                 pontos += 1.0; atendidos += 1
         if not atendidos:
             continue
-        # cobertura domina: atender todos os termos vale mais que muitas
-        # ocorrências de um só.
         cobertura = atendidos / len(brutos)
         score = cobertura * 10 + pontos
-        # desempate: termo do domínio no path é sinal forte
         if any(t in path_txt for t in expandidos):
             score += 2
         scored.append((score, path))
@@ -15507,7 +13941,6 @@ def _mcp_fetch(path: str, params: dict, key: str) -> dict:
             "buy": f"{_public_base()}{path}",
             "note": "Purchase endpoints are not executed through free MCP sampling."})}]}
 
-    # Sem assinatura: serve a amostra atrasada do cache (custo zero, dado real).
     if not live:
         cached = _PREVIEW_CACHE.get(path) or _preview_db_get(path)
         if cached and _sample_is_good(cached.get("data")):
@@ -15521,7 +13954,6 @@ def _mcp_fetch(path: str, params: dict, key: str) -> dict:
                     f"{_public_base()}{path}. See account_status."),
             })
 
-    # Assinante, ou sem amostra disponível: executa de verdade.
     qs = "&".join(f"{k}={v}" for k, v in (params or {}).items() if v is not None)
     try:
         with app.test_request_context(f"{path}?{qs}"):
@@ -15738,13 +14170,6 @@ def mcp_streamable():
     if request.method == "DELETE":
         return ("", 204)                     # encerra "sessão" (stateless aqui)
     if request.method == "GET":
-        # v48.22.0-MCPHEALTH: health checkers (8004scan marcava este serviço
-        # UNHEALTHY com "HTTP 405", Health 66.7/degraded) e humanos fazem GET
-        # bare, sem Accept de stream. A spec MCP permite 405 para GET de SSE —
-        # mas só para quem PEDIU stream. Quem pediu event-stream segue com 405
-        # spec-true; todo o resto recebe 200 com o descriptor do servidor
-        # (prova de vida + instrução de uso), o que também dá ao scanner as
-        # "capabilities" que ele dizia não encontrar.
         _acc = (request.headers.get("Accept") or "")
         if "text/event-stream" in _acc:
             r = app.response_class(json.dumps({"jsonrpc": "2.0", "error": {
@@ -15800,24 +14225,6 @@ def mcp_streamable():
     r.headers["Mcp-Session-Id"] = WALLET.node_id
     return r
 
-# ============================================================================
-# 21. X402 AUDIT (v32) — verificação de serviços x402 como produto.
-#
-#     O FATO: o paper "Five Attacks on x402" (2026) mostra que a descoberta
-#     está ligada ao pagamento — "o atacante só precisa vencer a etapa de
-#     seleção com frequência suficiente" — e que o facilitator não é
-#     verificável pelo cliente. Com 22.000 endpoints (Apify + Coinbase, jun/26),
-#     escolher errado ficou barato para o atacante e caro para o agente.
-#
-#     NINGUÉM vende verificação. O scanner do x402-trust é gratuito e mede só
-#     uptime. Este endpoint audita CONFORMIDADE e SANIDADE de qualquer serviço
-#     x402 — incluindo os quatro modos de falha que descobrimos operando este
-#     nó e que não constam de nenhuma documentação:
-#       1. cabeçalhos acima do limite derrubam clientes Node (16 KB)
-#       2. base64 sem padding quebra o desafio para clientes estritos
-#       3. ordem de accepts decide a chain e a indexação no Bazaar
-#       4. amostra grátis idêntica à paga elimina a razão de pagar
-# ============================================================================
 
 import ipaddress as _ipaddr
 from urllib.parse import urlparse as _urlparse
@@ -15905,8 +14312,6 @@ def _x402_audit_handler():
     pagamento e os modos de falha silenciosos que derrubam vendedores."""
     url = (request.args.get("url") or "").strip()
     if not url:
-        # v44.0.9: chamada bare = auditoria de demonstração no próprio nó —
-        # relatório limpo de um endpoint x402 exemplar, em vez de erro pago.
         url = f"{_public_base()}/fear-greed"
     ok, motivo = _audit_url_safe(url)
     if not ok:
@@ -15935,7 +14340,6 @@ def _x402_audit_handler():
     hdrs = p["headers"]
     hdr_bytes = sum(len(k) + len(str(v)) + 4 for k, v in hdrs.items())
 
-    # ---- 1. responde 402? ---------------------------------------------------
     if p["status_code"] != 402:
         add("critical", "returns_402",
             f"Endpoint returned HTTP {p['status_code']} instead of 402 — agents "
@@ -15943,7 +14347,6 @@ def _x402_audit_handler():
     else:
         add("pass", "returns_402", "Returns HTTP 402 as required.")
 
-    # ---- 2. tamanho dos cabeçalhos (modo de falha nº1) ----------------------
     if hdr_bytes > 16384:
         add("critical", "header_size",
             f"Response headers total {hdr_bytes} bytes. Node's default limit is "
@@ -15957,7 +14360,6 @@ def _x402_audit_handler():
     else:
         add("pass", "header_size", f"Headers within safe limits ({hdr_bytes} bytes).")
 
-    # ---- 3. desafio no header e padding base64 (modo de falha nº2) ----------
     b64 = hdrs.get("PAYMENT-REQUIRED") or hdrs.get("X-PAYMENT-REQUIRED") or ""
     challenge = None
     if p["status_code"] == 402 and not b64:
@@ -15980,7 +14382,6 @@ def _x402_audit_handler():
                 add("critical", "payment_required_header",
                     "PAYMENT-REQUIRED header present but not decodable at all.")
 
-    # corpo como fonte alternativa do desafio
     body = None
     try:
         body = json.loads(p["text"])
@@ -15988,7 +14389,6 @@ def _x402_audit_handler():
         pass
     ch = challenge or body or {}
 
-    # ---- 4. estrutura do desafio -------------------------------------------
     accepts = ch.get("accepts") or []
     if p["status_code"] == 402:
         if ch.get("x402Version") == 2 or (ch.get("x402Version") == 1 and ch.get("acceptsV2")):
@@ -16017,7 +14417,6 @@ def _x402_audit_handler():
                         f"minimum most facilitators enforce.")
             except Exception:
                 pass
-            # ---- modo de falha nº3: ordem dos accepts -----------------------
             redes = [str(x.get("network", "")) for x in accepts]
             if len(accepts) > 1 and not redes[0].startswith("eip155"):
                 add("warning", "accepts_order",
@@ -16028,7 +14427,6 @@ def _x402_audit_handler():
             else:
                 add("pass", "accepts_order", f"Payment rails: {redes}")
 
-    # ---- 5. extensão de descoberta -----------------------------------------
     bz = ((ch.get("extensions") or {}).get("bazaar")) or {}
     if p["status_code"] == 402:
         if not bz:
@@ -16043,7 +14441,6 @@ def _x402_audit_handler():
             else:
                 add("pass", "bazaar_extension", "Discovery extension complete.")
 
-    # ---- 6. modo de falha nº4: amostra grátis canibalizando ----------------
     prev_url = url + ("&" if "?" in url else "?") + "preview=1"
     try:
         pv = _audit_probe(prev_url)
@@ -16064,7 +14461,6 @@ def _x402_audit_handler():
     except Exception:
         pass
 
-    # ---- 7. latência --------------------------------------------------------
     if p["latency_ms"] > 3000:
         add("warning", "latency",
             f"402 challenge took {p['latency_ms']}ms. Reputation monitors score "
@@ -16072,7 +14468,6 @@ def _x402_audit_handler():
     else:
         add("pass", "latency", f"Challenge served in {p['latency_ms']}ms.")
 
-    # ---- veredito -----------------------------------------------------------
     if criticos:
         veredito, acao = "unsafe_to_integrate", (
             "Critical spec violations. An agent may be unable to pay at all, or "
@@ -16132,13 +14527,6 @@ FEATURED_ENDPOINTS.insert(0, "/x402-audit")
 log.info("🔍 x402 Audit registrado ($0.05) — verificação de serviços do ecossistema")
 
 
-# ---------------------------------------------------------------------------
-# /world-quote (v44.4.0) — ações sem fronteira: 16 praças, um schema.
-# Posicionamento "produto sem fronteiras": o agente manda symbol+market e
-# recebe envelope idêntico para NYSE, Tóquio, Xangai, Euronext, B3...
-# Fontes: pipeline já existente (chaveados → stooq → Yahoo), honestidade
-# mantida: sem fonte viva, "unavailable" sem cobrar.
-# ---------------------------------------------------------------------------
 BASE_PRICES["/world-quote"] = 0.02
 ENDPOINT_DESC["/world-quote"] = (
     "Global equity quote across 16 exchanges — NYSE/Nasdaq, B3, Tokyo (JPX), "
@@ -16155,72 +14543,14 @@ FEATURED_ENDPOINTS.insert(0, "/world-quote")
 log.info("🌍 world-quote registrado ($0.02) — 16 praças globais, um schema")
 
 
-# ---------------------------------------------------------------------------
-# v32/v39 — REPRECIFICAÇÃO
-#
-# v32 alinhou o topo do catálogo ao que o mercado transaciona de fato. Duas
-# correções da v39 sobre aquele bloco:
-#
-#  1. O dicionário literal estava REPETIDO TRÊS VEZES (uma no loop, duas no
-#     log.info). Três cópias da mesma tabela de preços é divergência
-#     garantida na próxima edição. Agora é uma constante só.
-#
-#  2. '/enterprise': 9.99 estava no meio de um bloco cujo comentário diz "o
-#     topo passa a ser $0,30" — era erro de digitação de 99.99. O efeito era
-#     a escada de preços INVERTIDA: enterprise (ilimitado, 365 dias) saía por
-#     $9.99, mais barato que subscribe-whale (ilimitado, 30 dias, $19.99) e
-#     igual a subscribe-pro (saldo de $15, 30 dias, $9.99). Nenhum comprador
-#     racional escolhia outra coisa. Corrigido para 99.99.
-#
-# Referência de mercado (jul/2026): o líder da categoria cobra $0.01–0.05 no
-# grosso do catálogo e $0.15–0.75 nos produtos de IA/score. O teto de $0.30
-# da v32 estava conservador demais para os flagships de IA — /council-deep,
-# /br-brief e /thesis-engine voltam a $0.35–0.50, ainda abaixo do líder.
-# v44.0.7: /br-brief sobe para $0.50 — é produto de síntese com IA sobre dados
-# BCB/B3 exclusivos, e o comparável de mercado para síntese é $0.15–0.75
-# (leaderboard x402scan, jul/2026). Sem concorrente no nicho, o desconto
-# agressivo só sinalizava baixa confiança.
-# ---------------------------------------------------------------------------
 
 
-# ===========================================================================
-# /llm  +  /v1/chat/completions   (v44.9.0-PROXY) — a SKU de RECOMPRA DIÁRIA.
-#
-# O que o mercado mediu (API do x402-list, ago/2026 — 508 serviços): o #1 do
-# ecossistema fatura ~90% de todo o volume medido sendo PROXY DE LLM via x402
-# (6,8M tx/30d a $0,003 — commodity de recompra diária, não relatório
-# ocasional). O insight: agente com USDC na carteira não quer gerenciar N
-# chaves de provedor; quer UM endpoint que aceita pagamento e devolve
-# inferência. Nós JÁ tínhamos as chaves e a cadeia de failover (LLM.ask com
-# Groq/Gemini/pagos) — faltava a porta. Aqui estão duas:
-#
-#   GET  /llm?q=...            — a vitrine: crawlers e indexadores do
-#                                ecossistema só sondam GET; resposta direta.
-#   POST /v1/chat/completions  — a porta de integração: formato OpenAI,
-#                                qualquer SDK entra trocando só a base_url.
-#
-# Preço flat por chamada ($0.005): cobre qualquer modelo da cadeia com margem
-# honesta e segue centavos abaixo do comparável premium (venice-ai: $10).
-# Caps server-side protegem o custo: prompt <= 16KB, saída <= 2048 tokens
-# (POST) / 512 (GET). Regra da casa preservada: cadeia LLM fora do ar →
-# pré-gate nem emite 402 (AI_REQUIRED_ENDPOINTS); falha pós-settle → tupla
-# (status:unavailable, 503) → estorno automático em crédito pelo paid_endpoint.
-# ===========================================================================
 LLM_PROXY_PRICE = float(os.environ.get("PRICE_LLM_PROXY", "0.005"))  # v48.10.3: repricing do gateway sem deploy (default mantém a isca $0.005)
 _LLM_PROXY_MAX_PROMPT_CHARS = 16000
 _LLM_PROXY_SAMPLE_Q = ("Give a one-paragraph briefing on current crypto market "
                        "sentiment, naming one bullish and one bearish signal.")
 
 
-# ---------------------------------------------------------------------------
-# v48.0.0-LLM-FIRST — GUARD-RAILS DE CUSTO (instalados ANTES da divulgação).
-# Medição 11/set/2026 (API x402-list): o #1 do ecossistema fatura ~90% de todo
-# o volume medido vendendo EXATAMENTE este produto (gateway LLM x402) — com
-# backend PAGO. Aqui o backend é free tier (Groq ~14,4K req/dia; Gemini 1,5K
-# RPD, e já vimos 429-quarentena nos logs): sem teto, o primeiro comprador
-# real derruba a cadeia para todos. Caps honestos de lançamento, configuráveis
-# por env, contados no SQLite do LEDGER — compartilhado entre os 4 workers do
-# gunicorn e persistente a restart (volume /data).
 LLM_DAILY_GLOBAL_CAP = int(os.environ.get("LLM_DAILY_GLOBAL_CAP", "3000"))
 LLM_DAILY_KEY_CAP    = int(os.environ.get("LLM_DAILY_KEY_CAP", "200"))
 _LLM_USE_MEM  = defaultdict(int)
@@ -16308,9 +14638,6 @@ def _llm_limits_block():
                          "Caps keep the chain alive for every buyer; paid "
                          "backends lift them. Live telemetry: GET /llm/status")}
 
-# v44.9.1: schema formal do corpo POST — alimenta o 402 (inputSchema), o blob
-# Bazaar (info.input.bodyParams) e a porta didática GET. Era o único warning
-# do registro no x402scan ("missing an input schema").
 ENDPOINT_BODY_SCHEMAS = {
     "/v1/chat/completions": {
         "method": "POST",
@@ -16341,8 +14668,6 @@ ENDPOINT_BODY_SCHEMAS = {
                           "content": "Summarize today's crypto market sentiment in one paragraph."}],
             "max_tokens": 300,
         },
-        # v44.9.2: o discovery (AgentCash/x402scan) exige input E output schema
-        # na operação — este é o shape chat.completion que o handler devolve.
         "outputSchema": {
             "type": "object",
             "properties": {
@@ -16468,9 +14793,6 @@ def llm_chat_completions():
     _g = _llm_gate()
     if _g:
         return _g
-    # v48.11.0-GLOBAL: o campo "model" do body OpenAI vira seletor de rota.
-    # "kimi"/"moonshot" -> Moonshot primeiro; "deepseek" -> OpenRouter/DeepSeek;
-    # "eco"/"fast"/"premium" -> perfil ClawRouter; qualquer outro -> cadeia auto.
     _req_model = str(body.get("model") or "").strip().lower()
     if any(k in _req_model for k in ("kimi", "moonshot")):
         _order = ["moonshot", "openrouter", "gemini", "groq"]
@@ -16530,20 +14852,6 @@ app.add_url_rule("/v1/chat/completions", "llm_chat_docs",
                  llm_chat_docs, methods=["GET"])
 
 
-# ============================================================================
-# v48.10.1-TRANSFORM — o que agentes de fato PAGAM: texto sujo -> estrutura
-#
-# Evidência verificável (set/2026): Visa/Artemis mediram ticket médio de
-# US$0,14 em 109,6M tx x402 — micro-utilidade, não dado exótico; os tutoriais
-# canônicos do protocolo (simplescraper.io, docs x402) usam "POST /extract a
-# $0.01" como produto-exemplo; TRM Labs mostra que o volume real de agentes é
-# pequeno mas concentrado em serviços de utilidade. O gateway LLM já existe
-# aqui — estes dois SKUs são a MESMA cadeia de failover com contrato estrito
-# e validação de saída, o que justifica o prêmio sobre o /llm cru ($0.005).
-# Mesmo motor, mesmo gate de caps, sem chave nova. Pré-gate AI_REQUIRED:
-# se a cadeia LLM estiver fora, nem 402 é emitido (não vendemos o que não
-# entregamos); falha pós-settle → o wrapper devolve o valor como crédito.
-# ============================================================================
 
 EXTRACT_PRICE   = float(os.environ.get("PRICE_EXTRACT", "0.01"))
 TRANSLATE_PRICE = float(os.environ.get("PRICE_TRANSLATE", "0.01"))  # v48.10.3: piso $0.01
@@ -16759,20 +15067,6 @@ for _path, (_fn, _price, _desc, _tags, _hint) in _XF_PRODUCTS.items():
 log.info("🔁 v48.10.1-TRANSFORM: /extract e /translate registrados (mesmo gateway LLM, contrato estrito)")
 
 
-# ============================================================================
-# v48.18.0-REGISTRY — mais 4 SKUs, escolhidos pelo que já aparece nos logs
-#
-#  · /br-cnpj  — o /br-doc diz em letras miúdas "NÃO prova que está ativo; para
-#    situação cadastral é preciso consulta oficial". Este é o passo seguinte do
-#    mesmo agente: situação, CNAE, porte, UF. Fonte pública (BrasilAPI), cache 24h.
-#    Sócios: só contagem e qualificação — nomes/CPF ficam de fora (LGPD).
-#  · /br-cep   — endereço por CEP (BrasilAPI v2), cache 30 dias.
-#  · /classify — texto -> um rótulo de um conjunto FECHADO que o comprador define.
-#  · /summarize— resumo com teto de frases. Mesmo gateway/failover do /extract.
-#  As duas primeiras NÃO usam LLM (custo ~0, sem teto diário). Falha de fonte ou
-#  entrada inválida devolve dict com "error": o wrapper v48.10.2 converte em
-#  crédito automaticamente (nunca cobra sem entregar).
-# ============================================================================
 
 BRCNPJ_PRICE  = float(os.environ.get("PRICE_BR_CNPJ", "0.02"))
 BRCEP_PRICE   = float(os.environ.get("PRICE_BR_CEP", "0.01"))
@@ -17034,10 +15328,6 @@ _V4818_PRODUCTS = {
         ["GET", "POST"]),
 }
 
-# v48.18.2-HOTFIX: a variável de desempacotamento chamava-se `_ai` e
-# SOBRESCREVIA a função global _ai() (linha ~9292) ao fim do loop — todos os
-# endpoints premium que chamam _ai()/_ai_required() passaram a 500ar com
-# "'bool' object is not callable" (16 endpoints: /analise /council /relatorio…).
 for _path, (_fn, _price, _uses_ai, _desc, _tags, _hint, _methods) in _V4818_PRODUCTS.items():
     BASE_PRICES[_path] = float(os.environ.get(
         "PRICE_" + _path.strip("/").replace("-", "_").upper(), str(_price)))
@@ -17054,21 +15344,9 @@ del _path, _fn, _price, _uses_ai, _desc, _tags, _hint, _methods  # não vaza nom
 log.info("🧾 v48.18.0-REGISTRY: /br-cnpj /br-cep /classify /summarize registrados")
 
 
-# ============================================================================
-# v48.34.0-GUARD — /prompt-guard: detector DETERMINÍSTICO de prompt injection
-#
-# Por quê: no marketplace x402 da Pocket Network (30d, por chamadas cobradas) um
-# serviço de "Prompt Injection Detection" é o 2º mais usado (6%), atrás só de um
-# serviço cripto. É a primeira coisa que um agente que lê web/e-mail/MCP precisa
-# antes de agir — e o nó já vende o texto que os agentes leem (/fetch,
-# /web-search, /ai-news). Zero upstream, zero LLM, sub-ms: custo marginal ~0.
-# Honestidade: é heurística com regras DECLARADAS (devolve quais casaram); não
-# é garantia de segurança e o campo "limits" diz isso em cada resposta.
-# ============================================================================
 GUARD_PRICE = float(os.environ.get("PRICE_PROMPT_GUARD", "0.005"))
 _GUARD_MAX_CHARS = int(os.environ.get("GUARD_MAX_CHARS", "20000"))
 
-# (id, peso 0-100, regex, descrição). Pesos combinados por 1-prod(1-w).
 _GUARD_RULES = [
     ("override_instructions", 70, re.compile(
         r"\b(ignore|disregard|forget|override|bypass)\b[^.\n]{0,40}\b(previous|prior|above|earlier|all|any|your|the)\b[^.\n]{0,30}"
@@ -17177,8 +15455,6 @@ app.add_url_rule("/prompt-guard", "prompt_guard_v4834",
                  paid_endpoint("/prompt-guard")(_h_prompt_guard), methods=["GET", "POST"])
 log.info("🛡 v48.34.0-GUARD: /prompt-guard registrado (determinístico, sem LLM)")
 
-# ---------------------------------------------------------------------------
-# v48.0.0 — DESCOBERTA GRATUITA DO GATEWAY (padrão OpenAI + telemetria honesta)
 def llm_models():
     """GET /v1/models — shape OpenAI. SDKs chamam isto no boot ao trocar a
     base_url; sem esta rota, a integração morria no primeiro passo."""
@@ -17225,11 +15501,6 @@ def llm_status():
 app.add_url_rule("/v1/models", "llm_models", llm_models, methods=["GET"])
 app.add_url_rule("/llm/status", "llm_status", llm_status, methods=["GET"])
 
-# ---------------------------------------------------------------------------
-# v48.1.0 — FREEMIUM DO FLAGSHIP (padrão OpenRouter: o grátis cria o hábito,
-# o pago remove o teto). 128 tokens, caps por IP e globais — custo ~zero no
-# free tier e NUNCA compete com o pago (16x mais tokens, POST OpenAI, caps
-# maiores). O avaliador sai com a resposta E o preço do upgrade na mesma tela.
 LLM_FREE_PER_DAY        = int(os.environ.get("LLM_FREE_PER_DAY", "5"))
 LLM_FREE_GLOBAL_PER_DAY = int(os.environ.get("LLM_FREE_GLOBAL_PER_DAY", "200"))
 
@@ -17271,19 +15542,8 @@ def llm_free():
 
 app.add_url_rule("/llm/free", "llm_free", llm_free, methods=["GET"])
 
-# v48.3.9.2-ALIAS — radar de demanda (17/09): /llm/freePublic com 7 IPs em 7d.
-# Convenção de nome que agentes tentam p/ achar o freemium; servimos a MESMA
-# view (mesmo cap de 5/dia por IP — sem brecha no rate limit) e o JSON de
-# resposta já carrega o cross-sell p/ o /llm pago. Funil completo.
 app.add_url_rule("/llm/freePublic", "alias_llm_freepublic", llm_free, methods=["GET"])
 
-# ---------------------------------------------------------------------------
-# v48.3.9.3-KEYDIR — Web Bot Auth: HTTP Message Signatures Directory
-# (draft-meunier-http-message-signatures-directory; IETF Web Bot Auth WG —
-# Cloudflare/OpenAI/Visa-TAP style). Radar: 10 reqs de 6 IPs em 7d — agentes
-# enterprise procuram este well-known para verificar identidade assinada.
-# Servimos a chave Ed25519 PUBLICA do no (a mesma que sela o PIT Brasil) como
-# JWKS, com a resposta assinada (RFC 9421) — prova de que o diretorio e nosso.
 def _wba_thumbprint(x_b64u: str) -> str:
     canon = json.dumps({"crv": "Ed25519", "kty": "OKP", "x": x_b64u},
                        separators=(",", ":"), sort_keys=True)
@@ -17312,9 +15572,6 @@ def manifest_sig_directory():
     resp.headers["Signature"] = f"sig1=:{sig}:"
     return resp
 
-# /legal + /support — radar: 7 reqs/4 IPs e 7 reqs/2 IPs em 7d. Agentes
-# enterprise fazem due-diligence (termos, contato) antes de integrar. Gratis,
-# honesto, sem PII alem do contato publico ja exposto no README.
 @app.route("/legal")
 def legal_terms():
     return jsonify({
@@ -17343,13 +15600,6 @@ def support_info():
                              "tx_debug": "https://api.losbeto.xyz/debug-tx?sig=<signature>"},
         "ts": int(time.time()), "version": VERSION})
 
-# ---------------------------------------------------------------------------
-# v48.3.10-COMMERCE — ACP discovery document (Agentic Commerce Protocol,
-# OpenAI+Stripe; discovery doc /.well-known/acp.json desde abr/2026).
-# Radar: 8 reqs de 4 IPs em 7d — agentes de commerce procuram o que podem
-# COMPRAR aqui. Declaramos: catálogo, planos, rail de pagamento (x402 USDC
-# em 3 chains via CDP) e transports (REST + MCP). UCP já existe (v42); ACP
-# completa o par — ChatGPT/Stripe-style agents e Google-style agents.
 @app.route("/.well-known/acp.json")
 def acp_discovery():
     return jsonify({
@@ -17383,11 +15633,6 @@ def acp_discovery():
         "contact": "roberto.martins622@gmail.com",
         "ts": int(time.time())})
 
-# ---------------------------------------------------------------------------
-# v48.1.0 — CONCIERGE DE INTEGRAÇÃO (IA, grátis, cap 30/dia global).
-# "Como eu pago?" respondido na hora, no idioma da pergunta — o avaliador
-# não vai embora esperando o operador acordar. Fallback estático se a cadeia
-# de LLM estiver em quarentena (suporte nunca tira 503).
 _INTEGRATE_SYSTEM = (
     "You are the integration concierge of the Losbeto x402 node "
     "(https://api.losbeto.xyz). Answer in the language of the question, max "
@@ -17463,7 +15708,6 @@ log.info("🧠 llm-proxy registrado ($0.005) — GET /llm + POST /v1/chat/comple
 
 
 _V32_REPRICE = {
-    # Produtos de IA/síntese — onde o comparável de mercado é $0.15–0.75
     "/council-deep":          0.35,
     "/portfolio-stress":      0.30,
     "/br-brief":              0.50,
@@ -17479,10 +15723,6 @@ _V32_REPRICE = {
     "/launch-sniper":         0.15,
     "/portfolio-copilot":     0.12,
     "/launch-risk":           0.10,
-    # Dado trabalhado — comparável $0.01–0.08
-    # v44.0.7: /br-agro é o ÚNICO feed de paridade agro do BCB no x402 inteiro
-    # (soja, milho, café, boi — com paridade de exportação CBOT/ICE). Exclusivo
-    # sem concorrente não fica no meio da faixa: vai para o topo do dado.
     "/br-agro":               0.09,
     "/forex-arbitrage":       0.08,
     "/mev-flow":              0.08,
@@ -17496,22 +15736,15 @@ _V32_REPRICE = {
     "/multi-chain-arbitrage": 0.06,
     "/sinais":                0.05,
     "/deep-think":            0.05,
-    # v48.17.14-REALCALL: /agent-call VOLTA a $0.10 — o produto agora é
-    # roteamento + EXECUÇÃO real do melhor endpoint, e o teto anti-arbitragem
-    # é o preço pago: a $0.05 o universo roteável perderia exatamente os
-    # produtos que agentes mais recompram (wallet-scan, token-intel,
-    # sanctions, smart-money, whale-alert — todos $0.05–0.10).
     "/whale-alert":           0.05,
     "/smart-money":           0.05,
     "/sanctions":             0.05,
-    # Plano anual — v39 FIX: era 9.99 por erro de digitação
     "/enterprise":           99.99,
 }
 for _ep, _p in _V32_REPRICE.items():
     if _ep in BASE_PRICES:
         BASE_PRICES[_ep] = _p
 
-# Trava de sanidade: a escada de planos precisa ser monotônica em $/dia-ilimitado.
 def _assert_plan_ladder() -> None:
     ladder = [("/day-pass", 1), ("/week-pass", 7),
               ("/subscribe-whale", 30), ("/enterprise", 365)]
@@ -17531,17 +15764,6 @@ log.info(f"💲 v39: {len(_V32_REPRICE)} preços realinhados "
          f"(topo de dado: ${max(v for k, v in _V32_REPRICE.items() if v < 1):.2f} · "
          f"plano anual: ${BASE_PRICES.get('/enterprise', 0):.2f})")
 
-# ============================================================================
-# 20. SENTIMENT CONSENSUS (v31) — mesmo padrão que funcionou no oráculo,
-#     aplicado ao segundo endpoint mais sondado (/fear-greed, 80 IPs distintos).
-#
-#     Problema idêntico: o índice de medo e ganância é GRÁTIS no alternative.me,
-#     então o agente sonda, compara e busca na fonte. O que NÃO existe de graça
-#     é a leitura conjunta de várias medidas independentes de sentimento — e,
-#     principalmente, a DIVERGÊNCIA entre elas. Quando o índice diz "medo" mas a
-#     amplitude do mercado está positiva, isso é sinal contrário; nenhuma fonte
-#     isolada consegue mostrar.
-# ============================================================================
 
 def _sent_feargreed():
     r = requests.get("https://api.alternative.me/fng/?limit=2", timeout=4)
@@ -17558,7 +15780,6 @@ def _sent_global():
     d = r.json().get("data", {})
     chg = float(d.get("market_cap_change_percentage_24h_usd") or 0)
     dom = float((d.get("market_cap_percentage") or {}).get("btc") or 0)
-    # variação de capitalização mapeada para 0-100 (±5% satura)
     score = max(0.0, min(100.0, 50 + (chg / 5.0) * 50))
     return {"score": round(score, 1), "mcap_change_24h_pct": round(chg, 2),
             "btc_dominance_pct": round(dom, 2)}
@@ -17587,7 +15808,6 @@ def _sent_volatility():
     media = sum(rets) / len(rets)
     dp = (sum((x - media) ** 2 for x in rets) / len(rets)) ** 0.5
     vol_anual = dp * (365 ** 0.5) * 100
-    # vol baixa = complacência (score alto); vol alta = estresse (score baixo)
     score = max(0.0, min(100.0, 100 - (vol_anual - 20) * 2))
     return {"score": round(score, 1), "annualized_vol_pct": round(vol_anual, 1),
             "note": "low volatility reads as complacency, high as stress"}
@@ -17648,8 +15868,6 @@ def _sentiment_consensus_handler():
     elif composto < 75: zona, viés = "greed", "trim_into_strength"
     else:               zona, viés = "extreme_greed", "contrarian_short"
 
-    # A divergência é o produto: quando as medidas discordam, uma delas está
-    # antecipando o movimento — e é isso que o agente precisa saber.
     if spread >= 40:
         conf, leitura = "low", ("Indicators strongly disagree. Survey sentiment and "
                                 "actual market behaviour are telling different "
@@ -17711,30 +15929,8 @@ if "/sentiment-consensus" in FEATURED_ENDPOINTS:
 FEATURED_ENDPOINTS.insert(0, "/sentiment-consensus")
 log.info("🌡 Sentiment Consensus registrado ($0.03) — 4 indicadores em paralelo")
 
-# ============================================================================
-# 19. ORACLE CONSENSUS (v30) — o primeiro produto deste projeto nascido de
-#     DEMANDA MEDIDA, não de intuição.
-#
-#     Telemetria: 113 IPs distintos sondam /pyth-price e 77 o /fear-greed —
-#     de longe o maior interesse seletivo do catálogo. Mas ambos vendem dado
-#     que é GRÁTIS na fonte (Pyth é oráculo público), então o agente compara
-#     e vai buscar de graça. Zero conversão.
-#
-#     A lacuna real: cada oráculo publica só o PRÓPRIO número. Ninguém publica
-#     o CONSENSO entre eles. Um agente que vai executar uma ordem precisa saber
-#     se o preço que está vendo é confiável — e essa resposta não existe de
-#     graça em lugar nenhum.
-#
-#     Preço na faixa validada pelo mercado ($0,01–$0,05; 76% dos serviços x402
-#     cobram <= $0,10), não na faixa aspiracional dos premium.
-# ============================================================================
 
-# v30.1: o Binance GLOBAL bloqueia IPs de data center dos EUA (o Railway roda em
-# us-west), e por isso retornava sempre "binance zero" gastando 1s de latência.
-# Trocado por Binance.US e Bitstamp, ambos acessíveis a partir dos EUA.
 ORACLE_SYMBOLS = {
-    # símbolo: (pyth_feed, binanceus_pair, coinbase_pair, kraken_pair,
-    #           coingecko_id, bitstamp_pair)
     "SOL": ("0xef0d8b6fda2ceba41da15d4095d1da392a0d2f8ed0c6c7bc0f4cfac8c280b56d",
             "SOLUSD", "SOL-USD", "SOLUSD", "solana", "solusd"),
     "BTC": ("0xe62df6c8b4a85fe1a67db44dc12de5db330f7ac66b72dc658afedf0f4a415b43",
@@ -17744,8 +15940,6 @@ ORACLE_SYMBOLS = {
 }
 
 def _oracle_pyth(feed_id):
-    # v48.14.1: sem chave o Hermes so responde 401 — falha rapido e deixa o
-    # consenso multi-oraculo seguir com as fontes restantes.
     if not PYTH_API_KEY:
         raise ValueError("pyth: PYTH_API_KEY ausente")
     p = _pyth_latest([feed_id]).get(str(feed_id).lower().lstrip("0x"), {}).get("price", {})
@@ -17857,7 +16051,6 @@ def _oracle_consensus_handler():
     vivas = [f for f in fontes if f.get("ok")]
     precos = [f["price"] for f in vivas]
 
-    # v30: com menos de 2 fontes não existe consenso — e não se cobra por isso.
     if len(precos) < 2:
         return {"status": "unavailable", "symbol": symbol,
                 "error": "Fewer than 2 oracle sources responded — no consensus "
@@ -17865,10 +16058,6 @@ def _oracle_consensus_handler():
                 "sources": fontes, "ts": int(time.time()),
                 "provider": "Losbeto/OracleConsensus", "version": VERSION}, 503
 
-    # v30.1 METODOLOGIA: o consenso sai das fontes PRIMÁRIAS (oráculo + bolsas).
-    # Índices agregados (CoinGecko) derivam das mesmas bolsas e chegam com atraso;
-    # incluí-los na mediana seria contar a mesma informação duas vezes. Ficam
-    # como referência cruzada, e é justamente aí que o atraso deles vira sinal.
     primarias = [f for f in vivas if f.get("type") in ("oracle", "cex")]
     base = [f["price"] for f in primarias] or precos
     mediana = _median(base)
@@ -17881,21 +16070,15 @@ def _oracle_consensus_handler():
         d = f["price"] - mediana
         f["deviation_bps"] = round((d / mediana * 10000) if mediana else 0, 2)
         f["deviation_usd"] = round(d, 6)
-        # Z-score modificado (Iglewicz & Hoaglin) — teste robusto padrão para
-        # outlier com MAD. O limiar fixo anterior (30bps) deixava passar uma
-        # fonte 20bps fora quando as outras concordavam em 0,5bps: em termos
-        # estatísticos era um outlier gritante.
         f["modified_z"] = (round(0.6745 * d / mad, 2) if mad > 0
                            else (0.0 if abs(d) < 1e-9 else 999.0))
     def _e_outlier(f):
-        # exige as duas coisas: significância estatística E relevância prática
         return abs(f.get("modified_z", 0)) > 3.5 and abs(f["deviation_bps"]) >= 5.0
     fora = [f for f in vivas if _e_outlier(f)]
     outlier = max(fora, key=lambda f: abs(f["deviation_bps"])) if fora else \
               max(vivas, key=lambda f: abs(f["deviation_bps"]))
     tem_outlier = bool(fora)
 
-    # veredito de execução — o que o agente realmente quer saber
     if spread_bps <= 10:
         verdict, action = "tight", "Safe to execute at consensus price."
     elif spread_bps <= 50:
@@ -17950,7 +16133,6 @@ def _oracle_consensus_handler():
         "provider": "Losbeto/OracleConsensus", "version": VERSION,
     }
 
-# registro do endpoint
 BASE_PRICES["/oracle-consensus"] = 0.03
 ENDPOINT_DESC["/oracle-consensus"] = (
     "Multi-oracle price consensus (?symbol=SOL|BTC|ETH): median across Pyth, "
@@ -17968,76 +16150,31 @@ if "/oracle-consensus" in FEATURED_ENDPOINTS:
 FEATURED_ENDPOINTS.insert(0, "/oracle-consensus")
 log.info("🔮 Oracle Consensus registrado ($0.03) — 5 fontes em paralelo")
 
-# ============================================================================
-# 18. MACHINE DEMAND INTELLIGENCE (v29) — o que as máquinas PEDEM e não temos.
-#     Registrávamos QUEM sondava (user-agent) mas nunca O QUE procurava. Um 404
-#     não é erro: é uma máquina declarando uma necessidade que o catálogo não
-#     atende. Cada caminho inexistente pedido por um agente real é um pedido de
-#     produto — de graça, direto da demanda.
-# ============================================================================
 
-# Caminhos que scanners hostis varrem: ruído, não demanda.
-# v44.3.0: `/wp/` (sem hífen) escapava do filtro e o radar de demanda chamava
-# sonda de WordPress de "produto novo" — 4 IPs em 7d poluindo a leitura.
 _SCAN_NOISE = re.compile(
     r"(\.env|\.git|\.aws|\.ssh|credentials|id_rsa|/wp(/|$)|wp-|wordpress|phpmyadmin|"
     r"\.php|phpinfo|_profiler|admin|backup|dump|\.sql|\.bak|service[-_]?account|_environment|firebase|"
     r"secrets?\.|config\.(json|yml|yaml)|actuator|/api/v1/(pods|namespaces)|"
     r"\.well-known/(acme|security)|favicon|robots|sitemap|apple-touch|"
     r"\.map$|\.asp|cgi-bin|xmlrpc|\.svn|docker|kube|"
-    # v48.25.0: leva vista no radar em 10/out — sondas de credencial de
-    # ecossistema JS/Node classificadas como "produto novo": não são demanda.
     r"\.npmrc|\.yarnrc|\.pnpm|aws-exports|runtime-config|env-config|"
     r"config/config\.js|/index\.js$|_zz_|wallet\.json|keys\.json|"
-    # v48.4.0: observado no radar de demanda classificando sonda de segredo
-    # como "produto novo" (/env, /config/master.key, /appsettings.json) —
-    # são scanners de vazamento de credenciais, não cliente em potencial.
-    # v48.9.17: /storage/logs/laravel.log (9 hits/9 IPs) — scanner de log
-    # Laravel exposto, mesma família. Não é demanda de produto.
-    # v48.9.18: /api/session/properties (12 hits/11 IPs) — sonda de SDK de
-    # analytics (Statsig/PostHog-style) atrás de config vazada. Também não.
     r"(^|/)\.?env$|/config/[^/]*\.key$|appsettings(\..*)?\.json$|"
     r"master\.key$|\.pem$|\.pfx$|\.p12$|\.htpasswd|\.htaccess|"
     r"\.log$|/storage/logs?/|laravel|/api/session/properties$|"
-    # v48.11.0-GLOBAL: fugiam do filtro e viravam "produto novo" no radar —
-    # /env.txt /env.js (a regra exigia .env com ponto ou env no fim),
-    # /settings.json (sem o prefixo appsettings) e /config/aws.yml (a regra
-    # pedia config. com ponto, nao config/ com barra). Mesma familia: caca a
-    # credencial vazada, nao demanda.
     r"(^|/)\.?env\.(txt|js|json|ya?ml|local|prod(uction)?)$|"
     r"(^|/)settings\.json$|(^|/)config/[^/]+\.(ya?ml|xml|ini|conf)$|"
-    # v48.18.0: o radar de 06/10 listava como "produto novo" /vendor/composer/
-    # installed.json (5 IPs), /keys.json, /auth/login e /wallet.json — é caça a
-    # dependência vulnerável, chave vazada e formulário de login, não cliente.
     r"(^|/)vendor/|composer\.(json|lock)$|installed\.json$|node_modules|"
     r"(^|/)(keys?|keystore|mnemonic|seed|wallet)s?\.json$|"
-    # v48.26.0: radar de 10-11/out — sondas de credencial de toolchains
-    # devops/IA (.s3cfg, .boto, .amplifyrc, .claude/settings.local.json) e
-    # asset de framework JS (/user/umi.min.js, 6 IPs/7d) classificados como
-    # "produto novo". Nenhum produto real deste nó termina em .min.js nem
-    # vive em diretório de configuração de ferramenta.
     r"\.s3cfg$|\.boto$|\.amplifyrc$|(^|/)\.claude(/|$)|(^|/)[^/]*\.min\.js$|"
     r"(^|/)auth/(login|signin|register|token)$|package(-lock)?\.json$|"
-    # v48.26.3: /app.config.js (7 hits/6 IPs em 11/out) — sonda de config Expo/
-    # React Native atrás de chave de API vazada; virou "produto novo" no radar.
-    # O [^/]+ antes de .config.js protege o /config.js REAL deste nó.
     r"(^|/)[^/]+\.config\.js$|"
-    # v48.34.0: o radar de 25/out ainda listava como "produto novo" bundles de
-    # front-end (/_nuxt/entry.js, /_next/static/..., /_app/immutable/...,
-    # /build/manifest-development.js, /polyfills.js), o canário de fuzz
-    # /zzq-not-a-real-route-7f3 (140 pedidos/11 IPs — é teste de 404 de monitor)
-    # e descoberta OAuth em /mcp/.well-known/openid-configuration. Nenhum é
-    # produto: este nó é API, não SPA. /static/ e /sw.js seguem 'já atendido'.
     r"(^|/)(_nuxt|_next|_app|_astro|webpack|chunks|assets|dist|build)(/|$)|"
     r"(^|/)(polyfills|runtime|vendor|bundle|entry)(\.[a-f0-9]{6,})?\.js$|"
     r"not-a-real-route|(^|/)zz[a-z]?-|openid-configuration|"
     r"oauth-(authorization-server|protected-resource)$)", re.I)
 
 
-# v48.38.0-SIGNAL: famílias de scanner que escapavam do _SCAN_NOISE e viravam
-# "produto novo"/"alias" no radar (/netrc, /server-status, /api/v1/users/N,
-# /tmp, /old, /db, /uploads, Yii/Laravel debug, configs de cloud). Validado
-# contra os 133 endpoints reais: zero falsos positivos.
 _SCAN_NOISE_EXTRA = re.compile(
     r"\.netrc$|\.pgpass$|\.git-credentials|\.dockercfg|\.netlify|\.htpasswd|"
     r"(^|/)(server-status|server-info|nginx_status|apache-status)(/|$)|"
@@ -18046,13 +16183,7 @@ _SCAN_NOISE_EXTRA = re.compile(
     r"(^|/)(tmp|temp|old|_old|backup|backups|bak|db|dump|uploads?|files?|archive|old_site)(/|$)|"
     r"(^|/)frontend/web/debug|(^|/)debug/|_debugbar|(^|/)telescope/requests|"
     r"(^|/)(aws|gcp|azure|firebase|supabase)\.(ya?ml|json)$|"
-    # v48.40.0: sondas de configuração Java/Sentry e descoberta fora do
-    # catálogo não são intenção de compra. Em especial, /.well-known/x402/*
-    # chegava ao planner como produto embora aliases well-known já fossem
-    # proibidos; /sentry.properties virava proposta de credential-hunting.
     r"(^|/)[^/]*\.properties$|(^|/)\.well-known/|"
-    # v48.41.0: scanners de identidade, configuração e APIs genéricas não
-    # representam intenção de compra nem podem virar aliases auto-atendidos.
     r"(^|/)\.(?:vscode|idea|git|svn|hg|aws|ssh)(/|$)|"
     r"(^|/)(?:manifest|keys?|wallet|sftp|config|secrets?|credentials?)\.json$|"
     r"(^|/)(?:auth|login|signin|logout|register)(/|$)|"
@@ -18066,9 +16197,6 @@ def _is_scan_noise(path: str) -> bool:
     return bool(_SCAN_NOISE.search(path or "") or _SCAN_NOISE_EXTRA.search(path or ""))
 
 
-# Filtro SQL para janelas históricas: mudar o kind somente no novo tráfego não
-# removeria scanners já gravados nos últimos sete dias. A cláusula é constante,
-# sem dados do request, e mantém clientes HTTP de agentes como requests/httpx.
 _DEMAND_UA_SQL = """NOT (
     LOWER(COALESCE(ua,'')) LIKE '%spider%' OR
     LOWER(COALESCE(ua,'')) LIKE '%crawler%' OR
@@ -18164,8 +16292,6 @@ def _demand_classify(path: str) -> dict:
     rota, zero dado novo. A segunda é decisão de produto.
     v44.1.0: antes de tudo, resolve o rótulo NA HORA da renderização — se a
     rota já existe, o pedido virou 'atendido', não 'produto novo'."""
-    # v44.3.0: sonda de exploração NÃO é demanda — sai do radar de produto e
-    # não dispara alerta no Telegram. Dados crus seguem gravados no ledger.
     if _is_scan_noise(path):
         return {"kind": "scanner_noise",
                 "action": "Sonda de exploração (WordPress/CMS/config) — ruído filtrado",
@@ -18176,7 +16302,6 @@ def _demand_classify(path: str) -> dict:
                 "closest": []}
     sug = _suggest_paths(path, n=2)
     if sug:
-        # existe endpoint parecido -> provavelmente é questão de NOME
         return {"kind": "alias_candidate",
                 "action": "Rota equivalente já existe — criar apelido resolve",
                 "closest": sug}
@@ -18184,14 +16309,6 @@ def _demand_classify(path: str) -> dict:
             "action": "Nada equivalente no catálogo — exige fonte de dados nova",
             "closest": []}
 
-# ============================================================================
-# v48.12.0-ML — CAMADA DE MACHINE LEARNING EMBARCADA
-# Tres modelos treinados nos dados do PROPRIO node (60k+ probes + ledger de
-# receita): nenhum concorrente pode copiar — eles nao tem o nosso trafego.
-# Tudo import-guarded: sem scikit-learn/fastembed instalado, o node roda
-# exatamente como antes (as features dormem, nada quebra). ML_DISABLED=1
-# desliga tudo. Deps novas no requirements: scikit-learn, fastembed.
-# ============================================================================
 ML_DISABLED = os.environ.get("ML_DISABLED", "") == "1"
 _ML_SK = None
 try:
@@ -18298,8 +16415,6 @@ def _ml_predict_path(path: str):
     try:
         proba = clf.predict_proba([_ml_path_features(path)])[0]
         j = int(proba.argmax())
-        # classes_ guarda os indices de _ML_LABELS vistos no treino — se uma
-        # classe estava ausente, argmax NAO bate com o indice do rótulo.
         i = int(clf.classes_[j])
         return (_ML_LABELS[i], round(float(proba[j]), 3))
     except Exception:
@@ -18332,8 +16447,6 @@ def _ml_hourly_aggregates(days=30) -> list:
             ips = dict(c.execute(
                 "SELECT ts/3600 h, COUNT(DISTINCT ip) FROM requests WHERE ts>? GROUP BY h",
                 (corte,)).fetchall())
-            # Vendas e receita precisam vir da MESMA fonte temporal. Reconciliações
-            # criam receita sem criar um novo request kind='paid' na hora do boot.
             paid = dict(c.execute(
                 "SELECT ts/3600 h, COUNT(*) FROM revenue WHERE ts>? GROUP BY h",
                 (corte,)).fetchall())
@@ -18428,15 +16541,7 @@ def _ml_score_current_hour() -> dict:
                     hist = json.loads(_ML_ANOM_FILE.read_text())
                 except Exception:
                     hist = []
-            # v48.13.0-INTEL: severidade. Anomalia de VOLUME puro (sem vendas
-            # nem pagadores) vira so log/arquivo — o retreino diario absorve o
-            # regime novo de trafego. So comportamento de COMPRADOR/receita
-            # acorda o operador no Telegram (fim do apito de hora em hora).
             sev = "buyer" if (cur[2] > 0 or cur[3] > 0 or cur[4] > 0) else "volume"
-            # v48.26.0-PREFLIGHT: anomalia em que TODO pagador da hora é da
-            # casa (rodada mensal dos indexadores / teste do operador) vira
-            # 'house' — registrada em log/arquivo, nunca Telegram. Misto
-            # (casa + externo) segue 'buyer' e alerta normal.
             if sev == "buyer" and _ml_hour_house_only():
                 sev = "house"
             out["severity"] = sev
@@ -18489,7 +16594,6 @@ def ml_ops_loop():
         time.sleep(3600)
 
 
-# ---- /discover — descoberta semantica do catalogo (FastEmbed/ONNX) ----------
 _ML_EMB = {"model": None, "vectors": None, "paths": [], "hash": ""}
 try:
     if not ML_DISABLED:
@@ -18597,26 +16701,7 @@ def discover():
             "ts": int(time.time()), "version": VERSION}
 
 
-# ============================================================================
-# v48.13.0-INTEL — SEGUNDA CAMADA DE IA LOCAL (tudo roda no proprio node)
-# ----------------------------------------------------------------------------
-# (1) /forecast $0.05 — previsao p10/p50/p90 com HistGradientBoosting
-#     quantilico treinado NO HISTORICO QUE O NODE COLETA (snapshot Pyth a cada
-#     10min + backfill CoinGecko 90d). MAPE de walk-forward em toda resposta;
-#     sem historico suficiente = 503 e NAO cobra. (2) Recomendador
-#     "agents_also_bought" por co-ocorrencia real de pagadores no ledger — o
-#     402 agora faz cross-sell + /recommend gratis. (3) Lead scoring SEMANTICO
-#     dos previews -> lead quente no Telegram. (4) Clustering semanal dos 404s
-#     por significado -> oportunidades publicadas em /ml. (5) /ml publico.
-# (6) /discover com reranker cross-encoder + modo multilingue sob demanda.
-# (7) LLM local de ultimo recurso (LOCAL_LLM=1 + llama-cpp-python; Qwen3-0.6B
-#     GGUF): se TODOS os provedores externos cairem, /llm responde com o modelo
-#     da casa. OFF por padrao = custo zero ate o operador decidir ativar.
-# Cada subsistema tem guard + backoff: se uma peca falha, o node segue como na
-# v48.12.0. requirements.txt INALTERADO (sklearn/fastembed ja estao la).
-# ============================================================================
 
-# ---- helpers de embedding compartilhados (discover, lead, clustering) ------
 _EMB_MODELS = {"base":  "sentence-transformers/all-MiniLM-L6-v2",
                "multi": "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"}
 _EMB_CACHE = {k: {"model": None, "vectors": None, "paths": [], "hash": "",
@@ -18735,7 +16820,6 @@ def _rerank(q, docs):
         return None
 
 
-# ---- /forecast — previsao de preco 100% local, dados do proprio node -------
 _FC_FEEDS = {  # simbolo: (pyth feed id, coingecko id)
     "BTC":  ("e62df6c8b4a85fe1a67db44dc12de5db330f7ac66b72dc658afedf0f4a415b43", "bitcoin"),
     "ETH":  ("ff61491a931112ddf1bd8147cd1b641375f79f5825126d665480874634fd0ace", "ethereum"),
@@ -18747,8 +16831,6 @@ _FC_FEEDS = {  # simbolo: (pyth feed id, coingecko id)
     "LINK": ("8ac0c70fff57e9aefdf5edf44b51d62c2d433653cbb2cf5cc06bb115af04d221", "chainlink")  # v48.17.3: id estava errado (o endpoint novo rejeita o lote inteiro por causa de 1 id),
 }
 _FC_SKIP_FILE = HOME_DIR / "fc_skip.json"   # v48.17.4-FEEDCLEAN
-# Produção (30/out): este feed XRP responde 403 "Not entitled" a cada batch.
-# Começa excluído para não repetir o erro após o deploy; CoinGecko mantém XRP.
 _FC_SKIP: set = {"ec5d399846a9209f3fe5881d70aae9268c94339ff9817e8d18ff19fa05eea1c8"}
 try:
     if _FC_SKIP_FILE.exists():
@@ -18812,13 +16894,11 @@ def _fc_collect():
         got = {}
         if PYTH_API_KEY:
             try:
-                # v48.17.4: batch já nasce sem os feeds sabidamente aposentados
                 ids_ok = [fid for fid, _cg in _FC_FEEDS.values()
                           if fid not in _FC_SKIP]
                 try:
                     by_id = _pyth_latest(ids_ok)
                 except RuntimeError as e1:
-                    # o corpo do erro nomeia o(s) id(s) culpado(s) — exclui e tenta de novo
                     bad = re.findall(r"(?:(?:not valid|not found):\s*|not entitled: feed )([0-9a-f]{64})",
                                      str(e1).lower())
                     if bad and len(ids_ok) - len(bad) > 0:
@@ -18840,11 +16920,6 @@ def _fc_collect():
                         ts = int(pd2.get("publish_time") or p.get("publish_time") or time.time())
                         got[sym] = (int(ts // 600 * 600), round(price, 8))
             except Exception as e:
-                # v48.17.2-WATCHDOG: o batch de 8 feeds tomou HTTP 400 em produção
-                # enquanto o feed único do /pyth-price passava. Em vez de perder o
-                # ciclo inteiro pro CoinGecko, tenta feed a feed (o endpoint novo
-                # rejeita o lote se UM id incomodar) e só depois cai pro CoinGecko
-                # no que faltar. O corpo do erro vai pro log — a causa sai no Railway.
                 log.info(f"🧠 collect pyth batch: {str(e)[:140]} — tentando feed a feed")
                 for sym, (fid, _cg) in _FC_FEEDS.items():
                     if sym in got or fid in _FC_SKIP:
@@ -18866,11 +16941,6 @@ def _fc_collect():
                         continue
         faltam = [s for s in _FC_FEEDS if s not in got]
         if faltam:
-            # v48.14.1: sem PYTH_API_KEY o coletor vive de CoinGecko (a chave
-            # que ja temos) — a serie do /forecast nunca para de crescer.
-            # v48.17.3: CoinGecko cobre os símbolos FALTANTES também (antes só
-            # rodava se NADA viesse do Pyth — 1 feed inválido no lote deixava o
-            # símbolo sem ponto novo mesmo com os outros 7 coletados).
             j = _cg_simple_prices([_FC_FEEDS[s][1] for s in faltam])
             for sym in faltam:
                 v = (j.get(_FC_FEEDS[sym][1]) or {}).get("usd")
@@ -18889,7 +16959,6 @@ def _fc_collect():
 
 
 
-# ---- v48.14.1-HOTFIX — Pyth pos-upgrade (chave) + fallback CoinGecko --------
 PYTH_API_KEY = os.environ.get("PYTH_API_KEY", "").strip()
 _PYTH_BASE = "https://pyth.dourolabs.app/hermes"
 
@@ -18901,17 +16970,12 @@ def _pyth_latest(feed_ids):
     na hora — o caller cai no fallback CoinGecko."""
     if not PYTH_API_KEY:
         raise RuntimeError("pyth: PYTH_API_KEY ausente (Hermes exige chave desde 26/ago/2026)")
-    # Query construída por params: os colchetes de ids[] são percent-encoded
-    # pela requests. A interpolação manual chegava ao Hermes/proxy como query
-    # sem o campo reconhecido e derrubava todo batch a cada 10 minutos.
     r = requests.get(f"{_PYTH_BASE}/v2/updates/price/latest",
                      params=[("ids[]", f) for f in feed_ids],
                      headers={"Authorization": f"Bearer {PYTH_API_KEY}"}, timeout=6)
     if not r.ok:
         body = r.text[:240]
         if r.status_code in (400, 403):
-            # Registra no ponto mais baixo também: mesmo um chamador fora do
-            # coletor passa a excluir o feed negado nos próximos ciclos.
             bad = re.findall(
                 r"(?:(?:not valid|not found):\s*|not entitled: feed )([0-9a-f]{64})",
                 body.lower())
@@ -19070,12 +17134,6 @@ def _fc_train(sym):
             actual = B[cut:] * (1.0 + Y[cut:])
             mape = float(_NP.mean(_NP.abs(pred_price - actual) /
                                   _NP.maximum(actual, 1e-9)) * 100)
-            # v48.17.0-RADAR: CALIBRACAO CONFORMAL (split-conformal no proprio
-            # trecho de teste walk-forward). Mede-se o erro de intervalo
-            # E = max(lo - real, real - hi)/real e guarda-se o quantil 90 de E
-            # como raio relativo + a cobertura empirica real da banda p10-p90.
-            # O cliente deixa de confiar no escuro: ve o quanto a banda cobriu
-            # no passado recente e recebe uma banda calibrada ao lado da crua.
             lo_p = B[cut:] * (1.0 + qs[0.1].predict(X[cut:]))
             hi_p = B[cut:] * (1.0 + qs[0.9].predict(X[cut:]))
             coverage = float(_NP.mean((actual >= lo_p) & (actual <= hi_p)))
@@ -19151,8 +17209,6 @@ def _fc_predict(sym, h):
     q10 = min(q10, q50)   # cruzamento de quantis acontece — a banda nunca inverte
     q90 = max(q90, q50)
     last = float(p[-1])
-    # v48.17.0-RADAR: aplica a calibracao conformal aprendida no walk-forward.
-    # .joblib antigo (sem "calib") segue servindo a banda crua ate o retreino.
     calib_h = (ent.get("calib") or {}).get(h) or {}
     radius = float(calib_h.get("radius_rel") or 0.0)
     coverage = calib_h.get("coverage80_empirical")
@@ -19222,16 +17278,11 @@ def _fc_loop():
     _last_seed = time.time()
     while True:
         try:
-            # v48.14.0: seed auto-recupera — simbolo sem backfill refaz a
-            # tentativa a cada 30min (429 de IP compartilhado se resolve
-            # sozinho; nao exige redeploy).
             if time.time() - _last_seed > 1800:
                 _last_seed = time.time()
                 try:
                     if _fc_seed_needed():
                         _fc_seed()
-                        # v48.14.1: simbolo recem-semeado treina NA HORA —
-                        # sem isto o /forecast ficava 503 ate o tick de 6h.
                         for _s in _FC_FEEDS:
                             if _s not in _FC_MODELS:
                                 try:
@@ -19253,7 +17304,6 @@ def _fc_loop():
         time.sleep(600)
 
 
-# ---- recommender — "agents also bought" (co-ocorrencia real de pagadores) --
 _ALSO_FILE = _ML_DIR / "ml_also_bought.json"
 _ALSO = {"map": {}, "computed_at": 0}
 
@@ -19327,7 +17377,6 @@ def recommend():
             "ts": int(time.time()), "version": VERSION}
 
 
-# ---- lead scoring semantico — avaliador com intencao de premium vira lead --
 _LEADS_FILE = _ML_DIR / "ml_leads.json"
 _LEADS = {"by_ip": {}, "last_alert": 0.0, "events": 0}
 _LEAD_EMB = {"hash": "", "paths": [], "vectors": None}
@@ -19403,7 +17452,6 @@ def _ml_lead_score(path, ip, ua, args):
         return
 
 
-# ---- clustering semanal dos 404s — o radar de demanda pensa em categorias --
 _CLUSTER_FILE = _ML_DIR / "ml_demand_clusters.json"
 
 
@@ -19468,7 +17516,6 @@ def _ml_cluster_digest():
         pass
 
 
-# ---- /ml — vitrine publica da camada de IA local ---------------------------
 _ML_PUB = {"at": 0.0, "json": None}
 
 
@@ -19550,7 +17597,6 @@ def ml_public():
     return out
 
 
-# ---- LLM local de ultimo recurso (LOCAL_LLM=1) ------------------------------
 _LOCAL_LLM_ON = (os.environ.get("LOCAL_LLM", "0") == "1") and not ML_DISABLED
 _LOCAL_LLM = {"llm": None, "backoff_until": 0.0, "lib_warned": False,
               "downloading": False,
@@ -19663,8 +17709,6 @@ def demand_watch_loop():
                 avisados.add(path)
                 cls = _demand_classify_ml(path)
                 if cls["kind"] in ("resolved", "scanner_noise"):
-                    # v44.1.0: a rota já existe — demanda atendida, não alerta.
-                    # v44.3.0: sonda de exploração — ruído, não alerta.
                     continue
                 _notify_telegram(
                     f"🎯 *DEMANDA DETECTADA*\n\n"
@@ -19724,8 +17768,6 @@ def lead_watch_loop():
                     "GROUP BY ip", (corte,)).fetchall())
             agora = time.time()
             avisados = {k: v for k, v in avisados.items() if agora - v < 86400}
-            # v48.6.1: 1 alerta por IP por ciclo — pega só o endpoint de maior
-            # contagem para cada IP elegível, em vez de um ping por endpoint.
             melhor_por_ip = {}
             for ip, ep, n, ua in linhas:
                 if ip in pagantes or ep not in BASE_PRICES:
@@ -19764,10 +17806,6 @@ def _slash_redirect():
     slash-stripped path is a real route for this method, answer with a
     308 redirect (method-preserving) instead of a 404."""
     p = request.path or ""
-    # v44.1.0 NOTA: barra dupla no início (//br-brief, visto em produção) NÃO
-    # precisa de redirect — o Werkzeug normaliza request.path antes de qualquer
-    # hook e casa a rota correta (o 402 observado em produção era o fluxo
-    # normal de /br-brief). Verificado em teste com PATH_INFO cru.
     if len(p) > 1 and p.endswith("/"):
         stripped = p.rstrip("/")
         if stripped:
@@ -19800,8 +17838,6 @@ def _capture_demand(e):
     return jsonify({
         "error": "not_found",
         "requested": path,
-        # v29: 404 que ENSINA. Em vez de beco sem saída, o agente recebe o
-        # caminho para se autoatender — e nós recebemos o sinal de demanda.
         "did_you_mean": _suggest_paths(path),
         "catalog": f"{base}/llms.txt",
         "free_samples": f"{base}/try",
@@ -19859,9 +17895,6 @@ def manifest_glama():
     o manifest de claim/manutenção do servidor. Formato oficial mínimo:
     $schema + maintainers (github.com/glama.ai — blog 'what-is-glamajson').
     Sem isso o servidor existia no índice deles sem dono verificado."""
-    # v48.3.9.1: claim por HTTP challenge — se GLAMA_CLAIM_JSON estiver setada
-    # (Railway Variables), serve o JSON exato que o Glama mostra no fluxo de
-    # claim, sem precisar de novo deploy de código.
     _claim = (os.environ.get("GLAMA_CLAIM_JSON") or "").strip()
     if _claim:
         return app.response_class(_claim, mimetype="application/json")
@@ -19905,8 +17938,6 @@ def manifest_mcp():
         "description":    (f"Cross-asset market intelligence over x402: forex, equities, "
                            f"commodities, macro and crypto. {len(BASE_PRICES)} tools. "
                            f"Free delayed samples; pay per call in USDC for real-time."),
-        # v26: transportes DECLARADOS — sem isto, clientes assumiam HTTP na raiz
-        # e recebiam 405 (o servidor aparecia como "unhealthy" nos diretórios).
         "transport": {
             "type": "streamable-http",
             "url":  f"{base}/mcp",
@@ -19926,9 +17957,6 @@ def manifest_mcp():
         },
     })
 
-# v33: 2 IPs distintos pediram /.well-known/agent-card.json e receberam 404.
-# É o nome CANÔNICO atual do Agent Card no A2A — servíamos só o nome antigo
-# (agent.json). Quem procurava pelo padrão vigente não nos encontrava.
 LIVE_HTML = r"""<!doctype html><html lang="en"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Losbeto — live node telemetry</title>
@@ -20053,22 +18081,6 @@ async function tick(){
 tick();setInterval(tick,30000);
 </script></body></html>"""
 
-# ============================================================================
-# 21. BAZAAR INDEX AUDIT (v35) — descoberto no Slack oficial do x402.
-#
-#     Um membro do #wg-domain-discovery relatou que POST /v2/x402/validate da
-#     CDP é uma sonda SEM PAGAMENTO que devolve, por recurso: `valid`,
-#     `index.active` e um preflight de 25 checagens. Ele rodou nos 19 endpoints
-#     dele: 19/19 válidos e indexados.
-#
-#     Isso responde de forma DEFINITIVA a pergunta que só conseguíamos inferir
-#     por correlação: os 61 endpoints que liquidamos estão realmente ativos no
-#     índice do Bazaar? Antes olhávamos IPs sondando e supunhamos. Agora dá
-#     para perguntar à fonte.
-#
-#     ARMADILHA relatada e evitada aqui: o campo do corpo é `resource`, NÃO
-#     `url` — enviar `url` retorna 400 com erro de schema.
-# ============================================================================
 
 CDP_API_BASE = os.environ.get("CDP_API_BASE",
                               "https://api.cdp.coinbase.com/platform/v2/x402")
@@ -20078,7 +18090,6 @@ def _cdp_validate(resource_url: str) -> dict:
     if not (CDP_API_KEY_ID and CDP_API_KEY_SECRET):
         return {"error": "CDP keys not configured"}
     try:
-        # is_cdp é derivado da URL no construtor, não é parâmetro
         fac = CDP_FAC or FacilitatorClient(CDP_API_BASE)
         hdrs = fac._headers("POST", "/validate")
         r = requests.post(f"{CDP_API_BASE}/validate",
@@ -20119,17 +18130,7 @@ def _audit_one(path: str) -> dict:
                        (idx.get("active") if isinstance(idx, dict) else False))
                        else "not_indexed")}
 
-# ============================================================================
-# 23. BRASIL (v37) — o único diferencial estrutural que ninguém pode copiar
-#     rápido: nenhum serviço x402 cobre o mercado brasileiro.
-#
-#     Fonte primária: API pública do Banco Central (SGS + PTAX). Grátis, sem
-#     chave, sem limite prático — e um banco central não bloqueia data center,
-#     ao contrário do Yahoo e do Binance global que já nos morderam.
-#     Equities B3 via Yahoo (.SA), comprovadamente funcionando neste nó.
-# ============================================================================
 
-# Séries do Sistema Gerenciador de Séries Temporais do BCB
 BCB_SERIES = {
     "selic_meta_pct":        (432,   "Meta Selic definida pelo Copom (% a.a.)"),
     "cdi_daily_pct":         (12,    "CDI taxa DIÁRIA (% ao dia) — série 12 do SGS"),
@@ -20172,9 +18173,6 @@ def _bcb_last(code: int, n: int = 2) -> Optional[dict]:
             except Exception:
                 return None
         def _dt(x):
-            # BCB usa dd/mm/aaaa. Ordenar pela DATA em vez de confiar na ordem
-            # do array: se a API algum dia inverter, pegaríamos o valor velho
-            # sem nenhum erro aparente — o pior tipo de bug.
             try:
                 p = str(x.get("data", "")).split("/")
                 return (int(p[2]), int(p[1]), int(p[0])) if len(p) == 3 else (0, 0, 0)
@@ -20240,14 +18238,10 @@ def _br_macro_handler():
                 "series": m, "ts": ts, "provider": "Losbeto/Brasil",
                 "version": VERSION}, 503
 
-    # leitura de juro real — o número que todo alocador olha primeiro no Brasil
     selic = (vivos.get("selic_meta_pct") or {}).get("value")
     ipca = (vivos.get("ipca_12m_pct") or {}).get("value")
     juro_real = (round(((1 + selic / 100) / (1 + ipca / 100) - 1) * 100, 2)
                  if (selic is not None and ipca is not None) else None)
-    # v38: a série 12 é DIÁRIA. Anualizar por 252 dias úteis é o padrão do
-    # mercado brasileiro — e o resultado deve ficar próximo da Selic, o que
-    # serve de checagem de sanidade do próprio dado.
     cdi_d = (vivos.get("cdi_daily_pct") or {}).get("value")
     if cdi_d is not None:
         try:
@@ -20325,7 +18319,6 @@ def _br_brief_handler():
     ipca = (vivos.get("ipca_12m_pct") or {}).get("value")
     juro_real = (round(((1 + selic / 100) / (1 + ipca / 100) - 1) * 100, 2)
                  if (selic is not None and ipca is not None) else None)
-    # contexto global para posicionar o Brasil
     glob = {}
     try:
         for nome, fn in (("dxy_proxy_eurusd", lambda: _brain_with_args(
@@ -20384,28 +18377,7 @@ BRASIL_SUITE = {
         ["Brazil", "Premium", "Macro"], {"format": "json"}),
 }
 
-# ---------------------------------------------------------------------------
-# v39.2 — SUÍTE AGRO + CURVA DI
-#
-# O ÚNICO fosso estrutural deste node. Todo o resto do catálogo — preço de
-# cripto, forex, ações americanas — qualquer um replica em uma tarde. O que
-# ninguém fora do Brasil monta é o preço da saca de soja em Mato Grosso, a
-# arroba do boi gordo e a curva de juro futuro da B3.
-#
-# Por que isso vale dinheiro para quem está lá fora: o Brasil é o maior
-# exportador mundial de soja, café, açúcar e carne bovina. Uma mesa em Chicago
-# que negocia soja PRECISA do preço no porto de Paranaguá e do câmbio PTAX
-# para calcular paridade de exportação — e hoje não existe API agentic para
-# isso em lugar nenhum. É dado que só quem está aqui consegue montar, vendido
-# para quem está lá.
-#
-# Fontes: séries do próprio BCB (que publica preços agrícolas e a curva de
-# juros) — mesma infra já usada por /br-macro, sem dependência nova, sem chave.
-# Cada série declara sua origem e sua data na resposta.
-# ---------------------------------------------------------------------------
 
-# Séries SGS/BCB de commodities agrícolas e juros. Cada uma é um endpoint
-# separado na origem, com decimal por vírgula; aqui vão montadas.
 _BCB_AGRO = {
     "soybean_brl_per_60kg_bag": (
         1466, "Soybean, domestic spot, BRL per 60kg bag"),
@@ -20425,24 +18397,7 @@ _BCB_CURVE = {
 }
 
 
-# ---------------------------------------------------------------------------
-# v39.3 — GUARDA DE FRESCOR (nasceu de um erro meu, em produção)
-#
-# A v39.2 publicou /br-agro usando as séries BCB 1464-1467. Elas EXISTEM, a API
-# responde 200 e devolve números plausíveis — mas foram DESCONTINUADAS: o
-# último dado é de 01/12/2022. O endpoint vendeu preço de soja de quatro anos
-# atrás como cotação corrente, por $0.06, e houve liquidação real.
-#
-# É o mesmo erro do /earnings-whisper que esta base já tinha: dado que não é o
-# que diz ser. A diferença é que aqui não havia nem disclaimer — a resposta
-# trazia "date" no meio de cada série e mais nada gritava.
-#
-# Lição generalizada: uma fonte que responde 200 não está viva. Toda série
-# datada passa por aqui, e o que estiver velho demais para o seu tipo NÃO É
-# VENDIDO. Prefira não faturar a faturar mentira.
-# ---------------------------------------------------------------------------
 
-# Idade máxima aceitável por tipo de série, em dias.
 MAX_AGE_DAYS = {
     "daily":     10,     # CDI, PTAX — publicação diária útil
     "commodity": 21,     # preço agrícola precisa ser recente para valer algo
@@ -20476,8 +18431,6 @@ def _check_freshness(series: dict, kind: str) -> tuple:
             continue
         idade = _series_age_days(v.get("date", ""))
         v = {**v, "age_days": idade}
-        # Idade negativa = data futura (Selic da próxima reunião, TJLP do
-        # próximo trimestre). Legítimo para séries de política, suspeito no resto.
         if idade is None:
             obsoletas[nome] = {**v, "reason": "unparseable date"}
         elif idade < 0:
@@ -20517,24 +18470,7 @@ def _bcb_parallel(series: dict) -> dict:
     return out
 
 
-# v42 — PARIDADE VIA FUTUROS: as séries BCB 1464-1467 morreram em 01/12/2022,
-# mas o PRODUTO (preço doméstico brasileiro que forma a paridade de exportação)
-# pode continuar vivo, com a fonte correta declarada. Cadeia: BCB fresco →
-# futuros CBOT/ICE (Yahoo) → Stooq → 503 honesto. Conversão para a unidade
-# doméstica (saca 60kg) usando a PTAX oficial — a mesma conta que um desk de
-# exportação faz na mão. Proveniência declarada em campo próprio: NÃO é o
-# spot oficial CEPEA/ESALQ, é paridade implícita de futuros.
-#
-# v42.1 — LE=F (boi gordo) REMOVIDO da suíte de futuros, por dois motivos
-# metodológicos: (1) CME Live Cattle é cotado em cents/lb de PESO VIVO, e a
-# arroba brasileira é peso de CARCAÇA — converter sem o rendimento de carcaça
-# (~50%) produz um número errado em dobro; (2) carne BR e US são mercados
-# praticamente separados (barreiras sanitárias, graus, demanda) — não existe
-# "paridade de exportação" como em soja/milho/café, que são globais. Três
-# commodities com proveniência sólida > quatro com uma inventada. O caminho
-# BCB oficial (se um dia voltar a publicar) continua intacto abaixo.
 _AGRO_FUTURES = {
-    # ticker: (chave no produto, unidade do contrato, fator USD->unidade doméstica)
     "ZS=F": ("soybean_brl_per_60kg_bag",      "cents/bushel", 60.0 / 27.2155),
     "ZC=F": ("corn_brl_per_60kg_bag",         "cents/bushel", 60.0 / 25.4012),
     "KC=F": ("coffee_arabica_brl_per_60kg_bag", "cents/lb",   132.277),
@@ -20573,7 +18509,6 @@ def _br_agro_handler():
     dados = _bcb_parallel(_BCB_AGRO)
     vivos, obsoletas = _check_freshness(dados, "commodity")
     if len(vivos) < 2:
-        # v42: antes de recusar a venda, tenta a paridade via futuros.
         par = _agro_futures_parity(usd_brl or 0.0)
         if len(par) >= 2:
             return {"product": "Brazil Agricultural Prices",
@@ -20599,9 +18534,6 @@ def _br_agro_handler():
                                  "coffee, sugar and beef — these parities are the gap "
                                  "every export desk watches."),
                     "ts": ts, "provider": "Losbeto/Brasil", "version": VERSION}
-        # v39.3: a v39.2 vendia estas séries sem olhar a data. Todas as quatro
-        # estão paradas em 01/12/2022 — descontinuadas pelo BCB. A API responde
-        # 200 alegremente; só a data denuncia. Não vendemos mais.
         return ({"status": "unavailable", "product": "Brazil Agricultural Prices",
                  "charged": False,
                  "error": "The BCB agricultural series this product relied on "
@@ -20616,7 +18548,6 @@ def _br_agro_handler():
                  "freshness_limit_days": MAX_AGE_DAYS["commodity"],
                  "ts": ts, "provider": "Losbeto/Brasil", "version": VERSION}, 503)
 
-    # PTAX: sem ela o número não serve para quem opera fora do Brasil.
     ptax = _bcb_last(1, 8)
     usd_brl = (ptax or {}).get("value")
 
@@ -20631,8 +18562,6 @@ def _br_agro_handler():
             linha["usd"] = round(v["value"] / usd_brl, 4)
         saida[nome] = linha
 
-    # Paridade de exportação em unidade internacional: a soja é cotada em
-    # bushel em Chicago; a saca brasileira tem 60kg. 1 bushel = 27,2155 kg.
     paridade = {}
     soja = saida.get("soybean_brl_per_60kg_bag")
     if soja and usd_brl:
@@ -20646,7 +18575,6 @@ def _br_agro_handler():
                                 "the export-parity gap.")
     cafe = saida.get("coffee_arabica_brl_per_60kg_bag")
     if cafe and cafe.get("usd"):
-        # ICE cota café em cents/lb; a saca tem 60kg = 132,277 lb.
         paridade["coffee_usc_per_pound_equivalent"] = round(
             cafe["usd"] / 132.277 * 100, 2)
 
@@ -20669,8 +18597,6 @@ def _br_curve_handler():
     """Estrutura de juros brasileira: nível, real e o que ela implica."""
     ts = int(time.time())
     dados = _bcb_parallel(_BCB_CURVE)
-    # Selic e TJLP têm data de VIGÊNCIA futura por natureza (a meta definida
-    # pelo Copom vale a partir da próxima reunião). Por isso "policy".
     vivos, obsoletas = _check_freshness(dados, "policy")
     if len(vivos) < 2:
         return ({"status": "unavailable", "product": "Brazil Rate Structure",
@@ -20756,20 +18682,6 @@ log.info(f"🇧🇷 Brasil Suite registrada: {len(BRASIL_SUITE)} endpoints "
          f"(BCB + B3) — inédito no x402")
 
 
-# ============================================================================
-# 21b. JOB PACKS (v44.2.0-VITRINE) — "um job inteiro num único pagamento".
-#
-#     O diagnóstico global de vendas (ago/2026) mostrou: quem vende no x402
-#     não vende endpoints, vende JOBS (Agent402: "research a stock in one
-#     payment"). Agente autônomo não navega catálogo de 78 rotas — ele quer
-#     UMA chamada que resolve a tarefa. Cada job abaixo compõe handlers
-#     existentes (custo marginal ~zero, tudo já está quente no warmer),
-#     cobra UMA vez, e entrega um relatório único com veredito.
-#
-#     Regra de ouro herdada da v21.11/v44.0.9: job NUNCA devolve erro cru
-#     pago. Se todos os componentes falharem, devolve (dict, 503) e o
-#     estorno automático universal cuida do pagador.
-# ============================================================================
 
 def _job_component(name: str, fn, args: dict, out: dict, ok: list):
     """Roda um componente de job com isolamento total: falha de um
@@ -20816,7 +18728,6 @@ def _job_token_research():
                 "error": "All research components are offline right now. No charge.",
                 "ts": ts, "version": VERSION}, 503
 
-    # veredito determinístico — não depende de LLM para existir
     risk = (parts.get("safety") or {}).get("risk_level", "unknown")
     score = (parts.get("safety") or {}).get("score")
     fg = (parts.get("regime") or {}).get("value")
@@ -20965,17 +18876,6 @@ log.info(f"🧰 Job Suite registrada: {len(JOB_SUITE)} jobs "
          f"(1 pagamento = 1 relatório completo)")
 
 
-# ============================================================================
-# 21b-ALIAS. APELIDOS DE DEMANDA (v44.3.2) — o radar de 7 dias mostrou agentes
-#     chutando caminhos convencionais e tomando 404: 29 pedidos de ~20 IPs
-#     distintos ("/search" 11/4ip, "/x402" 6/4ip, "/api/agent/discover" 6/4ip,
-#     "/token-research" 5/5ip, "/bootstrap-trust/x402" 5/5ip). Cada apelido
-#     serve o produto real INTEIRO — mesmo preço, mesmo 402, mesmo preview,
-#     mesma liquidação — porque reusa o paid_endpoint() do alvo (o verify
-#     não amarra o pagamento à URL; preço/desafio/registro seguem o alvo).
-#     Zero dado novo, zero entrada duplicada nos manifests/catálogos:
-#     os apelidos NÃO entram em BASE_PRICES nem ENDPOINT_HANDLERS.
-# ============================================================================
 
 ALIAS_ROUTES = {
     "/search":             "/web-search",          # convenção universal de busca
@@ -20983,8 +18883,6 @@ ALIAS_ROUTES = {
     "/api/agent/discover": "/agent-market",        # descoberta de agente
     "/token-research":     "/job/token-research",  # nome óbvio do job
     "/earnings-whisper/x402": "/x402-audit",       # v44.3.3: padrão "{rota}/x402"
-    # v48.9.18: "/ask" 12 reqs no radar — convenção de pergunta direta a um
-    # gateway LLM; serve o MESMO handler do /llm (mesmo preço, mesmo 402).
     "/ask":                "/llm",
 }
 for _alias, _target in ALIAS_ROUTES.items():
@@ -20998,27 +18896,14 @@ for _alias, _target in ALIAS_ROUTES.items():
         )
     else:
         log.warning(f"⚠️ apelido {_alias} sem alvo registrado ({_target}) — pulando")
-# /bootstrap-trust/x402: quem leu os docs e chutou o caminho — mesma view
-# (GET devolve as instruções de bootstrap; POST valida o X-Payment igual).
 app.add_url_rule("/bootstrap-trust/x402", "alias_bootstrap_trust_x402",
                  bootstrap_trust, methods=["GET", "POST"])
 
-# v44.6.0-DEMANDA — o radar de 7d flagrou um varredor SISTEMÁTICO testando
-# subcaminhos de /bootstrap-trust: /weather (6 pedidos/3 IPs), /pay (6/4),
-# /paid (6/4), /data (6/5), /api/x402 (6/4). Cinco regras fixas cobririam só
-# o passado — UMA regra-curinga cobre o padrão inteiro, inclusive o sufixo
-# que inventarem amanhã. GET devolve as instruções de bootstrap (grátis);
-# POST valida X-Payment igual à rota-mãe. A view não aceita kwargs, então
-# o wrapper descarta o sufixo.
 def _bootstrap_trust_sub(sub):
     return bootstrap_trust()
 app.add_url_rule("/bootstrap-trust/<path:sub>", "alias_bootstrap_trust_sub",
                  _bootstrap_trust_sub, methods=["GET", "POST"])
 
-# v44.6.0 — /api/v1: 7 pedidos de 4 IPs em 7d, radar classificou "produto
-# novo". Crawlers chutam a raiz convencional de API procurando o índice do
-# serviço. Resposta canônica: um índice GRÁTIS que transforma varredor em
-# crawler informado — aponta manifestos, catálogo, preços e como comprar.
 @app.route("/api/v1")
 def api_v1_index():
     base = _public_base()
@@ -21047,36 +18932,11 @@ log.info(f"🔗 Apelidos de demanda registrados: {len(ALIAS_ROUTES)} rotas "
          f"({', '.join(ALIAS_ROUTES)}) + /bootstrap-trust/x402 + "
          f"/bootstrap-trust/* (curinga) + /api/v1 (índice grátis)")
 
-# v48.3.4: /docs pedido por 4 IPs distintos no radar (convenção de
-# documentação de API). Aponta para o documento que agentes realmente leem.
 @app.route("/docs")
 def docs_redirect():
     return redirect("/llms.txt", code=302)
 
 
-# ============================================================================
-# 21b. /br-archive (v44.5.0-ARQUIVO) — o ativo que nenhum concorrente copia.
-#
-#     A lei da demanda x402: agente só paga pelo que não existe de graça.
-#     Dado brasileiro de graça (BCB, B3) qualquer um embrulha — mas um
-#     snapshot DIÁRIO, point-in-time, assinado com a chave Ed25519 do nó,
-#     acumulado desde o deploy, é IRREPRODUZÍVEL: para ter o histórico de
-#     90 dias é preciso ter operado os 90 dias. Cada dia que passa, o fosso
-#     aumenta e o custo marginal é zero.
-#
-#     - archive_loop: 1 snapshot/dia a partir das 21h UTC (B3 fechada,
-#       PTAX do dia publicada), INSERT OR IGNORE — imutável por construção.
-#     - Assinatura: sha256 do payload canônico + Ed25519 do próprio nó
-#       (mesma WALLET que assina os receipts) → qualquer agente verifica
-#       offline que o dado não foi retroativamente adulterado.
-#     - /archive: status GRÁTIS (dias arquivados, cadeia, signatário,
-#       instrução de verificação) — é a vitrine do produto pago.
-#     - /br-archive?day=YYYY-MM-DD: $0.05. Dia ausente → 503 com crédito
-#       automático (regra da casa: nunca cobrar por dado que não existe).
-#     - Honestidade mantida: o fallback "Neutral 50" do fear_greed (sem ts)
-#       NUNCA entra no arquivo como se fosse leitura viva; snapshot exige
-#       >= 3 fontes reais ou o dia fica vazio.
-# ============================================================================
 
 ARCHIVE_DB = HOME_DIR / "archive.db"
 
@@ -21106,8 +18966,6 @@ def _archive_take(day: str) -> bool:
     fng, fng_live = None, False
     try:
         _f = Market.fear_greed()
-        # o fallback {"value": 50, "Neutral"} não tem "ts" — não é leitura
-        # viva e não pode entrar num arquivo point-in-time como se fosse.
         if _f and _f.get("ts"):
             fng, fng_live = _f, True
     except Exception as e:
@@ -21221,8 +19079,6 @@ def _br_archive_handler():
         avail = conn.execute("SELECT day FROM snapshots ORDER BY day DESC"
                              " LIMIT 30").fetchall()
         conn.close()
-        # Regra da casa: dado que não existe não se vende — tupla 503 dispara
-        # o crédito automático do paid_endpoint (nunca 503 pago).
         return ({"status": "unavailable",
                  "error": (f"No snapshot for {day or 'any day yet'}. The archive "
                            "grows one signed day at a time and cannot be "
@@ -21263,7 +19119,6 @@ ENDPOINT_HANDLERS["/br-archive"] = _br_archive_handler
 app.add_url_rule("/br-archive", "br_archive",
                  paid_endpoint("/br-archive")(_br_archive_handler))
 FEATURED_ENDPOINTS.insert(0, "/br-archive")
-# dia malformado é erro do CLIENTE — 400 didático grátis, nunca pago.
 _PARAM_RULES["/br-archive"] = {
     "param": "day",
     "pattern": r"^\d{4}-\d{2}-\d{2}$",
@@ -21273,15 +19128,6 @@ log.info("📦 br-archive registrado ($0.05) — snapshot diário assinado Ed255
          "irreproduzível por construção")
 
 
-# ============================================================================
-# 21c. /skill.md (v44.2.0) — o onboarding padrão do ecossistema agente.
-#
-#     twit.sh, o melhor vendedor de dados do x402, não vende API — vende a
-#     frase "Set up https://twit.sh/skill.md with x402". Um agente que recebe
-#     essa instrução lê o skill.md e aprende TUDO: o que existe, como pagar,
-#     como avaliar de graça. Nosso /skill.md devolvia 404 — éramos
-#     invisíveis para o padrão de instalação de skills.
-# ============================================================================
 
 @app.route("/skill.md")
 @app.route("/.well-known/skill.md")
@@ -21372,11 +19218,6 @@ def jobs_index():
     })
 
 
-# ============================================================================
-# 21d. /terms (v44.2.0) — o ✗ que faltava no checklist do x402-list.
-#     Nó com Grade A 14/14 e "terms page: missing". Diretórios e avaliadores
-#     humanos procuram termos antes de integrar; a ausência custava confiança.
-# ============================================================================
 
 @app.route("/terms")
 @app.route("/tos")
@@ -21409,10 +19250,6 @@ def terms_page():
         },
         "ts": int(time.time()),
     }
-    # v44.8.1: inverter a negociação — crawlers de diretório (x402-list marca
-    # "terms page: missing") não mandam Accept: text/html nem UA de navegador,
-    # então caíam no JSON e o pillar não era detectado. HTML vira o padrão;
-    # JSON só para quem pede explicitamente.
     quer_json = ("application/json" in request.headers.get("Accept", "")
                  or request.args.get("format") == "json")
     if not quer_json:
@@ -21435,12 +19272,6 @@ def terms_page():
     return jsonify(payload)
 
 
-# ============================================================================
-# 21e. /privacy (v47.3.0) — 3 IPs distintos pediram /privacy em 7 dias no
-#      funil de demanda e ele não existia. Diretórios e compradores
-#      institucionais verificam política de privacidade antes de integrar;
-#      mesma lógica do /terms (v44.2.0) que fechou o checklist do x402-list.
-# ============================================================================
 
 @app.route("/privacy")
 @app.route("/privacy-policy")
@@ -21494,15 +19325,6 @@ def privacy_page():
     return jsonify(payload)
 
 
-# ============================================================================
-# 21f. /.well-known/oauth-protected-resource (v47.4.0) — RFC 9728.
-#      4 pedidos de 2 IPs em 7 dias no funil de demanda: são clientes MCP
-#      (Claude & cia.) fazendo a descoberta de autorização ANTES de conectar
-#      no /mcp. A spec MCP exige este documento; sem ele o cliente aborta a
-#      integração em silêncio. Não rodamos OAuth — o pagamento É a auth
-#      (x402) ou a chave de crédito (X-API-Key) — então o documento declara
-#      isso com honestidade em vez de fingir um authorization server.
-# ============================================================================
 
 @app.route("/.well-known/oauth-protected-resource")
 @app.route("/.well-known/oauth-protected-resource/<path:sub>")
@@ -21515,9 +19337,6 @@ def oauth_protected_resource(sub: str = ""):
         "resource_name": SERVICE_NAME,
         "bearer_methods_supported": ["header"],
         "scopes_supported": [],
-        # Lista vazia DE PROPÓSITO: não operamos um authorization server
-        # OAuth. Declarar um falso faria o cliente iniciar um fluxo que não
-        # existe. O campo está presente (a spec o exige) e vazio (a verdade).
         "authorization_servers": [],
         "resource_documentation": base + "/llms.txt",
         "auth_model": {
@@ -21530,14 +19349,6 @@ def oauth_protected_resource(sub: str = ""):
     })
 
 
-# ============================================================================
-# 21g. DESCOBERTA MCP COMPLETA (v47.5.1) — a demanda chegou pelos canais
-#      novos: 5 IPs distintos pedindo /mcp/.well-known/oauth-* e
-#      /.well-known/mcp/server-card.json em 7 dias (clientes MCP reais fazendo
-#      discovery depois da publicação no Registry). Implementa SEP-1649
-#      (server card) e SEP-1960 (manifest), com os headers que as specs
-#      exigem: CORS aberto, nosniff e cache de 1h.
-# ============================================================================
 
 def _discovery_headers(resp):
     resp.headers["Access-Control-Allow-Origin"] = "*"
@@ -21550,7 +19361,6 @@ def _discovery_headers(resp):
 def _server_card_doc() -> dict:
     base = _public_base()
     return {
-        # SEP-1649 (MCP Server Cards) — campos obrigatórios primeiro
         "$schema": "https://modelcontextprotocol.io/schemas/server-card/v1.0",
         "version": "1.0",
         "protocolVersion": MCP_PROTOCOL_VERSION,
@@ -21565,8 +19375,6 @@ def _server_card_doc() -> dict:
         "documentationUrl": f"{base}/llms.txt",
         "transport": {"type": "streamable-http", "endpoint": "/mcp"},
         "capabilities": {"tools": {}},
-        # autenticação honesta: o pagamento x402 É a credencial; amostras
-        # atrasadas são abertas, chave de crédito via X-API-Key.
         "auth": {"type": "x402-or-apikey",
                  "note": ("Free delayed samples need no auth. Real-time calls "
                           "are paid per call in USDC via x402 (Base/Solana/"
@@ -21584,7 +19392,6 @@ def mcp_server_card():
 def _mcp_manifest_doc() -> dict:
     base = _public_base()
     return {
-        # SEP-1960 (manifest de enumeração de endpoints)
         "mcp_version": MCP_PROTOCOL_VERSION,
         "endpoints": [{
             "url": f"{base}/mcp",
@@ -21624,18 +19431,6 @@ def oauth_authorization_server(sub: str = ""):
     }))
 
 
-# ============================================================================
-# 22. LIVE CHAT (v36) — atendimento humano no meio de um mercado de máquinas.
-#
-#     A telemetria mostrou o que ninguém esperava: os avaliadores são
-#     majoritariamente NAVEGADORES HUMANOS (iPhone, Android, Windows), e alguém
-#     pediu /about, /contact e /team. São pessoas avaliando se confiam no
-#     serviço — e iam embora sem poder perguntar nada.
-#
-#     Fluxo: visitante escreve na página -> chega no Telegram do operador ->
-#     operador responde com /r <id> <texto> -> resposta aparece na página.
-#     Sem cadastro, sem e-mail, sem terceiros.
-# ============================================================================
 
 CHAT_DB_PATH = HOME_DIR / "chat.db"
 CHAT_RETENTION_DAYS = int(os.environ.get("CHAT_RETENTION_DAYS", "30"))
@@ -21651,10 +19446,6 @@ def _chat_db():
         who TEXT NOT NULL, text TEXT NOT NULL,
         ip TEXT, ua TEXT, delivered INTEGER DEFAULT 0)""")
     c.execute("CREATE INDEX IF NOT EXISTS idx_chat_sid ON chat(sid, id)")
-    # v43: mapa notificação→sessão. Guarda o message_id do Telegram de cada
-    # aviso de visitante, para o operador responder com REPLY nativo (arrasta
-    # e responde) em vez de decorar `/r <id>`. É o refinamento que o fluxo
-    # pedia: zero fricção entre "chegou mensagem" e "respondi".
     c.execute("""CREATE TABLE IF NOT EXISTS chat_tg(
         tg_msg_id INTEGER PRIMARY KEY,
         sid TEXT NOT NULL, ts INTEGER NOT NULL)""")
@@ -21747,14 +19538,6 @@ def _chat_rate_ok(sid: str, ip: str) -> bool:
     except Exception:
         return True
 
-# ---------------------------------------------------------------------------
-# v48.9.21-CONCIERGE — IA atendente no /chat.
-# A visitante pergunta -> a IA responde em segundos com FATOS AO VIVO do nó
-# (preços reais, links reais — nunca inventados) -> o operador recebe TUDO no
-# Telegram com tag: "🤖 IA respondeu" (FYI) ou "🙋 precisa de você" (escalado).
-# Regras duras: reembolso/parceria/humano/IA insegura => escala; se o operador
-# respondeu a thread nas últimas 12h, a IA se retira (o humano assumiu).
-# ---------------------------------------------------------------------------
 _CHAT_AI_ESCALA = ("refund", "estorno", "chargeback", "reembolso",
                    "human", "humano", "operador", "operator", "roberto",
                    "parceria", "partnership", "enterprise", "contrato")
@@ -21824,7 +19607,6 @@ def _chat_ai_reply(texto: str, hist: list):
     out = out.strip()
     if "[HUMANO]" in out or len(out) < 3:
         return None, True
-    # higiene: a IA nunca cola link inventado — só deixamos passar links do próprio nó
     if "http" in out and _public_base() not in out:
         out = re.sub(r"https?://\S+", _public_base(), out)
     return out[:900], False
@@ -21837,7 +19619,6 @@ def _chat_ai_worker(sid: str, texto: str, curto: str, hist_n: int, ua: str):
         try:
             hist = c.execute("SELECT who, text FROM chat WHERE sid=? "
                              "ORDER BY id DESC LIMIT 7", (sid,)).fetchall()[::-1]
-            # operador presente na thread nas últimas 12h? => a IA se retira
             ultimo_op = c.execute(
                 "SELECT MAX(ts) FROM chat WHERE sid=? AND who='operator'",
                 (sid,)).fetchone()[0]
@@ -21863,14 +19644,6 @@ def _chat_ai_worker(sid: str, texto: str, curto: str, hist_n: int, ua: str):
     if _tg_id:
         _chat_tg_map(_tg_id, sid)
 
-# ---------------------------------------------------------------------------
-# v48.9.22-GREET — saudação proativa personalizada.
-# Ao carregar a página o widget chama /chat/greet: o nó cruza IP (geo),
-# UA (humano × máquina) e o HISTÓRICO do IP no ledger (qual endpoint ele
-# avaliou) e devolve uma saudação sob medida + chips de resposta rápida.
-# BR => Pix em destaque; máquina => pitch machine-readable com o manifesto.
-# O clique no chip cai no fluxo normal /chat/send => a IA concierge responde.
-# ---------------------------------------------------------------------------
 def _geo_country(ip: str) -> str:
     """Country code via ipapi.co, cache 30d no sqlite do chat. Nunca quebra."""
     if not ip or ip.startswith(("10.", "192.168.", "127.", "172.")):
@@ -21919,7 +19692,6 @@ def _chat_greet_message(ip: str, ua: str) -> dict:
                             f"First paid step that clears stock client spend caps: "
                             f"{base}/buy-credits-micro ($0.10 → $0.11 credit). "
                             f"Docs: {base}/llms.txt · MCP: {base}/mcp")}
-    # humano: o IP já avaliou algo? (preview/challenge = interesse real medido)
     visto = ""
     try:
         with LEDGER._conn() as c:
@@ -21996,7 +19768,6 @@ def chat_send():
 
     _chat_add(sid, "visitor", texto, ip, ua)
     curto = _chat_short(sid)
-    # contexto útil para o operador decidir como responder
     try:
         hist = 0
         c = _chat_db()
@@ -22007,10 +19778,6 @@ def chat_send():
             c.close()
     except Exception:
         hist = 1
-    # v48.9.21: a IA concierge responde em thread (o visitante recebe via
-    # /chat/poll em segundos) e o Telegram recebe pergunta+resposta com tag.
-    # Se a IA escalar ou cair, o Telegram avisa "🙋 precisa de você" — o
-    # operador NUNCA perde uma mensagem.
     try:
         threading.Thread(target=_chat_ai_worker,
                          args=(sid, texto, curto, hist, ua),
@@ -22028,16 +19795,6 @@ def chat_send():
                             "A human operator also sees every message and can "
                             "join this same thread. Poll /chat/poll?sid=<sid>."})
 
-# ---------------------------------------------------------------------------
-# v48.18.4-VITRINE: PIX CLAIM LOOP — o comprador Pix deixava o dinheiro num
-# beco sem saída: pagava o QR e a página só dizia "mande o comprovante no
-# /chat/send" (sem confirmação, sem status, sem entrega — teste real do
-# operador em 07/out: pagou R$4,92 e nada aconteceu). Agora o cartão Pix tem
-# formulário inline: o comprador registra o pagamento, recebe um claim-id
-# (segredo de entrega), o operador recebe Telegram com link de ativação de
-# 1 clique (HMAC assinado com o TG_TOKEN — sem env nova) e o comprador vê a
-# api_key no próprio status do claim. Sem webhook de PSP: a verificação do
-# Pix continua humana (app do banco), mas o caminho é fechado ponta a ponta.
 _PIX_RL: dict = {}
 
 def _pix_db():
@@ -22086,7 +19843,6 @@ def claim_pix():
                            "and poll it; your X-API-Key appears here.")
         return jsonify(out)
 
-    # POST — comprador registra o pagamento
     ip = (request.headers.get("X-Forwarded-For", request.remote_addr) or "").split(",")[0].strip()
     now = int(time.time())
     last = _PIX_RL.get(ip, 0)
@@ -22175,13 +19931,7 @@ def claim_pix_activate():
     except Exception as e:
         return f"error: {str(e)[:200]}", 500
 
-# ── v48.18.6-ONECLICK: registro ERC-8004 guiado, servido pelo proprio no ──────
-# A pagina conecta a carteira do OPERADOR (Phantom/MetaMask, rede Base) e chama
-# register(agentURI) no Identity Registry. NENHUMA chave passa pelo servidor:
-# a assinatura acontece inteira na carteira, no browser do operador.
 _ERC8004_REGISTRY = "0x8004A169FB4a3325136EB29fA0ceB6D2e539a432"  # Base mainnet
-# Arquivo de registro registration-v1 (name/services/x402Support) como data URI
-# auto-contida — imutavel, nao depende de nenhum endpoint estar no ar.
 _ERC8004_AGENT_URI = ("data:application/json;base64,eyJ0eXBlIjoiaHR0cHM6Ly9laXBzLmV0aGVyZXVtLm9yZy9FSVBTL2VpcC04MDA0I3JlZ2lzdHJhdGlvbi12MSIsIm5hbWUiOiJMb3NiZXRvIiwiZGVzY3JpcHRpb24iOiJBdXRvbm9tb3VzIHg0MDIgbWVyY2hhbnQgbm9kZTogMTAwKyBwYWlkIEFQSSBlbmRwb2ludHMgKEdFVCwgVVNEQywgJDAuMDAxLSQwLjEwKSBjb3ZlcmluZyBjcnlwdG8gbWFya2V0IGRhdGEgKGZlYXIgJiBncmVlZCwgUHl0aCBwcmljZXMsIHdoYWxlIGRvc3NpZXJzLCBsYXVuY2ggcmlzayksIEFJL0xMTSBqb2JzIChzdW1tYXJpemUsIGNsYXNzaWZ5LCB0cmFuc2xhdGUsIGRlZXAtdGhpbmspLCBCcmF6aWwgZGF0YSAoQ05QSiwgQ0VQLCBlcXVpdHksIGRvYykgYW5kIHV0aWxpdHkgc21va2UgdGVzdHMuIFBheXMgeDQwMiBvbiBCYXNlLCBTb2xhbmEsIEFsZ29yYW5kIGFuZCBQb2x5Z29uLiBDaGVhcGVzdCBsaXZlIGNhbGw6IC9waW5nNDAyIGF0ICQwLjAwMS4gT25lIGZyZWUgY2FsbCBhdCAvd2VsY29tZS4gQ2F0YWxvZyBtYXAgYXQgL2FnZW50LW1hcmtldC4gT3BlbkFQSSBhdCAvb3BlbmFwaS5qc29uLiIsImltYWdlIjoiaHR0cHM6Ly9hcGkubG9zYmV0by54eXovaWNvbi5wbmciLCJzZXJ2aWNlcyI6W3sibmFtZSI6IndlYiIsImVuZHBvaW50IjoiaHR0cHM6Ly9hcGkubG9zYmV0by54eXovIn0seyJuYW1lIjoiQTJBIiwiZW5kcG9pbnQiOiJodHRwczovL2FwaS5sb3NiZXRvLnh5ei8ud2VsbC1rbm93bi9hZ2VudC1jYXJkLmpzb24iLCJ2ZXJzaW9uIjoiMC4zLjAifSx7Im5hbWUiOiJNQ1AiLCJlbmRwb2ludCI6Imh0dHBzOi8vYXBpLmxvc2JldG8ueHl6L21jcCIsInZlcnNpb24iOiIyMDI1LTA2LTE4In1dLCJ4NDAyU3VwcG9ydCI6dHJ1ZSwiYWN0aXZlIjp0cnVlLCJyZWdpc3RyYXRpb25zIjpbeyJhZ2VudFJlZ2lzdHJ5IjoiZWlwMTU1Ojg0NTM6MHg4MDA0QTE2OUZCNGEzMzI1MTM2RUIyOWZBMGNlQjZEMmU1MzlhNDMyIn1dfQ==")
 _ERC8004_PAGE = """<!doctype html>
 <html lang="pt-BR"><head><meta charset="utf-8">
@@ -22344,9 +20094,6 @@ def chat_poll():
             rows = c.execute("SELECT id, ts, who, text FROM chat "
                              "WHERE sid=? AND id > ? ORDER BY id LIMIT 60",
                              (sid, desde)).fetchall()
-            # v43: confirmação de entrega — o visitante BUSCOU as respostas,
-            # então marca as do operador como entregues. O /chats passa a
-            # distinguir "respondido e lido" de "respondido, não lido".
             if rows:
                 _max_id = max(r[0] for r in rows)
                 c.execute("UPDATE chat SET delivered=1 WHERE sid=? AND "
@@ -22418,7 +20165,6 @@ def bazaar_audit():
         with lock:
             out.append(r)
 
-    # 6 por vez: a API da CDP tem limite e não queremos ser rudes
     for i in range(0, len(alvo), 6):
         ths = [threading.Thread(target=_run, args=(p,), daemon=True)
                for p in alvo[i:i + 6]]
@@ -22462,11 +20208,8 @@ def _live_api_build():
                ("paid_24h", "revenue_24h", "previews_24h", "probes_24h",
                 "buyers", "conv_evaluators", "avg_ticket", "avg_ticket_24h")}
     publico["preview_uas"] = (st.get("preview_uas") or [])[:8]
-    # v46.0.1: a página pública não pode chamar receita do operador de
-    # "revenue". O split honesto (v45) vai junto, e o KPI usa ele.
     try:
         publico["revenue_truth_24h"] = revenue_split(86400)
-        # v48.18.0: a conversão pública não pode misturar settles do operador.
         _o = publico["revenue_truth_24h"].get("organic_tx", 0)
         _pv = publico.get("previews_24h") or 0
         publico["conv_evaluators"] = round(_o / (_o + _pv) * 100, 1) if (_o + _pv) else 0.0
@@ -22559,19 +20302,10 @@ def _resources_alias():
     /resource). Apontam para o catálogo em vez de devolver 404."""
     return x402_resources()
 
-# v48.2-SMART: registration file no padrão ERC-8004 (Trustless Agents).
-# Concorrentes como agentutility já ostentam "ERC-8004 agentId" no perfil do
-# x402scan — é o passaporte que compradores-agentes verificam antes de pagar.
-# Este arquivo fica pronto para ser o tokenURI ao registrar a identidade
-# on-chain (Base) — o registro é 1 transação na wallet do operador.
 @app.route("/.well-known/erc8004.json")
 @app.route("/erc8004.json")
 def erc8004_registration():
     base = _public_base()
-    # v48.3.3: após o mint na Base, setar env ERC8004_AGENT_ID para publicar
-    # o agentId aqui — compradores-agentes conferem esse campo antes de pagar.
-    # v48.21.0: default passa a ser o agentId real (87048) — se a env sumir num
-    # redeploy, a identidade on-chain continua publicada em vez de sumir.
     _regs = []
     _aid = os.environ.get("ERC8004_AGENT_ID", "87048").strip() or "87048"
     if _aid.isdigit():
@@ -22602,9 +20336,6 @@ def erc8004_registration():
         "ts": int(time.time()),
     })
 
-# v47.0.3: sondas A2A pediram variantes sem .json e com underscore
-# (/.well-known/agent-card, /well_known/agent_json — visto no radar de demanda)
-# e tomavam 404. Mesma resposta, sem custo.
 @app.route("/.well-known/agent-card.json")
 @app.route("/.well-known/agent-card")
 @app.route("/.well-known/agent.json")
@@ -22635,9 +20366,6 @@ def manifest_agent():
     })
 
 
-# v24.9: manifests são o alvo nº1 dos scanners (centenas de /openapi.json por
-# minuto nos logs). Reconstruir a spec de 67 endpoints a cada hit desperdiça
-# CPU e piora a latência medida pelos monitores de reputação.
 _SPEC_CACHE: dict = {}
 SPEC_CACHE_TTL = int(os.environ.get("SPEC_CACHE_TTL", "120"))
 
@@ -22689,8 +20417,6 @@ def api_x402_alias():
     convenção de manifesto x402. 308 para o manifesto canônico."""
     return redirect("/.well-known/x402.json", code=308)
 
-# v48.11.0-GLOBAL: default 480 -> 390. x402lint P8 apontou 24 descriptions na
-# zona de risco 400-500 (CDP trunca em 500; margem p/ sufixo "..." e encoding).
 def _cap500(s, limit=390):
     """v48.9.20-LINT: teto duro de 480 chars nas descriptions PUBLICADAS
     (openapi/manifesto/bazaar). Docs CDP + x402lint P8: description >500 eh
@@ -22707,8 +20433,6 @@ def _build_openapi():
     contact_email = os.environ.get("CONTACT_EMAIL", "").strip()
 
     ENDPOINT_PARAMS = {
-        # v43: os dois produtos novos PRECISAM de schema aqui — é este dict que
-        # alimenta o OpenAPI (AgentCash exige input schema para listar pago).
         "/token-intel":   [{"name": "token", "in": "query", "required": True,
                             "description": "Token contract address (Solana mint or 0x) or ticker",
                             "schema": {"type": "string", "example": "SOL"}}],
@@ -22822,9 +20546,70 @@ def _build_openapi():
                             "schema": {"type": "integer", "example": 5}}],
     }
 
+    def _params_for_endpoint(path):
+        params, seen = [], set()
+
+        def add_param(name, example=None, required=False, description="", schema=None):
+            name = str(name or "")
+            if not name:
+                return
+            if name in seen:
+                if required:
+                    for item in params:
+                        if item["name"] == name:
+                            item["required"] = True
+                return
+            seen.add(name)
+            sch = dict(schema or {"type": "string"})
+            if example is not None and "example" not in sch:
+                sch["example"] = example
+            if path == "/agent-reputation" and name == "agentId":
+                sch["default"] = "87048"
+            params.append({
+                "name": name, "in": "query", "required": bool(required),
+                "description": description or "Input accepted by this endpoint.",
+                "schema": sch,
+            })
+
+        for item in ENDPOINT_PARAMS.get(path) or []:
+            add_param(item.get("name"), required=item.get("required", False),
+                      description=item.get("description", ""),
+                      schema=item.get("schema"))
+        merged_examples = dict(ENDPOINT_PARAM_HINTS.get(path) or {})
+        merged_examples.update(ENDPOINT_REQUIRED_PARAMS.get(path) or {})
+        if path == "/agent-reputation":
+            merged_examples.setdefault("agentId", "87048")
+            merged_examples.setdefault(
+                "clients", "0x0000000000000000000000000000000000000001")
+        for name, example in merged_examples.items():
+            add_param(name, example=example)
+
+        required_single, any_of_groups = set(), []
+        for group in _PARAM_REQUIRED.get(path) or []:
+            names = []
+            for item in group:
+                name, _pattern, example = item[0], item[1], item[2]
+                names.append(name)
+                add_param(name, example=example)
+            if len(names) == 1:
+                required_single.add(names[0])
+            elif names:
+                any_of_groups.append(names)
+        for item in params:
+            name = item["name"]
+            if name in required_single:
+                item["required"] = True
+            for names in any_of_groups:
+                if name in names:
+                    item["description"] += " Required any-of: " + ", ".join(names) + "."
+        if not params:
+            add_param("format", example="json",
+                      description="Response format.",
+                      schema={"type": "string", "enum": ["json"], "default": "json"})
+        return params
+
     paths = {}
 
-    # Endpoints gratuitos com "security": [] para não serem testados como pagos
     free_endpoints = {
         "/sample": {
             "get": {
@@ -23012,26 +20797,10 @@ def _build_openapi():
     }
     paths.update(free_endpoints)
 
-    # Endpoints pagos (mantêm security: [{"x402": []}])
     for p in BASE_PRICES:
-        # v48.17.13-SHELFSYNC: invendável (503 honesto) não é anunciado como
-        # pago — era o FAIL P6 do x402lint quando o /agent-call 503ava.
         if not _sellable_now(p):
             continue
-        # v48.9.27-PRICESYNC: era BASE_PRICES[p] — IGNORAVA os PRICE_OVERRIDES
-        # de env (Railway PRICE_*) que o 402 efetivamente cobra. Resultado:
-        # openapi dizia /fear-greed=$0.003 enquanto o desafio cobrava $0.010
-        # (e o manifesto slim republicava) — WARN S6 do x402lint "prices
-        # differ from openapi" (scan 28/09 06:49, A 94/100). Fonte única:
-        # get_dynamic_price honra override e devolve base quando
-        # DYNAMIC_PRICING=false.
         price = get_dynamic_price(p)
-        # v42.1 FIX: /bootstrap-trust é híbrido (GET grátis com instruções +
-        # POST pago) e já foi declarado em free_endpoints com requestBody
-        # completo. O loop SOBRESCREVA essa definição com um GET "pago" sem
-        # schema — exatamente o warning "Paid endpoint is missing an input
-        # schema" do Agentic.Market. Agora: preserva a definição rica e só
-        # marca o POST como pago (o requestBody dele É o input schema).
         if p == "/bootstrap-trust" and p in paths:
             post_op = paths[p].get("post", {})
             post_op["security"] = [{"x402": []}]
@@ -23041,11 +20810,7 @@ def _build_openapi():
                 "protocols": [{"x402": {}}],
             }
             continue
-        params = ENDPOINT_PARAMS.get(p, [
-            {"name": "format", "in": "query", "required": False,
-             "description": "Formato da resposta",
-             "schema": {"type": "string", "enum": ["json"], "default": "json"}}
-        ])
+        params = _params_for_endpoint(p)
         paths[p] = {
             "get": {
                 "summary":     _cap500(ENDPOINT_DESC.get(p, p), 200),
@@ -23054,9 +20819,6 @@ def _build_openapi():
                 "tags":        ENDPOINT_TAGS.get(p, ["Trading"]),
                 "parameters":  params,
                 "security":    [{"x402": []}],
-                # v23: formato exigido pelo validador @agentcash/discovery —
-                # price como OBJETO {mode,currency,amount}. Detalhes on-chain
-                # ficam em x-x402-details (legacy clients ainda leem).
                 "x-payment-info": {
                     "price": {"mode": "fixed", "currency": "USD",
                               "amount": f"{price:.6f}"},
@@ -23077,14 +20839,6 @@ def _build_openapi():
                 },
             }
         }
-        # v44.9.2: endpoints cujo contrato real é POST com corpo JSON (ex.:
-        # /v1/chat/completions, OpenAI-compatível) — o OpenAPI é a fonte nº 1
-        # do discovery (AgentCash/x402scan). Declarar o recurso como GET pago
-        # sem requestBody era exatamente o warning "Paid endpoint is missing
-        # an input schema" e ainda listava o recurso com o método errado.
-        # Aqui o documento passa a declarar SÓ o POST pago, com requestBody
-        # (input) e resposta 200 (output) formalizados; o GET didático
-        # gratuito fica fora do documento para não ser classificado como pago.
         _obs = ENDPOINT_BODY_SCHEMAS.get(p) if "ENDPOINT_BODY_SCHEMAS" in globals() else None
         if _obs:
             paths[p] = {
@@ -23123,8 +20877,6 @@ def _build_openapi():
                 }
             }
             continue
-        # v42.1 FIX: /portfolio-stress aceita POST com o JSON de posições —
-        # sem esse requestBody o validador marcava "missing input schema".
         if p == "/portfolio-stress":
             paths[p]["post"] = {
                 "summary":     ENDPOINT_DESC.get(p, p),
@@ -23168,7 +20920,6 @@ def _build_openapi():
         "title":       "Losbeto",
         "version":     VERSION,
         "description": f"Multi-chain x402 AI swarm — {_chains_text()}. {len(BASE_PRICES)} monetized resources.",
-        # v23: guidance p/ agentes (campo lido pelo discovery do AgentCash)
         "x-guidance": (
             "All priced routes answer 402 with x402 v1/v2 requirements "
             "(Solana and Base). Flow: call without payment, read the 402, "
@@ -23186,7 +20937,6 @@ def _build_openapi():
     return jsonify({
         "openapi": "3.1.0",
         "info":    info,
-        # v23: prova de propriedade p/ discovery (AgentCash)
         "x-discovery": {"ownershipProofs": [RECEIVE_ADDRESS, WALLET.solana_address]},
         "servers": [{"url": base}],
         "components": {
@@ -23207,7 +20957,7 @@ def llms_txt():
     base = _public_base()
     lines = [
         f"# Losbeto v{VERSION}",
-        f"> OpenAI-compatible LLM gateway (${LLM_PROXY_PRICE:.4f}/call) + {len(BASE_PRICES)} market-data endpoints. Solana + Base + TON. Pay-per-call via x402.",
+        f"> OpenAI-compatible LLM gateway (${LLM_PROXY_PRICE:.4f}/call) + {len(BASE_PRICES)} paid endpoints. {_chains_text()}. Pay-per-call via x402.",
         "",
         "## TALK TO THE OPERATOR",
         f"Missing an endpoint your agent needs? Open an issue: {FEEDBACK_GITHUB}",
@@ -23217,7 +20967,7 @@ def llms_txt():
         f"GET {_public_base()}/try  -> live samples from 6 endpoints in ONE free call",
         f"GET {_public_base()}/live -> public real-time node telemetry (no auth)",
         f"GET {_public_base()}/about -> who operates this and how to audit it",
-        f"GET {_public_base()}/pyth-price?preview=1  -> real delayed data, free (any paid endpoint)",
+        f"GET {_public_base()}/pyth-price?preview=1  -> free preview on selected data endpoints",
         "Every 402 response also carries an inline `upsell.sample` with real output.",
         "",
         "## FLAGSHIP — LLM GATEWAY (OpenAI-compatible, pay-per-call)",
@@ -23248,8 +20998,6 @@ def llms_txt():
         lines.append(f"- [{base}{ep}] ${BASE_PRICES[ep]:.2f} — {plan['pitch']}")
     lines.append("Usage: header `X-API-Key: lsk_...` on any paid endpoint. "
                  "Balance: GET /credits-status?key=...")
-    # v44.0.8 — bloco colável de system prompt (padrão StableEnrich): os nós
-    # que vendem se injetam no prompt do agente do cliente. Colar verbatim.
     lines += ["", "## FOR AGENT OPERATORS — SYSTEM PROMPT BLOCK (paste verbatim)",
         "When configuring an agent that may need market data, add this to its system prompt:",
         "",
@@ -23257,9 +21005,9 @@ def llms_txt():
         f"Market data: use the Losbeto node at {base} via the agentcash MCP tools.",
         f"- Discover what it offers: mcp__agentcash__discover_api_endpoints with origin {base}",
         "- Call an endpoint: mcp__agentcash__fetch with the full URL — payment settles automatically in USDC on Base.",
-        "- Free probes that cost nothing: GET /try, GET /welcome, GET /ip, and ?preview=1 on any paid path.",
+        "- Free probes that cost nothing: GET /try, GET /welcome, GET /ip, and ?preview=1 on selected data paths.",
         "- Brazil in depth: Selic, CDI, IPCA and Ibovespa series plus B3 data (/br-brief, /br-macro, /br-curve, /br-equity, /br-agro).",
-        f"- Cheapest calls start at $0.003; plan a budget in one request: GET {base}/agent-market",
+        f"- Cheapest calls start at ${min(get_dynamic_price(p) for p in BASE_PRICES if p not in CREDIT_PLANS):.3f}; plan a budget in one request: GET {base}/agent-market",
         "---"]
     lines += ["", "## Endpoints por Tier"]
     tiers = {"DISCOVERY ($0.01-0.03)": [], "CORE ($0.04-0.12)": [],
@@ -23283,8 +21031,6 @@ def llms_txt():
               f"- [{base}/ip]({base}/ip) — Caller-IP echo (ipify-style) + minimal node showcase — the zero-friction entry step",
               f"- [{base}/sample]({base}/sample) — Preview de dados reais (Fear&Greed + Sinais + Anomalias)",
               f"- [{base}/losbeto-alpha]({base}/losbeto-alpha) — Losbeto Alpha Score (índice proprietário exclusivo)",
-              f"- [{base}/bootstrap-trust]({base}/bootstrap-trust) — Bootstrap trust score (self-payment)",
-              f"- [{base}/starter-pack]({base}/starter-pack) — Pacote premium de US$1 para primeira compra manual",
               f"- [{base}/get-pricing]({base}/get-pricing) — full price list"]
     lines += ["", "## Discovery",
               f"- SKILL.MD:   {base}/skill.md (installable agent skill — 'Set up {base}/skill.md with x402')",
@@ -23304,10 +21050,6 @@ def llms_txt():
               f"- llms.txt:   {base}/llms.txt"]
     return app.response_class("\n".join(lines), mimetype="text/plain")
 
-# --- v48.5.1-LOGO: identidade visual real --------------------------------------
-# Moeda-L #4ade80 (anel de moeda + no de rede + L). PNG 256px transparente
-# embutido em base64 (6 KB otimizado): zero arquivo externo, independente do
-# working directory do Railway. Aposenta o placeholder SVG roxo "Ω10".
 import base64 as _b64img
 _FAVICON_PNG = _b64img.b64decode(
     "iVBORw0KGgoAAAANSUhEUgAAAQAAAAEACAMAAABrrFhUAAADAFBMVEUAAABI231L44JV/6pG1Xo9"
@@ -23413,8 +21155,6 @@ _FAVICON_PNG = _b64img.b64decode(
     "a7Vgr2vZGYkY+isQYyzisjMiiXPB9l+D7xOd6EQnOtGJTnRY9H/yhgISvPvBxAAAAABJRU5ErkJg"
     "gg==")
 _FAVICON_SVG = (
-    # v48.9.2-BRAND: réplica vetorial da marca v2 — caps redondos no arco,
-    # L com cantos arredondados, ponto orbital maior (match com o PNG v2).
     '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256">'
     '<circle cx="128" cy="128" r="90" fill="none" stroke="#4ade80" stroke-width="30"'
     ' stroke-linecap="round" stroke-dasharray="480 86" stroke-dashoffset="-46"/>'
@@ -23473,12 +21213,6 @@ def health():
     return jsonify({"ok": True, "version": VERSION, "ts": int(time.time())})
 
 
-# ---------------------------------------------------------------------------
-# v48.9.3 — /impressum: página de operador HONESTA (demanda do radar: 5 IPs/7d)
-# Agentes/parceiros europeus procuram impressum por convenção de confiança.
-# Regra permanente: NUNCA fabricar nome legal/endereço. Operador pseudônimo,
-# contato real via canais que existem de verdade.
-# ---------------------------------------------------------------------------
 _IMPRESSUM_HTML = """<!DOCTYPE html>
 <html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
@@ -23521,49 +21255,21 @@ def impressum():
                     mimetype="text/html; charset=utf-8")
 
 
-# ===========================================================================
-# v39.2 — /intel: FORENSE DE TRÁFEGO
-#
-# A pergunta que nenhum painel deste node respondia: "15.000 sondagens e
-# nenhuma venda orgânica — QUEM são essas máquinas e o que elas querem?"
-#
-# A tabela `requests` já tinha a resposta (ts, endpoint, kind, ua, params, ip)
-# mas ninguém a interrogava. O /dash mostra receita e latência; nada disso
-# diz se o tráfego é COMPRADOR ou CATALOGADOR.
-#
-# A distinção é tudo. Um scanner busca o 402, anota o preço e vai embora —
-# ele NUNCA pretendeu pagar. Um agente real avalia antes: usa ?preview=1,
-# manda parâmetros com sentido, volta noutro dia. Se 15.000 sondagens
-# produzem zero previews, não existe problema de conversão: existe problema
-# de PÚBLICO. Otimizar preço ou produto contra tráfego de robô de catálogo
-# é como reformar a vitrine para quem só passa medindo a calçada.
-# ===========================================================================
 
-# ORDEM IMPORTA. A primeira versão checava "comprador" antes de "scanner" e
-# classificava "x402scan-indexer" como CLIENTE — porque contém "x402". O
-# catalogador arquetípico do ecossistema entrava na coluna errada e inflava a
-# contagem de compradores em 60x. Catalogadores nomeados vêm primeiro.
 _UA_NAMED_SCANNER = re.compile(
     r"(x402scan|bazaar|agentic\.market|glama|smithery|mcpay|nevermined|"
     r"registry|indexer|crawler|spider|scanner|censys|shodan|masscan|nuclei|"
     r"zgrab|uptime|pingdom|datadog|newrelic|prometheus|zabbix|statuscake|"
-    # v47.4.0: três bots estavam sendo contados como HUMANO no funil —
-    # ZeroBot (zero.xyz, 872 hits/dia), heritrix (crawler do Internet
-    # Archive, 9 previews/dia) e hermes-contact-discovery. Métrica honesta
-    # vale mais do que funil inflado: eles nunca pagam.
     r"betteruptime|hetrixtools|zerobot|heritrix|hermes-contact|semrushbot|"
     r"conformance|agentrank|mekler|ibou-search|barkrowler|clueweb|agent402|"
     r"x402station|losbeto-x402-watch)", re.I)
 
-# Genéricos: bibliotecas HTTP e bots sem identidade. Podem ser qualquer coisa,
-# mas na prática são automação de catálogo.
 _UA_GENERIC_BOT = re.compile(
     r"(bot\b|headless|phantom|puppeteer|playwright|selenium|lighthouse|"
     r"facebookexternalhit|slackbot|twitterbot|discordbot|telegrambot|"
     r"whatsapp|linkedinbot|go-http-client|okhttp|libwww|"
     r"apache-httpclient|java/|wget|scrapy)", re.I)
 
-# Clientes que um agente REAL usaria para comprar.
 _UA_BUYER = re.compile(
     r"(agentcash|x402-fetch|x402-axios|x402/|mcp-client|claude|cursor|codex|"
     r"langchain|crewai|autogen|openai|anthropic|gemini|copilot|agentkit|"
@@ -23660,7 +21366,6 @@ def traffic_intel():
                 faltando[ep] += 1
         else:
             ep_probe[ep] += 1
-        # parâmetros vindos de quem NÃO é scanner são o sinal de demanda real
         if params and cls in ("agent_client", "curl_manual", "unknown"):
             params_reais[f"{ep}?{params}"[:90]] += 1
 
@@ -23670,8 +21375,6 @@ def traffic_intel():
     previews = por_kind.get("preview", 0)
     pagos = por_kind.get("paid", 0)
 
-    # Cadência: um crawler bate em intervalos regulares. Desvio-padrão baixo
-    # entre chegadas do mesmo IP é assinatura de robô agendado.
     regulares = []
     for ip, marcas in ts_por_ip.items():
         if len(marcas) < 8:
@@ -23691,7 +21394,6 @@ def traffic_intel():
                               "regularity_cv": round(cv, 3)})
     regulares.sort(key=lambda x: -x["hits"])
 
-    # Quem voltou noutro dia é o sinal mais forte de integração de verdade.
     recorrentes = sorted(
         ({"ip": ip[:18] + "…", "distinct_days": len(d), "hits": ips[ip]}
          for ip, d in ip_dias.items() if len(d) >= 3),
@@ -23700,7 +21402,6 @@ def traffic_intel():
     top_ip_share = round(100 * ips.most_common(1)[0][1] / total, 1) if ips else 0
     top10_share = round(100 * sum(v for _k, v in ips.most_common(10)) / total, 1) if ips else 0
 
-    # ---- veredito ---------------------------------------------------------
     sinais = []
     if previews == 0 and total > 500:
         sinais.append("ZERO usos de ?preview=1 em toda a janela. Nenhum "
@@ -23782,9 +21483,6 @@ def traffic_intel():
     })
 
 
-# v39.4: alias de compatibilidade. Renomear um endpoint publicado quebra quem
-# já integrou; um 301 permanente diz ao cliente para atualizar o bookmark sem
-# derrubar a chamada de hoje.
 @app.route("/nansen-flow")
 def _legacy_nansen_flow():
     return redirect("/holder-concentration"
@@ -23792,28 +21490,7 @@ def _legacy_nansen_flow():
                     code=301)
 
 
-# ---------------------------------------------------------------------------
-# v39.6 — TRÊS SUPERFÍCIES PEDIDAS PELA DEMANDA REAL
-#
-# O demand_watch_loop não inventou isto; ele contou IPs distintos batendo em
-# caminhos que não existiam:
-#     /.well-known/agent-card.json   5 IPs
-#     /apis.json                     3 IPs
-#     /.well-known/api-catalog       3 IPs
-#
-# Três padrões de descoberta diferentes, e nenhum deles é hipotético — são
-# clientes reais que chegaram, não acharam, e foram embora. Custam quase nada
-# para servir e são exatamente o tipo de coisa que decide se um agente
-# consegue te integrar sozinho.
-# ---------------------------------------------------------------------------
 
-# v39.6 — NOTA: /.well-known/agent-card.json JÁ EXISTE desde a v33 (linha
-# ~10283), criado quando 2 IPs pediram e receberam 404. Eu escrevi uma segunda
-# rota para o mesmo caminho sem verificar; o Flask usa a primeira registrada,
-# então a minha era código morto. Removida.
-#
-# O que sobrou aqui são as duas superfícies que realmente NÃO existiam:
-# /apis.json (3 IPs) e /.well-known/api-catalog (3 IPs).
 
 def _cheapest_call_label() -> str:
     """Menor preço entre os endpoints de dado (planos não contam)."""
@@ -23904,38 +21581,7 @@ def api_catalog():
     return r
 
 
-# ===========================================================================
-# v40 — O QUE OS DADOS MANDARAM CONSTRUIR
-#
-# O painel de 24h desfez a hipótese com que eu vinha trabalhando:
-#
-#   55 avaliadores · 23 pagamentos · 29,5% de conversão · 7 compradores
-#   80% dos avaliadores são HUMANOS EM NAVEGADOR (13 IPs móveis distintos)
-#   95% da receita vem dos endpoints /br-*
-#
-# Eu dizia "ninguém avalia, logo é problema de público". Falso. Gente avalia,
-# e converte a 29,5% — número que qualquer SaaS assinaria embaixo. As 14.244
-# sondagens de scanner e os 55 avaliadores reais coexistem; eu estava lendo o
-# ruído e concluindo que não havia sinal.
-#
-# Duas consequências práticas, ambas implementadas abaixo:
-#
-# 1. Quem avalia é HUMANO, e recebia JSON cru. Um humano que abre
-#    /br-brief?preview=1 no iPhone vê uma parede de chaves e fecha. Agora
-#    navegador recebe página legível; agente continua recebendo JSON idêntico.
-#
-# 2. Brasil é 95% da receita e estava no meio da página. Passa a abrir.
-# ===========================================================================
 
-# v40 — ALIASES QUE A DEMANDA PEDIU
-# Do painel (7 dias), caminhos pedidos por IPs reais que devolviam 404:
-#   /health/                6 pedidos · 2 IPs   (barra final!)
-#   /status                 3 · 2
-#   /openapi.yaml           3 · 2
-#   /.well-known/health     3 · 2
-#   /.well-known/llms.txt   3 · 2
-# Dezoito requisições de clientes reais perdidas por convenção de caminho.
-# Custo de servir: zero.
 
 @app.route("/health/")
 @app.route("/status")
@@ -23944,21 +21590,6 @@ def health_aliases():
     return health()
 
 
-# ===========================================================================
-# v42 — MULTIPROTOCOLO: UCP + MPP
-#
-# Dois sinais de demanda REAL da telemetria de 7 dias:
-#   /.well-known/ucp          3 pedidos · 3 IPs distintos
-#   (registro agentic.market) 74 endpoints com warning de "no Payment challenges"
-#
-# UCP (Universal Commerce Protocol) é o padrão do Google (jan/2026, com
-# Shopify/Walmart/Stripe/Visa no consórcio) para um agente de compra descobrir
-# o que um merchant vende, como transacionar e com o que pagar — um JSON em
-# /.well-known/ucp. MPP (Machine Payments Protocol, IETF draft da Stripe/Tempo)
-# padroniza o 402 como auth-scheme "Payment". Este node é, até onde consta, o
-# PRIMEIRO servidor x402 a publicar um perfil UCP com handler de pagamento x402
-# e a responder challenges MPP ao lado dos x402 — sem mudar nada na liquidação.
-# ===========================================================================
 
 def _ucp_signing_keys() -> list:
     """JWK Ed25519 da chave pública do node — UCP usa signing_keys para
@@ -23980,7 +21611,6 @@ def ucp_profile():
     base = _public_base()
     if not UCP_PROFILE:
         return jsonify({"error": "disabled"}), 404
-    # telemetria: platforms UCP se identificam pelo header UCP-Agent
     ucp_agent = (request.headers.get("UCP-Agent") or "").strip()
     try:
         LEDGER.log_request("/.well-known/ucp", True, 0,
@@ -24014,16 +21644,7 @@ def ucp_profile():
                      "endpoint": f"{base}/.well-known/agent-card.json"},
                 ],
             },
-            # v42.1: capability "dev.ucp.shopping.checkout" REMOVIDA. UCP
-            # checkout é uma máquina de estados de e-commerce (carrinho,
-            # fulfillment, pós-venda) — este node vende chamadas de API, não
-            # produtos físicos. Declarar uma capability que não servimos faria
-            # um agente do Google AI Mode tentar um checkout e falhar — o
-            # mesmo pecado do dado velho. O que É verdade fica: os três
-            # transports reais acima e o payment handler x402 abaixo (o nosso
-            # "checkout" é o fluxo 402: 1 request, 1 pagamento, 1 resposta).
             "payment_handlers": {
-                # namespace próprio (losbeto.xyz): handler x402 com USDC.
                 "xyz.losbeto.x402": [
                     {"id": "x402",
                      "version": "2",
@@ -24306,9 +21927,6 @@ def pricing_page():
         "ts": int(time.time()),
     }
 
-    # v44.8.1: HTML vira o padrão — o crawler do x402-list identifica-se como
-    # bot, caía no JSON e o pillar "pricing page" ficava ✗ apesar da página
-    # existir. JSON só para quem pedir explicitamente.
     if ("application/json" in request.headers.get("Accept", "").lower()
             or request.args.get("format") == "json"):
         return jsonify(corpo)
@@ -24419,7 +22037,6 @@ def health_storage():
     vol_path = os.environ.get("RAILWAY_VOLUME_MOUNT_PATH", "").strip()
     vol_name = os.environ.get("RAILWAY_VOLUME_NAME", "").strip()
     home = str(HOME_DIR)
-    # Persistente se HOME_DIR está dentro do ponto de montagem do volume.
     persistente = bool(vol_path) and (home == vol_path or home.startswith(vol_path.rstrip("/") + "/"))
 
     escrita_ok, erro_escrita = False, None
@@ -24431,10 +22048,6 @@ def health_storage():
     except Exception as e:
         erro_escrita = str(e)[:120]
 
-    # v44.6.0: a tabela referrals vive DENTRO do ledger (omega_v24.db) — o
-    # antigo item "referrals" apontava para um arquivo que nunca existiria.
-    # E o archive.db (v44.5.0) agora entra na checagem: é o ativo assinado
-    # que mais dói perder num redeploy sem volume.
     dbs = {}
     for rotulo, caminho in (("ledger", DB_PATH), ("preview", PREVIEW_DB_PATH),
                             ("rag", RAG_DB_PATH),
@@ -24484,8 +22097,6 @@ def ready():
                     "node_id": WALLET.node_id,
                     "endpoints": len(BASE_PRICES),
                     "cdp_bazaar": bool(CDP_FAC),
-                    # v44.3.3: estado do disjuntor visível de fora — "open" =
-                    # conta CDP irregular, vendas Base indo direto ao PayAI.
                     "cdp_breaker": ("open" if not _cdp_available() else "closed"),
                     "cdp_breaker_retry_in_s": (max(0, int(_CDP_BREAKER["open_until"]
                                                           - time.time()))
@@ -24500,9 +22111,6 @@ def peers_list():
                                "reputation": p[2], "win_rate": p[3]}
                               for p in peers]})
 
-# ============================================================================
-# 14b. ENDPOINTS DE DIAGNÓSTICO (mesmo da v18)
-# ============================================================================
 
 @app.route("/scan-tx")
 def scan_tx():
@@ -24737,12 +22345,6 @@ def force_register_tx():
         "new_total_usdc": LEDGER.stats()["total_usdc"],
     })
 
-# ============================================================================
-# v20 NEW: /verify-signature-manual  — endpoint público que credita uma tx
-# se ela for válida on-chain. Complementa o dashboard: se você tem uma tx
-# signature e quer que ela seja registrada no ledger E no manifest x402
-# (para o x402scan indexar), use este endpoint.
-# ============================================================================
 @app.route("/verify-signature-manual", methods=["POST"])
 def verify_signature_manual():
     tok = request.headers.get("X-Dash-Token") or request.args.get("token") or ""
@@ -24753,7 +22355,6 @@ def verify_signature_manual():
     endpoint = body.get("endpoint") or "/bootstrap-trust"
     if not sig:
         return jsonify({"error": "signature required in body"}), 400
-    # 1. Verifica on-chain (janela ampla: 30 dias)
     ok, info = SOL.verify_payment(sig, 0.0005, RECEIVE_ADDRESS, max_age=86400 * 30)
     if not ok:
         return jsonify({
@@ -24763,7 +22364,6 @@ def verify_signature_manual():
             "receive_address": RECEIVE_ADDRESS,
             "debug_url": f"{_public_base()}/debug-tx?sig={sig}",
         }), 200
-    # 2. Verifica se já foi registrada
     h = hashlib.sha256(sig.encode()).hexdigest()
     already = False
     with LEDGER._conn() as c:
@@ -24775,7 +22375,6 @@ def verify_signature_manual():
             "already_recorded": True,
             "tx": sig[:32] + "...",
         })
-    # 3. Registra
     payer = info.get("payer", "") if isinstance(info, dict) else ""
     amount = round(float(info.get("delta", 0.01)), 6) if isinstance(info, dict) else 0.01
     if not LEDGER.add_revenue(endpoint, amount, sig, payer, source="manual-verify", chain="solana"):
@@ -24791,10 +22390,6 @@ def verify_signature_manual():
         "note": "Registered locally. x402scan indexa on-chain, então pode levar 1-5min após a tx.",
     })
 
-# ============================================================================
-# v20 NEW: /dash/api/tx-list — lista todas as tx registradas (para reconciliar
-# com o que aparece no x402scan)
-# ============================================================================
 @app.route("/dash/api/tx-list")
 def dash_tx_list():
     if not _dash_token_ok(request.args.get("token", "")):
@@ -24827,9 +22422,6 @@ def dash_tx_list():
         "x402scan_server_url": f"https://www.x402scan.com/server/{WALLET.node_id}",
     })
 
-# ============================================================================
-# v20 NEW: /debug-x402scan — explica POR QUE uma tx aparece ou não no scanner
-# ============================================================================
 @app.route("/debug-x402scan")
 def debug_x402scan():
     sig = (request.args.get("sig") or "").strip()
@@ -24844,7 +22436,6 @@ def debug_x402scan():
     if not sig:
         diagnosis["note"] = "Passe ?sig=<signature> para diagnosticar uma tx específica"
         return jsonify(diagnosis)
-    # Diagnóstico completo da tx
     ok, info = SOL.verify_payment(sig, 0.0005, RECEIVE_ADDRESS, max_age=86400 * 30)
     with LEDGER._conn() as c:
         row = c.execute(
@@ -24858,7 +22449,6 @@ def debug_x402scan():
         diagnosis["ledger_record"] = {
             "ts": row[0], "endpoint": row[1], "amount_usdc": row[2], "source": row[3],
         }
-    # Por que aparece / não aparece no x402scan
     reasons_visible = []
     reasons_hidden = []
     if ok:
@@ -24901,9 +22491,6 @@ def clear_replay():
             cleared.append(sig[:20] + "...")
     return jsonify({"cleared": cleared, "count": len(cleared)})
 
-# ============================================================================
-# 15. DASHBOARD
-# ============================================================================
 
 DASH_HTML = r"""<!doctype html><html lang="pt-BR"><head>
 <meta charset="utf-8"><title>Losbeto // node console</title>
@@ -25269,10 +22856,6 @@ def _dash_token_ok(supplied: str) -> bool:
 
 @app.route("/dash")
 def dash():
-    # v48.27-CORTEX: UM painel só. Sem token: a telemetria pública (o antigo
-    # /live — agregados já públicos em /receipts e /health/providers). Com
-    # token: o painel completo do operador. Fim da divergência entre duas
-    # páginas de status.
     if not _dash_token_ok(request.args.get("token", "")):
         return app.response_class(LIVE_HTML, mimetype="text/html")
     return app.response_class(DASH_HTML.replace("__TOKEN__", DASH_TOKEN).replace("__DASHV__", VERSION),
@@ -25297,8 +22880,6 @@ def dash_api():
         "signer_address":  WALLET.solana_address,
         "ton_address":     TON_WALLET.address if TON_WALLET else None,
         "base_payto":      BASE_PAYTO_EVM if ENABLE_BASE else None,
-        # v48.26.3: o card "Chains" do /dash dizia só "solana · eip155" — a
-        # lista hardcoded nunca ganhou Algorand/Polygon. Derivada das flags.
         "chains":          ([BASE_CAIP2] if ENABLE_BASE else [])
                            + [f"solana:{SOL_GENESIS}"]
                            + ([ALGO_CAIP2] if ENABLE_ALGO else [])
@@ -25312,12 +22893,6 @@ def dash_api():
         "prices":          {ep: get_dynamic_price(ep) for ep in BASE_PRICES},
         "featured_endpoints": FEATURED_ENDPOINTS,
         "dynamic_pricing": PREDICTIVE_PRICING,
-        # v48.6.1: separado do trust genérico de diretório (paid_total>=3)
-        # de propósito — são dois requisitos DIFERENTES que o dashboard
-        # vinha misturando sob o mesmo rótulo "trust bootstrap completo",
-        # escondendo que o requisito específico do CDP Bazaar (>=1 settle
-        # em Base, qualquer valor) podia estar pendente mesmo com o
-        # genérico satisfeito.
         "base_bootstrap_done": _base_settles() > 0,
     })
     try:
@@ -25326,9 +22901,6 @@ def dash_api():
         pass
     return _resp
 
-# ============================================================================
-# 16. TELEGRAM BOT (com comandos adicionais)
-# ============================================================================
 
 class TelegramBot:
     """v39 — reescrito.
@@ -25353,7 +22925,6 @@ class TelegramBot:
         self.token = token
         self.last_update = 0
 
-    # ---------------------------------------------------------------- envio
     @staticmethod
     def esc(text: str) -> str:
         """Escapa o que quebra o parser Markdown legado do Telegram."""
@@ -25401,7 +22972,6 @@ class TelegramBot:
             out.append(buf)
         return out
 
-    # ------------------------------------------------------------- recepção
     def poll(self):
         try:
             r = requests.get(f"https://api.telegram.org/bot{self.token}/getUpdates",
@@ -25443,7 +23013,6 @@ class TelegramBot:
                       "from": cq.get("from", {}),
                       "text": cq.get("data", "")})
 
-    # -------------------------------------------------------------- comandos
     def _menu(self):
         return [
             [{"text": "📊 Hoje",  "callback_data": "/hoje"},
@@ -25458,10 +23027,6 @@ class TelegramBot:
         chat_id = msg["chat"]["id"]
         text = (msg.get("text") or "").strip()
 
-        # ---- v43: REPLY nativo do Telegram ---------------------------------
-        # O operador arrasta "responder" na notificação de um visitante e
-        # escreve direto — sem `/r`, sem copiar id. O message_id da notificação
-        # foi mapeado para a sessão quando o aviso foi enviado.
         _reply_to = (msg.get("reply_to_message") or {}).get("message_id")
         if _reply_to and text and not text.startswith("/"):
             _sid = _chat_sid_from_tg(_reply_to)
@@ -25476,7 +23041,6 @@ class TelegramBot:
                     "visitante mapeada. Use `/r <id> sua resposta`.")
             return
 
-        # ---- responder um visitante do site ------------------------------
         if text.startswith("/r "):
             partes = text[3:].strip().split(None, 1)
             if len(partes) < 2:
@@ -25503,7 +23067,6 @@ class TelegramBot:
                 buttons=self._menu())
             return
 
-        # ---- v39: o comando que faltava -----------------------------------
         if text == "/saude":
             h = llm_health_report()
             linhas = ["🩺 *Saúde do node*", ""]
@@ -25601,10 +23164,6 @@ class TelegramBot:
             try:
                 c = _chat_db()
                 try:
-                    # v43: triagem de fila — para cada sessão, quantas msgs do
-                    # visitante ainda NÃO têm resposta do operador depois delas.
-                    # O operador vê na hora o que está pendente, sem abrir uma
-                    # por uma.
                     rows = c.execute(
                         "SELECT sid, MAX(ts), COUNT(*), "
                         " SUM(CASE WHEN who='visitor' THEN 1 ELSE 0 END), "
@@ -25620,7 +23179,6 @@ class TelegramBot:
                 linhas, pendentes = [], 0
                 for sid, ts, n, nv, no, nd in rows:
                     quando = datetime.fromtimestamp(ts, timezone.utc).strftime("%d/%m %H:%M")
-                    # pendente = última palavra é do visitante
                     last_who = None
                     try:
                         c2 = _chat_db()
@@ -25649,7 +23207,6 @@ class TelegramBot:
             return
 
         if text == "/precos":
-            # v39: paginado por faixa. Antes eram 60+ linhas num sendMessage só.
             faixas = [
                 ("💵 Planos (1 tx → N chamadas)", lambda e, p: e in CREDIT_PLANS),
                 ("💎 Premium ($0.10+)", lambda e, p: e not in CREDIT_PLANS and p >= 0.10),
@@ -25712,7 +23269,6 @@ class TelegramBot:
             if not new:
                 self.send(chat_id, "Nenhum token detectado.")
                 return
-            # v39: descrições da Pump.fun vêm com _ e * e quebravam o parser.
             linhas = ["🚀 *Novos tokens monitorados*", ""]
             linhas += [f"• {self.esc(t.get('description', 'N/A'))[:60]}" for t in new]
             self.send(chat_id, "\n".join(linhas))
@@ -25744,8 +23300,6 @@ class TelegramBot:
             code = secrets.token_urlsafe(6)
             owner = msg.get("from", {}).get("id", "unknown")
             if LEDGER.create_referral(code, str(owner)):
-                # v39: a v38 dizia "compartilhe e ganhe 10%" sem entregar
-                # NADA para compartilhar. Agora sai o link pronto.
                 link = f"{_public_base()}/?ref={code}"
                 self.send(chat_id,
                     f"✅ *Seu link de indicação*\n\n`{link}`\n\n"
@@ -25759,9 +23313,6 @@ class TelegramBot:
 
 TG_BOT = TelegramBot(TG_TOKEN) if TG_TOKEN else None
 
-# ============================================================================
-# 17. WORKERS BACKGROUND (incluindo auto‑promoção no Twitter)
-# ============================================================================
 
 def signal_validator_loop():
     while True:
@@ -25810,10 +23361,6 @@ def sweeper_loop():
         try:
             bal = SOL.get_balance_usdc(RECEIVE_ADDRESS)
             if bal >= SWEEP_THRESHOLD:
-                # v48.31.9: o nó é NÃO-CUSTODIAL — não há chave privada no
-                # servidor, então nenhum código move fundos. O stub antigo
-                # dizia "Sweep solicitado" sem transferir 1 centavo
-                # ("pending-impl"). Agora: aviso verdadeiro 1×/dia.
                 log.info(f"💸 Saldo acumulado: ${bal:.4f} (resgate manual — "
                          f"nó não-custodial)")
                 LEDGER.log_sweep(bal, "manual-required", BINANCE_ADDRESS)
@@ -25886,23 +23433,9 @@ def autoregister_x402scan():
         log.info(f"   MCP:         {PUBLIC_URL}/.well-known/mcp.json")
         log.info(f"   llms.txt:    {PUBLIC_URL}/llms.txt")
         log.info("=" * 62)
-        # ------------------------------------------------------------------
-        # v39: o auto-registro da v38 fazia POST em cinco URLs que NÃO EXISTEM
-        # ("https://www.x402scan.com/api/register", ".../bazaar/register" etc).
-        # Os logs mostram 404 em quatro delas a cada boot — e como o gunicorn
-        # recicla worker a cada ~15 min com --max-requests, isso batia em
-        # endpoints inexistentes o dia inteiro. Registro em diretório agentic
-        # é feito por publicação/claim, não por ping. O que sobrou aqui é o
-        # que de fato serve: verificar se as NOSSAS superfícies de descoberta
-        # estão de pé, e falar alto quando não estão.
-        # ------------------------------------------------------------------
         surfaces = [
             ("x402 manifest",   "/.well-known/x402.json"),
             ("MCP registry",    "/server.json"),
-            # v39.5: GET /mcp devolve 405 DE PROPÓSITO — a spec MCP permite
-            # recusar o canal SSE server->client, e este servidor é stateless
-            # sobre POST. O health check da v39.2 fazia GET e marcava ❌ a cada
-            # boot. Alarme falso que eu mesmo introduzi; agora testa por POST.
             ("MCP endpoint",    "/mcp", "POST"),
             ("OpenAPI",         "/openapi.json"),
             ("llms.txt",        "/llms.txt"),
@@ -25957,29 +23490,7 @@ def autoregister_x402scan():
     except Exception as e:
         log.warning(f"autoregister erro: {e}")
 
-# ============================================================================
-# 15. AUTOPILOT v24.3 — autonomia honesta: o node se mantém sozinho.
-#     (Nenhum destes loops "vende" — eles garantem que, quando um agente
-#      chegar, a loja está aberta, o preview está quente e você fica sabendo.)
-# ============================================================================
 
-# Endpoints que o warmer mantém quentes (defaults dos handlers já são bons:
-# forex_rate→EUR/USD, stock_quote→AAPL, commodity_price→GOLD etc.)
-# ---------------------------------------------------------------------------
-# v39 — WARMER DIVIDIDO EM DOIS
-#
-# A v38 aquecia UMA lista a cada 900s, e nela estavam /sector-rotation,
-# /correlation-matrix, /launch-risk, /alpha-signal e /equity-dossier — todos
-# chamam LLM. São 96 ciclos por dia × 5 endpoints ≈ 480 chamadas de LLM
-# diárias para ninguém. Era exatamente isso que estourava o TPD do Groq: o
-# aquecimento GRÁTIS consumia a cota inteira e, quando um agente pagante
-# chegava, a cadeia de IA estava morta. Os logs mostram os 429 em rajada
-# sempre imediatamente antes de "warmer: 15/15 previews atualizados".
-#
-# Agora: dados baratos aquecem de 15 em 15 minutos; a camada de IA aquece
-# de 12 em 12 horas, que é a frequência com que uma amostra premium
-# realmente precisa mudar.
-# ---------------------------------------------------------------------------
 AUTOPILOT_WARM = [p.strip() for p in os.environ.get(
     "AUTOPILOT_WARM_ENDPOINTS",
     "/fear-greed,/pyth-price,/trust-hash,/forex-rate,/stock-quote,"
@@ -25994,9 +23505,6 @@ AUTOPILOT_WARM_AI = [p.strip() for p in os.environ.get(
     "/equity-dossier,/global-macro"
 ).split(",") if p.strip()]
 AUTOPILOT_WARM_AI_SECS = int(os.environ.get("AUTOPILOT_WARM_AI_SECS", "43200"))  # 12 h
-# v44.8.0: AI_WARMER=0 desliga o aquecimento de previews de IA — cada ciclo
-# custa chamadas de LLM contra a cota gratuita. Em semana de cota apertada,
-# o operador desliga o warmer e a cota fica 100% para quem paga.
 AUTOPILOT_WARM_AI_ON = os.environ.get("AI_WARMER", "1") != "0"
 
 def _warm_once(paths: List[str], label: str) -> int:
@@ -26009,8 +23517,6 @@ def _warm_once(paths: List[str], label: str) -> int:
             with app.test_request_context(path):
                 result = handler()
             if isinstance(result, dict) and _sample_is_good(result):
-                # v28: a amostra só é renovada após envelhecer — é o
-                # envelhecimento que dá valor à versão paga.
                 _cur = _PREVIEW_CACHE.get(path) or _preview_db_get(path)
                 _age = (time.time() - _cur["ts"]) if _cur else 1e9
                 if _age >= _preview_min_age(path):
@@ -26200,18 +23706,6 @@ def llm_watchdog_loop():
 
 
 
-# ============================================================================
-# v47.9.4-TOKENFILE — ACP SELLER OFICIAL RODANDO NO RAILWAY (via CLI oficial)
-#
-# Substitui o módulo SDK (modelo antigo de auth, dormente). Estratégia:
-# o nó orquestra a CLI OFICIAL @virtuals-protocol/acp-cli (instalada no
-# build via nixpacks.toml) em subprocessos. A sessão (token + signer P256)
-# mora em /data/acp-cli — volume persistente do Railway, sobrevive a
-# redeploys. Bootstrap é UMA VEZ: a thread imprime os links nos logs do
-# Railway; o operador clica (login + aprovar signer) e nunca mais.
-#
-#   Variables: ACP_SELLER=1 · ACP_AGENT_ID=<uuid do agente 0xd459...>
-# ============================================================================
 
 _ACP_CFG_DIR = "/data/acp-cli"
 _ACP_AGENT_ID_DEFAULT = "01a04598-1418-78d1-a728-98fc5118910a"  # 0xd459…f45b
@@ -26228,15 +23722,9 @@ _ACP_STATE = {"listener": None, "budget_set": set(), "submitted": set()}
 def _acp_env():
     env = dict(os.environ)
     env["ACP_CONFIG_DIR"] = _ACP_CFG_DIR
-    # Sem D-Bus no container, o keyring é instável: força o backend de
-    # arquivo (AES-256-GCM) e prende TUDO no volume persistente /data —
-    # secrets.json E a chave file.key (senão o token morre a cada processo
-    # e a cada redeploy)
     env["TS_KEYRING_BACKEND"] = "file"
     env["XDG_DATA_HOME"] = "/data/xdg-data"
     env["XDG_CONFIG_HOME"] = "/data/xdg-config"
-    # Node <22.12 (nixpacks) exige a flag p/ require() de ESM — sem ela
-    # a CLI morre com ERR_REQUIRE_ESM em @account-kit/infra
     _no = (env.get("NODE_OPTIONS") or "")
     if "require-module" not in _no:
         _no = (_no + " --experimental-require-module").strip()
@@ -26557,9 +24045,6 @@ def _start_background_once():
     threading.Thread(target=autopilot_report_loop, daemon=True).start()
     threading.Thread(target=llm_watchdog_loop, daemon=True).start()
     threading.Thread(target=acp_railway_seller_loop, daemon=True).start()
-    # v48.23.0-FORKSAFE: os loops v27 (CDP bootstrap + discovery ping) e o radar
-    # de demanda saíram do import e entram AQUI, no dono do flock — antes eles
-    # nasciam no ARBITER (preload) ou, sem preload, em TODOS os workers.
     try:
         threading.Thread(target=cdp_bazaar_bootstrap_loop, daemon=True,
                          name="v27-cdp-seed").start()
@@ -26609,7 +24094,6 @@ def post_fork_boot():
                 _v27_start_background() # banner do checklist: 1x (loops já subiram)
     except Exception as _e:
         log.warning(f"post_fork_boot: {_e}")
-    # Warm per-worker (TODOS os workers aquecem o PRÓPRIO ONNX/reranker):
     try:
         def _warm_worker():
             try:
@@ -26678,9 +24162,6 @@ def run_server():
         app.run(host="0.0.0.0", port=X402_PORT, threaded=True, use_reloader=False)
 
 
-# ============================================================================
-# ==================  v27.0.0-DISCOVERY LAYER (BELOW)  ======================
-# ============================================================================
 
 import os as _os
 import json as _json
@@ -26692,9 +24173,6 @@ import re as _re
 from datetime import datetime as _dt, timezone as _tz, timedelta as _td
 from flask import request as _request, jsonify as _jsonify, redirect as _redirect
 
-# ============================================================================
-# 1. AP2 (Agent Payments Protocol) — Google/Mastercard verifiable credentials
-# ============================================================================
 
 @app.route("/.well-known/ap2.json")
 def ap2_manifest():
@@ -26704,7 +24182,6 @@ def ap2_manifest():
     base = _public_base()
     ts = int(_time.time())
 
-    # Cart mandate schema: define o que agentes podem "comprar"
     cart_items = []
     for path, price in sorted(BASE_PRICES.items(), key=lambda x: x[1])[:20]:
         dyn = get_dynamic_price(path)
@@ -26719,7 +24196,6 @@ def ap2_manifest():
             "quantity_unit": "call",
         })
 
-    # Intent mandate template: o que o agente declara antes de comprar
     intent_template = {
         "type": "MarketIntelligenceIntent",
         "subject": "agent",
@@ -26729,7 +24205,6 @@ def ap2_manifest():
         "networks_accepted": [f"solana:{SOL_GENESIS}", BASE_CAIP2] if ENABLE_BASE else [f"solana:{SOL_GENESIS}"],
     }
 
-    # Payment mandate: como o agente autoriza (compatível com x402 signature)
     payment_mandate = {
         "authorization_type": "eip712_or_ed25519",
         "asset": "USDC",
@@ -26740,7 +24215,6 @@ def ap2_manifest():
         "settlement_via": "x402_facilitator",
     }
 
-    # Verifiable Credential do serviço (Ed25519-signed)
     vc_payload = {
         "@context": ["https://www.w3.org/2018/credentials/v1",
                      "https://ap2-protocol.org/schemas/v1"],
@@ -26785,9 +24259,6 @@ def ap2_manifest():
     })
 
 
-# ============================================================================
-# 2. AGENTIC.MARKET / NEVERMINED / AGENT-FIRST INDEX (proposta de spec unificada)
-# ============================================================================
 
 @app.route("/.well-known/agentic.json")
 @app.route("/.well-known/agents-index.json")
@@ -26798,7 +24269,6 @@ def agentic_market_manifest():
     e Solana Pay.sh."""
     base = _public_base()
 
-    # Trust signals reais (não estimados)
     try:
         stats = LEDGER.stats()
     except Exception:
@@ -26809,7 +24279,6 @@ def agentic_market_manifest():
     except Exception:
         win_rate, poi = 0.0, 1.0
 
-    # Categorias (spec agentic.market)
     categories = {
         "inference": [], "data": [], "trading": [], "search": [],
         "infrastructure": [], "media": [], "social": [],
@@ -26923,16 +24392,9 @@ def agentic_market_manifest():
     })
 
 
-# ============================================================================
-# 3. PROOF OF REVENUE — Ed25519-signed economic proof (competitor kill switch)
-# ============================================================================
 
 @app.route("/.well-known/proof-of-revenue.json")
 def proof_of_revenue():
-    # v27.1: atrás de flag. A ideia (atestado assinado de receita, verificável
-    # sem RPC) é boa, mas publicar números baixos é um ANTI-sinal: scanners que
-    # ranqueiam por volume/compradores únicos leriam "5 compradores, $0.29" e
-    # rebaixariam o node. Ative com PROOF_OF_REVENUE=1 quando houver tração.
     if _os.environ.get("PROOF_OF_REVENUE", "0") != "1":
         return jsonify({"status": "disabled",
                         "note": "Revenue attestation is disabled by the operator.",
@@ -26947,10 +24409,6 @@ def proof_of_revenue():
         stats = {}
     try:
         with LEDGER._conn() as c:
-            # v27.1 FIX: a coluna se chama "amount" (não "amount_usdc") e o
-            # cursor NAO tem row_factory -> retorna TUPLA, não dict. Do jeito
-            # anterior a query lançava exceção e o endpoint publicava, ASSINADO,
-            # "0 compradores / $0 de receita" — pior que não existir.
             row = c.execute(
                 "SELECT COUNT(DISTINCT payer), COUNT(*), COALESCE(SUM(amount), 0) "
                 "FROM revenue WHERE ts >= ?", (int(_time.time()) - 86400 * 30,)
@@ -26986,9 +24444,6 @@ def proof_of_revenue():
     return _jsonify(payload)
 
 
-# ============================================================================
-# 4. LLMS.TXT V2 — Stripe/Firecrawl padrão: markdown legível por LLM
-# ============================================================================
 
 @app.route("/llms-full.txt")
 def llms_full_txt():
@@ -27076,9 +24531,6 @@ def llms_full_txt():
     return app.response_class("\n".join(lines), mimetype="text/markdown; charset=utf-8")
 
 
-# ============================================================================
-# 5. PER-ENDPOINT MARKDOWN DOCS — cada /<endpoint>.md serve doc rica p/ LLM
-# ============================================================================
 
 @app.route("/<path:endpoint_name>.md")
 def endpoint_markdown(endpoint_name):
@@ -27095,7 +24547,6 @@ def endpoint_markdown(endpoint_name):
     desc  = ENDPOINT_DESC.get(path, path)
     tags  = ENDPOINT_TAGS.get(path, [])
     hints = ENDPOINT_PARAM_HINTS.get(path, {})
-    # Puxa exemplo real do cache (custo zero — o warmer já mantém quente)
     example = None
     try:
         cached = (None if path in _PREVIEW_REQUIRE_PAYMENT else
@@ -27163,7 +24614,6 @@ def endpoint_markdown(endpoint_name):
         "",
         "## Related endpoints",
     ]
-    # Sugere 3 relacionados (por preço próximo)
     related = sorted(
         [(p, pr) for p, pr in BASE_PRICES.items() if p != path],
         key=lambda x: abs(x[1] - price)
@@ -27179,9 +24629,6 @@ def endpoint_markdown(endpoint_name):
     return app.response_class("\n".join(body), mimetype="text/markdown; charset=utf-8")
 
 
-# ============================================================================
-# 6. CHATGPT PLUGIN + AI-PLUGIN.JSON (legacy but still crawled by Perplexity)
-# ============================================================================
 
 @app.route("/.well-known/ai-plugin.json")
 def ai_plugin_manifest():
@@ -27205,9 +24652,6 @@ def ai_plugin_manifest():
     })
 
 
-# ============================================================================
-# 7. AGENT BEACON HEADERS — reduz round-trips agentes de 4 para 1
-# ============================================================================
 
 @app.after_request
 def _inject_agent_beacon(resp):
@@ -27223,7 +24667,6 @@ def _inject_agent_beacon(resp):
                                                         "/sitemap.xml"):
             return resp
         base = _public_base()
-        # Beacon: JSON compacto num header
         beacon = {
             "v": 27,
             "svc": "losbeto",
@@ -27236,11 +24679,9 @@ def _inject_agent_beacon(resp):
         }
         if path in BASE_PRICES:
             beacon["price_usdc"] = round(get_dynamic_price(path), 6)
-        # Header compacto (não afeta payload)
         resp.headers["X-Agent-Beacon"] = _base64.b64encode(
             _json.dumps(beacon, separators=(",", ":")).encode()
         ).decode()
-        # Header legível também
         resp.headers["X-Losbeto-Discovery"] = f"{base}/.well-known/agentic.json"
         resp.headers["X-Losbeto-MCP"] = f"{base}/mcp"
         resp.headers["X-Losbeto-Docs"] = f"{base}/llms-full.txt"
@@ -27249,25 +24690,7 @@ def _inject_agent_beacon(resp):
     return resp
 
 
-# ============================================================================
-# 8. MCP REGISTRY SERVER.JSON — para publicação em registry.modelcontextprotocol.io
-# ============================================================================
 
-# v39: NOME E SCHEMA CORRIGIDOS — sem isto o `mcp-publisher publish` recusa
-# antes mesmo de sair da máquina.
-#
-#  · "io.losbeto/mcp" é IMPUBLICÁVEL. O registry valida posse do namespace:
-#    io.github.<usuário>/* via OAuth do GitHub, ou reverse-DNS do domínio via
-#    verificação de DNS. O domínio aqui é losbeto.XYZ, não losbeto.IO — ou
-#    seja, o namespace anunciado não era nem autenticável nem de posse do
-#    projeto. Por isso o item 2 do checklist de deploy nunca funcionou.
-#  · $schema apontava para uma URL de schema que não é a corrente.
-#  · capabilities / keywords / homepage / license / tools_count NÃO existem no
-#    schema do server.json — campos desconhecidos fazem o publisher recusar.
-#  · "38.0.0-BRASIL" é semver com tag de pré-release: registries tratam como
-#    versão instável. A versão publicada vai limpa.
-#
-# Configurável por env para quem fizer fork: MCP_SERVER_NAME.
 MCP_SERVER_NAME = os.environ.get(
     "MCP_SERVER_NAME", "io.github.rmartins1451/losbeto").strip()
 
@@ -27299,15 +24722,10 @@ def mcp_registry_server_json():
         "$schema": ("https://static.modelcontextprotocol.io/schemas/"
                     "2025-12-11/server.schema.json"),
         "name": MCP_SERVER_NAME,
-        # v47.4.1: o Registry oficial REJEITA description >100 chars (422).
-        # A ficha completa continua em /llms.txt e /.well-known/mcp.json;
-        # aqui vai só a linha de vitrine.
         "description": (
             "Cross-asset market data for AI agents: forex, equities, "
             "Brazil macro (BCB/B3), crypto."),
         "version": _semver_clean(VERSION),
-        # v47.5.0: ficha completa para o listing do Registry — título de
-        # vitrine, homepage e ícone (todos opcionais no schema 2025-12-11).
         "title": "Losbeto — Market Data for AI Agents",
         "websiteUrl": base,
         "icons": [{"src": f"{base}/favicon.png", "mimeType": "image/png"}],
@@ -27321,9 +24739,6 @@ def mcp_registry_server_json():
     })
 
 
-# ============================================================================
-# 9. BOOT AUTO-SEED CDP BAZAAR — 1 settle → visível em Agentic.Market
-# ============================================================================
 
 def cdp_bazaar_bootstrap_loop():
     """v27 INOVAÇÃO CRÍTICA: Agentic.Market indexa AUTOMATICAMENTE quando
@@ -27337,17 +24752,6 @@ def cdp_bazaar_bootstrap_loop():
         if not (ENABLE_BASE and BASE_PAYTO_EVM):
             log.info("[v27 bootstrap] Base desabilitado — skipping CDP seed")
             return
-        # v48.6.1 FIX — a ordem antiga checava BASE_OPERATOR_PRIVATE_KEY e
-        # desistia ANTES de perguntar se o bootstrap já não estava resolvido
-        # por tráfego real. Resultado visto ao vivo: todo boot avisava
-        # "chave não setada" mesmo com 3526 liquidações históricas em Base
-        # (mesma métrica que o _v46_boot usa para dizer "elegível ao CDP
-        # Bazaar" duas seções acima) — dois logs contraditórios na mesma
-        # inicialização, e o dashboard mostrando "trust bootstrap completo"
-        # por cima dos dois. Agora: verifica o histórico VITALÍCIO primeiro
-        # (mesma _base_settles() do resto do código, sem reimplementar com
-        # janela de 7d divergente); só menciona a chave que falta se o
-        # bootstrap realmente nunca aconteceu.
         base_settles_total = _base_settles()
         if base_settles_total > 0:
             log.info(f"[v27 bootstrap] {base_settles_total} settle(s) Base "
@@ -27368,22 +24772,11 @@ def cdp_bazaar_bootstrap_loop():
         log.warning(f"[v27 bootstrap] {e}")
 
 
-# ============================================================================
-# 10. ACTIVE PING TO DISCOVERY DIRECTORIES — pulso comercial contínuo
-# ============================================================================
 
 def active_discovery_ping_loop():
     """v27: os top servers no x402scan (Cluster, Firecrawl) mantêm pulso
     ativo pingando diretórios. Esse loop registra e MANTÉM VIVO o listing
     em 6 diretórios agentic-first, a cada 6h."""
-    # v27.1: DESLIGADO POR PADRÃO. Estes 8 endpoints de "ping" não constam da
-    # documentação pública dos respectivos serviços (o MCP Registry publica via
-    # `mcp-publisher`, o Smithery via CLI, o Glama por crawl+claim). POST não
-    # solicitado a cada 6h para APIs de terceiros gera tráfego inútil e pode ser
-    # lido como abuso -> risco de bloqueio de IP. Pior: o código contava 404
-    # como sucesso, então o log dizia "8/8 ack" mesmo com tudo inexistente.
-    # Ative conscientemente com DISCOVERY_PING=1 se confirmar que os endpoints
-    # existem e aceitam ping.
     if _os.environ.get("DISCOVERY_PING", "0") != "1":
         log.info("[v27 ping] desativado (DISCOVERY_PING=0) — registro em "
                  "diretórios é feito por publicação/claim, não por ping")
@@ -27395,7 +24788,6 @@ def active_discovery_ping_loop():
     while True:
         try:
             targets = [
-                # (nome, url_ping, payload)
                 ("x402scan.beacon", "https://www.x402scan.com/api/ping",
                  {"url": base, "manifest": f"{base}/.well-known/x402.json",
                   "version": 2, "keepalive": True}),
@@ -27431,9 +24823,6 @@ def active_discovery_ping_loop():
         _time.sleep(6 * 3600)  # 6h
 
 
-# ============================================================================
-# 11. ENRICHED BAZAAR BLOB — cada 402 agora carrega x-cdp-metadata premium
-# ============================================================================
 
 _ORIG_BAZAAR_BLOB = _bazaar_blob   # captura a função original antes do override
 
@@ -27448,7 +24837,6 @@ def _bazaar_blob_v27(endpoint):
             "core"      if price <= 0.12 else
             "pro"       if price <= 0.35 else
             "flagship")
-    # Casos de uso reais por endpoint (top ranking factor per CDP docs)
     use_cases_map = {
         "/fear-greed":     ["contrarian trading signal", "risk-off timing", "sentiment gauge"],
         "/regime":         ["portfolio rebalancing", "risk budgeting", "regime-aware sizing"],
@@ -27463,7 +24851,6 @@ def _bazaar_blob_v27(endpoint):
     }
     use_cases = use_cases_map.get(endpoint,
         ["market data input", "AI agent research", "systematic trading"])
-    # Sample queries — o que um agente perguntaria
     sample_queries = [
         f"GET {endpoint}?preview=1  # free delayed sample",
         f"GET {endpoint}  # live data (returns 402 with payment challenge)",
@@ -27498,13 +24885,9 @@ def _bazaar_blob_v27(endpoint):
     }
     return blob
 
-# Substitui a função globalmente (o _build_402 usa _bazaar_blob)
 globals()["_bazaar_blob"] = _bazaar_blob_v27
 
 
-# ============================================================================
-# 12. HTTPS SIGNATURES ON HEALTH — provar liveness sem chamar RPC caro
-# ============================================================================
 
 @app.route("/.well-known/liveness-attestation.json")
 def liveness_attestation():
@@ -27532,9 +24915,6 @@ def liveness_attestation():
     return resp
 
 
-# ============================================================================
-# 13. ROBOTS.TXT V2 — override com AI crawlers + agentic hints
-# ============================================================================
 
 def robots_txt_v27():
     base = _public_base()
@@ -27565,13 +24945,9 @@ def robots_txt_v27():
         "User-agent: cdp-bazaar\nAllow: /\n",
         mimetype="text/plain")
 
-# Substitui a rota /robots.txt pela v27 (Flask permite override via endpoint name)
 app.view_functions["robots_txt"] = robots_txt_v27
 
 
-# ============================================================================
-# 14. BOOT — inicia os novos loops
-# ============================================================================
 
 def _v27_start_background():
     """Banner do checklist v27 — 1x por container (worker dono do flock).
@@ -27585,8 +24961,6 @@ def _v27_start_background():
         _v27_started = True
     try:
         log.info("=" * 62)
-        # v43: o banner dizia "v27.1.0-MAGNET" desde aquela versão — log de
-        # produção mentia a versão em TODA reinicialização (confunde debug).
         log.info(f"🚀 LOSBETO v{VERSION} — MACHINE MAGNET ONLINE")
         log.info(f"   Unified manifest: {_public_base()}/.well-known/agentic.json")
         log.info(f"   AP2 endpoint:     {_public_base()}/.well-known/ap2.json")
@@ -27610,17 +24984,8 @@ def _v27_start_background():
     except Exception as e:
         log.warning(f"v27 boot: {e}")
 
-# v48.23.0-FORKSAFE: NÃO dispara mais no import (nascia no arbiter do preload).
-# O banner agora sobe via post_fork_boot() no worker dono do flock.
 
-# ============================================================================
-# 15. VERSION BUMP — atualiza a versão exposta em /health e demais endpoints
-# ============================================================================
 
-# NOTA: VERSION é usada em muitos lugares como constante módulo-level.
-# Mantemos v26 nas rotinas antigas para não quebrar chaves de cache; apenas
-# expomos v27 na landing e no manifest agentic. Isso é intencional: v27 é
-# uma CAMADA de descoberta, não uma quebra do motor v26.
 V27_LAYER_VERSION = "27.0.0-DISCOVERY"
 
 @app.route("/version")
@@ -27648,35 +25013,12 @@ def version_endpoint():
     })
 
 
-# ============================================================================
-# ---------------------------------------------------------------------------
-# v39 — REAPLICAÇÃO FINAL DA TABELA DE PREÇOS
-#
-# _V32_REPRICE roda no meio do módulo, ANTES de a Brasil Suite e a Premium
-# Suite registrarem os preços delas. Resultado na v38: parte da tabela era
-# silenciosamente sobrescrita depois e as entradas viravam letra morta —
-# /br-brief ficava com o preço da suíte, não com o realinhado. Reaplicar aqui,
-# no fim do carregamento, torna a tabela autoritativa de verdade.
-# ---------------------------------------------------------------------------
 for _ep, _p in _V32_REPRICE.items():
     if _ep in BASE_PRICES and BASE_PRICES[_ep] != _p:
         log.debug(f"reprice final: {_ep} {BASE_PRICES[_ep]} -> {_p}")
         BASE_PRICES[_ep] = _p
 _assert_plan_ladder()
 
-# ---------------------------------------------------------------------------
-# v40 — PRODUTO SEM INSUMO SAI DO CATÁLOGO, NÃO FICA DEVOLVENDO 503
-#
-# O pré-gate da v39.1 recusava /earnings-whisper sem cobrar — correto para o
-# comprador, desastroso para o catálogo. Os logs mostram o x402scan tentando
-# GET, HEAD, POST, PUT, PATCH, DELETE e OPTIONS em loop, recebendo 503, e
-# marcando o endpoint como "won't be registered". Dezenas de 503 por minuto
-# e o recurso fora do índice mesmo assim.
-#
-# A conclusão é simples: um produto que não pode ser entregue não deve estar
-# à venda. Sem provedor, ele some do catálogo inteiro — manifesto, OpenAPI,
-# preços, MCP. Aparece de volta sozinho no boot em que a chave existir.
-# ---------------------------------------------------------------------------
 for _ep, _precisa in list(PROVIDER_REQUIRED_ENDPOINTS.items()):
     if _ep in BASE_PRICES and not _precisa():
         BASE_PRICES.pop(_ep, None)
@@ -27686,7 +25028,6 @@ for _ep, _precisa in list(PROVIDER_REQUIRED_ENDPOINTS.items()):
         log.warning(f"📴 {_ep} removido do catálogo — sem provedor de dados. "
                     f"Configure a chave e ele volta no próximo boot.")
 
-# Trava de catálogo: nenhum endpoint precificado pode ir ao ar sem descrição.
 _sem_desc = [e for e in BASE_PRICES if not ENDPOINT_DESC.get(e)]
 if _sem_desc:
     log.error(f"🚨 CATÁLOGO INCOMPLETO — sem ENDPOINT_DESC: {_sem_desc}. "
@@ -27694,8 +25035,6 @@ if _sem_desc:
 else:
     log.info(f"📚 Catálogo: {len(BASE_PRICES)} endpoints, 100% com descrição")
 
-# ==================  END OF v27 DISCOVERY LAYER  ===========================
-# ============================================================================
 
 def cli():
     args = sys.argv[1:]
@@ -27722,91 +25061,13 @@ def cli():
     run_server()
 
 
-# ============================================================================
-# ============================================================================
-#  v45.0.0-VERDADE  —  "Pare de falar com scanners. Comece a vender dado
-#                       que não existe em lugar nenhum."
-# ============================================================================
-#
-#  DIAGNÓSTICO QUE ORIGINOU ESTA CAMADA (11/ago/2026, dados do próprio nó):
-#
-#   [1] O NÓ MENTE PARA O PRÓPRIO DONO.  GET /receipts devolve 50 recibos,
-#       TODOS com "origin":"organic", todos na Algorand, todos liquidados
-#       entre ts=1786474907 e ts=1786475117 — 50 pagamentos em 210 segundos,
-#       um por endpoint, em ordem decrescente de preço. Isso é uma varredura
-#       do catálogo feita pelo operador, não demanda. A rotulagem falha
-#       porque OPERATOR_WALLETS contém o payTo (MRVA6O…DUF4) e não a carteira
-#       PAGADORA. Consequência prática: (a) o dashboard não mede nada,
-#       (b) a página pública de transparência afirma algo falso, e (c) o
-#       Global x402 Challenge da Algorand exige explicitamente "proof of who
-#       is paying for it" — 86 endpoints pagos pela mesma carteira em 3
-#       minutos é o padrão exato que um avaliador classifica como wash.
-#       => BLOCO A reclassifica, separa e ASSINA a receita orgânica.
-#
-#   [2] O CARDÁPIO GRÁTIS ESTAVA SERVINDO COMIDA DE UMA SEMANA ATRÁS.
-#       GET /try em 11/ago devolveu um corpo inteiro capturado em
-#       04/ago 13:36 UTC (version:"44.2.0-VITRINE" dentro das amostras,
-#       age_seconds=50 congelado junto). Nenhuma rota dinâmica manda
-#       Cache-Control. O avaliador — o único humano/agente que chega perto
-#       de comprar — vê dado velho e vai embora.
-#       => BLOCO B: no-store nas rotas vivas + carimbo de idade honesto.
-#
-#   [3] O PRODUTO CARO DEPENDE DE COTA GRÁTIS DE LLM. Os logs mostram o
-#       Gemini em 429 e quarentena de 6h. /br-brief custa $0.50 e promete
-#       síntese. Vender um produto cuja matéria-prima acaba é pior do que
-#       não vender.  => BLOCO C: orçamento diário de LLM com RESERVA
-#       intocável para quem paga; warmer de IA desligado por padrão.
-#
-#   [4] 86 ENDPOINTS = NENHUM PRODUTO. O catálogo é, na maior parte, revenda
-#       de API grátis (Pyth, alternative.me, exchangerate-api, Yahoo). Um
-#       agente não paga $0.003 pelo que ele busca de graça na fonte. Só há
-#       UMA coisa aqui que ninguém pode copiar: o histórico point-in-time
-#       que este nó vem acumulando e assinando desde o deploy.
-#       => BLOCO D: o produto novo. E BLOCO E põe ele na frente.
-#
-#  A APOSTA DESTA VERSÃO (o que muda de verdade):
-#
-#    O nó para de competir em "dado de mercado" — onde ele perde para a
-#    fonte grátis — e passa a vender a ÚNICA classe de dado financeiro que
-#    é impossível de reconstruir depois: O QUE SE SABIA NAQUELE DIA.
-#
-#    Séries do BCB são REVISADAS. O IPCA que você lê hoje para março não é
-#    o número que estava publicado em março. Quem faz backtest com a série
-#    de hoje comete look-ahead bias e não percebe. A base de "vintages"
-#    (primeira impressão + cada revisão, com o carimbo de quando foi
-#    observada) não existe pública no Brasil, não pode ser raspada
-#    retroativamente, e vale dinheiro para quem faz modelo quantitativo,
-#    risco, ou avaliação de LLM em dado financeiro.
-#
-#    Este nó já roda 24/7 e já assina Ed25519. Registrar cada leitura com
-#    carimbo de tempo custa ZERO a mais — e cada dia que passa o fosso
-#    aumenta sozinho. É o oposto de tudo o que está no catálogo hoje:
-#    não dá para um concorrente subir amanhã e ter o mesmo produto.
-#
-#    /br-asof      — valor de uma série COMO ERA CONHECIDO numa data passada
-#    /br-revisions — histórico completo de revisões (1ª impressão → hoje)
-#    /br-pit-proof — GRÁTIS: raiz de Merkle + assinatura para auditoria
-#
-# ============================================================================
 
 V45_LAYER_VERSION = "45.0.1-VERDADE"
 
-# ============================================================================
-# BLOCO A — VERDADE NO LEDGER
-#   Nada aqui apaga um dado. O ledger continua imutável; o que muda é a
-#   CLASSIFICAÇÃO e o que o nó afirma em público.
-# ============================================================================
 
-# Carteiras que o próprio operador controla do lado COMPRADOR. O bug de hoje
-# é que só o lado RECEBEDOR estava listado. Configure via env (uma linha,
-# separada por vírgula) e o /receipts para de chamar seu teste de "orgânico".
 BUYER_WALLETS = {w.strip().lower() for w in
                  (os.environ.get("BUYER_WALLETS") or "").split(",") if w.strip()}
 
-# Varredura de catálogo: mesmo pagador liquidando N endpoints DISTINTOS
-# dentro de uma janela curta. Nenhum comprador real faz isso — um comprador
-# real chama o MESMO endpoint várias vezes, não 50 endpoints diferentes em
-# ordem de preço. Este é o detector que sobrevive à troca de carteira.
 SWEEP_MIN_ENDPOINTS = int(os.environ.get("SWEEP_MIN_ENDPOINTS", "8"))
 SWEEP_WINDOW_S      = int(os.environ.get("SWEEP_WINDOW_S", "600"))
 
@@ -27943,9 +25204,6 @@ def revenue_split(window_s: int = 0) -> dict:
         out["error"] = str(e)[:80]
         return out
     buyers = set()
-    # v48.17.10: repeat purchase — a métrica que o ecossistema inteiro ainda
-    # não mede (pergunta do relatório do Beck). Conta settlements POR carteira
-    # orgânica; >1 = cliente que voltou sem ser convocado.
     _buyer_tx: Dict[str, int] = {}
     for amt, payer, src, _tx in rows:
         k = classify_payer(payer or "", src or "", _tx or "")
@@ -27967,15 +25225,11 @@ def revenue_split(window_s: int = 0) -> dict:
             out["operator_usdc"] += a
             out["operator_tx"] += 1
     out["organic_buyers"] = len(buyers)
-    # v48.17.10: quantos voltaram — e quanto do volume vem de quem voltou.
     out["organic_repeat_buyers"] = sum(1 for n in _buyer_tx.values() if n > 1)
     out["organic_repeat_tx"] = sum(n for n in _buyer_tx.values() if n > 1)
     for k in ("organic_usdc", "operator_usdc", "self_sweep_usdc",
               "unattributed_usdc"):
         out[k] = round(out[k], 6)
-    # v48.17.10-FUNNEL: conversão desafio→pagamento (janela 7d), medida pelo
-    # requestId ecoado no PaymentPayload. Só existe para clientes v2; clientes
-    # v1 legados não ecoam o accept — o denominador é honesto mesmo assim.
     try:
         out["conversion_funnel_7d"] = LEDGER.funnel_stats(7 * 86400)
     except Exception:
@@ -28011,8 +25265,6 @@ def _receipts_json_v45():
         pass
     out = []
     try:
-        # leitura SEM LEDGER.lock — conexão thread-local + WAL; o lock do app
-        # existe para escritas, e era ele que travava o worker sob rajada.
         with LEDGER._conn() as _c:
             rows = _c.execute(
                 "SELECT ts, endpoint, amount, tx_sig, chain, payer, source "
@@ -28078,22 +25330,11 @@ except Exception as _e:
     log.warning(f"v45 receipts override: {_e}")
 
 
-# ---------------------------------------------------------------------------
-# v47.9.4-TOKENFILE — A CEREJA: /funnel.json, o funil do paywall PÚBLICO E ASSINADO
-#
-# Ninguém no ecossistema x402 publica o próprio funil: quantos 402 saem,
-# quantos voltam pagando, quantos pagadores são carteiras VISTAS PELA
-# PRIMEIRA VEZ depois de uma data de referência. É o número que o stipend.sh
-# pediu para medir a conversão do bloco no_wallet — e vira mais uma prova
-# de transparência auditável, no espírito do honest-revenue.
-# ---------------------------------------------------------------------------
 
 @app.route("/funnel.json")
 @app.route("/.well-known/funnel.json")
 def funnel_json():
     st = LEDGER.stats() or {}
-    # pagadores cuja PRIMEIRA liquidação no ledger é recente (= converteram
-    # depois do bloco no_wallet entrar no ar — a métrica que o Matt pediu)
     try:  # defina no Railway como número unix; texto inválido vira 0 (sem 500)
         ref = int(os.environ.get("FUNNEL_REF_TS", "0") or 0)
     except (TypeError, ValueError):
@@ -28191,9 +25432,6 @@ def honest_revenue_json():
     return jsonify(body)
 
 
-# ============================================================================
-# BLOCO B — FRESCOR (o /try de uma semana atrás nunca mais)
-# ============================================================================
 
 _NO_STORE_PREFIXES = ("/try", "/live", "/receipts", "/health", "/sample",
                       "/archive", "/dash", "/x402-resources", "/get-pricing",
@@ -28219,7 +25457,6 @@ def _v45_no_store(resp):
     return resp
 
 
-# Idade máxima que uma amostra pode ter antes de ser rotulada como velha.
 SAMPLE_STALE_S = int(os.environ.get("SAMPLE_STALE_S", "7200"))   # 2h
 _v45_inline_sample_orig = _inline_sample
 
@@ -28240,9 +25477,6 @@ def _inline_sample(endpoint: str) -> dict:            # noqa: F811
     return s
 
 
-# ============================================================================
-# BLOCO C — A COTA DE LLM PERTENCE A QUEM PAGA
-# ============================================================================
 
 LLM_DAILY_BUDGET  = int(os.environ.get("LLM_DAILY_BUDGET", "800"))
 LLM_PAID_RESERVE  = int(os.environ.get("LLM_PAID_RESERVE", "300"))
@@ -28281,46 +25515,16 @@ def health_llm_budget():
     return jsonify(llm_budget_state())
 
 
-# O warmer de IA passa a ser opt-in. Ele existia para deixar a vitrine bonita
-# e gastava a cota que o produto pago precisa. Ligue de volta com AI_WARMER=1
-# só quando houver cota paga sobrando.
 if os.environ.get("AI_WARMER", "") == "":
     AUTOPILOT_WARM_AI_ON = False
     log.info("🧯 v45: warmer de IA DESLIGADO por padrão — cota reservada para quem paga "
              "(AI_WARMER=1 religa)")
 
 
-# ============================================================================
-# BLOCO D — O PRODUTO QUE NINGUÉM PODE COPIAR AMANHÃ
-#           Point-in-Time Brasil: o que se sabia naquele dia.
-# ============================================================================
-#
-#  Por que isto vende e /pyth-price não:
-#
-#   - O valor do IPCA para março que está na API do BCB HOJE não é o valor
-#     que estava lá em março. Séries macro são revisadas. Quem faz backtest
-#     com a série atual está usando informação do futuro e não sabe disso.
-#   - Não existe base pública brasileira de vintages (1ª impressão + cada
-#     revisão + carimbo de observação). O FED publica ALFRED para os EUA;
-#     o Brasil não tem equivalente aberto.
-#   - Não pode ser raspado depois. Ou você estava ligado observando naquele
-#     dia, ou o dado se perdeu. Este nó ESTÁ ligado desde o deploy.
-#   - Custo marginal de produzir: uma chamada HTTP a cada 3 horas.
-#   - Comprador real e identificável: quant/risco/fintech/pesquisa — gente
-#     que já paga por dado e sabe o que é look-ahead bias.
-#
-#  Cada leitura vira uma folha; as folhas viram uma raiz de Merkle diária;
-#  a raiz é assinada Ed25519 e (opcionalmente) ancorada on-chain. A prova
-#  é verificável por qualquer um, de graça, em /br-pit-proof.
-# ============================================================================
 
 PIT_DB = HOME_DIR / "pit_brasil.db"
 PIT_INTERVAL_S = int(os.environ.get("PIT_INTERVAL_S", "10800"))   # 3h
 
-# O VALOR INTEIRO deste produto está na persistência: se o diretório de dados
-# for efêmero (Railway sem Volume), cada redeploy zera o arquivo de vintages
-# e o fosso nunca acumula. O ledger principal (omega_v24.db) tem a mesma
-# dependência — se ele já sobrevive a deploys, o PIT sobrevive também.
 if not (os.environ.get("DATA_DIR") or Path("/data").exists()):
     log.warning(f"⚠️ v45: DATA_DIR não definido e /data inexistente — PIT_DB em "
                 f"{PIT_DB} pode ser EFÊMERO. Monte um Volume no Railway e/ou "
@@ -28651,7 +25855,6 @@ def br_pit_proof():
     })
 
 
-# --- registro dos dois produtos pagos (mesmo padrão do /br-archive) ---------
 BASE_PRICES["/br-asof"]      = float(os.environ.get("PRICE_BR_ASOF", "0.09"))
 BASE_PRICES["/br-revisions"] = float(os.environ.get("PRICE_BR_REVISIONS", "0.19"))
 
@@ -28689,12 +25892,6 @@ log.info("📐 v45: /br-asof ($%.2f) e /br-revisions ($%.2f) registrados — "
          % (BASE_PRICES["/br-asof"], BASE_PRICES["/br-revisions"]))
 
 
-# --- ancoragem opcional na Algorand (uso nativo e honesto da chain) --------
-# Por que faz sentido: a raiz de Merkle diária é 32 bytes. Publicá-la numa
-# transação com nota na Algorand transforma "confie na minha assinatura" em
-# "confira o carimbo de tempo público". É um caso de uso REAL de chain — e
-# é exatamente o tipo de coisa que o Global x402 Challenge diz avaliar
-# ("use case quality, technical execution"), ao contrário de volume próprio.
 ALGO_ANCHOR_MNEMONIC = os.environ.get("ALGO_ANCHOR_MNEMONIC", "").strip()
 ALGOD_URL = os.environ.get("ALGOD_URL", "https://mainnet-api.algonode.cloud").strip()
 
@@ -28745,14 +25942,6 @@ def pit_anchor_loop():
         time.sleep(3600)
 
 
-# ============================================================================
-# BLOCO E — FOCO: o catálogo passa a ter uma frente
-# ============================================================================
-#
-#  86 endpoints numa vitrine não é abundância, é ruído. O scanner que lê o
-#  manifest pega os primeiros; hoje ele pegava /pyth-price — o item mais
-#  substituível do catálogo. A partir daqui a frente é a única coisa
-#  que só existe aqui.
 
 V45_HERO = ["/br-asof", "/br-revisions", "/br-archive", "/br-brief",
             "/br-macro", "/br-equity", "/br-curve", "/br-agro"]
@@ -28766,10 +25955,6 @@ try:
 except Exception as _e:
     log.warning(f"v45 featured: {_e}")
 
-# v48.10.1: os SKUs de transformação (produtos-porta, ticket mais baixo da
-# loja de IA) entram logo APÓS os heróis PIT — posição garantida aqui, no
-# fim da cadeia de suites; o insert(2) original da proposta rodava cedo
-# demais e era enterrado pelos insert(0) das suites seguintes.
 try:
     for _p in reversed(("/extract", "/translate")):
         if _p in FEATURED_ENDPOINTS:
@@ -28826,9 +26011,6 @@ def why_buy():
     })
 
 
-# ============================================================================
-# BLOCO F — BOOT
-# ============================================================================
 
 _v45_started = False
 
@@ -28838,8 +26020,6 @@ def _v45_start_loops():
     if _v45_started:
         return
     _v45_started = True
-    # Mesma disciplina do _start_background_once: com 2 workers gunicorn, sem
-    # lock o PIT gravaria em dobro e bateria no BCB duas vezes por ciclo.
     _own_loops = True
     try:
         import fcntl
@@ -28878,98 +26058,13 @@ def _v45_start_loops():
     log.info("=" * 62)
 
 
-# v48.23.0-FORKSAFE: _v45_start_loops() saiu do import → post_fork_boot().
-
-# ============================================================================
-# FIM DA CAMADA v45
-# ============================================================================
 
 
 
-# ============================================================================
-# ============================================================================
-#  v46.0.0-SCORECARD — "As 22.551 sondagens não são ruído. São o júri."
-# ============================================================================
-#
-#  O QUE MUDOU NO DIAGNÓSTICO DEPOIS DA v45
-#
-#  A v45 instalou o termômetro. O número que ele mostrou é este:
-#
-#      orgânico (vida inteira):  $1,0178  em 91 tx de 6 carteiras
-#      orgânico (7 dias):        $0,0030  em 1 tx
-#      orgânico (24 h):          $0,0000  em 0 tx
-#      operador (24 h):         $44,9230  em 531 tx
-#      sondagens (24 h):        22.551
-#
-#  Ou seja: o nó converte 22.551 visitas em zero. A v45 provou que o problema
-#  não é medição. É que o nó está falando com a plateia errada.
-#
-#  QUEM SÃO, DE FATO, AS 22.551 SONDAGENS
-#
-#  Os User-Agents da própria telemetria — x402-list-monitor, x402-observer,
-#  CarbonMonitor, mako-pulse-prober, PayAI-Uptime-Monitor — e o censo público
-#  do ecossistema (awesome-x402) dizem a mesma coisa: existe hoje uma camada
-#  inteira de INDEXADORES E AVALIADORES que vive sondando nós x402 e
-#  publicando rankings. ScoutScore monitora 1.700+ serviços com health checks
-#  e "fidelity probes" num modelo de 4 pilares (clareza de contrato,
-#  disponibilidade, fidelidade da resposta, identidade). EntRoute ranqueia
-#  350+ endpoints por taxa de sucesso, latência e preço. x402search indexa
-#  14.000+ APIs; o OpenClaw Discovery Index, 13.000+ a partir do CDP Bazaar;
-#  AgentIndex, 15.000+; BlockRun, 600+ com trust score.
-#
-#  ISSO MUDA TUDO: as sondagens não são tráfego desperdiçado, são a PROVA
-#  sendo colhida. O agente comprador não navega — ele pergunta a um desses
-#  índices "quem serve macro do Brasil, é confiável e é barato?" e compra do
-#  primeiro colocado. O nó vinha otimizando a resposta 402 para um comprador
-#  que não existe, e ignorando o avaliador que aparece 22 mil vezes por dia.
-#
-#  E FALTA A MAIOR PORTA DE TODAS
-#
-#  O maior índice do ecossistema é alimentado pelo CDP Bazaar da Coinbase —
-#  e a Amazon passou a usar a camada de descoberta da Coinbase nativamente no
-#  Bedrock AgentCore Payments. Entrar no Bazaar exige UMA liquidação em Base
-#  pelo facilitador da CDP. O log deste nó diz, deploy após deploy:
-#  "BASE_OPERATOR_PRIVATE_KEY não setada". Custo para resolver: $0,01.
-#
-#  O QUE A v46 FAZ
-#
-#   [G] SCORECARD — publica, assinado, exatamente os números que os
-#       avaliadores calculam sozinhos (uptime, p50/p95, taxa de erro,
-#       latência do desafio 402, frescor). Parar de ser medido às cegas.
-#   [H] FIDELITY — receita determinística de sondagem por endpoint: a URL
-#       exata, grátis, e o formato exato da resposta. Um "fidelity probe"
-#       passa a bater 100% em vez de adivinhar.
-#   [I] BLINDAGEM DA SONDAGEM — desafio 402 servido de cache em memória e
-#       jamais um 5xx antes do pagamento. Cada 500 numa sondagem é ponto
-#       perdido de disponibilidade num ranking que ele nem vê.
-#   [J] BAZAAR — diz na cara, no boot e numa rota, se o nó já liquidou em
-#       Base pela CDP, e o comando exato para fazer isso uma vez.
-#   [K] BACKFILL DO PIT — o arquivo point-in-time deixa de nascer vazio:
-#       os snapshots diários assinados que o nó já vinha guardando desde a
-#       v44.5 viram vintages HOJE, com a procedência criptográfica que já
-#       estava lá. O produto passa a ter profundidade no primeiro minuto.
-#   [L] ENTRADA DO DESAFIO — um único JSON assinado com tudo o que a
-#       Algorand pede na submissão, incluindo a parte ruim.
-#
-#  O QUE OS CONCORRENTES QUE VENDEM TÊM EM COMUM (censo awesome-x402)
-#
-#  Não é catálogo grande — é UMA afirmação verificável e estreita:
-#   · IBANforge: "1.190 registros SIX BankMaster — a única API que expõe isso"
-#   · Tick Aggregator: "spread 62-88% menor que qualquer fonte isolada"
-#   · Whale Intelligence: "412 mil endereços rotulados em 540 categorias"
-#   · Sanctions API: "26.800 entidades sancionadas"
-#   · CrossFin: "as primeiras APIs de dado financeiro coreano do x402"
-#  E o nicho por país está validado — Coreia (CrossFin, KR Crypto), Japão
-#  (kasanegi, hugen.tokyo), Suíça/UE (IBANforge). O Brasil segue vago.
-#  A afirmação verificável deste nó é uma só, e agora ela é demonstrável:
-#  o único arquivo de vintages de estatística oficial brasileira que existe.
-# ============================================================================
+
 
 V46_LAYER_VERSION = "46.0.4-SCORECARD"  # acompanha VERSION (banner de boot)
 
-# ============================================================================
-# BLOCO G — SCORECARD: os números que o avaliador ia calcular sozinho
-# ============================================================================
 
 SCORECARD_TTL = int(os.environ.get("SCORECARD_TTL", "120"))
 _scorecard_cache = {"ts": 0.0, "data": None}
@@ -29002,9 +26097,6 @@ def _latency_stats(window_s: int = 86400) -> dict:
     for ep, ok, ms, kind in rows:
         tot_n += 1
         k = kind or ""
-        # v48.27-CORTEX: 'challenge402' é o kind dominante (54k/24h) e NÃO
-        # entrava — o scorecard anunciava availability de 7% para rankers.
-        # Um desafio 402 correto é a definição de endpoint pago DISPONÍVEL.
         if ok or k in ("probe", "challenge402", "param_rejected", "partner",
                        "welcome", "fcb_bonus", "refused_unsellable"):
             avail_n += 1
@@ -29167,16 +26259,6 @@ def scorecard_json():
     return jsonify(build_scorecard())
 
 
-# ============================================================================
-# v48.9.28-TRANSPARENCY — /transparency: o radar de demanda registrou 2 IPs
-# distintos pedindo /transparency em 7d (28/set) e o nó devolvia 404. Quem
-# pede isso é avaliador institucional (due diligence de gateway/aggregator)
-# procurando UM documento que junte: receita verificável, disponibilidade,
-# provas criptográficas e identidade. Tudo isso já existia espalhado em
-# /receipts, /.well-known/honest-revenue.json, /scorecard.json e
-# /br-pit-proof — faltava a composição. Grátis e assinado: documento de
-# confiança NUNCA se vende, ele é o que faz vender.
-# ============================================================================
 
 _TRANSPARENCY_CACHE = {"ts": 0.0, "data": None}
 TRANSPARENCY_TTL = int(os.environ.get("TRANSPARENCY_TTL", "300"))
@@ -29288,15 +26370,6 @@ def transparency_doc():
     return resp
 
 
-# ============================================================================
-# BLOCO H — FIDELITY: a receita determinística para quem testa a resposta
-# ============================================================================
-#
-#  Um "fidelity probe" chama o endpoint e compara a resposta com o contrato
-#  declarado. Se o contrato é genérico ({"type":"object"}), o nó perde ponto
-#  por vagueza mesmo respondendo certo. Aqui cada produto declara: a URL
-#  grátis exata para testar, os campos obrigatórios da resposta, e o que
-#  significa "saudável". Quem sonda deixa de adivinhar.
 
 FIDELITY_SPECS = {
     "/br-pit-proof": {
@@ -29380,9 +26453,6 @@ def _v46_scorecard_header(resp):
     return resp
 
 
-# ============================================================================
-# BLOCO I — BLINDAGEM: uma sondagem nunca pode virar 5xx nem demorar
-# ============================================================================
 
 CHALLENGE_CACHE_TTL = int(os.environ.get("CHALLENGE_CACHE_TTL", "45"))
 _chal_cache: Dict[str, tuple] = {}
@@ -29456,10 +26526,6 @@ def _accept_to_v1(a: dict, endpoint: str) -> dict:
         "scheme":            a.get("scheme", "exact"),
         "network":           _n,
         "maxAmountRequired": str(a.get("amount") or a.get("maxAmountRequired") or "0"),
-        # v48.9.13-V1FIX.2: a CDP Facilititor no modo v1 lê o campo `amount`
-        # (v2) e devolve "invalid amount: " vazio sem ele. PayAI aceita o
-        # campo extra (verificado em teste local — ainda cai em
-        # insufficient_balance, não em erro de formato).
         "amount":            str(a.get("amount") or a.get("maxAmountRequired") or "0"),
         "resource":          f"{_public_base()}{endpoint}",
         "description":       _cap500(ENDPOINT_DESC.get(endpoint, f"Losbeto — {endpoint}")),
@@ -29475,25 +26541,12 @@ def _build_402(endpoint: str, price_override: float = None):  # noqa: F811 — v
     """Desafio 402 servido de memória por CHALLENGE_CACHE_TTL segundos.
     O conteúdo só muda quando o preço muda; com 22 mil sondagens/dia, montar
     o payload do zero toda vez é trabalho puro para o ranking de latência."""
-    # v47.3.1: humano em navegador recebe PÁGINA, não JSON cru. Os scanners
-    # e SDKs passam direto (o _wants_html exige UA de navegador real +
-    # Accept: text/html e exclui scanners nomeados) e o cache de desafio
-    # continua intacto para máquinas.
     try:
-        # v47.9.7 FIX CRÍTICO: a página HTML só pode sair quando o request
-        # ATUAL é para o PRÓPRIO endpoint (humano visitando /stock-quote).
-        # Sem o `request.path == endpoint`, um navegador pedindo o MANIFESTO
-        # (/.well-known/x402.json) fazia _wants_html()=True e TODO _build_402
-        # interno devolvia HTML → get_json()=None → os 93 endpoints eram
-        # pulados e o catálogo ia ao ar com resources: [] (vitrine vazia).
         if _wants_html() and request.path == endpoint:
             return app.response_class(_render_402_html(endpoint),
                                       status=402, mimetype="text/html")
     except Exception:
         pass
-    # v48.1.1 FIX CRÍTICO: desafio promocional (1ª compra reativa) NUNCA passa
-    # pelo cache — cachear vazaria o desconto para todos os visitantes por
-    # CHALLENGE_CACHE_TTL segundos e quebraria a unicidade da oferta.
     if price_override:
         return _with_manual_rail(_v46_build_402_orig(endpoint, price_override), endpoint)
     now = time.time()
@@ -29538,9 +26591,6 @@ def _v46_never_5xx_on_probe(e):
     return jsonify({"error": "internal", "ts": int(time.time())}), 500
 
 
-# ============================================================================
-# BLOCO J — A PORTA DO BAZAAR (a que nunca foi aberta)
-# ============================================================================
 
 def _base_settles() -> int:
     try:
@@ -29574,10 +26624,6 @@ def bazaar_status():
                      f"-H 'X-PAYMENT: <base64 payload, network eip155:8453>'"),
             "then": "Declare that wallet in OPERATOR_WALLETS so it is labelled honestly.",
         },
-        # v48.9.19-CATALOG: o loop da indexação fica visível aqui. Docs CDP
-        # (24/set/2026) confirmam: settle precisa de paymentPayload.resource
-        # p/ catalogar, e o header EXTENSION-RESPONSES diz se o metadata foi
-        # aceito ("processing") ou rejeitado. CDP_SEND_RESOURCE=1 liga o envio.
         "discovery_feedback": {
             "cdp_send_resource_env": bool(CDP_SEND_RESOURCE),
             "last_cdp_settle": _bazaar_ext_last(),
@@ -29591,16 +26637,6 @@ def bazaar_status():
     })
 
 
-# ============================================================================
-# BLOCO K — BACKFILL DO PIT: o arquivo deixa de nascer vazio
-# ============================================================================
-#
-#  Descoberta feliz: desde a v44.5 este nó guarda um snapshot DIÁRIO,
-#  assinado Ed25519, contendo as leituras do BCB daquele dia. Isso já é um
-#  conjunto de vintages — só não estava indexado como tal. O backfill lê os
-#  snapshots existentes em ordem cronológica e reconstrói a trilha de
-#  primeira impressão e revisões, mantendo o carimbo de observação original.
-#  Nada é inventado: cada folha vem de um payload que já estava assinado.
 
 def pit_backfill_from_archive() -> int:
     """Semeia o banco de vintages a partir do arquivo diário já assinado.
@@ -29664,8 +26700,6 @@ def pit_backfill_from_archive() -> int:
                         "SELECT seq, value, observed_ts FROM prints "
                         "WHERE series=? AND ref_date=? ORDER BY seq DESC LIMIT 1",
                         (series, ref)).fetchone()
-                    # Só avança a trilha para frente no tempo. Um snapshot mais
-                    # antigo que a última observação nunca vira "revisão".
                     if prev is not None:
                         if abs(float(prev[1]) - val) < 1e-12:
                             continue
@@ -29695,9 +26729,6 @@ def pit_backfill_from_archive() -> int:
     return n_new
 
 
-# ============================================================================
-# BLOCO L — A ENTRADA DO DESAFIO (um JSON, com a parte ruim incluída)
-# ============================================================================
 
 @app.route("/.well-known/challenge-entry.json")
 def challenge_entry_json():
@@ -29729,6 +26760,7 @@ def challenge_entry_json():
         "pay_to": ALGO_PAYTO or None,
         "facilitator": GO_FACILITATOR_URL,
         "network": ALGO_CAIP2,
+        "network_aliases": [ALGO_CAIP2, ALGO_CAIP2_FULL],
         "asset": {"usdc_asa": ALGO_USDC_ASA, "decimals": 6},
         "tag": "x402-global-challenge",
         "what_the_payment_unlocks": (
@@ -29784,16 +26816,6 @@ def challenge_entry_json():
     return jsonify(body)
 
 
-# ============================================================================
-# BLOCO M — FOCO, DE NOVO: o índice lê os primeiros itens
-# ============================================================================
-#
-#  Os endpoints mais SONDADOS eram /pyth-price, /fear-greed, /trust-hash —
-#  os mais substituíveis do catálogo, porque estavam no topo do manifest.
-#  Um índice que ranqueia por categoria vai catalogar este nó como "mais um
-#  wrapper de preço de cripto" e enterrá-lo entre milhares de iguais.
-#  Marcar a cauda como commodity não é autossabotagem: é o pilar de "clareza
-#  de contrato" que os avaliadores pontuam — e é verdade.
 
 COMMODITY_ENDPOINTS = {
     "/pyth-price": "https://hermes.pyth.network (public, free)",
@@ -29823,14 +26845,6 @@ except Exception as _e:
 
 
 
-# ============================================================================
-# BLOCO N-2 — /agents.json: a demanda que o próprio ledger revelou
-# ============================================================================
-#  O painel "asked for, not served" mostrou /agents.json pedido por 5 IPs
-#  distintos em 7 dias — o ÚNICO item sem resposta. É o padrão agents.json
-#  (wild-card-ai, v0.1.0): um contrato legível por LLM sobre o OpenAPI,
-#  com flows (o resultado que o agente quer) em vez de endpoints crus.
-#  Custa zero e transforma 404 em vitrine.
 
 _AGENTS_FLOWS = [
     {"id": "brazil-macro-asof",
@@ -29913,9 +26927,6 @@ def agents_json():
     resp.headers["Cache-Control"] = "public, max-age=3600"
     return resp
 
-# ============================================================================
-# BLOCO N — BOOT
-# ============================================================================
 
 _v46_started = False
 
@@ -29925,10 +26936,6 @@ def _v46_boot():
     if _v46_started:
         return
     _v46_started = True
-    # v46.0.3: o backfill NÃO roda mais na importação. Com --preload, todo
-    # trabalho de importação acontece ANTES do gunicorn abrir a porta —
-    # cada segundo aqui é um 502 a mais na janela do deploy. Vai para a
-    # thread pós-boot (abaixo), que roda com o nó já respondendo.
     base = _public_base()
     log.info("=" * 62)
     log.info(f"📊 LOSBETO {V46_LAYER_VERSION} — camada do avaliador ativa")
@@ -29945,9 +26952,6 @@ def _v46_boot():
         log.info(f"   ✅ {_n} liquidação(ões) em Base — elegível ao CDP Bazaar")
 
     def _warm():
-        # Fora da thread de import: _build_402 pode consultar o facilitator
-        # para descobrir o feePayer SVM, e uma chamada de rede lenta no boot
-        # atrasaria o healthcheck do Railway.
         time.sleep(25)
         try:
             pit_backfill_from_archive()
@@ -29956,8 +26960,6 @@ def _v46_boot():
         try:
             _sc = build_scorecard()
             _av = _sc.get("availability_24h", {})
-            # v46.0.3: as chaves mudaram na 46.0.2 (served_* / availability) —
-            # a linha lia os nomes antigos e logava None mesmo com dados.
             log.info(f"📊 v46 disponibilidade 24h: {_av.get('availability')} · "
                      f"servido p50={_av.get('served_p50_ms')}ms "
                      f"p95={_av.get('served_p95_ms')}ms · "
@@ -29973,124 +26975,17 @@ def _v46_boot():
     log.info("=" * 62)
 
 
-# v48.23.0-FORKSAFE: _v46_boot() saiu do import → post_fork_boot().
-
-# ============================================================================
-# FIM DA CAMADA v46
-# ============================================================================
 
 
 
-# ============================================================================
-# ============================================================================
-#  v47.0.0-PRIMITIVOS — "As máquinas compram o que elas NÃO conseguem de graça."
-# ============================================================================
-#
-#  O MISTÉRIO, RESOLVIDO
-#
-#  A pergunta era: 10.813 sondagens em 24h e US$ 0,0030 de receita orgânica.
-#  O que as máquinas procuram? Os concorrentes vendem? O quê, e por quê?
-#
-#  Eles vendem. E a resposta é embaraçosamente simples.
-#
-#  O maior vendedor curado do x402scan é o StableEnrich: ~108 mil transações
-#  em 30 dias. O catálogo dele é acesso por chamada a FullEnrich,
-#  CompanyEnrich, LeadMagic, Clado, Exa, Firecrawl, Google Maps, Serper e
-#  Whitepages, a US$ 0,10–0,28 por requisição. Um usuário de BD descreveu o
-#  valor em uma frase: torna a pesquisa de contas viável "sem precisar de uma
-#  assinatura enterprise de ZoomInfo, Apollo ou similar".
-#
-#  É isso. O produto do StableEnrich não é o dado — é o DESMEMBRAMENTO DA
-#  ASSINATURA. Ele pega APIs que exigem contrato mínimo de centenas ou
-#  milhares de dólares por mês, mais conversa comercial, mais duas semanas de
-#  onboarding, e entrega uma chamada avulsa por vinte centavos, sem conta.
-#
-#  A fórmula que decide se um endpoint x402 vende é uma só:
-#
-#      valor_para_o_agente = custo_da_alternativa_mais_barata − seu_preço
-#
-#  Aplique a este nó, honestamente:
-#
-#      /pyth-price      → alternativa: hermes.pyth.network, grátis  → valor ≤ 0
-#      /fear-greed      → alternativa: alternative.me, grátis       → valor ≤ 0
-#      /forex-rate      → alternativa: exchangerate-api, grátis     → valor ≤ 0
-#      /br-macro        → alternativa: api.bcb.gov.br, grátis       → valor ≤ 0
-#      /stock-quote     → alternativa: Finnhub free tier            → valor ≤ 0
-#
-#  Não existe assinatura para desmembrar. O nó revende o que já é público.
-#  Nenhuma quantidade de manifesto, ranking ou marketing conserta isso —
-#  e a única venda orgânica das últimas 24 horas foi US$ 0,003 em
-#  /pyth-price, que é exatamente alguém TESTANDO se o pagamento funciona.
-#
-#  O SEGUNDO MOTIVO, QUE O PRÓPRIO SCORECARD DA v46 DENUNCIOU
-#
-#      servido p50 = 2058 ms · p95 = 3752 ms
-#
-#  O desafio 402 sai em 1 ms, mas ENTREGAR o dado leva dois segundos na
-#  mediana, porque quase todo handler chama BCB, Yahoo, Finnhub ou
-#  exchangerate-api de forma síncrona no caminho da requisição. Os
-#  concorrentes que vendem rodam em Cloudflare Workers e respondem em
-#  dezenas de milissegundos. A EntRoute ranqueia por latência. Um agente
-#  dentro de um laço não espera 2 segundos por um número que ele busca de
-#  graça em 200 ms na fonte.
-#
-#  O TERCEIRO: 88 ENDPOINTS ESCRITOS PARA UM LEITOR HUMANO
-#
-#  "dossiê", "brief", "tese operacional", "conselho de cinco agentes",
-#  "relatório institucional". Isso é entregável de consultoria. Um agente
-#  não lê um brief de US$ 0,50 — ele chama a MESMA função dez mil vezes
-#  dentro de um pipeline. O que vende para máquina é primitivo:
-#  determinístico, idempotente, um verbo, um recurso.
-#
-#  O QUE A v47 CONSTRÓI
-#
-#  Quatro primitivos brasileiros que satisfazem a fórmula ao mesmo tempo em
-#  que consertam a latência, porque NÃO TÊM DEPENDÊNCIA EXTERNA NENHUMA —
-#  são computação pura, medida em 0,12 ms e 0,32 ms por chamada:
-#
-#    /br-pix-parse  decodifica e VALIDA o CRC de um BR Code (PIX EMV-MPM)
-#    /br-pix-code   gera um BR Code estático válido, com CRC16 correto
-#    /br-bizdays    dias úteis e fator 252 pelo calendário bancário ANBIMA
-#    /br-doc        validação de CNPJ e CPF por dígito verificador
-#
-#  Por que ISTO tem valor positivo pela fórmula, e /pyth-price não:
-#
-#   · Não existe fonte pública que devolva isso pronto. Existe a
-#     ESPECIFICAÇÃO — o Manual de Padrões do BACEN, a tabela de feriados da
-#     ANBIMA, a regra de módulo 11 da Receita. Implementar é 200 linhas e
-#     três armadilhas: o CRC16-CCITT/FALSE com polinômio 0x1021 e semente
-#     0xFFFF, o Carnaval e o Corpus Christi que se movem com a Páscoa, e a
-#     Consciência Negra que virou feriado nacional só em 2024. Errar
-#     qualquer uma corrompe silenciosamente um cálculo de taxa ou faz um QR
-#     ser recusado no caixa.
-#   · São idempotentes e ficam dentro de um laço — o perfil de consumo que
-#     gera 108 mil transações, não 1.
-#   · Zero upstream: sem chave, sem cota, sem 429, sem 503, sem 2058 ms.
-#     Isso é vantagem de RANKING, não só de produto: os indexadores medem
-#     latência e disponibilidade, e estes endpoints não têm como cair.
-#   · Compõem com o que já existe aqui: /br-bizdays é literalmente o
-#     denominador que o /br-curve já usa para anualizar o CDI em base 252.
-#
-#  E NÃO — isto não é o produto principal. É o degrau.
-#
-#  O arquivo point-in-time continua sendo a única coisa neste nó que
-#  ninguém pode copiar amanhã. Mas ele precisa de tempo para engordar, e
-#  precisa que alguém já tenha pagado uma vez para descobrir que este host
-#  existe e funciona. Primitivos baratos, instantâneos e infalíveis são o
-#  que faz a primeira transação acontecer. O vintage é o que faz a segunda
-#  valer US$ 0,19 em vez de US$ 0,004.
-# ============================================================================
+
 
 from datetime import date          # v47: o topo do arquivo importa datetime,
 from urllib.parse import urlencode  # timezone e timedelta, mas nao `date`.
 
 V47_LAYER_VERSION = "47.9.4-TOKENFILE"
 
-# ============================================================================
-# BLOCO O — PRIMITIVOS BRASILEIROS, COMPUTAÇÃO PURA, ZERO UPSTREAM
-# ============================================================================
 
-# ---- PIX BR Code (EMV-MPM, Manual de Padrões para Iniciação do PIX) -------
 
 def _crc16_ccitt(data: bytes) -> int:
     """CRC16-CCITT/FALSE: polinômio 0x1021, semente 0xFFFF, sem reflexão.
@@ -30126,13 +27021,10 @@ def _emv_f(tag: str, val: str) -> str:
 
 def _pix_build(key: str, name: str, city: str, amount=None,
                txid: str = "***", description: str = None, cep: str = None) -> str:
-    # v47.0.1: normaliza tudo para ASCII antes de montar (acentos em
-    # name/city/description crashavam com UnicodeEncodeError -> 500 pago).
     key = _pix_ascii(key).strip()
     name = _pix_ascii(name)
     city = _pix_ascii(city)
     description = _pix_ascii(description) if description else None
-    # txid: a norma aceita apenas [A-Za-z0-9]{1,25} ("***" = sem txid).
     if txid and txid != "***":
         txid = re.sub(r"[^A-Za-z0-9]", "", txid)[:25] or "***"
     mai = _emv_f("00", "br.gov.bcb.pix") + _emv_f("01", key)
@@ -30189,7 +27081,6 @@ def _pix_parse(code: str) -> dict:
     }
 
 
-# ---- Calendário bancário brasileiro / base 252 (ANBIMA) -------------------
 
 def _easter(y: int) -> "datetime.date":
     """Algoritmo gregoriano anônimo. Carnaval, Sexta-feira Santa e Corpus
@@ -30252,7 +27143,6 @@ def br_bizdays(a: "date", b: "date") -> int:
     return n
 
 
-# ---- CNPJ / CPF (módulo 11) -----------------------------------------------
 
 def _cnpj_valid(v: str) -> bool:
     s = re.sub(r"\D", "", v or "")
@@ -30277,7 +27167,6 @@ def _cpf_valid(v: str) -> bool:
     return True
 
 
-# ---- handlers --------------------------------------------------------------
 
 _ZERO_UPSTREAM = {"/br-pix-parse", "/br-pix-code", "/br-bizdays", "/br-doc"}
 
@@ -30555,7 +27444,6 @@ def _h_global_rates():
             "ts": ts_now, "version": VERSION}
 
 
-# ---- registro --------------------------------------------------------------
 
 _V47_PRODUCTS = {
     "/br-pix-parse": (_h_pix_parse, 0.010,  # v48.10.3: piso $0.01
@@ -30607,7 +27495,6 @@ _V47_PRODUCTS = {
         "account — USDC via x402.",
         ["GlobalMacro", "Rates", "CentralBanks", "China", "Russia", "Europe", "US"],
         {}),
-    # v48.13.0-INTEL — o primeiro produto cujo MODELO e cujos DADOS sao do node
     "/forecast": (_h_forecast, 0.050,
         "Machine-learning price forecast running entirely on this node: "
         "quantile gradient boosting (p10/p50/p90 bands) over 6h, 24h, 3d or 7d "
@@ -30617,7 +27504,6 @@ _V47_PRODUCTS = {
         "Not financial advice.",
         ["Forecast", "ML", "Crypto", "LocalModel", "QuantileBands"],
         {"symbol": "BTC", "horizon": "24h"}),
-    # v48.14.0-MONETIZE — o trafego de scanner vira produto
     "/ecosystem-pulse": (_h_ecosystem_pulse, 0.050,
         "First-party agent-traffic intelligence from this node's own request "
         "stream (~64k probes/day): most-probed endpoints with a heat score, "
@@ -30656,28 +27542,6 @@ log.info(f"🇧🇷 v47: {len(_V47_PRODUCTS)} primitivos brasileiros registrados
          "sub-milissegundo")
 
 
-# ============================================================================
-# v48.24.0-PROBEHARVEST — o tráfego de máquina vira produto e o funil vira
-# receita. Seis componentes:
-# 1) /x402-watch (pago $0.05): watch de 30 dias em QUALQUER endpoint x402 —
-#    mede agora (up/down, latência, 402, preço) e re-checa a cada 30 min;
-#    mudança de estado ou de preço dispara POST no webhook do comprador.
-#    Cliente-alvo: outros vendedores x402 vigiando a própria vitrine.
-# 2) /x402-watch-status (grátis): pull de estado pela capability URL.
-# 3) /account (grátis): portal do pagante SEM SENHA — a api_key lsk_ É a
-#    credencial (modelo OpenAI). Saldo/plano/uso/validade + top-up. Senha
-#    seria anti-padrão para comércio de máquinas e superfície de ataque.
-# 4) /.well-known/demand-teaser.json (grátis): top-3 da demanda de máquina
-#    (cache 1h) — a amostra que anuncia o /ecosystem-pulse pago. Probes já
-#    gravados são colhidos aqui em vez de apodrecer no SQLite.
-# 5) Preview pay-ready: toda amostra grátis carrega pay_link + quickstart;
-#    avaliador pesado (50+ previews/dia no MESMO endpoint) recebe oferta de
-#    créditos — NUNCA bloqueio. Veredito v44.3.0 é lei: o A/B provou que
-#    paywall de preview mata o funil (5 avaliadores/24h).
-# 6) ledger_prune_loop: probes/challenges com >8 dias são apagados (6h/6h).
-#    61k probes/dia inchavam a tabela; previews e vendas são eternos e o
-#    dashboard não perde nada (janelas dele são 24h/7d).
-# ============================================================================
 
 _WATCH_MAX = 300
 
@@ -30762,9 +27626,6 @@ def _h_x402_watch():
     if not url or not _watch_url_ok(url):
         return {"error": "pass ?url=https://... (public http/https). Optional: "
                          "&webhook=https://... for state/price change alerts."}
-    # v48.27-CORTEX: 45 watches ativos mirando https://api.example.com/endpoint
-    # — gente copiando o exemplo da doc e pagando. O watch rodava 30 dias
-    # medindo um domínio reservado pela RFC 2606. Recusa didática, sem cobrar.
     try:
         from urllib.parse import urlparse as _up
         _h = (_up(url).hostname or "").lower()
@@ -30780,8 +27641,6 @@ def _h_x402_watch():
     if webhook and not _watch_url_ok(webhook):
         return {"error": "webhook must be a public http/https URL"}
     m = _watch_measure(url)
-    # v48.24: em modo preview (amostra grátis gerada pelo paid_endpoint),
-    # entrega SÓ a medição — o watch de 30 dias exige pagamento.
     if request.args.get("preview"):
         return {"preview_demo": True, "measured_now": m,
                 "note": ("Free sample = one measurement. The paid product "
@@ -30851,7 +27710,6 @@ def x402_watch_loop():
             log.warning(f"x402_watch_loop: {e}")
         time.sleep(1800)
 
-# ── 5) preview pay-ready + nudge de avaliador pesado ────────────────────────
 def _preview_freq_24h(ip: str, path: str) -> int:
     try:
         with LEDGER._conn() as c:
@@ -30886,7 +27744,6 @@ def _preview_payready(path: str, ip: str) -> dict:
         pass
     return out
 
-# ── 6) poda do ledger: probes/challenges velhos fora, métricas intactas ─────
 def ledger_prune_loop():
     """Apaga probes/challenges402 com >8 dias a cada 6h. Previews, settles e
     vendas NUNCA são podados. O 'probes 24h' do dashboard e o '~64k probes/
@@ -30917,7 +27774,6 @@ def ledger_prune_loop():
                     time.sleep(20 * (_try + 1))
             if n:
                 log.info(f"🧹 ledger_prune: {n} probes/challenges >8d removidos")
-            # VACUUM semanal, com guarda de espaço (Railway Hobby = 5GB de volume)
             try:
                 stamp = HOME_DIR / ".last_vacuum"
                 last = float(stamp.read_text().strip()) if stamp.exists() else 0.0
@@ -30941,7 +27797,6 @@ def ledger_prune_loop():
             log.warning(f"ledger_prune_loop: {e}")
         time.sleep(6 * 3600)
 
-# ── 3) /account — portal do pagante sem senha ───────────────────────────────
 _ACCOUNT_PAGE = """<!doctype html><html><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Losbeto — Account</title>
@@ -30996,7 +27851,6 @@ def account_page():
     page = _ACCOUNT_PAGE.replace("__KEY__", safe_key).replace("__BODY__", body)
     return app.response_class(page, mimetype="text/html")
 
-# ── 4) demand-teaser — a amostra grátis que vende o /ecosystem-pulse ────────
 _TEASER_CACHE = {"ts": 0, "data": None}
 
 @app.route("/.well-known/demand-teaser.json")
@@ -31038,7 +27892,6 @@ def demand_teaser():
     _TEASER_CACHE.update({"ts": now, "data": data})
     return jsonify(data)
 
-# ── 1) registro do produto /x402-watch (padrão _V47_PRODUCTS) ───────────────
 ENDPOINT_REQUIRED_PARAMS["/x402-watch"] = {"url": "https://api.example.com/endpoint"}
 
 _V4824_PRODUCTS = {
@@ -31079,11 +27932,6 @@ log.info(f"👁 v48.24-PROBEHARVEST: /x402-watch (${BASE_PRICES.get('/x402-watch
          "/account, demand-teaser, preview pay-ready, ledger prune ativos")
 
 
-# ============================================================================
-# v48.25.0-GLOBAL (parte 2) — compliance de pagador (OFAC) + observabilidade
-# de storage. "Agentic commerce will need agentic compliance" (TRM Labs,
-# set/2026) — este nó é o primeiro do ecossistema com triagem SDN embutida.
-# ============================================================================
 
 _OFAC_PAYER_FILE = HOME_DIR / "ofac_addresses.json"
 _OFAC_PAYER_CACHE = {"ts": 0.0, "addrs": set()}
@@ -31204,15 +28052,6 @@ def admin_storage():
 log.info(f"🛡 v48.26.5-LINTP5: HEAD + payment lixo recebe 402 (não 400 didático) — fecha WARN P5 do x402lint; GET/POST intactos | 48.26.4: fix do card Chains no /dash (mapa eip155→Base/Polygon que faltou na 48.26.3) | 48.26.3: abas Human/Agent por classes (id duplicado+full-bleed mortos) · vitrine sem corte no meio da palavra e sem $49.9900 · links de conteudo legiveis · h1 balanceado · .bz eyebrow · dash/boot listam as 4 chains por flag · radar filtra app.config.js | base: 48.26.2 (uma-verdade-so de chains) (18 pontos dinamizados, Polygon/Arbitrum voltam à copy quando flag ON — prova live: X402_POLYGON=1 com eip155:137 no header v2) · badge Polygon condicional na vitrine · Prices __P_MIN__-__P_MAX__ dinâmico · Only here ganha /br-asof PIT · probe nu sempre vê 402 · 400 grátis só pré-settle · anomalia house-aware · scan-noise devops/IA")
 
 
-# ============================================================================
-# BLOCO P — A LATÊNCIA É UM PRODUTO, E AGORA É DECLARÁVEL
-# ============================================================================
-#
-#  servido p50 = 2058 ms é o número que mais custa ranking neste nó. Os
-#  primitivos acima não têm como ser lentos, e isso é verificável de fora.
-#  Declarar quais rotas não tocam a rede dá ao indexador algo que ele não
-#  consegue inferir sozinho — e dá ao agente uma garantia de SLA sem
-#  precisar confiar em nós.
 
 @app.route("/zero-upstream.json")
 def zero_upstream_json():
@@ -31243,9 +28082,6 @@ def zero_upstream_json():
     })
 
 
-# ============================================================================
-# BLOCO Q — POR QUE UM ENDPOINT VENDE (a fórmula, publicada)
-# ============================================================================
 
 @app.route("/what-agents-buy")
 def what_agents_buy():
@@ -31286,9 +28122,6 @@ def what_agents_buy():
     })
 
 
-# ============================================================================
-# BLOCO R — BOOT
-# ============================================================================
 
 def _v47_boot():
     base = _public_base()
@@ -31316,35 +28149,11 @@ def _v47_boot():
 if os.environ.get("AUTOPILOT", "1") != "0":
     _v47_boot()
 
-# ============================================================================
-# FIM DA CAMADA v47
-# ============================================================================
 
 
-# ============================================================================
-# v47.9.5-RADAR — O VENDEDOR QUE SE ABASTECE SOZINHO
-#
-# O radar de demanda original (v29.1) só AVISAVA no Telegram: "3+ IPs
-# pediram X". Esta camada FECHA O CICLO sem intervenção humana, no caso
-# seguro: quando a demanda repetida é um ALIAS (o produto existe, o cliente
-# chamou por outro nome), a rota-espelho é criada sozinha — redirect 308
-# preservando a query string —, persistida em /data e anunciada no
-# Telegram. O grito do mercado vira prateleira em até 6h.
-# Regra de ouro MANTIDA: nunca inventar dado — o auto-atendimento só
-# aponta para produtos que JÁ existem e estão no ar.
-#
-# + /br-macro-snapshot ($0.02) — a isca de volume: sweet spot $0.01–0.05 do
-#   x402, feita para farmar SUCCESSFUL_JOB_COUNT / UNIQUE_BUYER_COUNT no
-#   ranking do ACP e converter os ~26 avaliadores/dia do funil.
-# + /agent-directory.json — o catálogo que máquinas pediram (23 hits/7d).
-# + /.well-known/x402.sig — o selo Ed25519 que 11 IPs distintos procuraram.
-# + ACP: roteiro de requisitos ampliado (pediu Selic/IPCA → snapshot) e
-#   placa de graduação: conta entregas e avisa quando bater 10 jobs.
-# ============================================================================
 
 VERSION = "47.9.5-RADAR"
 
-# --- 1. /br-macro-snapshot — a isca de $0.02 --------------------------------
 
 def _br_macro_snapshot_handler():
     """As 6 séries oficiais do BCB numa chamada só, no preço de volume."""
@@ -31391,7 +28200,6 @@ ENDPOINT_HANDLERS["/br-macro-snapshot"] = _br_macro_snapshot_handler
 app.add_url_rule("/br-macro-snapshot", "br_macro_snapshot",
                  paid_endpoint("/br-macro-snapshot")(_br_macro_snapshot_handler))
 
-# --- 2. /agent-directory.json — o catálogo que as máquinas pediram ----------
 
 @app.route("/agent-directory.json")
 def agent_directory_json():
@@ -31450,7 +28258,6 @@ def agent_directory_json():
         "sla": {"delivery_max_min": 60, "uptime_target": "99.5%"},
     })
 
-# --- 3. /.well-known/x402.sig — o selo assinado do catálogo ------------------
 
 @app.route("/.well-known/x402.sig")
 def x402_sig():
@@ -31483,12 +28290,10 @@ def x402_sig():
         },
     })
 
-# --- 4. RADAR AUTO-ATENDIMENTO — aliases criados sozinhos --------------------
 
 _RADAR_ALIASES_FILE = "/data/radar_aliases.json"
 _RADAR_AUTO_IPS     = int(os.environ.get("RADAR_AUTO_IPS", "3"))
 _RADAR_MAX_ALIASES  = int(os.environ.get("RADAR_MAX_ALIASES", "60"))
-# Alvos permitidos: produto pago do catálogo OU endpoint gratuito conhecido.
 _RADAR_FREE_OK = ("/welcome", "/try", "/sample", "/health", "/ip",
                   "/receipts", "/agent-directory.json", "/losbeto-alpha",
                   "/get-pricing", "/api/v1", "/llms.txt", "/openapi.json")
@@ -31609,15 +28414,11 @@ def _radar_autofulfill_cycle() -> list:
                 continue          # já existe rota de verdade — não sombrear
             cls = _demand_classify(path)
             if cls["kind"] != "alias_candidate" or not cls["closest"]:
-                # v48.14.0: fallback SEMANTICO — o lexical nao achou nome
-                # parecido; o embedding casa pelo significado (multilingue
-                # se preciso). So aliasa rota real, limiar conservador.
                 _sem = _radar_semantic_target(path)
                 if not _sem:
                     continue      # nem significado parecido — decisao humana
                 cls = {"kind": "alias_candidate_ml", "closest": [_sem]}
             target = cls["closest"][0]
-            # _suggest_paths devolve URL absoluta — normaliza para path
             _b = _public_base()
             if target.startswith(_b):
                 target = target[len(_b):] or "/"
@@ -31635,7 +28436,6 @@ def _radar_autofulfill_cycle() -> list:
                 f"Sem código novo, sem deploy. A cereja foi plantada. 🍒")
         except Exception as e:
             log.debug(f"radar cycle {path}: {e}")
-    # poda: alias cujo caminho virou rota de verdade sai do mapa
     try:
         for p in [p for p in list(_AUTO_ALIASES) if _route_now_live(p)]:
             _AUTO_ALIASES.pop(p, None)
@@ -31683,10 +28483,7 @@ def _radar_alias_dispatch():
 
 
 _radar_alias_load()
-# v48.23.0-FORKSAFE: demand_autofulfill_loop saiu do import → nasce no worker
-# dono do flock, dentro de _start_background_once() (1x por container).
 
-# --- 5. ACP — roteiro ampliado + placa de graduação --------------------------
 
 _ACP_ENDPOINT["br-macro-snapshot"] = "/br-macro-snapshot"
 _ACP_MACRO_KW = ("selic", "ipca", "ptax", "cdi", "igpm", "juros br",
@@ -31772,29 +28569,8 @@ log.warning("🍒 v47.9.5-RADAR ativo: isca $0.02 em /br-macro-snapshot · "
             "auto-atendimento (alias em até 6h) · placa de graduação ACP")
 
 
-# ============================================================================
-# v47.9.6-VITRINE — demanda medida em produção, respondida no mesmo dia.
-# O painel de demanda mostrou (7d):
-#   · /.well-known/anvita-verification.txt — 3 IPs (marketplace Anvita quer
-#     verificar a propriedade do domínio; token via env, mesmo padrão do
-#     x402list.txt — sem token configurado responde 404 honesto)
-#   · /.well-known/agent-directory.json — 2 IPs (o catálogo no caminho
-#     well-known, convenção que os orquestradores esperam)
-#   · /healt — 2 IPs (typo clássico de /health; 308, zero custo)
-# ============================================================================
 
 VERSION = "47.9.8-NO-NONE"  # v47.9.8: corrige crashes f-string com None (CoinGecko null) no /relatorio, /analise, rag-loop e /launch-risk; redige token do Telegram nos logs de erro
-# v47.9.7-MANIFESTO — a vitrine que esvaziava sozinha:
-#   1) _build_402 (wrapper v46): página HTML de humano só quando
-#      request.path == endpoint. Antes, QUALQUER navegador pedindo o
-#      manifesto recebia resources: [] — os 93 produtos sumiam da vitrine
-#      para exatamente o público que mais avalia (humanos + indexadores
-#      com UA de browser). Reproduzido: browser→0, máquina→92.
-#   2) _resource: get_json(silent=True) + guarda — catálogo nunca mais
-#      morre por content-type.
-#   3) /.well-known/oauth-authorization-server/<sub> — RFC 8414 path
-#      suffix: clientes MCP sondavam .../mcp e levavam 404 (5 ips no
-#      ledger de demanda) → descoberta de auth morria antes da conexão.
 
 
 @app.route("/.well-known/anvita-verification.txt")
@@ -31843,45 +28619,12 @@ log.warning("🏪 v47.9.6-VITRINE: anvita-verification (env) · "
 
 
 
-# ============================================================================
-# v48.0.0-LLM-FIRST (11/set/2026) — A VERSÃO DO FATO NOVO.
-#
-# Diagnóstico (medição própria na API do x402-list, 685 serviços): o #1 do
-# ecossistema fatura ~90% de TODO o volume medido vendendo gateway de LLM
-# OpenAI-compatível via x402 — e o Losbeto JÁ tinha esse produto no ar,
-# enterrado na linha ~80 do catálogo, sem SDK, sem docs e sem guard-rails.
-# Esta versão transforma o /llm em flagship:
-#   1) GUARD-RAILS: caps beta por chave (200/dia) e global (3.000/dia),
-#      contados no SQLite do LEDGER (4 workers + restart-safe), env-tunáveis
-#      (LLM_DAILY_KEY_CAP / LLM_DAILY_GLOBAL_CAP). 429 honesto, nunca cobra
-#      quota de request rejeitado. SEM isto, o 1º comprador real derrubava
-#      o free tier do Groq/Gemini para todos.
-#   2) DESCOBERTA: GET /v1/models (shape OpenAI — SDKs chamam no boot) e
-#      GET /llm/status (telemetria pública: backends, quarentenas, caps).
-#   3) VITRINE: bloco FLAGSHIP no topo do llms.txt; cross-sell llm_gateway
-#      em TODO 402; /v1/chat/completions entra no FEATURED na posição 1;
-#      landing humana passa a liderar com o gateway.
-#   4) /.well-known/ard.json — descriptor mínimo (12 hits/7d medidos; spec
-#      pública não localizada — JSON útil em vez de 404).
-#   5) FIXES: boot-log BASE_PRICES None-safe; stats do Telegram None-safe
-#      (today/hour/total usdc).
 VERSION = "48.0.0-LLM-FIRST"
 log.warning("🚀 v48.0.0-LLM-FIRST — gateway LLM é o flagship: caps beta "
             "(%s/key, %s/global), /v1/models, /llm/status, ard.json, "
             "402 cross-sell, llms.txt LLM-first",
             LLM_DAILY_KEY_CAP, LLM_DAILY_GLOBAL_CAP)
 
-# ============================================================================
-# v48.3.9-FETCH (16/set/2026) — demanda orgânica virada produto, custo zero:
-#   1) /fetch ($0.010): o radar de 7d mostrou 22 pedidos de 2 IPs para
-#      "/fetch" — caminho que NÃO existia. Web-fetch é a primitiva mid-task
-#      clássica (ler doc, abrir link, puxar página além do cutoff do modelo).
-#      Anti-SSRF rigoroso: DNS validado em CADA salto de redirect
-#      (anti-rebinding), só IPs públicos, máx 3 redirects, 256KB, 8s.
-#      Erros são JSON honesto (url_not_allowed/fetch_failed), nunca 500 pago.
-#   2) /dashboard → 308 /dash: 50 pedidos/7d de 4 IPs procurando o painel
-#      pelo nome óbvio. Redirect gratuito, preserva query string.
-# ============================================================================
 
 _FETCH_MAX_BYTES = 256 * 1024
 _FETCH_TIMEOUT_S = 8
@@ -31993,9 +28736,6 @@ ENDPOINT_PARAM_HINTS["/fetch"] = {"url": "https://example.com"}
 _PARAM_DESC["url"] = "Public http/https URL to fetch (internal/private ranges refused)"
 ENDPOINT_HANDLERS["/fetch"] = _fetch_handler
 app.add_url_rule("/fetch", "fetch", paid_endpoint("/fetch")(_fetch_handler))
-# v48.3.9.4-PROXYFIX: /proxy é alias PAGO do /fetch (mesmo preço — o preço é o
-# filtro anti-abuso de open-proxy). Registrado aqui, DEPOIS do alvo: o loop de
-# ALIAS_ROUTES roda ~9k linhas antes e pulava este alias no boot.
 app.add_url_rule("/proxy", "alias_proxy", paid_endpoint("/fetch")(_fetch_handler),
                  methods=["GET", "POST"])
 
@@ -32008,38 +28748,6 @@ def dashboard_alias():
     return redirect(f"/dash{('?' + qs) if qs else ''}", code=308)
 
 
-# ============================================================================
-# v48.4.0-WALLETPAY (18/set/2026) — A PONTE QUE FALTA DO OUTRO LADO DO FUNIL.
-#
-# Diagnóstico do próprio node (dashboard + /receipts): 32 avaliações/24h,
-# 0 vendas/24h. E o comentário em _render_402_html já registra a causa desde
-# a v47.3.1: "Browsers cannot sign that payment, so here are your options as
-# a human" — mas a única opção oferecida a esse humano era /buy-credits, que
-# É ELA MESMA um endpoint pago via x402. Ou seja: o humano batia na mesma
-# parede duas vezes. Zero caminho de compra existia para quem chega por
-# navegador sem já ter CLI + carteira fundada configuradas fora daqui — e o
-# próprio radar de UA mostra que ~80% de quem avalia é exatamente esse humano
-# (iPhone Safari, Android, Chrome/Safari desktop).
-#
-# O que esta rota faz: usa a carteira que o humano JÁ TEM instalada no
-# navegador (qualquer provider EIP-1193 — MetaMask, Coinbase Wallet, Rabby)
-# para assinar uma autorização EIP-3009 (transferWithAuthorization) — a MESMA
-# assinatura que qualquer SDK x402 oficial (x402-fetch, AgentCash) produziria
-# — e envia exatamente o mesmo header X-PAYMENT que paid_endpoint() já sabe
-# verificar. Zero mudança no verificador, zero custódia nova, zero chave nova
-# no servidor: o domínio EIP-712 (name/version) e o contrato (asset) vêm do
-# PRÓPRIO accept que _build_402 já gera para Base — se o node mudar de
-# contrato USDC ou de rede um dia, esta página acompanha sozinha.
-#
-# Por que só Base (EVM) nesta primeira versão: EIP-3009 é uma ASSINATURA —
-# sem gas, sem blockhash, sem transação para montar, sem fee payer de
-# terceiro. O scheme "exact" da Solana exige uma transação parcialmente
-# assinada com o feePayer do facilitator (ver extra.feePayer em _build_402);
-# dá para fazer, mas testar contra o fee payer real antes de produção é
-# trabalho para outro patch. Base já é accepts[0] hoje — comentário v25.1:
-# "Base primeiro = cada venda vira uma entrada de catálogo" — então cobrir só
-# Base cobre exatamente a rota que o node já prioriza.
-# ============================================================================
 
 _PAY_BRIDGE_HTML = r"""<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
@@ -32660,17 +29368,6 @@ btn.addEventListener('click', payAndFetch);
 </script></body></html>"""
 
 
-# v48.9.6-PAYFIX — Pix Fase 0 no checkout humano (planos/bundles ≥ $0.99):
-# QR EMV gerado pelo PRÓPRIO motor /br-pix-code (_pix_build), valor em BRL
-# convertido do preço USDC pela PTAX oficial do BCB (mesmo preço, outro MÉTODO
-# — a regra do preço público único não é tocada). Ativação é manual (humano no
-# loop): cliente paga e envia o comprovante no /chat/send. Cliente Binance pode
-# pagar o QR com CRIPTO via Binance Pay→Pix (mai/2025) — recebemos BRL no banco.
-# Per-call de centavos NÃO ganha Pix (R$0,02 não cabe no rail); para esses o
-# caminho instantâneo continua sendo USDC/x402 acima.
-# v48.25.0-GLOBAL: rail Pix DESLIGADO por padrão — comércio de máquinas é
-# USDC/x402; o comprador humano brasileiro nunca converteu aqui. PIX_RAIL=1
-# reativa. Os dados do recebedor saíram do código (só via env, se reativar).
 PIX_RAIL          = os.environ.get("PIX_RAIL", "0") == "1"
 PIX_RECEIVER_KEY  = os.environ.get("PIX_RECEIVER_KEY",  "")
 PIX_RECEIVER_NAME = os.environ.get("PIX_RECEIVER_NAME", "")
@@ -32783,17 +29480,10 @@ def _pay_bridge_handler(raw_endpoint):
                          "hint": "This node's Base chain is not configured."}), 503
     price = get_dynamic_price(ep)
     desc = (ENDPOINT_DESC.get(ep, "") or "").replace('"', "&quot;")[:220]
-    # v48.18.3-PAYGUARD: a querystring da PRÓPRIA página (/pay/<ep>?doc=...)
-    # segue para a chamada paga e para o QR mobile — allowlist de caracteres
-    # (sem aspas, barra invertida ou <>) para não quebrar a string JS nem
-    # virar HTML injection.
     qs = re.sub(r"[^A-Za-z0-9._~!$&()*+,;=:@%/?-]", "",
                 request.query_string.decode("utf-8", "ignore"))[:600]
     endpoint_url = f"{_public_base()}{ep}" + (f"?{qs}" if qs else "")
     page_url = f"{_public_base()}/pay{ep}" + (f"?{qs}" if qs else "")  # v48.5.0: deep link + QR
-    # v48.18.3-PAYGUARD: cartão de parâmetros pré-preenchidos (obrigatórios
-    # de ENDPOINT_REQUIRED_PARAMS + hints opcionais de ENDPOINT_PARAM_HINTS).
-    # Só aparece quando a URL da página ainda não traz querystring.
     from html import escape as _esc
     param_card, param_fields = "", []
     if not qs:
@@ -32820,8 +29510,6 @@ def _pay_bridge_handler(raw_endpoint):
                    if any(k in (ENDPOINT_REQUIRED_PARAMS.get(ep) or {}) for k in merged)
                    else '— optional, pre-filled with an example. Edit if you like.')
                 + '</p>' + "".join(rows) + '</div>')
-    # v48.9.6: cartão Pix (somente planos/bundles — ver PIX_MIN_USD). Se a
-    # PTAX falhar, o cartão simplesmente não aparece (checkout cripto intacto).
     pix_card = ""
     if PIX_RAIL and price >= PIX_MIN_USD:
         try:
@@ -32841,10 +29529,6 @@ def _pay_bridge_handler(raw_endpoint):
                             .replace("__PIX_EMV__", emv))
         except Exception:
             pix_card = ""
-    # v48.17.6-RAILGUARD: com os DOIS facilitators em disjuntor, avisar ANTES
-    # do clique — o comprador não assina à toa e vai direto ao cartão manual,
-    # que é o rail que funciona agora (transferência comum + verificação
-    # on-chain, mesmo preço, sem facilitator).
     rails_banner = ""
     try:
         if _rails_facilitator_down():
@@ -32880,11 +29564,6 @@ def _pay_bridge_handler(raw_endpoint):
                             ua=request.headers.get("User-Agent", ""), params={})
     except Exception:
         pass
-    # v48.16.3-NOCACHE: o checkout NUNCA pode vir do cache do navegador.
-    # JS de pagamento defasado = payload rejeitado no facilitator (aconteceu
-    # no teste pos-deploy 01/10 20:16 BRT: aba aberta antes do deploy rodou o
-    # JS ANTIGO sem o campo "accepted" -> PayAI invalid_payload). Sem header,
-    # o browser aplica cache heuristico; no-store forca o JS atual a cada visita.
     r = app.response_class(html, mimetype="text/html")
     r.headers["Cache-Control"] = "no-store"
     return r
@@ -32894,39 +29573,6 @@ app.add_url_rule("/pay/<path:raw_endpoint>", "pay_bridge", _pay_bridge_handler,
                   methods=["GET"])
 
 
-# ============================================================================
-# v48.7.0-CIRCLE (19/set/2026) — CANAL DE DISTRIBUIÇÃO NOVO, AUSENTE DO
-# CHECKLIST ATÉ AGORA: a Circle (emissora do USDC) lançou em 09/set/2026 o
-# Agent Marketplace — catálogo curado + sanctions-screened, com Discovery API
-# pública (api.circle.com/v2/x402/discovery/resources) e vitrine em
-# agents.circle.com/services (600+ serviços em 15+ chains no lançamento).
-# Nenhum dos diretórios já perseguidos pelo checklist v27 (x402scan,
-# awesome-x402, AgentCash, MCPay, Nevermined) é este — é um catálogo
-# DIFERENTE, mais novo, com a marca mais forte do ecossistema (é a emissora
-# da moeda que todo mundo aqui já usa) atrás dele.
-#
-# A inscrição é hoje um formulário revisado por humano (a própria Circle diz
-# que o self-serve automático "está chegando"), então esta rota não submete
-# nada sozinha — mas monta exatamente os campos que o formulário pede
-# (endpoint, wallet de recebimento já sanctions-screenable, OpenAPI spec,
-# descrição) para o preenchimento levar 2 minutos em vez de uma volta pela
-# documentação inteira.
-# ============================================================================
-# ============================================================================
-# v48.9.0-TOOLKIT (19/set/2026) — "BECOME THE DEFAULT": a pesquisa de
-# distribuição mostrou que quem vende não espera ser descoberto — já está
-# instalado onde o agente vive (a Apify levou 20.000+ Actors para dentro do
-# x402 de uma vez, 10x o catálogo do protocolo). Duas superfícies novas,
-# zero dado inventado (tudo derivado de BASE_PRICES/ENDPOINT_DESC em runtime):
-#   1) /.well-known/function-schemas.json — schemas de function-calling
-#      (formato OpenAI tools[] E formato Anthropic) prontos para colar, da
-#      MESMA lista curada que virou os módulos CrewAI/AutoGen do pacote
-#      losbeto-tools (PyPI) — os dois lados nunca dessincronizam.
-#   2) /.well-known/x402-bazaar (+ alias .json) — a ficha de identidade
-#      curta no formato observado no ecossistema (GoldBean serve este path;
-#      Conflux o usa para verificar agentes): nome, versão, chains/moedas
-#      aceitas e a faixa de preço REAL computada de BASE_PRICES em runtime.
-# ============================================================================
 _FUNCTION_SCHEMA_ENDPOINTS = [
     ("/br-brief",              "losbeto_brazil_brief",         []),
     ("/br-macro",              "losbeto_brazil_macro",         []),
@@ -32942,8 +29588,6 @@ _FUNCTION_SCHEMA_ENDPOINTS = [
     ("/wallet-scan",           "losbeto_wallet_scan",          ["address"]),
 ]
 
-# Prefixos de plano/pacote — NÃO são preço por chamada (para a faixa honesta
-# do x402-bazaar: per-call min/max exclui assinaturas e pacotes de crédito).
 _PLAN_PREFIXES = ("/buy-credits", "/subscribe", "/day-pass", "/week-pass",
                   "/founding-agent", "/enterprise")
 
@@ -33055,14 +29699,6 @@ def x402_bazaar_wellknown():
 
 
 
-# ---------------------------------------------------------------------------
-# v48.9.5 — /.well-known/agent-skills/index.json (Cloudflare Agent Skills
-# Discovery RFC v0.2.0). 10 req / 5 IPs em 7d, e o Agent Readiness score da
-# Cloudflare (e o Glippy) CHECAM este path. O radar tinha criado um alias da
-# rota para /founding-agent (402) — pior que 404: o RFC diz que redirect para
-# página errada quebra o instalador. Rota real agora; o alias se aposenta
-# sozinho (_route_now_live vence no dispatcher e a poda remove em ate 6h).
-# ---------------------------------------------------------------------------
 _AGENT_SKILL_MD = """---
 name: losbeto-x402
 description: How to discover, preview for free, and pay for any of the 86 machine-payable data endpoints on the Losbeto x402 node (api.losbeto.xyz). Use when a task needs crypto/finance/Brasil data, web search, or LLM synthesis paid per-call with USDC via the x402 protocol.
@@ -33123,8 +29759,6 @@ def circle_listing_helper():
     base = _public_base()
     return jsonify({
         "submit_at": "https://developers.circle.com/agent-stack/agent-marketplace/get-listed",
-        # v48.8: o intake REAL é este Google Form (extraído do HTML da página
-        # acima em 19/set/2026) — a doc page só explica os pré-requisitos.
         "intake_form": "https://forms.gle/7YFzvdmMcn1JH5tF6",
         "verify_listing_after_approval":
             "https://api.circle.com/v2/x402/discovery/resources?query=losbeto",
@@ -33144,12 +29778,7 @@ def circle_listing_helper():
             "openapi_url": f"{base}/openapi.json",
             "payout_wallet_address": BASE_PAYTO_EVM,
             "network": "base",
-            # v48.8: categoria no ENUM real da Discovery API (não em prosa) —
-            # valores válidos: SOCIAL_INTELLIGENCE, FINANCIAL_ANALYSIS,
-            # WEB_SEARCH_RESEARCH, PREDICTION_MARKETS, CREATIVE, INFRASTRUCTURE.
             "category": "FINANCIAL_ANALYSIS",
-            # v47.4.1: o mesmo limite de 100 chars que o MCP Registry oficial
-            # já exige — reaproveitado aqui, não é coincidência de tamanho.
             "short_description": ("Cross-asset market data for AI agents: forex, "
                                    "equities, Brazil macro (BCB/B3), crypto."),
             "contact": "via /chat/send (Telegram do operador) ou GitHub do repositório",
@@ -33160,28 +29789,6 @@ def circle_listing_helper():
     })
 
 
-# ============================================================================
-# v48.1.0-REACTIVE (11/set/2026) — o nó que REAGE para não perder a venda:
-#   1) Escada de desconto em tempo real: 3º 402 sem pagar (mesmo IP+endpoint,
-#      24h) → 1 desafio a 50% (piso $0.001), 1x/dia, settle fecha no preço
-#      promocional via _challenge_remember (v39).
-#   2) Freemium do flagship: GET /llm/free (128 tokens, 5/dia por IP,
-#      200/dia global) — o padrão OpenRouter aplicado ao x402.
-#   3) Concierge de integração com IA: GET /integrate?q=... (cap 30/dia,
-#      fallback estático se a cadeia LLM estiver em quarentena).
-# ============================================================================
-# v48.8.0-ADCOPY (19/set/2026) — "EVERY 402 IS AN AD": achado da pesquisa de
-# conversão machine-to-machine (systemprompt.io + análise dos vendedores que
-# faturam: BlockRun, x402Vendor, os top-sellers do Bazaar): o agente comprador
-# lê UMA string antes de decidir pagar — o "error" do 402. Até aqui o nosso
-# corpo 402 era rico mas NÃO tinha esse campo: preço e CTA ficavam escondidos
-# em accepts/upsell que muitos clientes não renderizam. Agora cada um dos
-# ~15,4 mil probes/dia recebe o anúncio completo: preço exato, prova grátis
-# (?preview=1), 1 call real grátis (/welcome) e planos a partir de $0.99.
-# E o /circle-listing ganha o form de intake REAL + categoria no ENUM da
-# Discovery API — os dois bloqueadores práticos que restavam para o canal
-# Circle. Código pronto; o resto desta semana é SUBMISSÃO MANUAL, não feature.
-# ============================================================================
 VERSION = "48.9.20-LINT"  # → CHANGELOG.md
 VERSION = "48.9.21-CONCIERGE"  # → CHANGELOG.md
 VERSION = "48.9.22-GREET"  # → CHANGELOG.md
@@ -33189,8 +29796,6 @@ VERSION = "48.9.23-BAZAARFIX"  # → CHANGELOG.md
 VERSION = "48.9.26-WKSLIM"  # → CHANGELOG.md
 VERSION = "48.9.27-PRICESYNC"  # → CHANGELOG.md
 VERSION = "48.9.28-TRANSPARENCY"  # → CHANGELOG.md
-# (v48.8.0: 402 "error" vira anúncio de 1 linha · /circle-listing com form real + enum real
-# (v48.7.0: GET /circle-listing (campos prontos p/ o Agent Marketplace da Circle, lançado 09/set/2026 … (→ CHANGELOG.md)
 log.warning("🧠 v48.2.0-SMART — preço de tabela fixo + First-Call Bonus pós-compra · "
             "/llm/free (freemium %s/dia) · /integrate (concierge IA)",
             LLM_FREE_PER_DAY)
@@ -33231,11 +29836,6 @@ log.warning("🎟 v48.17.5-ENTITLED — parser do coletor cobre 'Not entitled' (
 log.warning("🔑 v48.17.7-KEYLANE — lane autenticada PayAI (JWT Ed25519 via PAYAI_API_KEY_ID/SECRET: settles debitam créditos da conta, imunes ao pool grátis LIFETIME que não reseta) · boot valida a chave e desliga sem derrubar · facilitators.payai.auth no /health/providers · log do disjuntor distingue pool-vs-conta")
 
 
-# --- v48.5.0-FUNIL: /blog/ e /login — gaps medidos pelo radar ---------------
-# /blog/ tinha 62 req/7d (maioria com rest_route=/batch/v1 = scanner de
-# WordPress, mas o 404 não nos servia nada) e /login 9 req/7d (agentes
-# procurando auth). Responder 200 útil converte scanner em avaliador e
-# explica o modelo: sem conta — o pagamento É a credencial.
 
 @app.route("/blog/")
 @app.route("/blog")
@@ -33291,13 +29891,6 @@ def login_info():
         "version": VERSION}), 200
 
 
-# --- v48.6.0-REGISTER — a porta do playbook SaaS das máquinas ----------------
-# Demanda medida pelo radar (7d): /register 17 req/3 IPs · /auth/callback 14/2 ·
-# /signup 11/3 — agentes rodando o playbook clássico de API (achar endpoint →
-# "registrar" → receber key) e levando 404. A resposta x402-nativa: conta não
-# existe, o pagamento É a credencial. Mas se o playbook EXIGE uma key, ela se
-# compra aqui: POST /register cobra o MESMO pacote de /buy-credits ($0.99 →
-# $1.25 de saldo, +25%) e devolve a key no corpo. Registrar = comprar a entrada.
 def _register_doc():
     base = _public_base()
     return {
@@ -33330,14 +29923,8 @@ def register_info():
 
 @app.route("/auth/callback", methods=["GET", "POST"])
 def auth_callback_info():
-    # Sonda de OAuth esperando troca de código por token. Não há OAuth aqui —
-    # mesma resposta do /login (JSON para máquina, 302→/pricing para navegador).
     return login_info()
 
-# A "matrícula": POST paga o pacote de entrada e devolve a key. Reusa a máquina
-# de créditos já provada em produção (emissão idempotente por tx + Telegram).
-# O 402 descreve /buy-credits de propósito: é LITERALMENTE o mesmo produto na
-# mesma tabela pública — outra porta, zero preço especial.
 app.add_url_rule("/register", "register_paid",
                  paid_endpoint("/buy-credits")(_credits_purchase_handler("/buy-credits")),
                  methods=["POST"])
@@ -33345,8 +29932,6 @@ app.add_url_rule("/signup", "signup_paid",
                  paid_endpoint("/buy-credits")(_credits_purchase_handler("/buy-credits")),
                  methods=["POST"])
 
-# RFC 9116 — o hermes-contact-discovery (456 hits/24h) e scanners enterprise
-# procuram isto; sem a rota, essa atenção virava 404 e ruído no radar.
 @app.route("/.well-known/security.txt")
 @app.route("/security.txt")
 def security_txt():
@@ -33361,13 +29946,6 @@ def security_txt():
     return r
 
 
-# ---------------------------------------------------------------------------
-# v48.9.16-SELLER — AGENT ECONOMY REPORT: claim por controle de domínio.
-# O serviço envia UM token por host e o verifica DIARIAMENTE nesta rota, nos
-# DOIS hosts (api.losbeto.xyz e o host railway). Tokens NUNCA no repo: chegam
-# por Railway Variables (AGENT_ECONOMY_TOKEN_API / AGENT_ECONOMY_TOKEN_RAILWAY).
-# Sem token configurado a rota responde 404 seco — nunca um token inventado.
-# ---------------------------------------------------------------------------
 _AGENT_ECONOMY_HOST_ENV = {
     "api.losbeto.xyz": "AGENT_ECONOMY_TOKEN_API",
     "losbeto-production-dd7c.up.railway.app": "AGENT_ECONOMY_TOKEN_RAILWAY",
@@ -33379,24 +29957,14 @@ def agenteconomy_verify():
     env_name = _AGENT_ECONOMY_HOST_ENV.get(host)
     token = (os.environ.get(env_name, "") if env_name else "").strip()
     if not token and host:
-        # host customizado futuro: tenta o token do domínio principal como
-        # fallback SOMENTE se for alias conhecido do mesmo serviço.
         token = ""
     if not token:
         return ("not configured\n", 404, {"Content-Type": "text/plain; charset=utf-8"})
     r = app.response_class(token + "\n", mimetype="text/plain")
-    # o verificador relê todo dia; cache curto p/ não atrasar uma rotação.
     r.headers["Cache-Control"] = "public, max-age=60"
     return r
 
 
-# ---------------------------------------------------------------------------
-# v48.9.16-SELLER — /config.js (radar: 13 IPs sondaram, "not built").
-# Agentes e SDKs procuram um descriptor machine-readable de bootstrap na raiz.
-# Servimos JS válido que TAMBÉM é JSON embutido (window.LOSBETO_CONFIG = {...})
-# e o espelho /config.json puro. Aponta para TODAS as portas de descoberta e
-# para o pagamento — é o índice dos índices. Cache 5 min (muda com deploy).
-# ---------------------------------------------------------------------------
 def _losbeto_config_dict() -> dict:
     base = _public_base()
     return {
@@ -33460,14 +30028,6 @@ def config_json():
     return r
 
 
-# ---------------------------------------------------------------------------
-# v48.17.0-RADAR — /auth.json (demanda medida: 8 IPs/7d tomavam 404). Agentes
-# seguem o playbook "procurar o descriptor de auth na raiz" (estilo OAuth
-# discovery). Num node x402 a resposta honesta: NÃO HÁ login — o pagamento É
-# a credencial. Reusa _register_doc() para a verdade ser UMA só em /login,
-# /register, /config.js e aqui — nunca dessincroniza. Grátis: descoberta não
-# se vende, ela vende.
-# ---------------------------------------------------------------------------
 @app.route("/auth.json")
 def auth_json_descriptor():
     doc = _register_doc()
@@ -33478,14 +30038,6 @@ def auth_json_descriptor():
     return r
 
 
-# ---------------------------------------------------------------------------
-# v48.17.0-RADAR — /app.js (demanda medida: 8 IPs/7d). Avaliadores e agentes
-# procuram o bundle JS do serviço na raiz (o mesmo instinto de /config.js).
-# Entregamos um mini-SDK REAL, zero dependências, que roda em browser e Node
-# 18+: catalog/preview/payUrl/welcome/health/fetchPaid/creditsUrl. Grátis de
-# propósito — SDK é porta de entrada, não produto. __VERSION__ é resolvido a
-# cada render (5min de cache), então o SDK nunca mente a versão do nó.
-# ---------------------------------------------------------------------------
 _APP_JS = """/* ==========================================================================
    Losbeto mini-SDK (node v__VERSION__) — https://api.losbeto.xyz
    Zero-dependency client for the x402 payment node. Browser and Node 18+.
@@ -33557,25 +30109,6 @@ def app_js_sdk():
 
 VERSION = "48.17.9-AINEWS"  # → CHANGELOG.md
 VERSION = "48.17.10-FUNNEL"  # → CHANGELOG.md
-# ---------------------------------------------------------------------------
-# v48.17.12-BESTBACK — /api/v1/best RESSUSCITADO + CHAINS DINÂMICAS
-# (1) /api/v1/best estava listado no x402-list mas 404 — rota morta degradava
-#     o badge público ("degraded", visto 06/10). Em vez de remover do listing,
-#     o produto volta MELHOR: concierge pago do catálogo ($0.01). ?task= em
-#     linguagem natural → busca semântica local (MiniLM ONNX, rerank cross-
-#     encoder quando ativo, fallback palavra-chave) elege o endpoint certo; a
-#     resposta traz preço, amostra grátis, link /pay e as co-compras REAIS do
-#     ledger (quem pagou X também pagou Y). Sem ?task= devolve o ranking dos
-#     mais vendidos 30d do próprio ledger — prova social auditável em /receipts.
-# (2) Textos "Base + Solana + Algorand" hardcoded na landing e no /pay viram
-#     dinâmicos (__CHAINS__): Base+Solana[+Algorand][+Polygon][+Arbitrum]
-#     conforme as flags X402_* — o site nunca mais anuncia rail errada.
-# ---------------------------------------------------------------------------
-# v48.26.2-LANDING: _chains_list/_chains_text (e os novos _chains_csv/_or/
-# _and/_md/_networks) moram junto às flags X402_* no topo do arquivo —
-# consumidores import-time (ENDPOINT_DESC, terms, concierge) precisam deles
-# antes desta linha. Definição única, zero duplicata.
-# ---------------------------------------------------------------------------
 
 
 def _api_v1_best_handler():
@@ -33623,7 +30156,6 @@ def _api_v1_best_handler():
                                  "leaves the node."),
                 "ts": int(time.time()), "version": VERSION}
 
-    # sem ?task= → ranking dos mais vendidos (30d), prova social do ledger
     try:
         corte = int(time.time()) - 30 * 86400
         with LEDGER._conn() as c:
@@ -33660,11 +30192,6 @@ app.add_url_rule("/api/v1/best", "api_v1_best",
                  paid_endpoint("/api/v1/best")(_api_v1_best_handler))
 log.info("🧭 /api/v1/best registrado ($0.01) — concierge semântico do catálogo")
 
-# v48.18.1-MERGE (da 48.17.15) — radar 7d: /mcp/sse (6req/5ip; transporte MCP
-# legado), /keys.json (6/3) e /auth/login (6/3; ambos majoritariamente scanners
-# de credencial — o radar v48.18.0 agora os filtra do relatório, mas o 402 aqui
-# converte o probe em vitrine para quem for agente de verdade). NUNCA servir
-# /vendor/composer/installed.json: scanner de vulnerabilidade PHP, fica 404.
 for _alias in ("/mcp/sse", "/keys.json", "/auth/login"):
     if _alias not in app.view_functions and not any(r.rule == _alias for r in app.url_map.iter_rules()):
         app.add_url_rule(
@@ -33681,19 +30208,6 @@ VERSION = "48.17.12-BESTBACK"  # → CHANGELOG.md
 
 VERSION = "48.17.13-SHELFSYNC"  # → CHANGELOG.md
 
-# ---------------------------------------------------------------------------
-# v48.17.14-REALCALL — /agent-call CONSERTADO DE VERDADE (roteia E executa)
-# Pedido do operador (06/10): "não é possível consertar o GET /agent-call?"
-# em vez de só escondê-lo dos catálogos (48.17.13). Diagnóstico: o design
-# original dependia de peers A2A externos — supply inexistente (spec v1.0
-# estável, mas registries públicos ainda em beta; descoberta real é URL
-# direta) — e, mesmo com peer, só devolvia o agent-card. O fix transforma o
-# endpoint em roteador semântico que EXECUTA o melhor endpoint do PRÓPRIO
-# catálogo dentro do teto anti-arbitragem (preço ≤ o pago na chamada), com
-# estorno automático (v48.10.2) em qualquer não-entrega. Com a dependência
-# estrutural morta, o gate de vendabilidade saiu e o endpoint volta a todos
-# os catálogos de máquinas por conta própria (_sellable_now → True).
-# ---------------------------------------------------------------------------
 ENDPOINT_PARAM_HINTS["/agent-call"] = {"task": "check if this token is a rug pull",
                                        "endpoint": "/rugcheck"}
 log.info("🤖 /agent-call REALCALL: roteador semântico que EXECUTA o endpoint "
@@ -33714,34 +30228,10 @@ VERSION = "48.26.5-LINTP5"  # → CHANGELOG.md
 if __name__ == "__main__":
     cli()
 else:
-    # Importado pelo gunicorn do Railway (`nexus_omega:app`). v48.23.0-FORKSAFE:
-    # NENHUM loop sobe mais no import — com --preload o import roda no arbiter
-    # e threads criadas aqui viravam locks herdados travados no fork. O boot
-    # acontece em post_fork_boot() (hook post_fork do start.sh; fallback na
-    # 1ª request de cada worker via @app.before_request).
     pass
 
-# v48.18.0-REGISTRY: (1) dashboard: manchete e conversão passam a ser ORGÂNICAS (o bruto incl. operador fica rotulado) | (2) radar de demanda … (→ CHANGELOG.md)
-# v48.18.1-MERGE: merge auditado de dois patches sobre a 48.17.14 — ver nexus_omega_v48_18_1.md
 
 
-# ============================================================================
-# v48.27.0-CORTEX — CAMADA DE INTELIGÊNCIA NATIVA
-#
-# Read-only sobre o ledger e os modelos já treinados. Zero dependências
-# novas, zero custo de boot, nenhum caminho de pagamento tocado.
-#
-#   GET /ml/insights — o cérebro do nó num JSON público e assinado:
-#     · roteamento LLM aprendido (bandit) e quarentenas ativas
-#     · conversão por endpoint (sondagem→avaliação→venda) com score Wilson
-#     · tendência de demanda por endpoint (regressão linear, 14d)
-#     · BACKLOG DE PRODUTO: o que as máquinas pediram e não existe (404 real,
-#       ≥3 IPs distintos, ruído de scanner filtrado pelo classificador ML)
-#       mapeado para o endpoint existente mais próximo (busca semântica)
-#     · saúde dos modelos: forecast, anomaly detector, demand classifier
-#   Loop diário (flock de 1 worker): digest Telegram com o que mudou.
-#   CORTEX_DIGEST=0 desliga o digest; o endpoint é sempre público.
-# ============================================================================
 
 CORTEX_TTL = float(os.environ.get("CORTEX_TTL", "120"))
 _CORTEX_CACHE = {"ts": 0.0, "data": None}
@@ -33777,8 +30267,6 @@ def _cortex_conversion(days: int = 7, limit: int = 15) -> dict:
                 "SELECT endpoint, COUNT(*) FROM requests WHERE ts>? "
                 "AND kind='preview' AND " + _DEMAND_UA_SQL +
                 " GROUP BY endpoint", (d,)).fetchall())
-            # Somente clientes externos: testes do operador e sweeps não são
-            # evidência de conversão para o Cortex nem para o planner.
             sales, _organic_rev = _v4843_organic_sales_by_endpoint(days)
     except Exception as e:
         return {"error": str(e)[:80]}
@@ -33820,8 +30308,6 @@ def _cortex_demand_trend(days: int = 14, top: int = 8) -> list:
         return [{"error": str(e)[:80]}]
     per = defaultdict(lambda: defaultdict(int))
     for ep, day, n in rows:
-        # v48.27.1-FIX: o dict interno plain quebrava com KeyError no primeiro
-        # insert — o teste local passava porque o ledger de teste estava vazio.
         per[ep][int(day)] += n
     out = []
     for ep, days_map in per.items():
@@ -34038,19 +30524,6 @@ log.info("🧠 v48.27.0-CORTEX ativo — /ml/insights público e assinado · "
 VERSION = "48.27.0-CORTEX"  # → CHANGELOG.md
 
 
-# ============================================================================
-# v48.27.1-BATCH — /batch: N consultas do catálogo em UMA round-trip
-#
-# O recurso que Exa e Nansen têm e ninguém do pelotão oferece: agente de
-# orçamento faz UMA compra on-chain (créditos) e executa até 20 chamadas
-# por request, com débito atômico por item e reembolso automático de item
-# que falhar (delivery-or-refund, mesma regra do caminho de créditos).
-#
-# Auth: X-API-Key (créditos). Sem chave → 401 didático com os links de
-# compra (o per-call x402 continua existindo em cada endpoint individual).
-# Teto por item: BATCH_MAX_ITEM_PRICE (default $0.10) — batch é camada de
-# descoberta/volume; produtos premium seguem 1 chamada cada.
-# ============================================================================
 
 BATCH_MAX_CALLS = int(os.environ.get("BATCH_MAX_CALLS", "20"))
 BATCH_ITEM_CAP  = float(os.environ.get("BATCH_MAX_ITEM_PRICE", "0.10"))
@@ -34166,7 +30639,6 @@ def batch_endpoint():
         return jsonify({"error": f"max {BATCH_MAX_CALLS} calls per batch",
                         "received": len(calls)}), 400
 
-    # validação + preço total ANTES de debitar qualquer item
     items, total = [], 0.0
     for c in calls:
         p = c["path"]
@@ -34261,28 +30733,6 @@ log.info("📦 v48.27.1-BATCH: /batch registrado — até "
 
 VERSION = "48.27.1-BATCH"  # → CHANGELOG.md
 
-# ============================================================================
-# v48.28.0-AUTONOMOUS — AUTO-CONSCIÊNCIA OPERACIONAL (control plane vivo)
-#
-# O padrão mais sofisticado de automação em produção hoje: o LLM PROPÕE,
-# a POLÍTICA DETERMINÍSTICA VALIDA, o HUMANO APROVA pelo Telegram — e as
-# mudanças entram em vigor SEM DEPLOY, porque o estado operacional vive em
-# /data (control plane), lido por mtime em todos os workers.
-#
-#   error-watch : reembolsos demais em 1h → endpoint sai da vitrine sozinho
-#                 (503 honesto + fora dos catálogos via _sellable_now) e
-#                 RETOMA sozinho quando a sonda passa (backoff até 6h).
-#   llm-planner : a cada 6h lê o cortex vivo e propõe ações de uma whitelist.
-#                 Ação cujo alvo não está na telemetria real = alucinação =
-#                 descartada. Alias seguro auto-aplica (mesmo padrão do
-#                 radar); preço/pausa/produto novo viram botões no Telegram.
-#   /ops        : ok/no/pause/resume/price — o operador governa por mensagem.
-#   Auditoria   : toda decisão (automática ou humana) vai para ops_audit e
-#                 para /ops/log (DASH_TOKEN); resumo público em /ops/status.
-#
-# Flags: OPS_AGENT=0 desliga o loop · OPS_LLM=0 desliga o planner ·
-#        OPS_PAUSE_MIN_REFUNDS (3) · OPS_CYCLE_S (900) · OPS_LLM_EVERY_S (21600)
-# ============================================================================
 
 OPS_AGENT = os.environ.get("OPS_AGENT", "1") != "0"
 OPS_LLM = os.environ.get("OPS_LLM", "1") != "0"
@@ -34389,7 +30839,6 @@ def _ops_pending():
             if isinstance(v, dict) and v.get("status") == "pending"}
 
 
-# ---------------------------------------------------------------- auditoria --
 def _ops_audit(actor, action, target="", detail=None, status="applied"):
     """Append-only. Falha de lock NUNCA derruba o chamador — auditoria é
     importante, mas a loja continuar vendendo é mais."""
@@ -34433,7 +30882,6 @@ def _ops_audit_recent(n=10):
         return []
 
 
-# ------------------------------------------------------------- pausa/retomo --
 def _ops_pause(endpoint, reason, by, refunds_1h=0, cooldown_s=None):
     cd = int(cooldown_s or OPS_PAUSE_COOLDOWN_S)
     now = int(time.time())
@@ -34513,7 +30961,6 @@ def _ops_resume_sweep():
             log.debug(f"ops resume sweep {ep}: {e}")
 
 
-# v48.28.0 — o hook de vendabilidade agora consulta o control plane.
 _SELLABILITY_BLOCK_ORIG = _sellability_block
 
 
@@ -34544,7 +30991,6 @@ def _sellability_block(path):
         return None
 
 
-# ------------------------------------------------------------- error-watch --
 def _ops_error_watch():
     """O termômetro de entrega: reembolso = cobramos e NÃO entregamos. Um
     endpoint que reembolsa mais do que entrega deixa de vender na hora —
@@ -34588,7 +31034,6 @@ def _ops_error_watch():
             log.debug(f"ops error-watch {ep}: {e}")
 
 
-# --------------------------------------------------------------- executor ---
 def _ops_target(action):
     return str(action.get("endpoint") or action.get("path") or "")
 
@@ -34598,8 +31043,6 @@ def _ops_apply(action, actor):
     k = action.get("action")
     if k == "create_alias":
         path, target = str(action["path"]), str(action["target"])
-        # Revalida no momento da aplicação: uma proposta pendente pode ter
-        # ficado obsoleta ou sido criada antes de uma regra anti-scanner.
         if not _radar_safe_path(path) or _route_now_live(path):
             return False, "path inseguro, scanner ou rota já atendida"
         if path in _AUTO_ALIASES:
@@ -34692,8 +31135,6 @@ def _ops_validate(action, candidates):
         if abs(np_ - cur) < 0.0005:
             return False, "sem variação real"
         action["new_price"] = round(np_, 4)
-        # PRICE_AUTO=1 → o price-advisor já tem trava semanal própria; aqui
-        # o LLM segue a mesma flag. Default: humano aprova.
         return True, ("auto" if PRICE_AUTO else "approval")
     if k == "pause_endpoint":
         ep = str(action.get("endpoint", ""))
@@ -34721,7 +31162,6 @@ def _ops_validate(action, candidates):
     return False, "ação fora da whitelist"
 
 
-# -------------------------------------------------------------- propostas ---
 def _ops_describe(action):
     k = action.get("action")
     why = TelegramBot.esc(str(action.get("reason", ""))[:220])
@@ -34750,7 +31190,6 @@ def _ops_propose(action, by):
     _OPS_PROPOSALS["items"][str(pid)] = {
         "action": action, "by": str(by)[:24],
         "ts": int(time.time()), "status": "pending"}
-    # higiene: guarda só as últimas 60 propostas
     items = _OPS_PROPOSALS["items"]
     if len(items) > 60:
         for old in sorted(items, key=lambda i: items[i].get("ts", 0))[:-60]:
@@ -34814,7 +31253,6 @@ def _ops_proposals_expire():
         _ops_proposals_save()
 
 
-# ------------------------------------------------------------- llm-planner --
 _BUILD_CORTEX_ORIG = build_cortex
 
 
@@ -34964,7 +31402,6 @@ def _ops_llm_planner():
                 f"{proposed} propostas, {len(notes)} notas")
 
 
-# ----------------------------------------------------------------- Telegram --
 def _ops_tg_status():
     paused = _ops_paused()
     pend = _ops_pending()
@@ -35086,7 +31523,6 @@ def _tg_handle_with_ops(self, msg):
 TelegramBot._handle = _tg_handle_with_ops
 
 
-# --------------------------------------------------------------- HTTP ops ---
 @app.route("/ops/status")
 def ops_status_public():
     paused = _ops_paused()
@@ -35129,7 +31565,6 @@ def ops_log_private():
     })
 
 
-# ------------------------------------------- build_cortex ganha bloco ops ---
 def build_cortex():
     """v48.28.0: /ml/insights passa a publicar o estado operacional autônomo
     (pausas, propostas, decisões recentes) — assinado como o resto."""
@@ -35160,7 +31595,6 @@ def build_cortex():
     return brain
 
 
-# ------------------------------------------------------------- loop agente --
 def ops_agent_loop():
     """Ciclo da auto-consciência. Roda SÓ no worker dono do flock (registrado
     via _start_background_once). Tudo aqui é best-effort: uma exceção em
@@ -35216,33 +31650,7 @@ log.warning("🤖 v48.28.0-AUTONOMOUS ativo — auto-pausa por reembolso · "
 
 VERSION = "48.28.0-AUTONOMOUS"  # → CHANGELOG.md
 
-# ============================================================================
-# v48.29.0-SALESMIND — A LOJA QUE FECHA A VENDA
-#
-# Objetivo único: converter sondagem em venda e nunca perder a venda por
-# atrito. Cinco peças:
-#
-#   1. Telegram em linguagem natural — "sim", "pode adicionar", "confirmei"
-#      agora APLICAM as propostas pendentes do ops-planner (antes só /ops ok N
-#      funcionava; 3 propostas ficaram penduradas em produção por causa
-#      disso). Keywords PT/EN + classificador de intenção via LLM para
-#      mensagens curtas fora do vocabulário. Reply de visitante passa intacto.
-#   2. /models e /v1/models GRÁTIS — a convenção OpenAI que as máquinas
-#      procuram antes de comprar inference (backlog nº 1 do cortex). Shape
-#      OpenAI + stats AO VIVO do bandit por provedor + caminho de compra.
-#      O menu é grátis; a refeição (/llm) é paga.
-#   3. Captura de demanda well-known: /.well-known/openapi.json → 308 →
-#      /openapi.json · /mcp/.well-known/agent.json → 308 →
-#      /.well-known/agent.json (o radar não pode aliasar .well-known).
-#   4. 402 CLOSER — no desafio de sondador repetido: cheaper_alternatives
-#      (mesma categoria, preço menor, vendável agora) e bundle_offer
-#      (≥3 endpoints sondados em 1h → /batch + créditos). accepts[]/preços
-#      intocados — conformidade x402lint preservada.
-#   5. Boot: stagger do warm ML alargado (4–40s) — fim do WORKER TIMEOUT 120s
-#      por contenção de GIL no deploy.
-# ============================================================================
 
-# ------------------------------------------------ 1. Telegram linguagem natural
 _OPS_YES_WORDS = ("sim", "ok", "pode", "confirma", "confirmo", "confirmei",
                   "aprova", "aprovo", "aprovado", "yes", "apply", "manda",
                   "adiciona", "adicionar", "bora", "go", "aceito", "aceita",
@@ -35317,10 +31725,6 @@ def _tg_handle_salesmind(self, msg):
 TelegramBot._handle = _tg_handle_salesmind
 
 
-# ---------------------------------- 2. /models — o cardápio OpenAI do nó ----
-# Nota: /v1/models JÁ EXISTE no nó (shape {"backends": ...}, do gateway
-# OpenAI-compatible). Aqui nasce o /models puro — o caminho que o backlog
-# mostra as máquinas pedindo (convenção OpenAI clássica).
 @app.route("/models")
 def models_catalog():
     """Backlog nº 1 das máquinas (convenção OpenAI). Grátis de propósito:
@@ -35379,7 +31783,6 @@ def models_catalog():
     })
 
 
-# ------------------------------ 3. captura well-known (backlog real) --------
 @app.route("/.well-known/openapi.json")
 def _wk_openapi_capture():
     from flask import redirect as _r
@@ -35392,7 +31795,6 @@ def _wk_mcp_agent_capture():
     return _r("/.well-known/agent.json", code=308)
 
 
-# ------------------------------------------------- 4. 402 CLOSER ------------
 _REACTIVE_402_ORIG = _reactive_402
 _CLOSER_IP_CACHE = {}
 _CLOSER_MIN_PRICE = float(os.environ.get("CLOSER_MIN_PRICE", "0.10"))
@@ -35495,23 +31897,7 @@ log.warning("🏪 v48.29.0-SALESMIND ativo — /models+/v1/models grátis com st
 
 VERSION = "48.29.0-SALESMIND"  # → CHANGELOG.md
 
-# ============================================================================
-# v48.29.1-SWEEP — HIGIENE DO LOOP AUTÔNOMO
-#
-# Em produção (12/out 23:43) o planner repropôs /models e as duas capturas
-# well-known 4 minutos DEPOIS delas entrarem no ar: o backlog do cortex olha
-# o histórico de 7 dias de notfound e não sabia que a rota já existia. As 3
-# propostas viraram 6 e iam continuar duplicando a cada 6h. Quatro correções:
-#   1. backlog filtra rotas vivas (mesmo juiz do radar: _route_now_live);
-#   2. proposta pendente cujo alvo já tem rota vira 'superseded' no ciclo de
-#      15 min, com auditoria e aviso no Telegram;
-#   3. _ops_propose deduplica (mesma ação+alvo pendente reutiliza o id);
-#   4. /models: x_live.bandit_quarantined (a quarentena de exploit do bandit)
-#      ao lado de .quarantined (disjuntor de indisponibilidade) — eram dois
-#      conceitos com o mesmo nome.
-# ============================================================================
 
-# ------------------------------------------------- 1. backlog honesto -------
 _CORTEX_BACKLOG_ORIG = _cortex_backlog
 
 
@@ -35534,7 +31920,6 @@ def _cortex_backlog(days: int = 7, min_ips: int = 3, limit: int = 12) -> list:
     return out
 
 
-# ------------------------------------ 2. sweep de propostas obsoletas -------
 _OPS_PROPOSALS_EXPIRE_ORIG = _ops_proposals_expire
 
 
@@ -35572,7 +31957,6 @@ def _ops_proposals_expire():
     return _OPS_PROPOSALS_EXPIRE_ORIG()
 
 
-# ------------------------------------------------------- 3. dedupe ----------
 _OPS_PROPOSE_ORIG = _ops_propose
 
 
@@ -35590,7 +31974,6 @@ def _ops_propose(action, by):
     return _OPS_PROPOSE_ORIG(action, by)
 
 
-# --------------------------- 4. /models: as DUAS quarentenas nomeadas -------
 _MODELS_CATALOG_ORIG = app.view_functions.get("models_catalog")
 
 
@@ -35623,34 +32006,6 @@ log.info("🧹 v48.29.1-SWEEP ativo — backlog só com demanda não atendida ·
 
 VERSION = "48.29.1-SWEEP"  # → CHANGELOG.md
 
-# ============================================================================
-# v48.30.0-BUNDLE — REPLY QUE ENTENDE + O BUNDLE QUE VENDE
-#
-# Dois buracos medidos em produção (12-13/out):
-#
-#   1. TELEGRAM — o operador RESPONDIA (arrastava reply) a proposta do planner
-#      com "Sim"/"Yes" e recebia "⚠ não é reply de visitante mapeada": o
-#      wrapper da 48.29 pulava qualquer mensagem com reply_to_message e o
-#      handler original só conhecia o mapa visitante↔sessão. A prova estava
-#      no export do chat: duas confirmações perdidas. Agora o reply passa por
-#      TRÊS mapas em ordem — visitante (intocado) → proposta mapeada (o
-#      message_id da PROPOSTA passa a ser capturado no envio e persistido no
-#      registro) → intenção sobre as pendentes (fallback da 48.29). Responder
-#      "sim" numa proposta aplica EXATAMENTE ela; sem mapa, aplica/recusa o
-#      conjunto pendente como a 48.29 já fazia; sem pendência nenhuma, o aviso
-#      didático original permanece.
-#
-#   2. /bundle ($0.20, BUNDLE_PRICE) — o bundle_offer do closer vira produto:
-#      um pagamento x402 único devolve 2-5 endpoints do catálogo numa só
-#      resposta. Explícito (?paths=/a,/b,/c — validação antes da execução,
-#      rejeitados listados com motivo, menos de 2 válidos = erro completo e o
-#      wrapper v48.10.2 estorna 100%) ou AUTOMÁTICO (sem paths: top endpoints
-#      sondados pelo PRÓPRIO IP do comprador em 7d, com fallback para um set
-#      utilitário elegível). Falha de item válido = estorno parcial
-#      proporcional em crédito; transparência de valor (preço somado à la
-#      carte vs. do bundle) em toda resposta. Preço FIXO — P6 price-integrity
-#      intocada: o desafio 402 não depende dos parâmetros.
-# ============================================================================
 
 BUNDLE_PRICE     = float(os.environ.get("BUNDLE_PRICE", "0.20"))
 BUNDLE_MAX_ITEMS = int(os.environ.get("BUNDLE_MAX_ITEMS", "5"))
@@ -35659,7 +32014,6 @@ BUNDLE_BUDGET_S  = float(os.environ.get("BUNDLE_BUDGET_S", "25"))
 _BUNDLE_EXCLUDED = ("/batch", "/bundle", "/starter-pack")
 
 
-# -------------------------------- 1. Telegram: reply que entende -------------
 
 def _tg_send_capture_buttons(text, buttons):
     """sendMessage COM botões que DEVOLVE o message_id (o TG_BOT.send é
@@ -35785,9 +32139,6 @@ def _tg_handle_opsreply(self, msg):
                         f"🤖 Há {len(pend)} proposta(s) pendente(s): responda "
                         "`sim`/`não`, toque nos botões ✅/❌ ou use `/ops ok <n>`.")
                 return
-            # v48.31.1: reply sim/não SEM nenhuma pendência — feedback
-            # explícito em vez de cair no aviso genérico de visitante (o
-            # operador respondia e achava que "nada aconteceu").
             _toks = set(re.findall(r"[a-zà-ÿ]+", text.lower()))
             if _toks & (set(_OPS_YES_WORDS) | set(_OPS_NO_WORDS)):
                 self.send(chat_id,
@@ -35802,7 +32153,6 @@ def _tg_handle_opsreply(self, msg):
 TelegramBot._handle = _tg_handle_opsreply
 
 
-# ------------------------------------------------ 2. /bundle -----------------
 
 def _bundle_eligible(path):
     """O que pode entrar num bundle: endpoint pago real, com handler, vendável
@@ -35869,9 +32219,6 @@ def _h_bundle():
     want = [("/" + p.lstrip("/")) for p in want if p and p.strip()]
     seen = set()
     want = [p for p in want if not (p in seen or seen.add(p))]
-    # parâmetros compartilhados: tudo que não é a lista de paths vale para
-    # todos os itens (ex.: ?paths=/pyth-price,/stock-quote&symbol=SOL);
-    # defaults didáticos (ENDPOINT_PARAM_HINTS) preenchem o que faltar.
     shared = {k: v for k, v in body.items()
               if k not in ("paths", "endpoints")}
 
@@ -36006,7 +32353,6 @@ app.add_url_rule("/bundle", "bundle_checkout",
                  methods=["GET", "POST"])
 
 
-# ------------------------- 3. closer: bundle_offer aponta o produto real ----
 _REACTIVE_402_4829 = _reactive_402
 
 
@@ -36036,27 +32382,6 @@ log.warning("🧺 v48.30.0-BUNDLE ativo — Telegram reply entende proposta "
 
 VERSION = "48.30.0-BUNDLE"  # → CHANGELOG.md
 
-# ============================================================================
-# v48.30.1-GLAMA — O NÓ FALA MCP NA RAIZ + REIVINDICAÇÃO GLAMA + BACKLOG
-#
-#   1. /.well-known/glama.json — prova de propriedade do diretório Glama
-#      (1,6M visitas/mês): JSON público com o token de claim (estável, ligado
-#      à conta Glama do operador; o Glama re-verifica DIARIAMENTE — o arquivo
-#      precisa ficar no ar para sempre). Token via env GLAMA_CLAIM_TOKEN, com
-#      default = o token emitido em 13/out/2026 (ele é público por desenho).
-#   2. POST / com corpo JSON-RPC agora fala MCP — o health check do Glama
-#      (e de qualquer diretório) aponta para a RAIZ do domínio e tomava 405:
-#      era por isso que o listing marcava "Unhealthy, 0.0% over 57 days" com
-#      o /mcp 100% funcional. GET / (a landing) intocado; POST não-JSON-RPC
-#      segue com 405 didático.
-#   3. Três itens do backlog real (planner 13/out): /model → 308 /models,
-#      /api/v1/ping → 308 /health, e /facilitator/supported passa a servir os
-#      "kinds" x402 que o nó aceita (a convenção que os clientes x402 sondam;
-#      respondido com honestidade: este nó é vendedor, não facilitator).
-#   4. Boot: stagger do warm ML 10-100s (no deploy da 48.30.0 os 4 warms
-#      colidiam no 1º minuto — 2 WORKER TIMEOUT, auto-recuperado) e gunicorn
-#      --timeout 120→180 no start.sh (folga para o warm mais lento).
-# ============================================================================
 
 GLAMA_CLAIM_TOKEN = os.environ.get(
     "GLAMA_CLAIM_TOKEN", "glama_claim_nua5scf5vqDbdZIIQbou_IXqJPw1leCT")
@@ -36076,12 +32401,9 @@ def glama_claim_file():
         mimetype="application/json")
 
 
-# a rota /.well-known/glama.json já existia (manifest_glama, v46) — troca-se
-# a view mantendo o path exato que o verificador do Glama consulta:
 app.view_functions["manifest_glama"] = glama_claim_file
 
 
-# -------------------------------- POST / fala MCP ----------------------------
 def _root_post_mcp():
     """Diretórios (Glama, Smithery, scanners caseiros) testam o servidor MCP
     POSTando `initialize` na RAIZ do host. Antes: 405 → 'Unhealthy 0.0%'."""
@@ -36105,7 +32427,6 @@ def _root_post_mcp():
 app.add_url_rule("/", "root_mcp_rpc", _root_post_mcp, methods=["POST"])
 
 
-# --------------------------------- backlog real ------------------------------
 @app.route("/model")
 def _alias_model_singular():
     from flask import redirect as _r
@@ -36152,34 +32473,6 @@ log.warning("🛡 v48.30.1-GLAMA ativo — /.well-known/glama.json (claim do "
 
 VERSION = "48.30.1-GLAMA"  # → CHANGELOG.md
 
-# ============================================================================
-# v48.31.0-FACTORY — A FÁBRICA DE PRODUTOS: CRIAR SEM DEPLOY
-#
-# O degrau final de autonomia. Até aqui o loop autônomo pausava, retomava,
-# precificava e aliasava sem deploy — mas PRODUTO NOVO exigia código. Agora
-# o planner (ou o operador, via /ops) transforma um item do backlog real em
-# endpoint pago EM MINUTOS, sem tocar no Railway:
-#
-#   backlog real (7d de notfound) → LLM propõe factory_product {path, price,
-#   desc, upstream https sem chave, params, pick} → guardrails determinísticos
-#   (path seguro, preço $0.005-0.05, upstream https fora de host próprio/IP
-#   interno, desc 20-280, ≤6 params, anti-alucinação: path TEM que estar no
-#   backlog) → operador aprova no Telegram (botão ou reply "sim") → SONDA DE
-#   CRIAÇÃO executa a chamada real ao upstream — falhou, o produto MORRE ali
-#   → aprovado: entra em /data/factory_products.json e TODOS os workers
-#   enxergam por mtime-reload (mesmo padrão dos aliases do radar): nasce em
-#   BASE_PRICES/ENDPOINT_DESC/ENDPOINT_HANDLERS → aparece sozinho em
-#   get-pricing, openapi, manifesto x402, /api/for-you, recommended_next,
-#   /batch e /bundle → cobra via paid_endpoint normal (402, settle, funnel,
-#   preview grátis, delivery-or-refund, error-watch auto-pausa se reembolsar
-#   demais). Pausa/retomada/preço usam os comandos /ops de sempre.
-#
-#   + warm de boot SERIALIZADO (flock /data/ml_warm.lock, 1 worker por vez,
-#   espera máx 6min senão pula — o lazy async cobre): fim da classe WORKER
-#   TIMEOUT de boot (1 ocorrência auto-recuperada no deploy da 48.30.1).
-#   + backlog de 13/out: /api/supported → /facilitator/supported,
-#   /api/status → /health, /api/chat → /.well-known/agent.json (308).
-# ============================================================================
 
 _FACTORY_FILE = HOME_DIR / "factory_products.json"
 _FACTORY = {"mtime": 0.0, "items": {}, "owned": set()}
@@ -36215,7 +32508,6 @@ def _factory_upstream_ok(url):
             if not _ip_is_public(ip):
                 return False, "IP interno"
         except ValueError:
-            # v48.34.0: hostname → resolve e exige TODOS os IPs públicos
             if not _host_resolves_public(host, u.port or 443):
                 return False, "host resolve para IP não-público"
         return True, "ok"
@@ -36297,8 +32589,6 @@ def _make_factory_handler(path):
                 params[k] = str(v)[:120]
         ok, out = _factory_fetch(spec, params)
         if not ok:
-            # dict com "error" → wrapper v48.10.2 estorna 100% e o error-watch
-            # pausa o produto sozinho se ele reembolsar mais do que entrega.
             return {"error": "upstream_failed", "detail": str(out)[:200],
                     "endpoint": path}
         from urllib.parse import urlparse
@@ -36327,7 +32617,6 @@ def _factory_reload(force=False):
         live = {p: s for p, s in items.items()
                 if isinstance(s, dict) and s.get("status") == "live"
                 and _FACTORY_PATH_RE.match(p)}
-        # remove o que morreu/saiu do ar (só entradas que a fábrica possui)
         for p in list(_FACTORY["owned"]):
             if p not in live:
                 for d in (BASE_PRICES, ENDPOINT_DESC, ENDPOINT_HANDLERS,
@@ -36368,7 +32657,6 @@ def _factory_dispatch():
         return None
 
 
-# ------------------------- integração com o ops planejador --------------------
 _OPS_VALIDATE_48301 = _ops_validate
 
 
@@ -36470,7 +32758,6 @@ def _ops_describe(action):
     return _OPS_DESCRIBE_48301(action)
 
 
-# ------------------------- warm serializado (boot limpo) ----------------------
 def _ml_boot_warm_serialized():
     """1 worker aquecendo por vez (flock em /data): 4 loads ONNX+sklearn
     simultâneos seguiam derrubando 1 worker por deploy mesmo com a janela
@@ -36513,7 +32800,6 @@ def _ml_boot_warm_serialized():
             pass
 
 
-# ----------------------------- backlog 13/out ---------------------------------
 @app.route("/api/supported")
 def _alias_api_supported():
     from flask import redirect as _r
@@ -36540,16 +32826,6 @@ log.warning("🏭 v48.31.0-FACTORY ativo — produtos novos SEM deploy (backlog 
             "serializado · 3 aliases do backlog")
 
 VERSION = "48.31.0-FACTORY"  # → CHANGELOG.md
-# ============================================================================
-# v48.31.1-IDENTITY — DESCRITORES DE IDENTIDADE (demanda real do radar)
-# ============================================================================
-# Radar 14/out (7d): /actions.json (17 pedidos · 5 IPs),
-# /.well-known/solana.txt (17 · 5) e /.well-known/atproto-did (17 · 5) —
-# demanda "not built" REAL. São descriptors ESTÁTICOS de identidade, não
-# wrappers de upstream: a factory não os cobre. Servidos grátis (verificação
-# de identidade exige acesso livre), com CORS e cache público, registrados
-# no sitemap + llms.txt. /catalog (404 até aqui, com link no /live) vira o
-# catálogo-máquina canônico em JSON.
 
 
 @app.route("/actions.json", methods=["GET", "OPTIONS"])
@@ -36645,16 +32921,6 @@ log.warning("🔧 v48.31.2-PAYTO ativo — solana.txt passa a servir o "
             "desafio e a divergencia derrubava a checagem")
 
 VERSION = "48.31.2-PAYTO"  # → CHANGELOG.md
-# ============================================================================
-# v48.31.3-DISCOVERY — O PATH QUE OS AGENTES BAZAAR RASTREIAM
-# ============================================================================
-# Radar 15/out: /x402/discovery/resources e /v2/x402/discovery/resources —
-# 5 IPs distintos cada (7d) tomando 404 didático. É o path da Discovery API
-# do ecossistema x402 (api.circle.com/v2/x402/discovery/resources): agentes
-# Bazaar-compatíveis rastejam exatamente ele para montar o índice de
-# vendedores. Agora servem o catálogo REAL no schema discovery (items[].accepts
-# com payTo/asset/network por chain, paginado) — grátis, CORS aberto.
-# /ads.txt (proposta #21, 5 IPs) — IAB: vendedor direto, sem intermediários.
 
 
 @app.route("/x402/discovery/resources")
@@ -36696,13 +32962,14 @@ def x402_discovery_resources():
             "extra": {"name": "USDC", "version": "2"},
         })
         if ENABLE_ALGO:
-            accepts.append({
-                "scheme": "exact", "network": ALGO_CAIP2,
-                "maxAmountRequired": micro, "resource": url,
-                "description": desc, "mimeType": "application/json",
-                "payTo": ALGO_PAYTO, "asset": ALGO_USDC_ASA,
-                "maxTimeoutSeconds": 300,
-            })
+            for algo_network in (ALGO_CAIP2, ALGO_CAIP2_FULL):
+                accepts.append({
+                    "scheme": "exact", "network": algo_network,
+                    "maxAmountRequired": micro, "resource": url,
+                    "description": desc, "mimeType": "application/json",
+                    "payTo": ALGO_PAYTO, "asset": ALGO_USDC_ASA,
+                    "maxTimeoutSeconds": 300,
+                })
         items.append({
             "resource": url, "type": "http", "x402Version": 2,
             "accepts": accepts, "lastUpdated": now_iso,
@@ -36742,18 +33009,6 @@ log.warning("🛰 v48.31.3-DISCOVERY ativo — /x402/discovery/resources (+/v2/)
             "(proposta #21) · sitemap/llms/catalog registram")
 
 VERSION = "48.31.3-DISCOVERY"  # → CHANGELOG.md
-# ============================================================================
-# v48.31.4-TGPROOF — O TELEGRAM AGORA DEIXA RASTRO (E SE AUTO-CURA)
-# ============================================================================
-# O operador responde "sim" e reporta silêncio; a cadeia passa 8/8 em
-# simulação. Sem rastro de inbound em produção, ninguém prova nada — então:
-# (1) TODA mensagem inbound vira log INFO + ring buffer em /data/tg_inbox.json
-#     com a classificação do destino, visível em /ops/log;
-# (2) WEBHOOK GUARD: webhook fantasma é a causa clássica de polling 100%
-#     mudo — getWebhookInfo no arranque e a cada ~6h, remove e avisa;
-# (3) "sim 17"/"não 17" decide a proposta exata SEM reply;
-# (4) proposta parada >24h ganha re-ping consolidado (botões por proposta,
-#     tg_msg_id fresco recapturado) — a fila nunca mais morre enterrada.
 
 _TG_INBOX_FILE = HOME_DIR / "tg_inbox.json"
 _TG_REMINDER_FILE = HOME_DIR / "ops_reminder.json"
@@ -36823,7 +33078,6 @@ def _tg_handle_proof(self, msg):
 TelegramBot._handle = _tg_handle_proof
 
 
-# ---------------------------------------------------------- webhook guard ----
 def _tg_webhook_guard():
     """Webhook setado = polling mudo para sempre (updates iam para uma URL
     morta). Se houver, remove e avisa — auto-cura da falha de silêncio."""
@@ -36851,7 +33105,6 @@ def _tg_webhook_guard():
     return False
 
 
-# ----------------------------------------------------- lembrete 24h -----------
 def _ops_reminder_once():
     """Uma passada do lembrete: proposta mais antiga >24h parada → re-ping
     consolidado (máx 3) com botões e tg_msg_id fresco. Máx 1x a cada 12h."""
@@ -36936,18 +33189,6 @@ log.warning("📨 v48.31.4-TGPROOF ativo — toda mensagem inbound vira log + "
 VERSION = "48.31.4-TGPROOF"  # → CHANGELOG.md
 
 
-# ============================================================================
-# v48.31.5-BOTPING — O CANAL SE AUTO-TESTA A CADA DEPLOY
-# ============================================================================
-# Diagnóstico 15/out: infra 100% limpa (polling único via flock, webhook guard
-# sem fantasma, zero 409/401, inbox gravando TUDO) e inbox VAZIO desde o boot —
-# ou seja: nenhuma mensagem do operador chegou ao getUpdates. Em vez de esperar
-# a próxima proposta para testar, o próprio boot agora entrega um alvo de
-# teste: mensagem com botão 🏓 (callback = prova de vida mesmo em grupo com
-# privacy mode, pois botão da própria msg do bot sempre chega) + reply `ok` na
-# mensagem de boot (reply a msg do bot também fura privacy mode) + comando
-# `/ops ping` (comandos sempre chegam). Três caminhos independentes — se NENHUM
-# registrar no tg_inbox, o problema é fora do código (token/chat errado).
 
 _TG_BOOT_FILE = HOME_DIR / "tg_boot.json"
 
@@ -36979,7 +33220,6 @@ def _tg_boot_ping():
         log.warning(f"boot ping: {e}")
 
 
-# ---- /ops ping (comando fura privacy mode de grupos) -----------------------
 _OPS_TG_CMD_48314 = _ops_tg_command
 
 
@@ -36994,7 +33234,6 @@ def _ops_tg_command(bot, msg, text):  # noqa: F811 — camada 48.31.5
     return _OPS_TG_CMD_48314(bot, msg, text)
 
 
-# ---- reply à mensagem de boot = pong (nunca decide proposta) ---------------
 _TG_HANDLE_48314 = TelegramBot._handle   # camada proof (grava inbox)
 
 
@@ -37026,7 +33265,6 @@ def _tg_handle_botping(self, msg):
 TelegramBot._handle = _tg_handle_botping
 
 
-# ---- boot ping no arranque (worker dono do flock) ---------------------------
 _START_BG_48315 = _start_background_once
 
 
@@ -37048,23 +33286,6 @@ log.warning("🏓 v48.31.5-BOTPING ativo — a cada deploy o Telegram recebe uma
             "se nada registrar no tg_inbox, o problema é fora do código")
 
 
-# ============================================================================
-# v48.31.6-AUTOPILOT — CONSCIÊNCIA DE DESISTÊNCIA (decide quando você some)
-# ============================================================================
-# Medido em produção: 9+ propostas (#13–#25) giraram em propose→expira→repropõe
-# sem nunca registrar decisão — o planner gastava o orçamento de 3 propostas
-# por ciclo repetindo os MESMOS alvos (/vip ×2, /rate ×2, /price ×2,
-# /x402/supported já com alias). Regra nova: mesma ação+alvo expirou
-# OPS_AUTO_AFTER_EXPIRY× (default 2 = ~4 dias + lembretes + botões) sem
-# resposta → o planner APLICA em vez de propor a 3ª vez. Guardrails intactos:
-#   • só classes de risco limitado: adjust_price (passo ±30%, faixa MIN/MAX,
-#     ENV-pin respeitado), queue_product (wishlist — nada vai ao ar),
-#     resume_endpoint (sonda obrigatória no resume);
-#   • factory_product JAMAIS auto-aplica (cria endpoint pago real — humano);
-#   • pause_endpoint JAMAIS (quem pausa é o error-watch);
-#   • OPS_AUTO_AFTER_EXPIRY=0 desliga (modo 100% manual).
-# E o backlog do planner para de oferecer paths que já têm alias no ar —
-# fim das propostas #24 (/x402/supported já servido).
 
 OPS_AUTO_AFTER_EXPIRY = int(os.environ.get("OPS_AUTO_AFTER_EXPIRY", "2") or 2)
 _OPS_AUTO_CLASSES = frozenset({"adjust_price", "queue_product",
@@ -37101,19 +33322,6 @@ log.warning("🔁 v48.31.6-AUTOPILOT ativo — proposta segura expirada "
             "tem alias no ar")
 
 
-# ============================================================================
-# v48.31.7-BUNDLEWATCH — O ESTORNO AGORA TEM NOME (E O CULPADO SAI DA VITRINE)
-# ============================================================================
-# Medido em produção (16/out): 2 estornos parciais de $0.04 em /bundle sem
-# nenhuma linha de log dizendo QUAL item falhou — o operador via o estorno
-# mas não o produto problemático. Agora:
-#   (1) cada item falho do bundle vira WARNING nomeado (/ep + motivo + contagem);
-#   (2) contador por endpoint em /data/bundle_item_fails.json (janela 24h);
-#   (3) ≥2 falhas em 24h → o endpoint sai da AUTO-seleção de bundle (compra
-#       explícita via ?paths= continua — quem pediu nominalmente recebe a
-#       tentativa + estorno se falhar) e o Telegram avisa 1× por path/janela;
-#   (4) a linha do estorno lista os culpados: "culpados: /x, /y".
-# Auto-cura sem deploy: endpoint ruim para de ser empacotado até se provar.
 
 _BUNDLE_FAIL_FILE = HOME_DIR / "bundle_item_fails.json"
 _BUNDLE_FAIL_WINDOW_S = 24 * 3600
@@ -37165,20 +33373,6 @@ log.warning("🧺 v48.31.7-BUNDLEWATCH ativo — item falho de bundle nomeado no
             "log · ≥2 falhas/24h sai da auto-seleção · Telegram avisa 1×/path")
 
 
-# ============================================================================
-# v48.31.8-AUTOPICK — AUTO-SELEÇÃO SÓ COM DEFAULTS QUE ENTREGAM DE VERDADE
-# ============================================================================
-# Causa-raiz medida dos estornos $0.04 em /bundle (16/out): o auto-pick
-# escolhia /x402-watch pelo histórico de probes do IP e executava com o
-# DEFAULT da doc (url=https://api.example.com/endpoint); o produto recusa
-# domínio de documentação com 200+{"error":...} (v48.27) → o juiz do bundle
-# marcava "não entregou" e estornava. O produto NÃO estava quebrado — o
-# parâmetro era lixo. Regra nova: endpoint cujo default (ENDPOINT_PARAM_HINTS
-# ou exemplo de _PARAM_REQUIRED) aponta p/ example.com/.org/.net NÃO entra na
-# AUTO-seleção (compra explícita via ?paths= continua livre). Exceções que
-# ENTREGAM com o default doc (computação pública do domínio IANA): /fetch,
-# /br-pix-code — ficam selecionáveis. /agent-call (target=peer.example.com)
-# sai da auto-seleção pelo mesmo critério.
 
 _BUNDLE_AUTOPICK_ALLOW = frozenset({"/fetch", "/br-pix-code"})
 _BUNDLE_DOC_HOSTS = ("example.com", "example.org", "example.net")
@@ -37212,39 +33406,6 @@ log.warning("🎯 v48.31.8-AUTOPICK ativo — auto-seleção de bundle ignora "
             "fail-note de error-200 explicativo")
 
 
-# ============================================================================
-# v48.31.9-MEMORY — O PLANNER AGORA LEMBRA O QUE VOCÊ DECIDIU
-# ============================================================================
-# Medido em produção (16-19/out): a MESMA pergunta voltava a cada 6h no
-# Telegram — /site/ 7× (#30,42,45,46,49,52,56), /press/ 6×, /news/ 5×,
-# /vip 3×, /notice 2×. Causa-raiz tripla:
-#   (1) o dedupe de _ops_propose só olha propostas PENDENTES — depois de
-#       aplicada/recusada/expirada, o planner recebia a mesma telemetria 6h
-#       depois e sugeria de novo; (2) queue_product aprovada cai numa fila
-#       que nada consumia → a demanda seguia "não atendida" → loop eterno;
-#   (3) a higiene de 60 itens do ops_proposals.json apagava o histórico.
-# Correções:
-#   1. MEMÓRIA DE DECISÃO persistente (/data/ops_decisions.json, 500 regs,
-#      sobrevive a restart e à higiene): toda transição terminal (applied /
-#      rejected / expired / superseded) vira registro com action+target+ts.
-#   2. _ops_propose ganha SUPRESSÃO determinística: já na fila de produto →
-#      nunca repropõe; recusada → 30d; aplicada → até 30d por classe; rota
-#      viva → nunca; factory expirada → 7d; adjust_price é CONSCIENTE DE
-#      PREÇO — a escada /pyth-price 0.010→0.008→0.006 segue livre, só morre
-#      a repetição idêntica.
-#   3. O PROMPT do planner recebe a memória e a fila de produto: o LLM para
-#      de sugerir o decidido e pode transformar fila em factory_product —
-#      o caminho que o /price provou (fila → fábrica → NO AR = endpoint 119).
-#   4. /ops status lista a fila de produto (o que já foi aprovado e espera).
-#   5. WATCHDOG DE WATCH ZUMBI: alvo com http 0 (DNS/conexão) em 48 ciclos
-#      seguidos (~24h) → watch cancelado + aviso 1× (o w_y5hQL0zbp-qq
-#      apontado p/ api.example.com poluía o log a cada 31 min desde 16/out).
-#   6. SWEEP HONESTO: sem chave no servidor (não-custodial), o aviso agora
-#      diz a verdade 1×/dia com instrução de resgate — nada de "solicitado".
-#   7. Threads /council e br-paridade daemon=True — sobrevivente de
-#      join(timeout) não segura o teardown do worker (classe dos WORKER
-#      TIMEOUT/SIGABRT de 18/out nos recycles por max-requests).
-# ---------------------------------------------------------------- memória ---
 
 _OPS_DECISIONS_FILE = HOME_DIR / "ops_decisions.json"
 
@@ -37336,7 +33497,6 @@ def _ops_decision_suppress(action):
     return False, ""
 
 
-# -------------------------------------------------- gravação das decisões ---
 _OPS_APPLY_48318 = _ops_apply
 
 
@@ -37390,7 +33550,6 @@ def _ops_proposals_expire():  # noqa: F811 — camada 48.31.9
     return out
 
 
-# ------------------------------------------------------- supressão no ponto ---
 _OPS_PROPOSE_48318 = _ops_propose
 
 
@@ -37409,7 +33568,6 @@ def _ops_propose(action, by):  # noqa: F811 — camada 48.31.9
     return _OPS_PROPOSE_48318(action, by)
 
 
-# ------------------------------------------------------- memória no prompt ---
 def _ops_planner_memory_text():
     """Resumo das decisões + fila de produto — o LLM para de sugerir o que
     já foi decidido e vê o que pode virar fábrica."""
@@ -37434,7 +33592,6 @@ def _ops_planner_memory_text():
         return ""
 
 
-# ------------------------------------------------------- fila visível no /ops
 _OPS_TG_STATUS_48318 = _ops_tg_status
 
 
@@ -37456,7 +33613,6 @@ def _ops_tg_status():  # noqa: F811 — camada 48.31.9
     return txt
 
 
-# ------------------------------------------------------- watchdog de zumbi ---
 _WATCH_ZERO_FILE = HOME_DIR / "x402_watch_zero.json"
 _WATCH_ZERO_MAX = int(os.environ.get("WATCH_ZERO_EXPIRE", "48") or 48)
 
@@ -37498,7 +33654,6 @@ def _watch_zero_track(wid, url, http, now):
         log.debug(f"watch zero track: {e}")
 
 
-# ------------------------------------------------------------- sweep honesto --
 _SWEEP_NAG_FILE = HOME_DIR / "sweep_nag.json"
 
 
@@ -37531,50 +33686,9 @@ log.warning("🧠 v48.31.9-MEMORY ativo — planner com memória de decisão "
 
 
 
-# ============================================================================
-# v48.32.0-ZEROWARN — revisão geral 19/out (operador: "estornos + botões
-# mortos + 2 WARN no x402lint + saldo que não aparece")
-#
-# Diagnóstico fechado com logs + on-chain + relatório fresco do x402lint:
-#
-#  1. ESTORNOS BR (/br-macro, /br-curve, /br-archive → auto-pausa 14:34 UTC):
-#     o BCB estava parcialmente FORA (série PTAX devolvendo 502, Selic viva) —
-#     <2 séries vivas = 503 = estorno; e o snapshot diário abortou 18 e 19/out
-#     ("só N fontes vivas") deixando o ?day= de ontem sem arquivo = 503 =
-#     estorno. Fix: cache last-good por série (7d — taxa oficial BR é diária,
-#     o último fix É a taxa vigente; resposta marcada stale:true, fonte
-#     declarada) + /br-archive com gap recente (<=3d) serve o snapshot MAIS
-#     RECENTE com substituição declarada (requested_day/served_day) em vez de
-#     503 — gap antigo segue 503 honesto (não dá para backfillar) + archive
-#     loop agora AVISA no Telegram quando um snapshot aborta (antes: silêncio).
-#
-#  2. BOTÕES TELEGRAM MORTOS: 7 dias de logs com ZERO via=cmd — nenhum clique
-#     chegou ao getUpdates (replies "Sim" funcionam 100%). _handle_button não
-#     logava NADA: falha silenciosa total. Agora: todo callback vira
-#     "📨 TG cb" (INFO) + entrada no tg_inbox (via=button), o answerCallbackQuery
-#     volta COM TOAST do resultado ("✅ #59 aplicada"), e a proposta decidida
-#     perde os botões (editMessageReplyMarkup — anti duplo-clique). Se após
-#     este deploy um clique não aparecer no log, a prova é definitiva de que
-#     o callback nem chega (cliente/conta), e o reply/comando seguem 100%.
-#
-#  3. x402lint P7 (WARN major, 98→100): a evidência do scan mostrou que o
-#     linter lê o CORPO v1 do 402 ("x402Version=1, accepts[2]" — Algorand e
-#     Polygon/Arbitrum já eram v2-only e NÃO foram flagrados). O corpo v1
-#     anunciava Base+Solana = 2 payTos. Agora anuncia SÓ Base (flag
-#     X402_V1_PRIMARY_ONLY=0 desfaz). Solana/Algorand seguem 100% pagáveis:
-#     header PAYMENT-REQUIRED (acceptsV2), página /pay e manual rail intactos;
-#     verify/settle aceitam todas as chains independente do anúncio.
-#
-#  4. AUTO-APROVAÇÃO 24h (OPS_AUTO_APPROVE_HOURS, 0 desliga): proposta
-#     queue_product parada >24h sem resposta é aprovada pelo autopilot e vai
-#     para a fila de produto (a fábrica ainda sonda o upstream real antes de
-#     vender; falha = estorno + auto-pausa). Preço/pausa/resume seguem 100%
-#     humanos. Menos clique, mais autonomia — o objetivo declarado do node.
-# ============================================================================
 
 X402_V1_PRIMARY_ONLY = os.environ.get("X402_V1_PRIMARY_ONLY", "1") == "1"
 
-# ---------------------------------------------------------- 1a. cache BCB ---
 _BCB_LAST_48319 = _bcb_last
 _BCB_CACHE_FILE = HOME_DIR / "bcb_cache.json"
 _BCB_CACHE_TTL_S = int(os.environ.get("BCB_CACHE_TTL_S", str(7 * 86400))
@@ -37625,7 +33739,6 @@ def _collect_br_macro():  # noqa: F811 — camada 48.32.0
     return m
 
 
-# --------------------------------------- 1b. archive com alerta (sem silêncio)
 def archive_loop():  # noqa: F811 — camada 48.32.0
     """Mesma regra (1 snapshot/dia a partir das 21h UTC, retry a cada 30min),
     mas o aborto por fontes insuficientes agora AVISA no Telegram (máx 1x/3h
@@ -37666,7 +33779,6 @@ def archive_loop():  # noqa: F811 — camada 48.32.0
         time.sleep(1800)
 
 
-# ----------------------------- 1c. /br-archive: gap recente = último snapshot
 _BR_ARCHIVE_HANDLER_48319 = _br_archive_handler
 
 
@@ -37725,7 +33837,6 @@ except Exception as e:
     log.warning(f"br-archive v2 bind: {e}")
 
 
-# ---------------------------------------------------- 2. botões com prova ---
 def _tg_handle_button_48320(self, cq):
     """Botão agora: (1) loga 📨 TG cb + grava tg_inbox via=button — nunca mais
     falha em silêncio; (2) processa pela cadeia normal (texto sintético);
@@ -37784,7 +33895,6 @@ def _tg_handle_button_48320(self, cq):
 TelegramBot._handle_button = _tg_handle_button_48320
 
 
-# ------------------------------------------- 4. auto-aprovação 24h (fila) ---
 _OPS_AUTO_APPROVE_H = float(os.environ.get("OPS_AUTO_APPROVE_HOURS", "36")
                             or 36)
 
@@ -37840,36 +33950,7 @@ log.warning("🎯 v48.32.0-ZEROWARN ativo — BCB à prova de queda (cache "
 
 
 
-# ============================================================================
-# v48.32.1-WEBOPS — o Telegram sai do caminho crítico das decisões
-#
-# Prova fechada (logs 19/out, 16:43→21:46 UTC): com a instrumentação da
-# 48.32.0 ligada, NENHUM "📨 TG cb" apareceu — callback_query simplesmente
-# não chega ao getUpdates (mensagens chegam: via=nl-pending e reply "sim").
-# O problema é externo ao código (cliente/conta Telegram do operador).
-#
-# Resposta de engenharia (pedido explícito do operador: "não depender de
-# ação manual em canal que falha"):
-#
-#  1. /ops/panel?token=DASH_TOKEN — painel WEB mobile de decisões: lista as
-#     propostas pendentes com botões gigantes ✅ Aplicar / ❌ Recusar. Um
-#     toque decide via HTTP DIRETO no servidor (o mesmo _ops_decide dos
-#     botões/reply) — zero dependência de entrega de callback do Telegram.
-#     Após decidir, remove os botões da proposta no Telegram (se houver
-#     tg_msg_id) e mostra o histórico recente. Auto-refresh 60s.
-#
-#  2. TG poll cru: todo lote de updates loga os TIPOS recebidos
-#     ("📨 TG poll: 2 update(s): message,callback_query"). Se um clique de
-#     botão nem aparecer AQUI, a prova é matemática: o update não saiu do
-#     Telegram.
-#
-#  3. /ops tgdiag — diagnóstico sob demanda: getMe + getWebhookInfo (url,
-#     pending_update_count) + nova mensagem-teste com botão 🏓.
-#
-#  4. /ops status passa a exibir o link do painel web.
-# ============================================================================
 
-# ---------------------------------------------------- 2. /ops tgdiag --------
 _OPS_TG_CMD_48320 = _ops_tg_command
 
 
@@ -37907,7 +33988,6 @@ def _ops_tg_command(bot, msg, text):  # noqa: F811 — camada 48.32.1
     return _OPS_TG_CMD_48320(bot, msg, text)
 
 
-# ---------------------------------------------------- 1. painel web ---------
 def _ops_panel_html(flash, rows, decisions, token):
     def esc(s):
         return (str(s).replace("&", "&amp;").replace("<", "&lt;")
@@ -38004,7 +34084,6 @@ def ops_panel():
         mimetype="text/html")
 
 
-# ---------------------------------------------------- 4. link no /ops -------
 _OPS_TG_STATUS_48320 = _ops_tg_status
 
 
@@ -38026,34 +34105,7 @@ log.warning("🌐 v48.32.1-WEBOPS ativo — painel web de decisões "
             "poll cru com tipos de update · /ops tgdiag")
 
 
-# ===========================================================================
-# v48.33.0-CONVERT — revisão geral 21/out (camada terminal; nada acima é
-# tocado). Tema: converter máquinas em compradores, com governança humana.
-#
-#   (1) OPSINBOX   POST /ops/propose (DASH_TOKEN) — propostas externas caem
-#                  na MESMA fila do llm-planner (_ops_validate + backlog real
-#                  anti-alucinação). Nada executa: decisão segue 100% humana
-#                  no /ops/panel ou Telegram.
-#   (2) SELFPAY    _self_pay_wallets passa a incluir os pagadores de rajada
-#                  (_sweep_payers_cached) — a Conta B Algorand (MRVA6O…) não
-#                  está em nenhuma env de endereço, então o upsell falava com
-#                  o próprio nó: 2.899 "savings tip" em 05–11/out (medido).
-#                  Mesma definição do classify_payer, como a docstring manda.
-#   (3) SKILLS     /.well-known/agent-skills (404 hoje) → 301 para
-#                  /.well-known/agent-skills/index.json — é o path curto que
-#                  a listagem pública divulga.
-#   (4) PRESS/SITE /press/ e /site/ — demanda MEDIDA no radar (10 hits ·
-#                  3 IPs cada em 7d, sem rota). Páginas humanas com números
-#                  vivos do próprio ledger; cache 300s; sem JS.
-#   (5) LEAD-ALERT scoring de intenção: UA (ex-scanners) que prova ≥3
-#                  endpoints distintos em 2h vira "lead quente" no Telegram,
-#                  no máx. 1x/dia/UA (rate-limit persistido em /data).
-#
-# Flags: OPSINBOX=0 · PRESS_PAGE=0 · LEAD_ALERT=0 desligam cada parte.
-# | base: v48.32.1-WEBOPS
-# ===========================================================================
 
-# ------------------------------------------------------------- (2) SELFPAY --
 def _self_pay_wallets():  # noqa: F811 — camada 48.33.0
     """Todo endereço que este nó controla — agora incluindo pagadores de
     varredura detectados pela rajada (a Conta B Algorand só existe como
@@ -38072,7 +34124,6 @@ def _self_pay_wallets():  # noqa: F811 — camada 48.33.0
     return s
 
 
-# ------------------------------------------------------------- (1) OPSINBOX --
 def _ops_candidates_live():
     """Mesmo recorte que o llm-planner enxerga (backlog real da telemetria)."""
     backlog = {}
@@ -38109,7 +34160,6 @@ if os.environ.get("OPSINBOX", "1") != "0":
                         "decide": f"{_public_base()}/ops/panel"}), 202
 
 
-# -------------------------------------------------------------- (3) SKILLS --
 @app.route("/.well-known/agent-skills")
 def v48330_agent_skills_alias():
     """A listagem pública divulga o path curto; a RFC Cloudflare serve o
@@ -38118,7 +34168,6 @@ def v48330_agent_skills_alias():
         f"{_public_base()}/.well-known/agent-skills/index.json", code=301)
 
 
-# ------------------------------------------------------------ (4) PRESS/SITE --
 _PRESS_CACHE = {"ts": 0.0, "html": {}}
 _PRESS_TTL_S = 300
 
@@ -38251,14 +34300,12 @@ if os.environ.get("PRESS_PAGE", "1") != "0":
                                   mimetype="text/html")
 
 
-# ---------------------------------------------------------- (5) LEAD-ALERT --
 LEAD_ALERT_ON = os.environ.get("LEAD_ALERT", "1") != "0"
 LEAD_ALERT_SECS = int(os.environ.get("LEAD_ALERT_SECS", "1800"))       # varredura
 LEAD_ALERT_MIN_EPS = int(os.environ.get("LEAD_ALERT_MIN_ENDPOINTS", "3"))
 LEAD_ALERT_GAP_S = int(os.environ.get("LEAD_ALERT_GAP_S", "86400"))    # 1x/dia/UA
 _LEAD_SEEN = {}  # ua -> ts do último alerta (memória do worker)
 _LEAD_FILE = "lead_alerts.json"
-# scanners/monitores conhecidos nunca são leads (medido nos top_uas):
 _LEAD_UA_BLOCK = ("monitor", "probe", "scanner", "crawler", "uptime",
                   "healthcheck", "x402-list", "carbonmonitor", "bazaar",
                   "lumiere", "x402-observer", "x402lint", "agentrank",
@@ -38332,7 +34379,6 @@ def _lead_scan_once() -> None:
 
 
 def _lead_alert_loop() -> None:
-    # flock próprio: um dono por container (padrão _start_background_once)
     try:
         import fcntl
         lf = open(HOME_DIR / "lead_alert.lock", "w")
@@ -38364,8 +34410,6 @@ def _lead_alert_start_once() -> None:
                      name="lead-alert").start()
 
 
-# plug no boot pós-fork existente (hook do gunicorn chama o NOME global; o
-# fallback @app.before_request idem — as duas vias pegam este wrapper):
 _POSTFORK_BOOT_48321 = post_fork_boot
 
 
@@ -38383,19 +34427,13 @@ log.warning("🧠 v48.33.0-CONVERT ativo — ops-inbox externo · self-pay cobre
             "lead-alert no TG (≥3 previews distintos/2h)")
 
 
-# ===========================================================================
-#       down — flap de segundos não fecha a loja; falha sustentada continua
-#   (4) LOG HYGIENE — sklearn UserWarning "delayed" disparava 1.103× na
-#       sinal. Filtro cirúrgico só dessa mensagem; demais warnings intactos.
 
-# ------------------------------------------------------------ (4) LOG HYGIENE
 import warnings as _warnings
 _warnings.filterwarnings(
     "ignore",
     message=r".*sklearn\.utils\.parallel\.delayed.*",
     category=UserWarning)
 
-# ------------------------------------------------------------- (3) /sw.js ---
 if os.environ.get("SW_NOOP", "1") != "0":
     @app.route("/sw.js")
     def v48331_sw_noop():
@@ -38410,7 +34448,6 @@ if os.environ.get("SW_NOOP", "1") != "0":
             mimetype="application/javascript")
 
 
-# --------------------------------------------------------- (1) HEALTH GRACE --
 _HEALTH_GRACE_S = int(os.environ.get("HEALTH_GRACE_S", "600"))
 _HEALTH_GRACE_FILE = "health_grace.json"
 
@@ -38469,7 +34506,6 @@ def _health_providers_48331():
             elif now - float(first) < _HEALTH_GRACE_S:
                 chk["live"] = True
                 chk["source"] = f"{chk.get('source')} · grace"
-            # else: falha sustentada > grace — segue down (proteção real)
         if changed:
             _health_grace_write(state)
         ai_live = bool((data.get("ai") or {}).get("live"))
@@ -38489,12 +34525,7 @@ log.warning("🛡 v48.33.1-STABILITY ativo — premium_ready com grace "
             "log sem o spam sklearn")
 
 
-# ===========================================================================
-# cliente paga e não recebe na 1ª tentativa. A fábrica e o preço não tinham
-#   (1) FACTORY FETCH v2 — todo produto da fábrica ganha: timeout 8s→20s
-#       A sonda de criação NÃO usa cache (sonda mede o upstream de verdade).
 
-# ---------------------------------------------------- (1) FACTORY FETCH v2 --
 FACTORY_TIMEOUT_S = float(os.environ.get("FACTORY_TIMEOUT_S", "20"))  # noqa: F811
 _FACTORY_LG_ON = os.environ.get("FACTORY_LASTGOOD", "1") != "0"
 _FACTORY_LG_FILE = "factory_lastgood.json"
@@ -38591,7 +34622,6 @@ def _factory_fetch(spec, params, _allow_cache=True):  # noqa: F811 — 48.33.2
         if tentativa == 0:
             time.sleep(2)  # respiro — transitório de fonte free costuma passar
 
-    # last-good: melhor um dado declarado velho que um 502 cobrado
     if _use_cache:
         try:
             rec = (_factory_lg_read() or {}).get(_factory_lg_key(url, pick))
@@ -38612,7 +34642,6 @@ def _factory_fetch(spec, params, _allow_cache=True):  # noqa: F811 — 48.33.2
     return False, str(err)[:160]
 
 
-# --- a sonda de criação (ramo factory_product do _ops_apply) em probe-mode --
 _OPS_APPLY_48331 = _ops_apply
 
 
@@ -38630,7 +34659,6 @@ def _ops_apply(action, actor):  # noqa: F811 — camada 48.33.2
     return _OPS_APPLY_48331(action, actor)
 
 
-# ------------------------------------------------------ (2) _sym_price v2 ---
 def _sym_price(symbol):  # noqa: F811 — camada 48.33.2
     """Preço USD do símbolo do universo _FC_FEEDS: Pyth (com retry) →
     CoinGecko (com retry + respiro p/ 429) → último preço do histórico ML
@@ -38681,12 +34709,7 @@ log.warning("🏭 v48.33.2-FACTORYCARE ativo — fábrica com retry+last-good 24
             "· _sym_price com Pyth/CG retry + last-good ML (rótulo honesto)")
 
 
-# ===========================================================================
-# O que a auditoria ACHOU de verdade (medido no painel/logs, não na teoria):
-#       x402 é dado, não arquivo. O llm-planner deixa de gastar cota Groq
-# A forma CAIP-2-namespace estrita (url-safe, 32 chars, sem "=") NÃO é
 
-# ------------------------------------------------ (1) BACKLOG ANTI-FUZZ -----
 _FUZZ_SUBSTR = (
     "zzq", "wp-admin", "wp-content", "wp-includes", "wordpress", ".env",
     ".git", "xmlrpc", "phpmyadmin", "pma", "/admin", "administrator",
@@ -38733,7 +34756,6 @@ def _cortex_backlog(days: int = 7, min_ips: int = 3, limit: int = 12):  # noqa: 
     return out
 
 
-# ------------------------------------------------ (2) /service-worker.js ----
 @app.route("/service-worker.js")
 def v48333_service_worker_alias():
     """Variante longa que browsers/PWAs pedem (estava no radar como demanda
@@ -38753,8 +34775,6 @@ log.warning("🧹 v48.33.3-CLEANSLATE ativo — backlog anti-fuzz (planner sem "
             "documentado")
 
 
-# ===========================================================================
-# "nunca levanta" está restaurado, com retry e last-good intactos.
 
 def _factory_fetch(spec, params, _allow_cache=True):  # noqa: F811 — 48.33.4
     """(ok, data|erro) — NUNCA levanta. retry 1× (2s) + last-good 24h stale.
@@ -38848,8 +34868,6 @@ log.warning("🔧 v48.33.4-HOTFIX ativo — _factory_fetch nunca levanta; "
             "sonda de fábrica falha limpa (sem 500 no painel)")
 
 
-# ===========================================================================
-# auto-seleção e falha de novo — o autopick não injeta params e /chain-tx
 
 _BUNDLE_AUTO_48334 = _bundle_auto_paths  # cadeia vigente (48.31.8)
 
@@ -38877,13 +34895,7 @@ log.warning("🧺 v48.33.5-BUNDLEBAN ativo — auto-seleção de bundle com ban 
             "duradouro p/ falhão crônico (≥3 falhas acumuladas)")
 
 
-# ===========================================================================
-# não "settings", não ".json" final, não os arquivos-clássico de credencial.
-#       (netrc/keyfile/terraform/credentials/secrets/sa.json/aws.json/
-#       existe. Planner nunca mais gasta LLM propondo caça-segredo.
-#       memória longa (planner não repõe por 30d). Com TG-aviso da limpeza.
 
-# --- (1) filtro ampliado (a 48.33.3 chama este nome — pega a versão nova) --
 _IS_FUZZ_48333 = _is_fuzz_or_static
 
 _FUZZ_CREDENTIALS = (
@@ -38910,7 +34922,6 @@ def _is_fuzz_or_static(path: str) -> bool:  # noqa: F811 — camada 48.33.6
     return _IS_FUZZ_48333(p)
 
 
-# --- (2) limpeza única da fila de produto (boot; idempotente) ---------------
 def _fuzzwall_queue_sweep():
     """Paths de credential-hunting já aprovados saem da fila e viram
     'rejected' na memória de decisões — o planner não repropõe por 30d."""
@@ -38955,11 +34966,8 @@ VERSION = "48.34.0-GUARD"  # v48.33.6-FUZZWALL: o painel aprovou 8 paths que era
 log.warning("🧹 v48.33.6-FUZZWALL ativo — filtro anti-credential-hunter "
             "ampliado · fila de produto higienizada (fuzzing vira rejected)")
 
-# v48.34.0-GUARD: (1) SSRF: /x402-audit seguia redirects sem revalidar (302→IP interno) e a fabrica nao resolvia DNS nem barrava redirect; guards antigos nao cobriam 100.64.0.0/10 (rede interna do Railway) nem ::ffff:a.b.c.d → helper unico _ip_is_public (is_global); /fetch confere o peer real (anti-rebinding) | (2) ledger_prune_loop: retry em 'table is locked' | (3) radar: bundles de front-end, canario de fuzz e discovery OAuth deixam de virar 'produto novo' | (4) o proprio x402-watch nao conta como trafego externo nem entra no ecosystem-pulse | (5) SyntaxWarning '\\/' corrigido; pip install em runtime nao derruba o boot | (6) NOVO /prompt-guard (12 regras declaradas, sem LLM) | base: v48.33.6-FUZZWALL
 
 
-# ============================================================================
-# string (senão ?x=1,?x=2 furaria o cache) e a falha também é cacheada.
 import functools as _functools
 
 
@@ -38989,9 +34997,6 @@ for _p_, _ttl_ in (("/health/deep", 60.0), ("/sample", 30.0)):
             app.view_functions[_rule_.endpoint] = _ttl_wrap(app.view_functions[_rule_.endpoint], _ttl_)
 
 
-# ===========================================================================
-# ?text= mas NÃO estava em _PARAM_REQUIRED — a barreira da 48.26.x, que
-# pagamento anexado, não existia para ele. Resultado: liquidava primeiro e
 
 _PARAM_REQUIRED["/prompt-guard"] = [[
     ("text", r"[\s\S]+",
@@ -39006,12 +35011,6 @@ log.warning("🛡 v48.34.1-GUARDFIX ativo — /prompt-guard com barreira de "
             "obrigatório: 400 grátis antes do settle quando falta ?text=")
 
 
-# ===========================================================================
-#     repetição IDÊNTICA (mesmo método, URL e corpo) recebe o mesmo resultado,
-#     sem novo settle e sem novo handler. Parâmetros diferentes NÃO reaproveitam.
-#     que não é dinheiro de volta). Agora: parâmetro ausente + pagamento anexado
-#     = 400 didático ANTES de qualquer settle. (Auditoria dinâmica de todos os
-#     alias conhecido — que não seja ele próprio canônico naquela rota — o valor
 import collections as _collections
 from werkzeug.datastructures import MultiDict as _MultiDict
 
@@ -39126,11 +35125,9 @@ _PARAM_REQUIRED.update({
                      ("year", r"^\d{4}$", "2026")],
                     [("to", r"^\d{4}-\d{2}-\d{2}$", "2026-07-01"),
                      ("year", r"^\d{4}$", "2026")]],
-    "/agent-reputation": [[("agentId", r"^\d{1,12}$", "87048")]],
 })
 
 
-# ---- 3 + 5: normalização de parâmetros e captura de intenção (before_request)
 _INTENT_PATHS = {"/agent-call": "task", "/api/v1/best": "task", "/web-search": "q",
                  "/research-brief": "q", "/llm": "q"}
 
@@ -39141,7 +35138,6 @@ def _v4835_args_and_intents():
         path = request.path
         if path not in BASE_PRICES or request.method not in ("GET", "POST"):
             return None
-        # 3a) query string
         if request.args:
             add = _alias_fill(path, {k: request.args.get(k) for k in request.args.keys()})
             if add:
@@ -39149,7 +35145,6 @@ def _v4835_args_and_intents():
                 for k, v in add.items():
                     md[k] = v
                 request.__dict__["args"] = md
-        # 3b) corpo JSON
         if request.method == "POST":
             body = request.get_json(silent=True)
             if isinstance(body, dict) and body:
@@ -39158,7 +35153,6 @@ def _v4835_args_and_intents():
                     nb = dict(body)
                     nb.update(addb)
                     request._cached_json = (nb, nb)
-        # 5) intenção em texto livre
         key = _INTENT_PATHS.get(path)
         if key:
             t = (request.args.get(key) or "").strip().lower()
@@ -39172,7 +35166,6 @@ def _v4835_args_and_intents():
     return None
 
 
-# ---- 1: entrega idempotente --------------------------------------------------
 def _pay_sig():
     return (request.headers.get("X-PAYMENT") or request.headers.get("X-Payment")
             or request.headers.get("PAYMENT-SIGNATURE") or request.headers.get("Payment-Signature"))
@@ -39249,7 +35242,6 @@ def _v4835_store_delivered(resp):
     return resp
 
 
-# ---- 4: JSON Schema de saída inferido da amostra real -------------------------
 def _infer_schema(v, depth: int = 0):
     if isinstance(v, bool):
         return {"type": "boolean"}
@@ -39312,12 +35304,8 @@ def _v4835_snapshot() -> dict:
 
 log.info("📦 v48.35.0-DELIVER ativo — entrega idempotente, barreira POST, aliases, schema de saída, intenções")
 
-# v48.35.0-DELIVER: (1) retry do MESMO pagamento ja liquidado recebe a resposta entregue (15 min, SQLite, entre workers) em vez de replay-blocked → 402 | (2) barreira de obrigatorios enxerga corpo JSON; +9 rotas (classify summarize extract translate v1/chat fetch x402-audit br-bizdays agent-reputation) | (3) aliases de parametro (Symbol/zip/wallet/link/target_lang...) com contagem | (4) JSON Schema de saida inferido da amostra real no Bazaar | (5) ranking de intencoes de ?task=/?q= no /dash/api/stats | base: v48.34.1-GUARDFIX
 
 
-# ============================================================================
-# Envs (Railway Variables, nunca no repo):
-# Sem SMTP configurado o email não é enviado; o resto funciona normalmente.
 import smtplib as _smtplib_contact
 from email.mime.text import MIMEText as _MimeTextContact
 
@@ -39482,7 +35470,6 @@ def _chat_ai_worker(sid, texto, curto, hist_n, ua):  # noqa: F811 — camada 48.
     except Exception:
         pass
 
-# Cobre /r E REPLY nativo: os dois gravam a resposta do operador via _chat_add.
 _CHAT_ADD_ORIG_CONTACT = _chat_add
 def _chat_add(sid, who, text, ip="", ua=""):  # noqa: F811 — camada 48.35.0
     rid = _CHAT_ADD_ORIG_CONTACT(sid, who, text, ip, ua)
@@ -39514,9 +35501,6 @@ def _chat_add(sid, who, text, ip="", ua=""):  # noqa: F811 — camada 48.35.0
 VERSION = "48.36.1-SEAL"
 
 
-# ============================================================================
-# on-chain) e payer que não é Pix. Compras Pix (tx_sig="pix:...") e reembolsos
-# (plan="refund") NUNCA entram. Fluxo em 2 passos: GET lista (dry-run), e só
 _PLAN_VALUES = {"credits", "day-pass", "week", "pro", "whale", "founding", "enterprise"}
 
 def _farmed_keys():
@@ -39576,7 +35560,6 @@ def ops_farmed_keys():
 VERSION = "48.41.0-V1RAILFIX"
 
 
-# v48.37.0-CONVERGE: cache de 300s no agentic manifest. O manifest era
 try:
     _agentic_orig = app.view_functions.get("agentic_market_manifest")
     if _agentic_orig is not None:
@@ -39603,13 +35586,6 @@ except Exception:
     pass
 
 
-# ============================================================================
-# v48.42.0-RECONCILE — SETTLE, PROVA E ENTREGA SÃO UMA SÓ OPERAÇÃO
-# ============================================================================
-# Uma resposta 2xx do facilitator não é recibo; um hash não é entrega; e um
-# pagamento confirmado não pode virar replay-blocked. O schema 26 preserva a
-# operação ORIGINAL (payload + requirements + facilitator + request) e cria um
-# grant durável para retry idempotente. Nenhum segredo novo é exigido.
 
 _V4842_PENDING_COLUMNS = {
     "payload_json": "TEXT NOT NULL DEFAULT ''",
@@ -39692,8 +35668,6 @@ def _v4842_pending_save(self, fingerprint: str, endpoint: str, tx_sig: str,
                 if tx_old and tx_new and tx_old.lower() != tx_new.lower():
                     log.error(f"🚨 pending {fingerprint[:12]} tentou trocar TX; original preservada")
                 tx_final = tx_old or tx_new
-                # Uma operação já identificada nunca muda de requirements nem de
-                # facilitator. O único upgrade permitido é enriquecer uma row legada.
                 req_final = (req_json if (not old[2] and payload_json) else (old[1] or req_json))
                 payload_final = old[2] or payload_json
                 fac_final = old[3] or facilitator
@@ -39944,8 +35918,6 @@ def _v4842_fac_settle(self, payment_payload: dict, requirements: dict,
             log.warning(f"⏳ {self.tag} {reason_l} tx={str(data.get('transaction') or '')[:24]}")
             return False, data
         if uncertain_http or data.get("error") in ("invalid-json", "invalid-settle-response"):
-            # O servidor pode ter liquidado e a resposta se perdeu. Reenviar a
-            # mesma operação é permitido; trocar de facilitator não é.
             data.update({"pending": True, "uncertain": True,
                          "error": reason or f"settle-transport-http-{r.status_code}"})
             log.warning(f"⏳ {self.tag} settle incerto HTTP {r.status_code}; operação preservada")
@@ -39974,7 +35946,6 @@ def _v4842_fac_settle(self, payment_payload: dict, requirements: dict,
             _bazaar_ext_note(ext, bool(pp.get("resource")))
         return True, data
     except Exception as e:
-        # Timeout/DNS/socket/JSON local depois do POST são incertos por definição.
         log.warning(f"⏳ {getattr(self, 'tag', 'Facilitator')} settle sem resposta confiável: {str(e)[:140]}")
         return False, {"pending": True, "uncertain": True,
                        "error": "settle-transport-uncertain", "detail": str(e)[:160]}
@@ -39989,7 +35960,6 @@ def _v4842_chain_verify(tx_sig, requirement, max_age):
     if chain in ("base", "polygon", "arbitrum"):
         return _evm_receipt_verify(tx_sig, requirement, min_confirmations=0, max_age=max_age)
     if chain == "solana":
-        # A API Solana histórica deste monólito retorna (ok, info), não 3-tupla.
         out = SOL.verify_payment(tx_sig, expected, str(requirement.get("payTo") or ""),
                                  max_age=(10 * 365 * 86400 if not max_age else max_age))
         if isinstance(out, tuple) and len(out) == 2:
@@ -40010,7 +35980,6 @@ def _v4842_verify_poll(tx_sig, requirement, max_age=None):
     last = (False, "tx-not-found", {})
     started = time.monotonic()
     for i, delay in enumerate(delays):
-        # Nunca empilhar várias chamadas RPC lentas no worker sync de 45s.
         if i and time.monotonic() - started > 6:
             break
         if delay:
@@ -40022,7 +35991,6 @@ def _v4842_verify_poll(tx_sig, requirement, max_age=None):
 
 
 def _v4842_verify_settlement_onchain(tx_sig: str, requirement: dict):
-    # Poll curto cobre a corrida settle→bloco→receipt sem estourar o worker sync.
     return _v4842_verify_poll(tx_sig, requirement)
 
 
@@ -40281,8 +36249,6 @@ def _v4842_verify_payment(endpoint: str, payment_header: str):
                 return _v4842_reconcile_known(pending, allow_plan_delivery=True)
             if pending.get("payload") and pending.get("facilitator"):
                 return _v4842_retry_original_settle(pending, allow_plan_delivery=True)
-            # Rows da 48.41 sem hash não contêm facilitator: é impossível provar
-            # qual operação foi enviada. Não adivinhar nem trocar de rail.
             return _v4842_pending_response(pending, "legacy-operation-incomplete")
     return _V4842_VERIFY_PAYMENT_ORIG(endpoint, payment_header)
 
@@ -40342,9 +36308,6 @@ def _start_background_once():
 _start_background_once = _start_background_once
 
 
-# ---------------------------------------------------------------------------
-# PYTH — AUTENTICAÇÃO NÃO É FEED APOSENTADO; LISTA VAZIA NÃO FAZ HTTP
-# ---------------------------------------------------------------------------
 _FC_SKIP_LEGACY = set(_FC_SKIP)
 try:
     if _FC_SKIP_FILE.exists():
@@ -40391,8 +36354,6 @@ except Exception as e:
 
 
 def _v4842_fc_skip_note(feed_ids_bad, reason=""):
-    # Callers antigos chamam sem reason (inclusive após 403/Not entitled): são
-    # deliberadamente ignorados. Só o parser HTTP 400 abaixo pode persistir.
     if reason != "http400_invalid_feed":
         return
     global _FC_SKIP
@@ -40433,8 +36394,6 @@ def _v4842_pyth_latest(feed_ids):
     if not r.ok:
         body = r.text[:300]
         if r.status_code == 400:
-            # Não incluir 'Not entitled': isso é autorização/conta, nunca prova
-            # de que o feed deixou de existir.
             bad = re.findall(r"(?:not valid/found|not valid|not found|invalid/found):\s*([0-9a-f]{64})",
                              body.lower())
             if bad:
@@ -40453,9 +36412,6 @@ def _v4842_pyth_latest(feed_ids):
 
 _pyth_latest = _v4842_pyth_latest
 
-# ---------------------------------------------------------------------------
-# GOVERNANÇA — scanner não é backlog; quarentena alcança o que já estava live
-# ---------------------------------------------------------------------------
 _V4842_SCAN_ORIG = _is_scan_noise
 _V4842_SCAN_NEW = re.compile(r"(?:^|/)\.ds_store$|(?:^|/)graphql/?$", re.I)
 
@@ -40620,13 +36576,6 @@ log.warning("💳 v48.42.0-RECONCILE ativa — operação original persistida ·
 
 
 
-# ============================================================================
-# v48.43.0-SIGNALFIX — pós-deploy: fontes de ML e sinais orgânicos
-# ============================================================================
-# Pagamento/schema 26 permanecem os da 48.42. Este bloco corrige apenas os
-# defeitos observados em produção: feed DOGE inválido, tempestade 401/403,
-# probes tratados como demanda, receita do operador no aprendizado de preço,
-# anomalia com duas fontes de "vendas" e recomendação obsoleta /api/pricing.
 
 
 def _v4843_organic_sales_by_endpoint(days: int = 7):
@@ -40653,9 +36602,6 @@ def _v4843_organic_sales_by_endpoint(days: int = 7):
     return dict(sales), {ep: round(v, 4) for ep, v in revenue.items()}
 
 
-# ---------------------------------------------------------------------------
-# PYTH — ID oficial DOGE, invalidade 400/404 e backoff temporário 401/403
-# ---------------------------------------------------------------------------
 _V4843_DOGE_OLD = "dcef50dd0a4cd2dcc17e45df6476d336a4cba99c1a925a7f7a1db6f42335ccba"
 _V4843_DOGE_OFFICIAL = "dcef50dd0a4cd2dcc17e45df1676dcb336a11a61c69df7a0299b0150c672d25c"
 _FC_FEEDS["DOGE"] = (_V4843_DOGE_OFFICIAL, "dogecoin")
@@ -40674,7 +36620,6 @@ try:
                     _V4843_SKIP_REASONS[_fid] = reason
 except Exception:
     pass
-# Um ID que deixou de ser referenciado não precisa permanecer no skip ativo.
 _FC_SKIP.discard(_V4843_DOGE_OLD)
 _V4843_SKIP_REASONS.pop(_V4843_DOGE_OLD, None)
 for _fid in _FC_SKIP:
@@ -40738,6 +36683,46 @@ def _v4843_fid(value):
     return f[2:] if f.startswith("0x") else f
 
 
+def _v4844_pyth_backoff_blocked(feed_ids, now):
+    blocked = set()
+    for fid in feed_ids:
+        key = f"pyth:backoff:{fid}"
+        try:
+            rec = LEDGER.cache_get(key, PYTH_ENTITLEMENT_BACKOFF_S + 60)
+            until = float((rec or {}).get("until") or 0)
+        except Exception:
+            with _PYTH_ENTITLEMENT_LOCK:
+                until = float(_PYTH_ENTITLEMENT_BACKOFF.get(fid, 0) or 0)
+        if until > now:
+            blocked.add(fid)
+        else:
+            with _PYTH_ENTITLEMENT_LOCK:
+                _PYTH_ENTITLEMENT_BACKOFF.pop(fid, None)
+    return blocked
+
+
+def _v4844_pyth_backoff_set(feed_ids, until):
+    with _PYTH_ENTITLEMENT_LOCK:
+        for fid in feed_ids:
+            _PYTH_ENTITLEMENT_BACKOFF[fid] = until
+    for fid in feed_ids:
+        try:
+            LEDGER.cache_set(f"pyth:backoff:{fid}", {"until": until})
+        except Exception as e:
+            log.warning(f"Pyth shared backoff write {fid[:12]}: {str(e)[:100]}")
+
+
+def _v4844_pyth_backoff_clear(feed_ids):
+    with _PYTH_ENTITLEMENT_LOCK:
+        for fid in feed_ids:
+            _PYTH_ENTITLEMENT_BACKOFF.pop(fid, None)
+    for fid in feed_ids:
+        try:
+            LEDGER.cache_set(f"pyth:backoff:{fid}", {"until": 0})
+        except Exception as e:
+            log.warning(f"Pyth shared backoff clear {fid[:12]}: {str(e)[:100]}")
+
+
 def _v4843_pyth_latest(feed_ids):
     ids, seen = [], set()
     for value in feed_ids or []:
@@ -40746,12 +36731,7 @@ def _v4843_pyth_latest(feed_ids):
             ids.append(fid)
             seen.add(fid)
     now = time.time()
-    with _PYTH_ENTITLEMENT_LOCK:
-        for fid in list(_PYTH_ENTITLEMENT_BACKOFF):
-            if _PYTH_ENTITLEMENT_BACKOFF[fid] <= now:
-                _PYTH_ENTITLEMENT_BACKOFF.pop(fid, None)
-        blocked = {fid for fid in ids
-                   if _PYTH_ENTITLEMENT_BACKOFF.get(fid, 0) > now}
+    blocked = _v4844_pyth_backoff_blocked(ids, now)
     permanent = {fid for fid in ids if fid in _FC_SKIP}
     eligible = [fid for fid in ids if fid not in blocked and fid not in permanent]
     if not eligible:
@@ -40785,18 +36765,14 @@ def _v4843_pyth_latest(feed_ids):
                     if fid in eligible]
             targets = named or eligible
             until = time.time() + PYTH_ENTITLEMENT_BACKOFF_S
-            with _PYTH_ENTITLEMENT_LOCK:
-                for fid in targets:
-                    _PYTH_ENTITLEMENT_BACKOFF[fid] = until
+            _v4844_pyth_backoff_set(targets, until)
             log.warning(f"🧠 Pyth auth/entitlement HTTP {r.status_code}; "
                         f"backoff temporário para {len(targets)} feed(s), "
                         f"NENHUM feed excluído: {body[:160]}")
         else:
             log.warning(f"🧠 Pyth HTTP {r.status_code} ids={len(eligible)}: {body[:180]}")
         raise RuntimeError(f"pyth HTTP {r.status_code}: {body[:160]}")
-    with _PYTH_ENTITLEMENT_LOCK:
-        for fid in eligible:
-            _PYTH_ENTITLEMENT_BACKOFF.pop(fid, None)
+    _v4844_pyth_backoff_clear(eligible)
     out = {}
     for p in r.json().get("parsed", []):
         out[_v4843_fid(p.get("id", ""))] = p
@@ -40810,9 +36786,6 @@ except Exception as e:
     log.warning(f"Pyth skip v48.43 migration: {e}")
 
 
-# ---------------------------------------------------------------------------
-# DESCOBERTA — scanner não é produto; alias existente não é nova demanda
-# ---------------------------------------------------------------------------
 _V4843_SCAN_ORIG = _is_scan_noise
 _V4843_SCAN_AXD = re.compile(r"(?:^|/)[a-z0-9_-]+\.axd$", re.I)
 
@@ -40929,9 +36902,6 @@ def _v4843_cortex_demand_trend(days: int = 14, top: int = 8) -> list:
 _cortex_demand_trend = _v4843_cortex_demand_trend
 
 
-# ---------------------------------------------------------------------------
-# PLANNER — evidência orgânica para preço e notas incompatíveis com o catálogo
-# ---------------------------------------------------------------------------
 _V4843_OPS_VALIDATE_ORIG = _ops_validate
 
 
@@ -40969,11 +36939,8 @@ def _v4843_ops_validate(action, candidates):
 
 _ops_validate = _v4843_ops_validate
 
-# Reprocessa filas/propostas já persistidas com a nova família .axd. Nenhuma
-# transferência ou receita é alterada; somente governança de descoberta.
 _v4842_sanitize_governance()
 
-VERSION = "48.43.0-SIGNALFIX"
-log.warning("🧠 v48.43.0-SIGNALFIX ativa — DOGE oficial · Pyth 400/404 sem loop · "
-            "401/403 com backoff temporário · demanda por previews · vendas orgânicas "
-            "no advisor/Cortex · anomalia coerente · /api/pricing resolvido")
+VERSION = "48.44.0-PROOFGATE"
+log.warning("🧠 v48.44.0-PROOFGATE ativa — Algorand dual CAIP-2 · OpenAPI executável · "
+            "backoff Pyth compartilhado · planos sem preview · pagamentos/schema 26 preservados")
