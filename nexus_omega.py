@@ -2,7 +2,7 @@
 """
 Losbeto x402 — monolithic Flask service for Railway.
 
-Current release: 48.46.0-CLEANFUNNEL.
+Current release: 48.47.0-CLEARCHECKOUT.
 Payment requirements are server-side. Delivery requires verified settlement;
 pending payments are reconciled against independent chain evidence.
 Operational history lives in CHANGELOG.md, not in executable boot output.
@@ -6902,7 +6902,7 @@ _PULSE_MONITORS = ("losbeto-x402", "carbonmonitor", "x402-list-monitor", "lumier
                    "bazaardiscovery", "x402scan", "uptime", "pingdom",
                    "statuscake", "betterstack", "hetrixtools",
                    "losbetolinkaudit", "losbetoexternalaudit", "losbetomcpaudit",
-                   "agentcash-readonly-audit")
+                   "agentcash-readonly-audit", "losbeto-x402-audit")
 
 
 def _h_ecosystem_pulse():
@@ -16204,6 +16204,7 @@ _DEMAND_UA_SQL = """NOT (
     LOWER(COALESCE(ua,'')) LIKE '%losbetoexternalaudit%' OR
     LOWER(COALESCE(ua,'')) LIKE '%losbetomcpaudit%' OR
     LOWER(COALESCE(ua,'')) LIKE '%agentcash-readonly-audit%' OR
+    LOWER(COALESCE(ua,'')) LIKE '%losbeto-x402-audit%' OR
     LOWER(COALESCE(ua,'')) LIKE '%losbeto-x402-watch%'
 )"""
 
@@ -21250,7 +21251,7 @@ _UA_NAMED_SCANNER = re.compile(
     r"betteruptime|hetrixtools|zerobot|heritrix|hermes-contact|semrushbot|"
     r"conformance|agentrank|mekler|ibou-search|barkrowler|clueweb|agent402|"
     r"x402station|losbeto-x402-watch|losbetolinkaudit|losbetoexternalaudit|"
-    r"losbetomcpaudit|agentcash-readonly-audit)", re.I)
+    r"losbetomcpaudit|agentcash-readonly-audit|losbeto-x402-audit)", re.I)
 
 _UA_GENERIC_BOT = re.compile(
     r"(bot\b|headless|phantom|puppeteer|playwright|selenium|lighthouse|"
@@ -28885,7 +28886,7 @@ const IS_CREDIT = __IS_CREDIT__;
     return true;
   }
   const PAYGATE_MSG = 'Fill the required parameters above before paying — '
-    + 'the endpoint rejects empty ones AFTER the payment (auto-refund, but the call is lost).';
+    + 'required parameters are checked before you sign or pay — no settlement is attempted with empty values.';
 const statusEl = document.getElementById('status');
 const statusMEl = document.getElementById('statusM');
 const resultEl = document.getElementById('result');
@@ -28994,6 +28995,7 @@ async function baseRpc(method, params){
 }
 async function preflightWallet(from){
   const warns = [];
+  let insufficient = false;
   try{
     const code = await baseRpc('eth_getCode',[from,'latest']);
     if(code && code !== '0x'){
@@ -29009,6 +29011,7 @@ async function preflightWallet(from){
       const bal  = Number(BigInt(balHex))/1e6;
       const need = Number(BigInt(ACCEPT.amount))/1e6;
       if(bal < need){
+        insufficient = true;
         warns.push('USDC balance on Base: '+bal.toFixed(4)+' — this payment needs '+need.toFixed(4)+'. '+
           'Top up first: card via Coinbase Onramp (pay.coinbase.com), or buy USDC on any '+
           'exchange and withdraw choosing the BASE network. A short balance reverts on-chain.');
@@ -29021,7 +29024,7 @@ async function preflightWallet(from){
     const mc = document.getElementById('manualCard');
     if(mc && !IS_CREDIT) mc.style.border = '2px solid #f59e0b';
   }
-  return warns.length === 0;
+  return { ok: warns.length === 0, insufficient };
 }
 
 // ============================================================================
@@ -29297,7 +29300,13 @@ async function payAndFetch(){
     setStatus('Switching to Base network…');
     await ensureBaseChain(chainIdHex, w);
     setStatus('Checking wallet compatibility and USDC balance…');
-    await preflightWallet(from);
+    const pre = await preflightWallet(from);
+    if (pre && pre.insufficient){
+      setStatus('Payment stopped before signature: insufficient USDC on Base. '+
+                'Top up first, then use this checkout or the plain-transfer option below.','err');
+      btn.disabled = false;
+      return;
+    }
     const validBefore = String(Math.floor(Date.now()/1000)+(ACCEPT.maxTimeoutSeconds||300));
     const authorization = {from,to:ACCEPT.payTo,value:ACCEPT.amount,validAfter:"0",validBefore,nonce:hex32()};
     const domain = {name:(ACCEPT.extra&&ACCEPT.extra.name)||'USD Coin',
@@ -29477,7 +29486,7 @@ def _pay_bridge_handler(raw_endpoint):
                 '<div class="card"><p style="margin:0 0 2px;font-size:14px">'
                 '<b>Parameters</b> '
                 + ('— <span style="color:var(--err)">* required</span>: the endpoint '
-                   'rejects empty ones AFTER charging (auto-refund, but a lost call). '
+                   'rejects empty ones BEFORE settlement. '
                    'Pre-filled with a working example — edit to your data.'
                    if any(k in (ENDPOINT_REQUIRED_PARAMS.get(ep) or {}) for k in merged)
                    else '— optional, pre-filled with an example. Edit if you like.')
@@ -34144,7 +34153,7 @@ _LEAD_UA_BLOCK = ("monitor", "probe", "scanner", "crawler", "uptime",
                   "lumiere", "x402-observer", "x402lint", "agentrank",
                   "losbeto-x402", "x402-watch", "x402-audit",
                   "losbetolinkaudit", "losbetoexternalaudit", "losbetomcpaudit",
-                  "agentcash-readonly-audit")
+                  "agentcash-readonly-audit", "losbeto-x402-audit")
 
 
 def _lead_seen_load() -> dict:
@@ -36753,4 +36762,4 @@ _ops_validate = _v4843_ops_validate
 
 _v4842_sanitize_governance()
 
-VERSION = "48.46.0-CLEANFUNNEL"
+VERSION = "48.47.0-CLEARCHECKOUT"
