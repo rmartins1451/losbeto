@@ -2,7 +2,7 @@
 """
 Losbeto x402 — monolithic Flask service for Railway.
 
-Current release: 48.47.0-CLEARCHECKOUT.
+Current release: 48.48.0-CLEANMETRICS.
 Payment requirements are server-side. Delivery requires verified settlement;
 pending payments are reconciled against independent chain evidence.
 Operational history lives in CHANGELOG.md, not in executable boot output.
@@ -6901,8 +6901,7 @@ _PULSE_MONITORS = ("losbeto-x402", "carbonmonitor", "x402-list-monitor", "lumier
                    "x402-observer", "forum-labs", "402explorer",
                    "bazaardiscovery", "x402scan", "uptime", "pingdom",
                    "statuscake", "betterstack", "hetrixtools",
-                   "losbetolinkaudit", "losbetoexternalaudit", "losbetomcpaudit",
-                   "agentcash-readonly-audit", "losbeto-x402-audit")
+                   "x402lint", "audit", "agentcash-readonly-audit")
 
 
 def _h_ecosystem_pulse():
@@ -16200,11 +16199,9 @@ _DEMAND_UA_SQL = """NOT (
     LOWER(COALESCE(ua,'')) LIKE '%agent402%' OR
     LOWER(COALESCE(ua,'')) LIKE '%x402station%' OR
     LOWER(COALESCE(ua,'')) LIKE '%agentrank%' OR
-    LOWER(COALESCE(ua,'')) LIKE '%losbetolinkaudit%' OR
-    LOWER(COALESCE(ua,'')) LIKE '%losbetoexternalaudit%' OR
-    LOWER(COALESCE(ua,'')) LIKE '%losbetomcpaudit%' OR
+    LOWER(COALESCE(ua,'')) LIKE '%x402lint%' OR
+    LOWER(COALESCE(ua,'')) LIKE '%losbeto%audit%' OR
     LOWER(COALESCE(ua,'')) LIKE '%agentcash-readonly-audit%' OR
-    LOWER(COALESCE(ua,'')) LIKE '%losbeto-x402-audit%' OR
     LOWER(COALESCE(ua,'')) LIKE '%losbeto-x402-watch%'
 )"""
 
@@ -21250,8 +21247,8 @@ _UA_NAMED_SCANNER = re.compile(
     r"zgrab|uptime|pingdom|datadog|newrelic|prometheus|zabbix|statuscake|"
     r"betteruptime|hetrixtools|zerobot|heritrix|hermes-contact|semrushbot|"
     r"conformance|agentrank|mekler|ibou-search|barkrowler|clueweb|agent402|"
-    r"x402station|losbeto-x402-watch|losbetolinkaudit|losbetoexternalaudit|"
-    r"losbetomcpaudit|agentcash-readonly-audit|losbeto-x402-audit)", re.I)
+    r"x402station|losbeto-x402-watch|x402lint|"
+    r"losbeto[a-z0-9_-]*audit|agentcash-readonly-audit)", re.I)
 
 _UA_GENERIC_BOT = re.compile(
     r"(bot\b|headless|phantom|puppeteer|playwright|selenium|lighthouse|"
@@ -36762,4 +36759,4 @@ _ops_validate = _v4843_ops_validate
 
 _v4842_sanitize_governance()
 
-VERSION = "48.47.0-CLEARCHECKOUT"
+VERSION = "48.48.0-CLEANMETRICS"
