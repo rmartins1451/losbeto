@@ -2,7 +2,7 @@
 """
 Losbeto x402 — monolithic Flask service for Railway.
 
-Current release: 48.49.0-LOCKPROOF.
+Current release: 48.50.0-BUNDLEPROOF.
 Payment requirements are server-side. Delivery requires verified settlement;
 pending payments are reconciled against independent chain evidence.
 Operational history lives in CHANGELOG.md, not in executable boot output.
@@ -17771,6 +17771,10 @@ _SCAN_NOISE = re.compile(
 
 
 _SCAN_NOISE_EXTRA = re.compile(
+    r"(^|/)\.(?:cursor|vscode|idea|git|svn|hg|aws|ssh)(/|$)|"
+    r"(^|/)api/(?:claim|publish|submit|onboard)$|"
+    r"(^|/)marketplace(?:/|$)|"
+    r"(^|/)a2a$|"
     r"\.netrc$|\.pgpass$|\.git-credentials|\.dockercfg|\.netlify|\.htpasswd|"
     r"(^|/)(server-status|server-info|nginx_status|apache-status)(/|$)|"
     r"(^|/)api/v?\d*/(users?|orders?|accounts?|customers?|admin|version|config)(/|$)|"
@@ -33804,7 +33808,10 @@ def _h_bundle():
             continue
         h = ENDPOINT_HANDLERS.get(p)
         params = dict(ENDPOINT_PARAM_HINTS.get(p, {}))
-        params.update(shared)
+        params.update(ENDPOINT_REQUIRED_PARAMS.get(p, {}))
+        for key, value in shared.items():
+            if value is not None and str(value).strip() != "":
+                params[key] = value
         try:
             raw = _batch_exec(h, params)
             status, data = _batch_unpack(raw)
@@ -38385,4 +38392,4 @@ _ops_validate = _v4843_ops_validate
 
 _v4842_sanitize_governance()
 
-VERSION = "48.49.0-LOCKPROOF"
+VERSION = "48.50.0-BUNDLEPROOF"
