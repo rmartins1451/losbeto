@@ -2,7 +2,7 @@
 """
 Losbeto x402 — monolithic Flask service for Railway.
 
-Current release: 48.50.0-BUNDLEPROOF.
+Current release: 48.51.0-QUIETDEMAND.
 Payment requirements are server-side. Delivery requires verified settlement;
 pending payments are reconciled against independent chain evidence.
 Operational history lives in CHANGELOG.md, not in executable boot output.
@@ -17772,7 +17772,7 @@ _SCAN_NOISE = re.compile(
 
 _SCAN_NOISE_EXTRA = re.compile(
     r"(^|/)\.(?:cursor|vscode|idea|git|svn|hg|aws|ssh)(/|$)|"
-    r"(^|/)api/(?:claim|publish|submit|onboard)$|"
+    r"(^|/)api/(?:claim|publish|submit|onboard|provider/apply|listings/create|listings|listing)$|"
     r"(^|/)marketplace(?:/|$)|"
     r"(^|/)a2a$|"
     r"\.netrc$|\.pgpass$|\.git-credentials|\.dockercfg|\.netlify|\.htpasswd|"
@@ -38392,4 +38392,4 @@ _ops_validate = _v4843_ops_validate
 
 _v4842_sanitize_governance()
 
-VERSION = "48.50.0-BUNDLEPROOF"
+VERSION = "48.51.0-QUIETDEMAND"
