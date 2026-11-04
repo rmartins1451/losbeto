@@ -29184,8 +29184,7 @@ def _watch_url_ok(url: str) -> bool:
 def _watch_measure(url: str) -> dict:
     t0 = time.time()
     try:
-        r = requests.get(url, timeout=8, allow_redirects=True,
-                         headers={"User-Agent": "losbeto-x402-watch/1.0 (+https://api.losbeto.xyz)"})
+        r = _watch_get(url)
         lat = int((time.time() - t0) * 1000)
         price = None
         if r.status_code == 402:
@@ -29204,7 +29203,10 @@ def _watch_measure(url: str) -> dict:
     except Exception as e:
         return {"up": False, "http": 0,
                 "latency_ms": int((time.time() - t0) * 1000),
-                "is_x402": False, "price_usdc": None, "error": str(e)[:140]}
+                "is_x402": False, "price_usdc": None,
+                # v48.52.0: sem texto da exceção — "connection refused" x "timeout" era
+                # um oráculo de port-scan; agora só a classe do erro
+                "error": ("blocked-target" if isinstance(e, ValueError) else type(e).__name__)}
 
 def _watch_status_payload(wid: str):
     try:
@@ -29310,7 +29312,7 @@ def x402_watch_loop():
                                  f"${m.get('price_usdc')}")
                         if webhook:
                             try:
-                                requests.post(webhook, timeout=6, json={
+                                _watch_post(webhook, {
                                     "watch_id": wid, "url": url, "now": m,
                                     "ts": now, "by": "losbeto /x402-watch"})
                             except Exception:
@@ -38392,4 +38394,230 @@ _ops_validate = _v4843_ops_validate
 
 _v4842_sanitize_governance()
 
-VERSION = "48.51.0-QUIETDEMAND"
+VERSION = "48.52.0-WATCHGUARD"
+
+
+# ============================================================================
+# v48.52.0-WATCHGUARD — camada terminal (aditiva)
+#
+#  1. /x402-watch: SSRF. _watch_url_ok só olhava o TEXTO do host (regex de
+#     127./10./192.168./169.254./172.16-31): passavam 100.64.0.0/10 (a rede
+#     interna do Railway), IPv6 (::1, fd12::), IP decimal/hex e qualquer nome DNS
+#     que resolva para IP interno; _watch_measure seguia redirects sozinho e
+#     devolvia http/latência/is_x402/erro — um oráculo de varredura interna,
+#     acessível de GRAÇA em ?preview=1; e o webhook era gravado e disparado
+#     depois sem revalidar, com redirects. Agora: resolve DNS e exige todos os
+#     IPs públicos (_ip_is_public: is_global), portas 80/443/8080/8443,
+#     redirects à mão (3) revalidando cada salto, webhook revalidado NA HORA do
+#     envio, sem seguir redirect, e erro devolvido sem texto da exceção.
+#  2. /ops/farmed-keys v2 + retenção do contato do chat (mesma lógica testada na
+#     v48.37; a revogação da v48.36.2 expirava planos pagos com tx_sig vazio).
+# ============================================================================
+import ipaddress as _ipaddr_w
+from urllib.parse import urlparse as _urlparse_w, urljoin as _urljoin_w
+
+_WATCH_PORTS = {80, 443, 8080, 8443}
+
+
+def _watch_url_ok(url: str) -> bool:  # noqa: F811 — v48.52.0
+    try:
+        u = _urlparse_w(url)
+        if u.scheme not in ("http", "https"):
+            return False
+        h = (u.hostname or "").lower()
+        if not h or h == "localhost" or h.endswith((".internal", ".local", ".localhost")):
+            return False
+        port = u.port or (443 if u.scheme == "https" else 80)
+        if port not in _WATCH_PORTS:
+            return False
+        try:
+            return _ip_is_public(_ipaddr_w.ip_address(h))       # IP literal (v4/v6)
+        except ValueError:
+            pass
+        return _host_resolves_public(h, port)                    # nome → todos os IPs públicos
+    except Exception:
+        return False
+
+
+def _watch_get(url: str):
+    current = url
+    for hop in range(4):
+        if not _watch_url_ok(current):
+            raise ValueError("blocked target")
+        r = requests.get(current, timeout=8, allow_redirects=False, stream=True,
+                         headers={"User-Agent": "losbeto-x402-watch/1.0 (+https://api.losbeto.xyz)"})
+        try:                                    # peer real == público (anti DNS-rebinding)
+            sock = r.raw._connection.sock
+            peer = sock.getpeername()[0] if sock is not None else None
+            if peer and not _ip_is_public(peer):
+                r.close()
+                raise ValueError("blocked peer")
+        except AttributeError:
+            pass
+        loc = r.headers.get("Location")
+        if r.is_redirect and loc and hop < 3:
+            r.close()
+            current = _urljoin_w(current, loc)
+            continue
+        return r
+    raise ValueError("too many redirects")
+
+
+def _watch_post(webhook: str, payload: dict) -> None:
+    if not _watch_url_ok(webhook):
+        log.warning("x402-watch: webhook bloqueado (alvo não público) — descartado")
+        return
+    requests.post(webhook, timeout=6, json=payload, allow_redirects=False)
+
+
+
+# ============================================================================
+# v48.37.0-VERIFY — camada terminal (aditiva, fail-open onde indicado)
+#
+#  1. /ops/farmed-keys v2. A v48.36.2 expira "toda key de plano com tx_sig
+#     vazio e payer não-Pix". Mas tx_sig vazio TAMBÉM ocorre em compra legítima
+#     quando o facilitator não devolve o hash — o POST ?confirm=1 expiraria um
+#     plano que o cliente PAGOU. Agora cada candidata é cruzada com o ledger de
+#     receita (mesmo plano/valor, ±15 min, mesmo pagador): com evidência de
+#     pagamento vira "likely_paid" e é poupada. Payers "credits"/"partner"
+#     (as assinaturas do exploit) continuam suspeitos sempre. A expiração usa
+#     a chave EXATA (o LIKE por prefixo tratava "_" como curinga) e o GET nunca
+#     devolve a key inteira.
+#  2. _sol_postverify (ver acima): defesa em profundidade contra o bug de
+#     facilitator Solana divulgado em 22/out.
+#  3. Retenção do contato do chat (LGPD/GDPR): e-mail/telefone guardados por
+#     CONTACT_RETENTION_DAYS (padrão 180) e removidos depois; o pedido de
+#     contato passa a dizer isso.
+# ============================================================================
+_PLAN_ENDPOINTS: Dict[str, list] = {}
+for _ep_, _pl_ in CREDIT_PLANS.items():
+    _PLAN_ENDPOINTS.setdefault(_pl_["plan"], []).append((_ep_, float(_pl_.get("anchor_price", 0) or 0)))
+
+
+def _key_has_payment_evidence(plan: str, payer: str, created: int) -> bool:
+    eps = _PLAN_ENDPOINTS.get(plan) or []
+    if not eps or not created:
+        return False
+    normalized_payer = str(payer or "").strip().lower()
+    if normalized_payer in ("", "unknown", "credits", "partner", "partner:storefront", "bootstrap"):
+        return False                                   # ausência de identidade não prova pagamento
+    try:
+        with LEDGER._conn() as c:
+            for ep, price in eps:
+                row = c.execute(
+                    "SELECT payer FROM revenue WHERE endpoint=? AND ts BETWEEN ? AND ? AND amount>=? "
+                    "AND source!='bootstrap' LIMIT 20", (ep, created - 900, created + 900,
+                                                         max(0.0, price * 0.95))).fetchall()
+                for (rp,) in row:
+                    if str(rp or "").strip().lower() == normalized_payer:
+                        return True
+    except Exception as e:
+        log.warning(f"key evidence: {e}")
+    return False
+
+
+def _farmed_keys_v2():
+    out = {"suspect": [], "likely_paid": []}
+    now = int(time.time())
+    try:
+        with LEDGER._conn() as c:
+            rows = c.execute("SELECT key, payer, plan, balance_usd, created, expires, calls_used "
+                             "FROM api_keys WHERE (tx_sig IS NULL OR tx_sig='')").fetchall()
+    except Exception as e:
+        log.warning(f"farmed-keys v2 scan: {e}")
+        return out
+    for key, payer, plan, bal, created, expires, used in rows:
+        if plan not in _PLAN_VALUES or str(payer or "").startswith("pix:"):
+            continue
+        rec = {"key_prefix": key[:14] + "…", "_key": key, "payer": payer, "plan": plan,
+               "balance_usd": ("unlimited" if (bal is not None and bal < 0) else bal),
+               "created": created, "expires": expires, "calls_used": used,
+               "active": bool(expires and expires > now)}
+        (out["likely_paid"] if _key_has_payment_evidence(plan, payer, created or 0)
+         else out["suspect"]).append(rec)
+    for k in out:
+        out[k].sort(key=lambda r: (not r["active"], -(r["created"] or 0)))
+    return out
+
+
+def _ops_farmed_keys_v2():
+    if not _dash_token_ok(request.args.get("token", "") or request.headers.get("X-Dash-Token", "")):
+        return jsonify({"error": "forbidden"}), 403
+    res = _farmed_keys_v2()
+    strip = lambda rs: [{k: v for k, v in r.items() if k != "_key"} for r in rs]
+    if request.method == "POST" and request.args.get("confirm") == "1":
+        revoked = skipped = 0
+        try:
+            now = int(time.time())
+            with LEDGER.lock, LEDGER._conn() as c:
+                for r in res["suspect"]:
+                    if not r["active"]:
+                        skipped += 1
+                        continue
+                    c.execute("UPDATE api_keys SET expires=? WHERE key=? AND (tx_sig IS NULL OR tx_sig='')",
+                              (now - 1, r["_key"]))
+                    revoked += 1
+            _notify_telegram(f"🧹 Revogação v2: {revoked} key(s) SEM evidência de pagamento expiradas "
+                             f"({skipped} já inativas; {len(res['likely_paid'])} poupadas por evidência).")
+        except Exception as e:
+            return jsonify({"error": str(e)}), 500
+        return jsonify({"revoked": revoked, "already_inactive": skipped,
+                        "spared_likely_paid": len(res["likely_paid"])})
+    return jsonify({
+        "suspect_keys": len(res["suspect"]),
+        "active_suspect": sum(1 for r in res["suspect"] if r["active"]),
+        "likely_paid_spared": len(res["likely_paid"]),
+        "note": ("suspect = plano sem TX on-chain, sem Pix e SEM linha de receita correspondente "
+                 "(mesmo plano/valor, ±15 min); likely_paid = tx_sig vazio mas com evidência de "
+                 "pagamento no ledger — nunca é revogada. Para expirar as suspeitas ativas: "
+                 "POST /ops/farmed-keys?confirm=1 com X-Dash-Token no header."),
+        "keys": strip(res["suspect"]), "likely_paid": strip(res["likely_paid"])})
+
+
+app.view_functions["ops_farmed_keys"] = _ops_farmed_keys_v2
+
+# --- retenção do contato do chat ------------------------------------------------
+CONTACT_RETENTION_DAYS = int(os.environ.get("CONTACT_RETENTION_DAYS", "180"))
+
+
+def _contact_purge_maybe() -> int:
+    try:
+        if LEDGER.cache_get("contact_purge_ts", 86400):
+            return 0
+        LEDGER.cache_set("contact_purge_ts", {"ts": int(time.time())})
+        cutoff = int(time.time()) - CONTACT_RETENTION_DAYS * 86400
+        c = _contact_db()
+        try:
+            n = c.execute("DELETE FROM chat_contact WHERE ts<?", (cutoff,)).rowcount or 0
+            c.commit()
+        finally:
+            c.close()
+        if n:
+            log.info(f"🧹 contatos do chat expirados (> {CONTACT_RETENTION_DAYS} d): {n}")
+        return n
+    except Exception as e:
+        log.debug(f"contact purge: {e}")
+        return 0
+
+
+_CONTACT_SAVE_PREV = _contact_save
+
+
+def _contact_save(sid, found, raw=""):  # noqa: F811 — v48.37.0
+    r = _CONTACT_SAVE_PREV(sid, found, raw)
+    _contact_purge_maybe()
+    return r
+
+
+_CONTACT_ASK_PREV = _contact_ask_text
+
+
+def _contact_ask_text(texto):  # noqa: F811 — v48.37.0
+    base = _CONTACT_ASK_PREV(texto)
+    pt = "Para eu poder" in base
+    return base + (f" (guardo por até {CONTACT_RETENTION_DAYS} dias; peça e eu apago.)" if pt else
+                   f" (kept up to {CONTACT_RETENTION_DAYS} days; ask and I delete it.)")
+
+
+log.info("🔐 v48.52.0 — revogação v2 com evidência, retenção do contato, watch com guarda SSRF")
+# v48.52.0-WATCHGUARD: /x402-watch (preview gratis incluso) validava so o texto do host → 100.64.0.0/10, IPv6, DNS interno e redirects passavam, e o webhook era disparado sem revalidar; agora DNS publico + portas + redirect manual + webhook revalidado | /ops/farmed-keys v2 (poupa plano pago com tx_sig vazio) | retencao do contato do chat | base: v48.51.0-QUIETDEMAND
