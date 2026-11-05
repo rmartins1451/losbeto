@@ -38394,7 +38394,7 @@ _ops_validate = _v4843_ops_validate
 
 _v4842_sanitize_governance()
 
-VERSION = "48.52.0-WATCHGUARD"
+VERSION = "48.53.0-AMBIGUOUS"
 
 
 # ============================================================================
@@ -38621,3 +38621,114 @@ def _contact_ask_text(texto):  # noqa: F811 — v48.37.0
 
 log.info("🔐 v48.52.0 — revogação v2 com evidência, retenção do contato, watch com guarda SSRF")
 # v48.52.0-WATCHGUARD: /x402-watch (preview gratis incluso) validava so o texto do host → 100.64.0.0/10, IPv6, DNS interno e redirects passavam, e o webhook era disparado sem revalidar; agora DNS publico + portas + redirect manual + webhook revalidado | /ops/farmed-keys v2 (poupa plano pago com tx_sig vazio) | retencao do contato do chat | base: v48.51.0-QUIETDEMAND
+
+
+# ============================================================================
+# v48.53.0-AMBIGUOUS — refina a revogação v2 sem desfazer a regra mais estrita
+#
+# A v48.52.1 (sua) corretamente deixou de aceitar pagador vazio/"unknown" como
+# evidência: antes, QUALQUER venda no ±15 min poupava a key. Efeito colateral: o
+# plano legítimo cujo facilitator não revelou o pagador (api_key_create grava
+# "unknown", o ledger grava payer vazio) virava "suspect" e o POST ?confirm=1 o
+# expirava — um cliente que PAGOU. Agora há um 3º balde, "ambiguous_review":
+# pagador desconhecido + linha de receita do mesmo plano/valor (±15 min) cujo
+# pagador TAMBÉM é desconhecido. Não é revogado por padrão; só com
+# include_ambiguous=1. Pagador conhecido diferente, "credits"/"partner"/
+# "bootstrap" e ausência total de receita continuam "suspect".
+# ============================================================================
+def _key_ambiguous_payment(plan: str, payer: str, created: int) -> bool:
+    eps = _PLAN_ENDPOINTS.get(plan) or []
+    if not eps or not created:
+        return False
+    if str(payer or "").strip().lower() not in ("", "unknown"):
+        return False
+    try:
+        with LEDGER._conn() as c:
+            for ep, price in eps:
+                rows = c.execute(
+                    "SELECT payer FROM revenue WHERE endpoint=? AND ts BETWEEN ? AND ? AND amount>=? "
+                    "AND source!='bootstrap' LIMIT 20", (ep, created - 900, created + 900,
+                                                         max(0.0, price * 0.95))).fetchall()
+                for (rp,) in rows:
+                    if str(rp or "").strip().lower() in ("", "unknown"):
+                        return True
+    except Exception as e:
+        log.warning(f"key ambiguous: {e}")
+    return False
+
+
+def _farmed_keys_v2():  # noqa: F811 — v48.53.0
+    out = {"suspect": [], "ambiguous_review": [], "likely_paid": []}
+    now = int(time.time())
+    try:
+        with LEDGER._conn() as c:
+            rows = c.execute("SELECT key, payer, plan, balance_usd, created, expires, calls_used "
+                             "FROM api_keys WHERE (tx_sig IS NULL OR tx_sig='')").fetchall()
+    except Exception as e:
+        log.warning(f"farmed-keys v2 scan: {e}")
+        return out
+    for key, payer, plan, bal, created, expires, used in rows:
+        if plan not in _PLAN_VALUES or str(payer or "").startswith("pix:"):
+            continue
+        rec = {"key_prefix": key[:14] + "…", "_key": key, "payer": payer, "plan": plan,
+               "balance_usd": ("unlimited" if (bal is not None and bal < 0) else bal),
+               "created": created, "expires": expires, "calls_used": used,
+               "active": bool(expires and expires > now)}
+        if _key_has_payment_evidence(plan, payer, created or 0):
+            out["likely_paid"].append(rec)
+        elif _key_ambiguous_payment(plan, payer, created or 0):
+            out["ambiguous_review"].append(rec)
+        else:
+            out["suspect"].append(rec)
+    for k in out:
+        out[k].sort(key=lambda r: (not r["active"], -(r["created"] or 0)))
+    return out
+
+
+def _ops_farmed_keys_v2():  # noqa: F811 — v48.53.0
+    if not _dash_token_ok(request.args.get("token", "") or request.headers.get("X-Dash-Token", "")):
+        return jsonify({"error": "forbidden"}), 403
+    res = _farmed_keys_v2()
+    strip = lambda rs: [{k: v for k, v in r.items() if k != "_key"} for r in rs]
+    if request.method == "POST" and request.args.get("confirm") == "1":
+        targets = list(res["suspect"])
+        if request.args.get("include_ambiguous") == "1":
+            targets += res["ambiguous_review"]
+        revoked = skipped = 0
+        try:
+            now = int(time.time())
+            with LEDGER.lock, LEDGER._conn() as c:
+                for r in targets:
+                    if not r["active"]:
+                        skipped += 1
+                        continue
+                    c.execute("UPDATE api_keys SET expires=? WHERE key=? AND (tx_sig IS NULL OR tx_sig='')",
+                              (now - 1, r["_key"]))
+                    revoked += 1
+            _notify_telegram(f"🧹 Revogação v2: {revoked} key(s) expiradas ({skipped} já inativas; "
+                             f"{len(res['likely_paid'])} poupadas por evidência; "
+                             f"{len(res['ambiguous_review'])} ambíguas "
+                             f"{'revogadas' if request.args.get('include_ambiguous') == '1' else 'preservadas'}).")
+        except Exception as e:
+            return jsonify({"error": str(e)}), 500
+        return jsonify({"revoked": revoked, "already_inactive": skipped,
+                        "spared_likely_paid": len(res["likely_paid"]),
+                        "ambiguous_review": len(res["ambiguous_review"]),
+                        "ambiguous_revoked": request.args.get("include_ambiguous") == "1"})
+    return jsonify({
+        "suspect_keys": len(res["suspect"]),
+        "active_suspect": sum(1 for r in res["suspect"] if r["active"]),
+        "ambiguous_review": len(res["ambiguous_review"]),
+        "likely_paid_spared": len(res["likely_paid"]),
+        "note": ("suspect = plano sem TX on-chain, sem Pix e sem receita correspondente; "
+                 "ambiguous_review = pagador desconhecido mas há receita do mesmo plano/valor (±15 min) "
+                 "também sem pagador — confira em /receipts antes de revogar (não entra no POST padrão; "
+                 "use &include_ambiguous=1); likely_paid = pagador idêntico no ledger — nunca revogada. "
+                 "Revogar suspeitas ativas: POST /ops/farmed-keys?confirm=1 com X-Dash-Token no header."),
+        "keys": strip(res["suspect"]), "ambiguous": strip(res["ambiguous_review"]),
+        "likely_paid": strip(res["likely_paid"])})
+
+
+app.view_functions["ops_farmed_keys"] = _ops_farmed_keys_v2
+
+# v48.53.0-AMBIGUOUS: revogacao v2 ganha o balde ambiguous_review (pagador desconhecido + receita sem pagador no mesmo plano/valor); POST padrao so revoga suspect; include_ambiguous=1 inclui os ambiguos | base: v48.52.0-WATCHGUARD + sua regra de evidencia estrita
