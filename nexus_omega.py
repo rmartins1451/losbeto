@@ -38397,7 +38397,7 @@ _ops_validate = _v4843_ops_validate
 
 _v4842_sanitize_governance()
 
-VERSION = "48.55.0-MCPROUTES"
+VERSION = "48.55.1-PURGEHARDEN"
 
 
 # ============================================================================
@@ -38813,8 +38813,10 @@ _PREVIEW_PURGED = {"done": False}
 def _preview_purge_param_driven() -> int:
     paths = [p_ for p_ in set(list(ENDPOINT_PARAM_HINTS) + list(_PARAM_REQUIRED) + list(ENDPOINT_BODY_SCHEMAS))
              if _endpoint_takes_input(p_)]
-    for p_ in paths:
-        _PREVIEW_CACHE.pop(p_, None)
+    if not _PREVIEW_PURGED.get("mem"):      # v48.55.0: memória só 1x — retries não zeram o cache de novo
+        _PREVIEW_PURGED["mem"] = True
+        for p_ in paths:
+            _PREVIEW_CACHE.pop(p_, None)
     n = 0
     try:
         if LEDGER.cache_get("preview_purge_v4854", 10 * 365 * 86400):
@@ -38837,12 +38839,43 @@ def _preview_purge_param_driven() -> int:
 
 @app.before_request
 def _v4854_purge_once():
-    if not _PREVIEW_PURGED["done"]:
-        try:
-            if _preview_purge_param_driven() >= 0:
-                _PREVIEW_PURGED["done"] = True
-        except Exception as e:
-            log.warning(f"preview purge retry needed: {e}")
+    # v48.55.0: o retry "a cada requisição" virava tempestade se a falha fosse
+    # persistente (40 requisições = 40 tentativas, cache em memória zerado em cada
+    # uma, 1 warning por chamada). Agora: backoff exponencial (30 s … 10 min) e
+    # no máximo 8 tentativas; enquanto não concluir, o SQLite de preview das rotas
+    # que recebem entrada NÃO é servido (guarda abaixo), então dado de cliente
+    # já gravado não vaza nem durante a falha.
+    st = _PREVIEW_PURGED
+    if st["done"] or st.get("tries", 0) >= 8:
+        return None
+    now = time.time()
+    if now < st.get("next", 0.0):
+        return None
+    st["tries"] = st.get("tries", 0) + 1
+    try:
+        if _preview_purge_param_driven() >= 0:
+            st["done"] = True
+            return None
+    except Exception as e:
+        log.warning(f"preview purge retry needed: {e}")
+    if st["tries"] >= 8:
+        st["next"] = float("inf")
+        log.error("preview purge: 8 tentativas falharam — desistindo; amostras em SQLite das rotas com "
+                  "entrada continuam bloqueadas. Apague a tabela preview_cache e reinicie.")
+    else:
+        st["next"] = now + min(600.0, 15.0 * (2 ** st["tries"]))
     return None
 
 # v48.54.0-ISOLATE: amostra gratis (preview) compartilhada vazava entrada de CLIENTE (resposta paga virava a amostra de todos, tambem no output.example do 402/Bazaar) e deixava o visitante escolher o "exemplo" publico (geracao sob demanda com os params dele) → resposta paga so entra no cache sem entrada de usuario; geracao sob demanda com os hints da rota; purga unica das amostras ja gravadas | base: v48.53.0-AMBIGUOUS
+
+
+# ---- v48.55.0: enquanto a purga não concluiu, não serve do SQLite amostra de rota com entrada
+_PREVIEW_DB_GET_PREV = _preview_db_get
+
+
+def _preview_db_get(path: str):  # noqa: F811 — v48.55.0
+    if not _PREVIEW_PURGED["done"] and _endpoint_takes_input(path):
+        return None
+    return _PREVIEW_DB_GET_PREV(path)
+
+# v48.55.0-PURGEHARDEN: a purga do preview (v48.54) que falha tentava de novo a CADA requisicao (40 req = 40 tentativas, cache em memoria zerado a cada uma, 1 warning por chamada) → backoff exponencial, max 8 tentativas, memoria limpa 1x; e enquanto nao concluir o SQLite de preview das rotas com entrada nao e servido | base: v48.54.0-ISOLATE (com o seu retry)
