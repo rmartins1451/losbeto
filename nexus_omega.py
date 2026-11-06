@@ -2,7 +2,7 @@
 """
 Losbeto x402 — monolithic Flask service for Railway.
 
-Current release: 48.51.0-QUIETDEMAND.
+Current release: 48.55.0-MCPROUTES.
 Payment requirements are server-side. Delivery requires verified settlement;
 pending payments are reconciled against independent chain evidence.
 Operational history lives in CHANGELOG.md, not in executable boot output.
@@ -15767,6 +15767,8 @@ def _mcp_handle(msg: dict):
     return _jsonrpc_error(rid, -32601, f"Method not found: {method}")
 
 @app.route("/mcp", methods=["POST", "GET", "DELETE", "OPTIONS"])
+@app.route("/mcp/jsonrpc", methods=["POST", "GET", "DELETE", "OPTIONS"])
+@app.route("/mcp/v1/message:send", methods=["POST", "GET", "DELETE", "OPTIONS"])
 @app.route("/mcp/mcp", methods=["POST", "GET", "DELETE", "OPTIONS"])  # v48.17.8: alias — 4 IPs/7d sondavam /mcp/mcp e tomavam 404
 @app.route("/api/mcp", methods=["POST", "GET", "DELETE", "OPTIONS"])  # v48.9.9: alias — 12 IPs em 7d
 @app.route("/mcp/v1", methods=["POST", "GET", "DELETE", "OPTIONS"])   # v48.9.17: alias — 13 reqs/10 IPs; probes MCP versionados tomavam 308 p/ /v1/chat/completions (errado: probe MCP quer JSON-RPC, não o gateway LLM)
@@ -38395,7 +38397,7 @@ _ops_validate = _v4843_ops_validate
 
 _v4842_sanitize_governance()
 
-VERSION = "48.54.0-ISOLATE"
+VERSION = "48.55.0-MCPROUTES"
 
 
 # ============================================================================
