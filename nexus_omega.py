@@ -9798,7 +9798,7 @@ def paid_endpoint(path):
                         "price_usd": f"{get_dynamic_price(path):.3f}"}), 200
                 _PREVIEW_GEN_AT[path] = time.time()
                 try:
-                    fresh = handler()
+                    fresh = _call_handler_sanitized(path, handler)   # v48.54.0: isolamento
                     if isinstance(fresh, dict) and "error" not in fresh:
                         _PREVIEW_SERVED[path] += 1
                         _slow = _preview_min_age(path) >= 3600
@@ -10174,7 +10174,8 @@ def paid_endpoint(path):
                         _age = (time.time() - _cur["ts"]) if _cur else 1e9
                         if (path not in _PREVIEW_REQUIRE_PAYMENT
                                 and _age >= _preview_min_age(path)
-                                and _sample_is_good(prev_data)):
+                                and _sample_is_good(prev_data)
+                                and not _request_has_user_input()):   # v48.54.0: isolamento
                             _PREVIEW_CACHE[path] = {"ts": time.time(), "data": prev_data}
                             _preview_db_put(path, prev_data)
                 except Exception: pass
@@ -38394,7 +38395,7 @@ _ops_validate = _v4843_ops_validate
 
 _v4842_sanitize_governance()
 
-VERSION = "48.53.0-AMBIGUOUS"
+VERSION = "48.54.0-ISOLATE"
 
 
 # ============================================================================
@@ -38732,3 +38733,114 @@ def _ops_farmed_keys_v2():  # noqa: F811 — v48.53.0
 app.view_functions["ops_farmed_keys"] = _ops_farmed_keys_v2
 
 # v48.53.0-AMBIGUOUS: revogacao v2 ganha o balde ambiguous_review (pagador desconhecido + receita sem pagador no mesmo plano/valor); POST padrao so revoga suspect; include_ambiguous=1 inclui os ambiguos | base: v48.52.0-WATCHGUARD + sua regra de evidencia estrita
+
+
+# ============================================================================
+# v48.54.0-ISOLATE — isolamento da amostra grátis (cache de preview compartilhado)
+#
+# Achado (reproduzido com teste): _PREVIEW_CACHE[path] é UM valor por endpoint,
+# servido a QUALQUER visitante como "delayed_data" — e é lido também pelo 402
+# (extensions.bazaar.info.output.example, amostra embutida), ou seja, vai parar
+# nos catálogos públicos. Dois caminhos o alimentavam com entrada de usuário:
+#   A) toda chamada PAGA bem-sucedida gravava a resposta no cache (passado o
+#      "delay" da rota) → o /extract, /translate, /llm, /fetch, /wallet-scan,
+#      /br-doc... de um cliente que pagou virava a amostra grátis de todos:
+#      texto do documento, endereço de carteira, URL com token, CNPJ;
+#   B) o ?preview=1 grátis, quando o cache estava vazio, executava o handler
+#      com os parâmetros de QUEM CHAMOU e cacheava o resultado para todos —
+#      qualquer um escolhia o "exemplo" público (conteúdo de /fetch?url=...
+#      com prompt injection, por exemplo).
+# Correção: (A) resposta paga só entra no cache se a requisição NÃO trouxe
+# entrada (nenhum argumento além dos neutros, nenhum corpo POST); (B) a geração
+# sob demanda roda com os exemplos declarados da rota (ENDPOINT_PARAM_HINTS e
+# _PARAM_REQUIRED) e corpo vazio; (C) uma única vez, as amostras já gravadas
+# (memória + SQLite) das rotas que recebem entrada são apagadas — podem conter
+# dados de clientes — e regeneram com entrada segura.
+# ============================================================================
+_NEUTRAL_ARGS = {"preview", "format", "pretty", "api_key", "callback", "ref", "_",
+                 "utm_source", "utm_medium", "utm_campaign"}
+
+
+def _request_has_user_input() -> bool:
+    try:
+        for k in request.args.keys():
+            if k.lower() not in _NEUTRAL_ARGS:
+                return True
+        if request.method in ("POST", "PUT", "PATCH"):
+            body = (request.get_data(cache=True) or b"").strip()
+            if body not in (b"", b"{}", b"null"):
+                return True
+        return False
+    except Exception:
+        return True            # na dúvida, NÃO publica
+
+
+def _safe_preview_args(path: str) -> dict:
+    safe = {k: v for k, v in (ENDPOINT_PARAM_HINTS.get(path) or {}).items()}
+    for grp in (_PARAM_REQUIRED.get(path) or []):
+        if grp and not any(it[0] in safe for it in grp):
+            safe[grp[0][0]] = grp[0][2]
+    return {str(k): str(v) for k, v in safe.items() if k not in ("preview", "format")}
+
+
+def _call_handler_sanitized(path: str, handler):
+    safe = _safe_preview_args(path)
+    d = request.__dict__
+    saved = {k: d.get(k, None) for k in ("args", "_cached_json", "_cached_data")}
+    try:
+        d["args"] = _MultiDict(safe)
+        request._cached_json = ({}, {})
+        request._cached_data = b""
+        return handler()
+    finally:
+        for k, v in saved.items():
+            if v is None:
+                d.pop(k, None)
+            else:
+                d[k] = v
+
+
+def _endpoint_takes_input(path: str) -> bool:
+    hints = {k for k in (ENDPOINT_PARAM_HINTS.get(path) or {}) if k not in ("format", "preview")}
+    return bool(hints) or path in _PARAM_REQUIRED or path in ENDPOINT_BODY_SCHEMAS
+
+
+_PREVIEW_PURGED = {"done": False}
+
+
+def _preview_purge_param_driven() -> int:
+    paths = [p_ for p_ in set(list(ENDPOINT_PARAM_HINTS) + list(_PARAM_REQUIRED) + list(ENDPOINT_BODY_SCHEMAS))
+             if _endpoint_takes_input(p_)]
+    for p_ in paths:
+        _PREVIEW_CACHE.pop(p_, None)
+    n = 0
+    try:
+        if LEDGER.cache_get("preview_purge_v4854", 10 * 365 * 86400):
+            return 0
+        c = _preview_db()
+        try:
+            for p_ in paths:
+                n += c.execute("DELETE FROM preview_cache WHERE path=?", (p_,)).rowcount or 0
+            c.commit()
+        finally:
+            c.close()
+        LEDGER.cache_set("preview_purge_v4854", {"ts": int(time.time()), "rows": n})
+        if n:
+            log.warning(f"🧹 v48.54.0: {n} amostra(s) de preview apagadas (podiam conter entrada de cliente)")
+    except Exception as e:
+        log.warning(f"preview purge: {e}")
+        return -1
+    return n
+
+
+@app.before_request
+def _v4854_purge_once():
+    if not _PREVIEW_PURGED["done"]:
+        try:
+            if _preview_purge_param_driven() >= 0:
+                _PREVIEW_PURGED["done"] = True
+        except Exception as e:
+            log.warning(f"preview purge retry needed: {e}")
+    return None
+
+# v48.54.0-ISOLATE: amostra gratis (preview) compartilhada vazava entrada de CLIENTE (resposta paga virava a amostra de todos, tambem no output.example do 402/Bazaar) e deixava o visitante escolher o "exemplo" publico (geracao sob demanda com os params dele) → resposta paga so entra no cache sem entrada de usuario; geracao sob demanda com os hints da rota; purga unica das amostras ja gravadas | base: v48.53.0-AMBIGUOUS
