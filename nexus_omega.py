@@ -2,7 +2,7 @@
 """
 Losbeto x402 — monolithic Flask service for Railway.
 
-Current release: 48.55.0-MCPROUTES.
+Current release: 48.56.0-A2AGUARD.
 Payment requirements are server-side. Delivery requires verified settlement;
 pending payments are reconciled against independent chain evidence.
 Operational history lives in CHANGELOG.md, not in executable boot output.
@@ -38397,7 +38397,7 @@ _ops_validate = _v4843_ops_validate
 
 _v4842_sanitize_governance()
 
-VERSION = "48.55.1-PURGEHARDEN"
+VERSION = "48.56.0-A2AGUARD"
 
 
 # ============================================================================
@@ -38879,3 +38879,41 @@ def _preview_db_get(path: str):  # noqa: F811 — v48.55.0
     return _PREVIEW_DB_GET_PREV(path)
 
 # v48.55.0-PURGEHARDEN: a purga do preview (v48.54) que falha tentava de novo a CADA requisicao (40 req = 40 tentativas, cache em memoria zerado a cada uma, 1 warning por chamada) → backoff exponencial, max 8 tentativas, memoria limpa 1x; e enquanto nao concluir o SQLite de preview das rotas com entrada nao e servido | base: v48.54.0-ISOLATE (com o seu retry)
+
+
+# ============================================================================
+# v48.56.0-A2AGUARD — /mcp/v1/message:send não é MCP
+#
+# "message:send" é o caminho do binding HTTP+JSON do A2A (Agent2Agent): corpo
+# {"message": {...}}, resposta {"message"|"task": {...}} e erros como status HTTP.
+# O alias da v48.55.1 aponta esse caminho para o handler MCP (JSON-RPC 2.0) — o
+# cliente A2A deixava de tomar 404, mas recebia HTTP 200 com um envelope
+# JSON-RPC de erro ("Method not found: ''", id null) que ele interpreta como
+# resposta válida. Aqui, POST sem "jsonrpc" nesse caminho devolve 501 com a
+# explicação e os caminhos que funcionam. O JSON-RPC legítimo continua igual.
+# (O nó não implementa A2A: as respostas de message/send continuam -32601.)
+# ============================================================================
+@app.before_request
+def _v4856_a2a_rest_guard():
+    try:
+        if request.path != "/mcp/v1/message:send" or request.method != "POST":
+            return None
+        body = request.get_json(silent=True)
+        if isinstance(body, dict) and "jsonrpc" in body:
+            return None
+        resp = jsonify({
+            "error": {"code": 501, "status": "UNSUPPORTED_OPERATION",
+                      "message": ("This path serves MCP (JSON-RPC 2.0), not the A2A HTTP+JSON binding; "
+                                  "A2A message:send is not implemented on this node."),
+                      "try": {"mcp": "POST /mcp  (JSON-RPC 2.0: initialize, tools/list, tools/call)",
+                              "catalog": "GET /.well-known/x402.json",
+                              "openapi": "GET /openapi.json",
+                              "free_samples": "GET /try"}},
+            "provider": f"Losbeto/{VERSION}"})
+        resp.status_code = 501
+        return resp
+    except Exception as e:
+        log.debug(f"a2a guard: {e}")
+        return None
+
+# v48.56.0-A2AGUARD: /mcp/v1/message:send e caminho do binding HTTP+JSON do A2A; o alias para o handler MCP devolvia HTTP 200 + envelope JSON-RPC de erro a clientes A2A → POST sem "jsonrpc" nesse caminho agora devolve 501 explicativo; docstring do cabecalho alinhada a VERSION | base: v48.55.1-PURGEHARDEN
