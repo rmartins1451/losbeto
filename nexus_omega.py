@@ -2,7 +2,7 @@
 """
 Losbeto x402 — monolithic Flask service for Railway.
 
-Current release: 48.56.0-A2AGUARD.
+Current release: 48.57.0-REFUNDSIGNAL.
 Payment requirements are server-side. Delivery requires verified settlement;
 pending payments are reconciled against independent chain evidence.
 Operational history lives in CHANGELOG.md, not in executable boot output.
@@ -20821,6 +20821,7 @@ def jobs_index():
 
 @app.route("/terms")
 @app.route("/tos")
+@app.route("/terms-of-service")
 def terms_page():
     base = _public_base()
     payload = {
@@ -22867,6 +22868,7 @@ are final. Free previews: append <code>?preview=1</code> only where the catalog 
 </body></html>"""
 
 @app.route("/impressum")
+@app.route("/imprint")
 def impressum():
     return Response(_IMPRESSUM_HTML.replace("__VERSION__", VERSION),
                     mimetype="text/html; charset=utf-8")
@@ -33807,8 +33809,13 @@ def _h_bundle():
     for p in paths:
         if time.time() - t0 > BUNDLE_BUDGET_S:
             fails += 1
-            _bundle_fail_note(p, "time budget")
+            # O orçamento global do bundle não prova falha do endpoint. Não
+            # alimentar o ban automático: isso excluía itens saudáveis que
+            # apenas apareceram depois de um item lento na sequência.
+            log.warning(f"↩️ /bundle item não executado: {p} "
+                        "(bundle time budget; endpoint não penalizado)")
             results.append({"endpoint": p, "ok": False,
+                            "reason": "bundle_time_budget",
                             "error": "bundle time budget exhausted — refunded"})
             continue
         h = ENDPOINT_HANDLERS.get(p)
@@ -33845,6 +33852,7 @@ def _h_bundle():
 
     resp = {"bundle": True, "mode": mode, "items": len(paths),
             "delivered": delivered,
+            "delivery_complete": fails == 0,
             "price_usdc": f"{BUNDLE_PRICE:.4f}",
             "results": results}
     if rejected:
@@ -33864,6 +33872,9 @@ def _h_bundle():
                     f"estorno ${refund:.4f} p/ {(payer or '?')[:14]} · "
                     f"culpados: {', '.join(_feps)}")
         key = _refund_as_credit(payer, refund, "/bundle", tx)
+        # Sinalização máquina-legível: entrega parcial + crédito não pode ser
+        # confundida com entrega integral por AgentCash, indexadores ou clientes.
+        resp["refunded"] = True
         resp["partial_refund_usdc"] = refund
         resp["refund_api_key"] = key
         resp["refund_note"] = ("Items that failed were refunded as credit — "
@@ -38397,7 +38408,7 @@ _ops_validate = _v4843_ops_validate
 
 _v4842_sanitize_governance()
 
-VERSION = "48.56.0-A2AGUARD"
+VERSION = "48.57.0-REFUNDSIGNAL"
 
 
 # ============================================================================
