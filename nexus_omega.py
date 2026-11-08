@@ -2,7 +2,7 @@
 """
 Losbeto x402 — monolithic Flask service for Railway.
 
-Current release: 48.60.0-LEANML.
+Current release: 48.61.0-CALIBRATED.
 Payment requirements are server-side. Delivery requires verified settlement;
 pending payments are reconciled against independent chain evidence.
 Operational history lives in CHANGELOG.md, not in executable boot output.
@@ -5689,6 +5689,20 @@ def _mpp_realm() -> str:
 
 _INLINE_SAMPLE_MAX = int(os.environ.get("INLINE_SAMPLE_MAX_CHARS", "900"))
 
+
+def _preview_key(path: str) -> str:
+    """Preview é por produto e parâmetro, não apenas por URL. Evita servir BTC
+    para quem pediu ETH/SOL ou um horizonte diferente."""
+    if path != "/forecast":
+        return path
+    try:
+        sym = re.sub(r"[^A-Z0-9]", "", (request.args.get("symbol") or "BTC").upper())[:8] or "BTC"
+        hz = re.sub(r"[^a-z0-9]", "", (request.args.get("horizon") or "24h").lower())[:4] or "24h"
+    except Exception:
+        sym, hz = "BTC", "24h"
+    return f"{path}?symbol={sym}&horizon={hz}"
+
+
 def _inline_sample(endpoint: str) -> dict:
     """v24.6: amostra compacta do dado real, embutida no corpo do 402.
     Vem do cache de preview (populado pelo warmer, sem custo). Truncada para
@@ -5697,8 +5711,8 @@ def _inline_sample(endpoint: str) -> dict:
         if endpoint in _PREVIEW_REQUIRE_PAYMENT:
             return {"status": "payment_required",
                     "hint": "Purchase endpoints never expose cached credentials."}
-        cached = _PREVIEW_CACHE.get(endpoint) or _preview_db_get(endpoint)
-        if not cached:
+        cached = _PREVIEW_CACHE.get(_preview_key(endpoint)) or _preview_db_get(_preview_key(endpoint))
+        if not cached or not _preview_valid(endpoint, cached.get("data")):
             return {"status": "warming", "hint": f"GET {endpoint}?preview=1 for a free sample"}
         data = cached.get("data")
         blob = json.dumps(data, default=str, ensure_ascii=False)
@@ -6067,7 +6081,7 @@ def _bazaar_blob(endpoint: str) -> dict:
     example_out = {}
     try:
         cached = (None if endpoint in _PREVIEW_REQUIRE_PAYMENT else
-                  (_PREVIEW_CACHE.get(endpoint) or _preview_db_get(endpoint)))
+                  (_PREVIEW_CACHE.get(_preview_key(endpoint)) or _preview_db_get(_preview_key(endpoint))))
         if cached:
             data = cached.get("data")
             if isinstance(data, dict):
@@ -9313,6 +9327,12 @@ def _preview_db_put(path: str, data) -> None:
     except Exception as e:
         log.debug(f"preview_db_put {path}: {e}")
 
+def _preview_valid(path: str, data) -> bool:
+    if path == "/forecast" and isinstance(data, dict) and isinstance(data.get("model"), dict):
+        return data["model"].get("raw_interval_coverage80_empirical") is not None
+    return True
+
+
 def _preview_db_get(path: str) -> Optional[dict]:
     try:
         c = _preview_db()
@@ -9326,7 +9346,10 @@ def _preview_db_get(path: str) -> Optional[dict]:
         ts, blob = row
         if time.time() - ts > PREVIEW_MAX_AGE:
             return None
-        return {"ts": ts, "data": json.loads(blob)}
+        payload = json.loads(blob)
+        if not _preview_valid(path, payload):
+            return None  # preview anterior à separação de cobertura: força regeneração
+        return {"ts": ts, "data": payload}
     except Exception as e:
         log.debug(f"preview_db_get {path}: {e}")
         return None
@@ -9348,9 +9371,14 @@ def _premium_teaser(result: dict) -> dict:
             elif isinstance(v, list) and len(v) > 2:
                 teaser[k] = v[:2] + [f"… +{len(v)-2} more in paid version"]
             elif isinstance(v, dict):
-                teaser[k] = {kk: ("…" if isinstance(vv, (dict, list)) or
-                                  (isinstance(vv, str) and len(vv) > 80) else vv)
-                             for kk, vv in list(v.items())[:6]}
+                if k in ("model", "forecast"):
+                    # Métricas de validação não são texto promocional: cobertura,
+                    # largura e método precisam sobreviver ao teaser.
+                    teaser[k] = v
+                else:
+                    teaser[k] = {kk: ("…" if isinstance(vv, (dict, list)) or
+                                      (isinstance(vv, str) and len(vv) > 80) else vv)
+                                 for kk, vv in list(v.items())[:6]}
             else:
                 teaser[k] = v
         teaser["_teaser"] = True
@@ -9793,12 +9821,15 @@ def paid_endpoint(path):
                     except Exception:
                         pass
                     return jsonify(_preview_paywall_body(path)), 402
-                cached = _PREVIEW_CACHE.get(path)
+                preview_key = _preview_key(path)
+                cached = _PREVIEW_CACHE.get(preview_key)
                 if not cached or (time.time() - cached["ts"]) > PREVIEW_MAX_AGE:
-                    db_hit = _preview_db_get(path)   # v24.3: outro worker / pós-restart
+                    db_hit = _preview_db_get(preview_key)   # v24.3: outro worker / pós-restart
                     if db_hit:
                         cached = db_hit
-                        _PREVIEW_CACHE[path] = db_hit
+                        _PREVIEW_CACHE[preview_key] = db_hit
+                if cached and not _preview_valid(path, cached.get("data")):
+                    cached = None
                 if cached:
                     _PREVIEW_SERVED[path] += 1
                     try:
@@ -9844,12 +9875,12 @@ def paid_endpoint(path):
                                    request.args)
                 except Exception:
                     pass
-                _last = _PREVIEW_GEN_AT.get(path, 0)
+                _last = _PREVIEW_GEN_AT.get(preview_key, 0)
                 if time.time() - _last < PREVIEW_GEN_COOLDOWN:
                     return jsonify({"preview": True, "status": "warming_up",
                         "note": "Sample being generated — retry in a few seconds.",
                         "price_usd": f"{get_dynamic_price(path):.3f}"}), 200
-                _PREVIEW_GEN_AT[path] = time.time()
+                _PREVIEW_GEN_AT[preview_key] = time.time()
                 try:
                     fresh = _call_handler_sanitized(path, handler)   # v48.54.0: isolamento
                     if isinstance(fresh, dict) and "error" not in fresh:
@@ -9857,8 +9888,8 @@ def paid_endpoint(path):
                         _slow = _preview_min_age(path) >= 3600
                         payload = (_premium_teaser(fresh)
                                    if (path in PREMIUM_TEASER_PATHS or _slow) else fresh)
-                        _PREVIEW_CACHE[path] = {"ts": time.time(), "data": payload}
-                        _preview_db_put(path, payload)
+                        _PREVIEW_CACHE[preview_key] = {"ts": time.time(), "data": payload}
+                        _preview_db_put(preview_key, payload)
                         return jsonify({"preview": True, "data_age_seconds": 0,
                             "delayed_data": payload,
                             "building_something": _building_block(),
@@ -10223,14 +10254,15 @@ def paid_endpoint(path):
                             pass
                         prev_data = (_premium_teaser(result)
                                      if path in PREMIUM_TEASER_PATHS else result)
-                        _cur = _PREVIEW_CACHE.get(path) or _preview_db_get(path)
+                        preview_key = _preview_key(path)
+                        _cur = _PREVIEW_CACHE.get(preview_key) or _preview_db_get(preview_key)
                         _age = (time.time() - _cur["ts"]) if _cur else 1e9
                         if (path not in _PREVIEW_REQUIRE_PAYMENT
                                 and _age >= _preview_min_age(path)
                                 and _sample_is_good(prev_data)
                                 and not _request_has_user_input()):   # v48.54.0: isolamento
-                            _PREVIEW_CACHE[path] = {"ts": time.time(), "data": prev_data}
-                            _preview_db_put(path, prev_data)
+                            _PREVIEW_CACHE[preview_key] = {"ts": time.time(), "data": prev_data}
+                            _preview_db_put(preview_key, prev_data)
                 except Exception: pass
                 if not _refunded_here:
                     LEDGER.log_request(path, True, int((time.time() - t0) * 1000), ip,
@@ -15615,8 +15647,8 @@ def _mcp_fetch(path: str, params: dict, key: str) -> dict:
             "note": "Purchase endpoints are not executed through free MCP sampling."})}]}
 
     if not live:
-        cached = _PREVIEW_CACHE.get(path) or _preview_db_get(path)
-        if cached and _sample_is_good(cached.get("data")):
+        cached = _PREVIEW_CACHE.get(_preview_key(path)) or _preview_db_get(_preview_key(path))
+        if cached and _preview_valid(path, cached.get("data")) and _sample_is_good(cached.get("data")):
             return _mcp_wrap(cached["data"], {
                 "_data_status": "delayed_sample",
                 "_age_seconds": int(time.time() - cached["ts"]),
@@ -18856,9 +18888,61 @@ def _fc_feat(p, i, ts):
             math.sin(2 * math.pi * dow / 7), math.cos(2 * math.pi * dow / 7)]
 
 
+def _fc_eval_split(X, Y, B, h):
+    """Split temporal 70/15/15: treino, calibração e teste final intocado.
+    O raio conformal NUNCA é avaliado no mesmo recorte usado para calculá-lo."""
+    n = len(X)
+    tr, ca = int(n * 0.70), int(n * 0.85)
+    if tr < 100 or ca - tr < 20 or n - ca < 20:
+        return None, None, None
+    qs = {}
+    for q in (0.1, 0.5, 0.9):
+        m = HistGradientBoostingRegressor(
+            loss="quantile", quantile=q, max_iter=250,
+            learning_rate=0.06, max_leaf_nodes=31, random_state=42)
+        m.fit(X[:tr], Y[:tr])
+        qs[q] = m
+    actual_c = B[tr:ca] * (1.0 + Y[tr:ca])
+    lo_c = B[tr:ca] * (1.0 + qs[0.1].predict(X[tr:ca]))
+    hi_c = B[tr:ca] * (1.0 + qs[0.9].predict(X[tr:ca]))
+    nonconf = _NP.maximum(lo_c - actual_c, actual_c - hi_c) / _NP.maximum(actual_c, 1e-9)
+    scores = _NP.sort(_NP.maximum(nonconf, 0.0))
+    rank = min(len(scores), max(1, int(_NP.ceil((len(scores) + 1) * 0.80))))
+    radius = float(scores[rank - 1]) if len(scores) else 0.0
+
+    actual_t = B[ca:] * (1.0 + Y[ca:])
+    lo_t = B[ca:] * (1.0 + qs[0.1].predict(X[ca:]))
+    hi_t = B[ca:] * (1.0 + qs[0.9].predict(X[ca:]))
+    pred_t = B[ca:] * (1.0 + qs[0.5].predict(X[ca:]))
+    raw_cov = float(_NP.mean((actual_t >= lo_t) & (actual_t <= hi_t)))
+    cal_lo = lo_t * (1.0 - radius)
+    cal_hi = hi_t * (1.0 + radius)
+    cov = float(_NP.mean((actual_t >= cal_lo) & (actual_t <= cal_hi)))
+    raw_width = float(_NP.mean((hi_t - lo_t) / _NP.maximum(actual_t, 1e-9)))
+    width = float(_NP.mean((cal_hi - cal_lo) / _NP.maximum(actual_t, 1e-9)))
+    mape = float(_NP.mean(_NP.abs(pred_t - actual_t) /
+                          _NP.maximum(actual_t, 1e-9)) * 100)
+    violations = _NP.maximum(cal_lo - actual_t, actual_t - cal_hi)
+    winkler = float(_NP.mean(width + (2.0 / 0.20) * violations))
+    calib = {
+        "radius_rel": round(radius, 5),
+        "raw_coverage80_empirical": round(raw_cov, 3),
+        "coverage80_empirical": round(cov, 3),
+        "raw_bandwidth_pct": round(raw_width * 100, 3),
+        "bandwidth_pct": round(width * 100, 3),
+        "winkler_score": round(winkler, 4),
+        "target_coverage": 0.80,
+        "train_points": tr,
+        "calibration_points": ca - tr,
+        "test_points": n - ca,
+        "method": "chronological 70/15/15 train/calibration/test; split-conformal q80 finite-rank",
+    }
+    return qs, round(mape, 2), calib
+
+
 def _fc_train(sym):
-    """Treina p10/p50/p90 por horizonte com walk-forward 85/15 e publica o
-    MAPE do trecho de teste — o cliente ve o erro real antes de confiar."""
+    """Treina quantis e calibra em blocos temporais independentes. O campo de
+    cobertura publicado é medido no teste final, não no bloco da calibração."""
     if not _ML_SK or _NP is None:
         return False
     try:
@@ -18877,29 +18961,12 @@ def _fc_train(sym):
             if len(X) < 200:
                 continue
             X = _NP.array(X); Y = _NP.array(Y); B = _NP.array(B)
-            cut = int(len(X) * 0.85)
-            qs = {}
-            for q in (0.1, 0.5, 0.9):
-                m = HistGradientBoostingRegressor(
-                    loss="quantile", quantile=q, max_iter=250,
-                    learning_rate=0.06, max_leaf_nodes=31, random_state=42)
-                m.fit(X[:cut], Y[:cut])
-                qs[q] = m
-            pred_ret = qs[0.5].predict(X[cut:])
-            pred_price = B[cut:] * (1.0 + pred_ret)
-            actual = B[cut:] * (1.0 + Y[cut:])
-            mape = float(_NP.mean(_NP.abs(pred_price - actual) /
-                                  _NP.maximum(actual, 1e-9)) * 100)
-            lo_p = B[cut:] * (1.0 + qs[0.1].predict(X[cut:]))
-            hi_p = B[cut:] * (1.0 + qs[0.9].predict(X[cut:]))
-            coverage = float(_NP.mean((actual >= lo_p) & (actual <= hi_p)))
-            nonconf = (_NP.maximum(lo_p - actual, actual - hi_p)
-                       / _NP.maximum(actual, 1e-9))
-            radius_rel = float(_NP.quantile(_NP.maximum(nonconf, 0.0), 0.9))
-            calib[h] = {"radius_rel": round(radius_rel, 5),
-                        "coverage80_empirical": round(coverage, 3)}
+            qs, mape, metrics = _fc_eval_split(X, Y, B, h)
+            if qs is None:
+                continue
             models[h] = qs
-            mapes[h] = round(mape, 2)
+            mapes[h] = mape
+            calib[h] = metrics
         if not models:
             return False
         _FC_MODELS[sym] = {"models": models, "mape": mapes, "calib": calib,
@@ -18914,6 +18981,11 @@ def _fc_train(sym):
     except Exception as e:
         log.info(f"🧠 /forecast train {sym}: {e}")
         return False
+
+
+def _fc_ready(sym):
+    """Prontidão é memória + volume compartilhado, nunca apenas o worker atual."""
+    return bool(sym in _FC_MODELS or (_FC_DIR / f"{sym}.joblib").exists())
 
 
 def _fc_load(sym):
@@ -18968,11 +19040,15 @@ def _fc_predict(sym, h):
     calib_h = (ent.get("calib") or {}).get(h) or {}
     radius = float(calib_h.get("radius_rel") or 0.0)
     coverage = calib_h.get("coverage80_empirical")
+    raw_coverage = calib_h.get("raw_coverage80_empirical")
     p10_px = max(last * (1 + q10), 0.0)
     p50_px = max(last * (1 + q50), 0.0)
     p90_px = max(last * (1 + q90), 0.0)
     p10_cal = round(max(p10_px * (1.0 - radius), 0.0), 6) if radius > 0 else None
     p90_cal = round(p90_px * (1.0 + radius), 6) if radius > 0 else None
+    raw_bw = round((q90 - q10) * 100, 2)
+    calibrated_bw = (round((p90_cal - p10_cal) / last * 100, 2)
+                     if radius > 0 and p10_cal is not None and p90_cal is not None else raw_bw)
     return {"symbol": sym,
             "horizon": f"{h}h", "horizon_hours": h,
             "last_price": round(last, 6),
@@ -18983,7 +19059,8 @@ def _fc_predict(sym, h):
                          "p10_calibrated": p10_cal,
                          "p90_calibrated": p90_cal,
                          "expected_move_pct": round(q50 * 100, 2),
-                         "bandwidth_pct": round((q90 - q10) * 100, 2),
+                         "bandwidth_pct": calibrated_bw,
+                         "raw_bandwidth_pct": raw_bw,
                          "direction": ("up" if q50 > 0.005 else
                                        "down" if q50 < -0.005 else "flat")},
             "model": {"type": "HistGradientBoosting quantile regression — 100% local",
@@ -18992,10 +19069,11 @@ def _fc_predict(sym, h):
                       "trained_at": ent["trained_at"],
                       "backtest_mape_pct_walkforward": ent["mape"].get(h),
                       "interval_coverage80_empirical": coverage,
+                      "raw_interval_coverage80_empirical": raw_coverage,
                       "conformal_radius_rel": (radius or None),
-                      "calibration": ("split-conformal on the walk-forward test "
-                                      "slice" if radius > 0 else
-                                      "uncalibrated (pre-48.17 model file — "
+                      "validation": calib_h,
+                      "calibration": (calib_h.get("method") if radius > 0 else
+                                      "uncalibrated (pre-48.61 model file — "
                                       "retrains within 6h)")},
             "disclaimer": ("Statistical forecast from a local model trained on this "
                            "node's own collected price history. The p10-p90 band is "
@@ -19299,11 +19377,11 @@ def ml_public():
                 n = c.execute("SELECT COUNT(*) FROM ml_price_history WHERE symbol=?",
                               (sym,)).fetchone()[0]
                 fc_syms[sym] = {"hours": n,
-                                "ready": bool(n >= _FC_MIN_POINTS and sym in _FC_MODELS)}
+                                "ready": bool(n >= _FC_MIN_POINTS and _fc_ready(sym))}
     except Exception:
         for sym in _FC_FEEDS:
             fc_syms[sym] = {"hours": _FC_STATS["points"].get(sym, 0),
-                            "ready": sym in _FC_MODELS}
+                            "ready": _fc_ready(sym)}
     out = {
         "node": "Losbeto", "version": VERSION,
         "how_it_runs": ("All models below run 100% on this node (ONNX Runtime + "
@@ -25290,11 +25368,12 @@ def _warm_once(paths: List[str], label: str) -> int:
             with app.test_request_context(path):
                 result = handler()
             if isinstance(result, dict) and _sample_is_good(result):
-                _cur = _PREVIEW_CACHE.get(path) or _preview_db_get(path)
+                preview_key = _preview_key(path)
+                _cur = _PREVIEW_CACHE.get(preview_key) or _preview_db_get(preview_key)
                 _age = (time.time() - _cur["ts"]) if _cur else 1e9
                 if _age >= _preview_min_age(path):
-                    _PREVIEW_CACHE[path] = {"ts": time.time(), "data": result}
-                    _preview_db_put(path, result)
+                    _PREVIEW_CACHE[preview_key] = {"ts": time.time(), "data": result}
+                    _preview_db_put(preview_key, result)
                 ok += 1
         except LLMUnavailable:
             log.debug(f"warm {path}: IA fora, amostra anterior mantida")
@@ -26323,7 +26402,7 @@ def endpoint_markdown(endpoint_name):
     example = None
     try:
         cached = (None if path in _PREVIEW_REQUIRE_PAYMENT else
-                  (_PREVIEW_CACHE.get(path) or _preview_db_get(path)))
+                  (_PREVIEW_CACHE.get(_preview_key(path)) or _preview_db_get(_preview_key(path))))
         if cached:
             example = cached.get("data")
     except Exception:
@@ -38561,7 +38640,7 @@ _ops_validate = _v4843_ops_validate
 
 _v4842_sanitize_governance()
 
-VERSION = "48.60.0-LEANML"
+VERSION = "48.61.0-CALIBRATED"
 
 
 # ============================================================================
@@ -38946,6 +39025,11 @@ def _safe_preview_args(path: str) -> dict:
     for grp in (_PARAM_REQUIRED.get(path) or []):
         if grp and not any(it[0] in safe for it in grp):
             safe[grp[0][0]] = grp[0][2]
+    if path == "/forecast":
+        safe["symbol"] = re.sub(r"[^A-Z0-9]", "",
+                                (request.args.get("symbol") or safe.get("symbol") or "BTC").upper())[:8] or "BTC"
+        safe["horizon"] = re.sub(r"[^a-z0-9]", "",
+                                 (request.args.get("horizon") or safe.get("horizon") or "24h").lower())[:4] or "24h"
     return {str(k): str(v) for k, v in safe.items() if k not in ("preview", "format")}
 
 
