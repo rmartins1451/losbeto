@@ -2,7 +2,7 @@
 """
 Losbeto x402 — monolithic Flask service for Railway.
 
-Current release: 48.57.0-REFUNDSIGNAL.
+Current release: 48.58.0-DISCOVERYCREDIT.
 Payment requirements are server-side. Delivery requires verified settlement;
 pending payments are reconciled against independent chain evidence.
 Operational history lives in CHANGELOG.md, not in executable boot output.
@@ -6084,11 +6084,14 @@ def _bazaar_blob(endpoint: str) -> dict:
 
     _bs = ENDPOINT_BODY_SCHEMAS.get(endpoint) if "ENDPOINT_BODY_SCHEMAS" in globals() else None
     if _bs:
+        _body_type = str(_bs.get("contentType") or "json").lower()
+        if _body_type not in ("json", "form-data", "text"):
+            _body_type = "json"
         return {
             "info": {
                 "input": {"type": "http", "method": _bs["method"],
-                          "contentType": _bs["contentType"],
-                          "bodyParams": _bs["example"]},
+                          "bodyType": _body_type,
+                          "body": _bs["example"]},
                 "output": ({"type": "json", "example": example_out} if example_out
                            else {"type": "json"}),
             },
@@ -6097,10 +6100,19 @@ def _bazaar_blob(endpoint: str) -> dict:
                 "$schema": "https://json-schema.org/draft/2020-12/schema",
                 "type": "object",
                 "properties": {
-                    "input": {"type": "object", "properties": {
-                        "method": {"type": "string", "description": _bs["method"]},
-                        "bodyParams": _bs["schema"]}},
+                    "input": {
+                        "type": "object",
+                        "properties": {
+                            "type": {"type": "string", "const": "http"},
+                            "method": {"type": "string", "enum": ["POST", "PUT", "PATCH"]},
+                            "bodyType": {"type": "string", "enum": ["json", "form-data", "text"]},
+                            "body": _bs["schema"],
+                        },
+                        "required": ["type", "method", "bodyType", "body"],
+                        "additionalProperties": False,
+                    },
                     "output": {"type": "object", "properties": {
+                        "type": {"type": "string"},
                         "example": {"type": "object", "description": desc}}},
                 },
                 "required": ["input"]},
@@ -6124,10 +6136,19 @@ def _bazaar_blob(endpoint: str) -> dict:
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "type": "object",
             "properties": {
-                "input": {"type": "object", "properties": {
-                    "queryParams": {"type": "object", "properties": props,
-                                    "required": _req_params}}},
+                "input": {
+                    "type": "object",
+                    "properties": {
+                        "type": {"type": "string", "const": "http"},
+                        "method": {"type": "string", "enum": ["GET", "HEAD", "DELETE"]},
+                        "queryParams": {"type": "object", "properties": props,
+                                        "required": _req_params},
+                    },
+                    "required": ["type", "method"],
+                    "additionalProperties": False,
+                },
                 "output": {"type": "object", "properties": {
+                    "type": {"type": "string"},
                     "example": {"type": "object", "description": desc}}},
             },
             "required": ["input"]},
@@ -6271,40 +6292,69 @@ def _upsell_note(payer: str) -> Optional[dict]:
     return None
 
 
+def _plan_options(unit_price: float) -> list:
+    """Opções viáveis para um preço de endpoint, sem break-even fictício.
+
+    Crédito finito só entra se cobrir pelo menos uma chamada. O retorno inclui
+    o número real de chamadas cobertas e deixa explícito que os produtos são
+    pré-pagos ou por janela, nunca assinaturas recorrentes implícitas.
+    """
+    try:
+        unit = float(unit_price)
+    except Exception:
+        return []
+    if unit <= 0:
+        return []
+    base = _public_base()
+    out = []
+    for ep, cfg in CREDIT_PLANS.items():
+        price = BASE_PRICES.get(ep)
+        if not price:
+            continue
+        unlimited = cfg["balance_usd"] == -1
+        balance = cfg["balance_usd"]
+        covers = None if unlimited else int((float(balance) + 1e-9) // unit)
+        if not unlimited and covers < 1:
+            continue
+        breakeven = int(price / unit) + 1
+        out.append({
+            "plan": cfg["plan"], "endpoint": ep, "buy": f"{base}{ep}",
+            "billing_model": "time_limited_access" if unlimited else "prepaid_credit",
+            "recurring": False,
+            "price_usdc": round(price, 2), "duration_days": cfg["ttl_days"],
+            "grants": ("unlimited calls to every endpoint" if unlimited
+                       else f"${balance:.2f} of call credit"),
+            "covers_calls": ("unlimited" if unlimited else covers),
+            "breaks_even_after": breakeven,
+            "value_ratio": (None if unlimited else round(balance / price, 3)),
+            "note": (f"At ${unit:.4f}/call, this option covers "
+                     f"{'unlimited' if unlimited else covers} calls and becomes "
+                     f"rational from call #{breakeven} if the credit is fully used."),
+        })
+    out.sort(key=lambda x: (x["breaks_even_after"], x["price_usdc"]))
+    if out:
+        out[0]["recommended"] = True
+        out[0]["recommended_reason"] = (
+            f"Earliest viable break-even at ${unit:.4f}/call: "
+            f"{out[0]['grants']}, from call #{out[0]['breaks_even_after']}.")
+    return out
+
+
+def _best_plan_option(unit_price: float) -> Optional[dict]:
+    options = _plan_options(unit_price)
+    return options[0] if options else None
+
+
 def _subscription_offer(endpoint: str, unit_price: float) -> Optional[dict]:
     """Alternativas mais baratas que pagar esta chamada avulsa, com o
     ponto de equilíbrio calculado no preço deste endpoint."""
     if unit_price <= 0 or endpoint in CREDIT_PLANS:
         return None
     base = _public_base()
-    opcoes = []
-    for ep, cfg in CREDIT_PLANS.items():
-        preco = BASE_PRICES.get(ep)
-        if not preco:
-            continue
-        ilimitado = cfg["balance_usd"] == -1
-        equilibrio = int(preco / unit_price) + 1
-        item = {
-            "plan": cfg["plan"],
-            "buy": f"{base}{ep}",
-            "price_usdc": round(preco, 2),
-            "duration_days": cfg["ttl_days"],
-            "grants": ("unlimited calls to every endpoint" if ilimitado
-                       else f"${cfg['balance_usd']:.2f} of call credit"),
-            "breaks_even_after": equilibrio,
-            "note": (f"Cheaper than paying per call from call #{equilibrio} "
-                     f"onward, at this endpoint's price."),
-        }
-        if ilimitado:
+    opcoes = _plan_options(unit_price)
+    for item in opcoes:
+        if item["billing_model"] == "time_limited_access":
             item["includes_mcp_live"] = True
-        opcoes.append(item)
-    opcoes.sort(key=lambda x: x["price_usdc"])
-    if opcoes:
-        _best = min(opcoes, key=lambda x: x["breaks_even_after"])
-        _best["recommended"] = True
-        _best["recommended_reason"] = (
-            f"Earliest break-even at this endpoint's price: from call "
-            f"#{_best['breaks_even_after']} onward you stop paying per call.")
     return {
         "why": ("If your agent will call this more than a handful of times, "
                 "one of these costs less and removes settlement latency "
@@ -11628,39 +11678,51 @@ for _ep in CREDIT_PLANS:
 
 @app.route("/plans")
 def plans_json():
-    """v48.3-PLANS: catálogo de planos em JSON para agentes (o /pricing é HTML
-    para humanos). Break-even calculado contra o preço médio do catálogo —
-    um agente de orçamento decide sem nenhuma chamada extra."""
+    """Catálogo de planos com economia por endpoint ou por demanda orgânica real.
+    `/plans?endpoint=/fetch` dá a decisão para esse produto. Sem o parâmetro,
+    usa VWAP orgânico de 30d quando disponível; nunca auto compras."""
     base = _public_base()
-    paid = [p for e, p in BASE_PRICES.items() if e not in CREDIT_PLANS and p > 0]
+    paid = sorted(p for e, p in BASE_PRICES.items() if e not in CREDIT_PLANS and p > 0)
     avg = (sum(paid) / len(paid)) if paid else 0.02
+    median = paid[len(paid) // 2] if paid else 0.02
+    selected = (request.args.get("endpoint") or "").strip()
+    if selected and not selected.startswith("/"):
+        selected = "/" + selected
+    if selected in BASE_PRICES and selected not in CREDIT_PLANS:
+        reference = get_dynamic_price(selected)
+        basis = "endpoint"
+    else:
+        selected = ""
+        sales, revenue, _buyers = _v4843_organic_sales_by_endpoint(30, True)
+        n_sales = sum(sales.values())
+        reference = (sum(revenue.values()) / n_sales) if n_sales else median
+        basis = "organic_30d_vwap" if n_sales else "catalog_median"
+    options = _plan_options(reference)
     plans = []
-    for ep, cfg in CREDIT_PLANS.items():
-        preco = BASE_PRICES.get(ep)
-        if not preco:
-            continue
-        ilimitado = cfg["balance_usd"] == -1
+    for option in options:
+        cfg = CREDIT_PLANS[option["endpoint"]]
         plans.append({
-            "plan": cfg["plan"], "endpoint": ep, "buy": f"{base}{ep}",
-            "price_usdc": round(preco, 2), "duration_days": cfg["ttl_days"],
-            "grants": ("unlimited calls to every endpoint" if ilimitado
-                       else f"${cfg['balance_usd']:.2f} of call credit"),
+            **option,
             "bonus": cfg.get("bonus", ""), "pitch": cfg.get("pitch", ""),
-            "break_even_calls_at_avg_price": int(preco / avg) + 1,
-            "value_ratio": (None if ilimitado
-                            else round(cfg["balance_usd"] / preco, 3)),
+            "reference_price_usdc": round(reference, 6),
+            "break_even_calls_at_avg_price": int(option["price_usdc"] / avg) + 1,
             "how_to_use": ("Pay once via x402; the returned key goes in the "
                            "X-API-Key header and calls skip settlement (~1ms)."),
         })
-    plans.sort(key=lambda p: p["price_usdc"])
+    recommended = plans[0] if plans else None
     return jsonify({
         "plans": plans,
+        "reference": {"basis": basis, "endpoint": selected or None,
+                      "price_usdc": round(reference, 6)},
         "catalog_avg_call_usdc": round(avg, 4),
+        "catalog_median_call_usdc": round(median, 4),
         "endpoints_covered": len(BASE_PRICES) - len(CREDIT_PLANS),
-        "advice_for_agents": ("If your expected calls x avg price exceed a "
-                              "plan's price, the plan is the rational choice — "
-                              "and settled calls arrive without latency."),
-        "recommended_first_purchase": f"{base}/buy-credits",
+        "advice_for_agents": ("Choose by the endpoint and expected call count. "
+                              "Finite plans are shown only when they cover at least "
+                              "one call; use covers_calls and breaks_even_after, not "
+                              "the catalog average alone."),
+        "recommended_first_purchase": (recommended or {}).get("buy", f"{base}/buy-credits-micro"),
+        "recommendation": recommended,
         "human_readable": f"{base}/pricing",
         "ts": int(time.time()),
     })
@@ -13905,7 +13967,7 @@ body.show-agent .tab-h{display:none!important}
 body.show-agent .tab-a{display:block}
 </style></head><body>
 <header><div class="wrap hrow">
-  <div class="logo"><img src="/favicon.svg?v=2" width="22" height="22" alt="" style="vertical-align:-5px;margin-right:8px">los<span>beto</span></div>
+  <div class="logo"><img src="/favicon.ico?v=2" width="22" height="22" alt="" style="vertical-align:-5px;margin-right:8px">los<span>beto</span></div>
   <nav>
     <a href="#top">Top</a><a href="#start">Start</a>
     <a href="/get-pricing">Pricing</a><a href="/openapi.json">API</a>
@@ -13918,12 +13980,12 @@ body.show-agent .tab-a{display:block}
 </div></header>
 
 <section class="band" id="hero"><div class="wrap">
-<h1>LLM inference + market data <em>agents pay for</em>, one call at a time.</h1>
-<p class="sub">OpenAI-compatible LLM gateway at $0.005/call — point any SDK at
-/v1/chat/completions and pay per call in USDC. Plus Brazil central-bank
-macro and B3 equities, US equities, forex,
-commodities, global macro and crypto. No API keys, no accounts — your agent
-settles a few cents in USDC per request and gets clean JSON back.</p>
+<h1>Market intelligence and compliance <em>your agent can buy on demand</em>.</h1>
+<p class="sub">Signed point-in-time Brazil macro archives, global equities and FX,
+counterparty and wallet risk checks, x402 diagnostics and OpenAI-compatible
+inference. Pay per task in USDC or use prepaid credit — no account, no vendor
+lock-in and no provider key to manage. Start with a free live sample, then
+choose the pricing model that fits your workload.</p>
 <a class="pill8004" href="https://8004scan.io/agents/base/87048">✓&nbsp; ERC-8004 registered on-chain · agent #87048 on Base&nbsp;↗</a>
 <div class="cta">
   <a class="p" href="/try">Try free — 6 live samples</a>
@@ -13956,7 +14018,7 @@ settles a few cents in USDC per request and gets clean JSON back.</p>
      forecast ML, classe de carteira, ENS, explainer LLM e reputação ERC-8004.
      Visível nas DUAS abas (human/agent) — fora do #human de propósito. -->
 <section class="band alt"><div class="wrap">
-<h2>New — Base chain intelligence, priced for loops</h2>
+<h2>Base chain intelligence for autonomous workflows</h2>
 <p class="lede">Base chain reads with explicit schemas and pay-per-call settlement:
 gas forecasting, wallet classification, ENS resolution, LLM transaction
 explanations and ERC-8004 reputation lookups. Live availability and current
@@ -15384,6 +15446,7 @@ def _mcp_search(query: str, limit: int = 8) -> list:
             "price_usdc": round(get_dynamic_price(path), 4),
             "parameters": {k: v for k, v in hints.items() if k != "format"} or None,
             "free_sample": path not in _PREVIEW_REQUIRE_PAYMENT,
+            "recommended_plan": _best_plan_option(get_dynamic_price(path)),
         })
     return out
 
@@ -15559,41 +15622,80 @@ def _mcp_fetch(path: str, params: dict, key: str) -> dict:
                     "Subscribe once and pass Authorization: Bearer <key> on this MCP "
                     f"connection, or pay ${price:.4f} per call over x402 at "
                     f"{_public_base()}{path}. See account_status."),
+                "_recommended_plan": _best_plan_option(price),
             })
+
+    credit_used = None
+    if live:
+        try:
+            credit_used = LEDGER.api_key_use(key, price)
+        except Exception as e:
+            log.warning(f"mcp credit reservation failed {path}: {e}")
+            credit_used = None
+        if credit_used is None:
+            return {"isError": True, "content": [{"type": "text", "text": json.dumps({
+                "error": "insufficient_balance", "charged": False,
+                "endpoint": path, "price_usdc": round(price, 6),
+                "detail": "The live handler was not executed and no credit was consumed.",
+                "top_up": f"{_public_base()}/buy-credits",
+                "plans": f"{_public_base()}/plans"})}]}
 
     qs = "&".join(f"{k}={v}" for k, v in (params or {}).items() if v is not None)
     try:
         with app.test_request_context(f"{path}?{qs}"):
             result = handler()
     except LLMUnavailable:
+        if credit_used is not None:
+            try:
+                LEDGER.api_key_credit(key, price)
+            except Exception as e:
+                log.warning(f"mcp credit refund failed {path}: {e}")
         return _mcp_wrap({
-            "status": "unavailable",
+            "status": "unavailable", "charged": False,
             "error": "The AI synthesis behind this product is temporarily down. "
                      "Nothing was charged.",
             "retry_after_seconds": 300,
         })
     except Exception as e:
+        if credit_used is not None:
+            try:
+                LEDGER.api_key_credit(key, price)
+            except Exception as re:
+                log.warning(f"mcp credit refund failed {path}: {re}")
         log.debug(f"mcp fetch {path}: {e}")
         return {"isError": True, "content": [{"type": "text",
-                "text": f"Execution failed: {str(e)[:140]}"}]}
+                "text": f"Execution failed; credit was not consumed: {str(e)[:140]}"}]}
 
-    if isinstance(result, tuple):
-        result = result[0]
+    status, data = _batch_unpack(result)
+    failed_result = (_is_error_result(result) or (status and status >= 500) or
+                     (isinstance(data, dict) and bool(data.get("error"))))
+    if failed_result:
+        refunded = False
+        if credit_used is not None:
+            try:
+                refunded = LEDGER.api_key_credit(key, price) is not None
+            except Exception as e:
+                log.warning(f"mcp credit refund failed {path}: {e}")
+        return {"isError": True, "content": [{"type": "text", "text": json.dumps({
+            "error": "endpoint did not deliver", "charged": False,
+            "refunded": refunded, "endpoint_status": status,
+            "detail": data if isinstance(data, dict) else None,
+            "note": ("Credit returned to the API key." if refunded else
+                     "Credit refund could not be confirmed; reconcile the key.")}, default=str)}]}
 
     if live:
-        try:
-            if isinstance(sub, dict) and sub.get("balance_usd") != -1:
-                LEDGER.api_key_use(key, price)
-        except Exception as e:
-            log.debug(f"mcp meter {path}: {e}")
-        return _mcp_wrap(result, {"_data_status": "live", "_billed_usdc": round(price, 4)})
+        extra = {"_data_status": "live", "_billed_usdc": round(price, 4)}
+        if credit_used:
+            extra["_credits_remaining"] = credit_used.get("remaining")
+        return _mcp_wrap(data, extra)
 
-    payload = (_premium_teaser(result)
-               if path in PREMIUM_TEASER_PATHS and isinstance(result, dict) else result)
+    payload = (_premium_teaser(data)
+               if path in PREMIUM_TEASER_PATHS and isinstance(data, dict) else data)
     return _mcp_wrap(payload, {
         "_data_status": "delayed_sample",
         "_live_price_usdc": round(price, 4),
         "_how_to_get_live": f"Pay over x402 at {_public_base()}{path}, or subscribe.",
+        "_recommended_plan": _best_plan_option(price),
     })
 
 
@@ -15641,22 +15743,22 @@ def _mcp_categories() -> dict:
 
 def _mcp_account(key: str) -> dict:
     base = _public_base()
-    plans = {ep: {"price_usdc": BASE_PRICES.get(ep),
-                  "grants": ("unlimited calls" if p["balance_usd"] == -1
-                             else f"${p['balance_usd']:.2f} of call credit"),
-                  "duration_days": p["ttl_days"],
-                  "buy": f"{base}{ep}"}
-             for ep, p in CREDIT_PLANS.items() if ep in BASE_PRICES}
+    plan_options = _plan_options(0.01)
+    plans = {p["endpoint"]: p for p in plan_options}
+    recommended = plan_options[0] if plan_options else None
     if not key:
         return _mcp_wrap({
             "subscribed": False,
             "reason": "No key presented on this connection.",
             "how_to_subscribe": {
-                "step_1": f"Pay one of the plans over x402, e.g. {base}/subscribe-pro",
+                "step_1": f"Pay the recommended prepaid option over x402: "
+                          f"{(recommended or {}).get('buy', base + '/buy-credits-micro')}",
                 "step_2": "The response contains your key.",
                 "step_3": "Reconnect this MCP server with "
                           "Authorization: Bearer <key> to get live data.",
             },
+            "reference_price_usdc": 0.01,
+            "recommended_plan": recommended,
             "plans": plans,
             "note": "Without a subscription, data tools return real delayed "
                     "samples at no cost; plans and passes require new revenue.",
@@ -17112,10 +17214,9 @@ def llm_free():
     q = (request.args.get("q") or "").strip()[:2000]
     base = _public_base()
     if not q:
-        return jsonify({"error": "missing-q",
-                        "how": f"GET {base}/llm/free?q=your+question",
-                        "paid_full_version": f"{base}/llm?q=... (2048 tokens, x402 ${LLM_PROXY_PRICE})",
-                        "ts": int(time.time())}), 400
+        # Link público de avaliação: a URL sem query também deve demonstrar o
+        # produto, mantendo exatamente as mesmas quotas e o mesmo timeout.
+        q = "Give a concise, neutral overview of today's crypto market regime."
     day = time.strftime("%Y-%m-%d", time.gmtime())
     ip = (request.headers.get("X-Forwarded-For", request.remote_addr or "")).split(",")[0].strip() or "unknown"
     g = _llm_db_read(f"fg:{day}")
@@ -21944,7 +22045,6 @@ def erc8004_registration():
         "services": [
             {"name": "web", "endpoint": base},
             {"name": "MCP", "endpoint": f"{base}/mcp", "version": "2025-06-18"},
-            {"name": "A2A", "endpoint": f"{base}/.well-known/agent.json", "version": "0.3.0"},
             {"name": "OASF", "endpoint": f"{base}/openapi.json"},
         ],
         "x402Support": True,
@@ -21971,7 +22071,14 @@ def manifest_agent():
         "version":        VERSION,
         "provider":       {"organization": "Losbeto", "url": base},
         "capabilities":   {"streaming": False, "pushNotifications": False,
-                           "stateTransitionHistory": True},
+                           "stateTransitionHistory": False, "a2aMessageSend": False},
+        "additionalInterfaces": [
+            {"name": "MCP", "transport": "streamable-http",
+             "url": f"{base}/mcp"},
+            {"name": "OpenAPI", "url": f"{base}/openapi.json"},
+        ],
+        "a2a": {"messageSend": False,
+                "reason": "A2A message:send is not implemented; use MCP JSON-RPC or x402 HTTP."},
         "defaultInputModes":  ["application/json"],
         "defaultOutputModes": ["application/json"],
         "skills": [{
@@ -22788,7 +22895,7 @@ def favicon():
     r.headers["Cache-Control"] = "public, max-age=86400"
     return r
 
-@app.route("/favicon.svg")
+@app.route("/favicon.ico")
 def favicon_svg():
     r = app.response_class(_FAVICON_SVG, mimetype="image/svg+xml")
     r.headers["Cache-Control"] = "public, max-age=86400"
@@ -22835,7 +22942,7 @@ _IMPRESSUM_HTML = """<!DOCTYPE html>
 <html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Impressum — Losbeto x402 Node</title>
-<link rel="icon" href="/favicon.svg?v=2">
+<link rel="icon" href="/favicon.ico?v=2">
 <style>
 body{background:#0b0f14;color:#e6edf3;font-family:ui-monospace,Menlo,monospace;
 max-width:760px;margin:40px auto;padding:0 20px;line-height:1.65}
@@ -22844,7 +22951,7 @@ a{color:#4ADE80} h1{font-size:22px} h2{font-size:15px;color:#4ADE80;margin-top:2
 img{vertical-align:middle;height:28px;margin-right:8px}
 .small{color:#8b949e;font-size:12px;margin-top:28px}
 </style></head><body>
-<h1><img src="/favicon.svg?v=2" alt="Losbeto">Impressum / Operator</h1>
+<h1><img src="/favicon.ico?v=2" alt="Losbeto">Impressum / Operator</h1>
 <div class="card">
 <h2>Service</h2>
 <p><b>Losbeto</b> — an autonomous, machine-payable API node speaking the
@@ -23224,10 +23331,10 @@ def _ucp_signing_keys() -> list:
 
 @app.route("/.well-known/ucp")
 def ucp_profile():
-    """Perfil UCP (ucp.dev/specification). Declara serviços nos 3 transportes
-    que o node JÁ tem (REST/OpenAPI, MCP streamable, A2A agent-card), a
-    capability de checkout e o handler de pagamento x402 com os instrumentos
-    USDC nas duas redes. Nada aqui muda o fluxo — é descoberta pura."""
+    """Perfil UCP (ucp.dev/specification). Declara os transportes realmente
+    implementados (REST/OpenAPI e MCP streamable), a capability de checkout e
+    o handler x402. O agent-card A2A informativo não é anunciado como um
+    transporte A2A funcional, pois message:send não é implementado."""
     base = _public_base()
     if not UCP_PROFILE:
         return jsonify({"error": "disabled"}), 404
@@ -23258,10 +23365,6 @@ def ucp_profile():
                      "transport": "mcp",
                      "endpoint": f"{base}/mcp",
                      "schema": f"{base}/.well-known/mcp.json"},
-                    {"version": "2026-04-08",
-                     "spec": "https://ucp.dev/2026-04-08/specification/overview",
-                     "transport": "a2a",
-                     "endpoint": f"{base}/.well-known/agent-card.json"},
                 ],
             },
             "payment_handlers": {
@@ -23529,11 +23632,11 @@ def pricing_page():
             "six_at_once": f"{base}/try",
             "mcp": "All MCP tools return delayed samples with no subscription.",
         },
-        "subscriptions": planos,
-        "what_a_subscription_adds": [
+        "prepaid_options": planos,
+        "what_a_prepaid_key_adds": [
             "Live data through MCP — connect once, no payment per tool call.",
             "No settlement latency: the key is checked in about a millisecond.",
-            "Priority routing over free traffic.",
+            "One-time purchase with no automatic renewal; each option states its term.",
         ],
         "connect_mcp": {
             "claude_code": ("claude mcp add --transport http losbeto "
@@ -23574,12 +23677,12 @@ code{{padding:2px 6px}} pre{{padding:14px;overflow-x:auto;color:#9ecbff}}
 a{{color:#60a5fa}} .m{{color:#8b9199;font-size:13px}}
 </style></head><body>
 <h1>Pricing</h1>
-<p class="l">Pay per call with no account, or subscribe once and connect the whole
+<p class="l">Pay per call with no account, or prepay once and connect the whole
 catalog to your agent.</p>
 
 <h2>Per call</h2>
 <p>{len(pagos)} endpoints, ${min(get_dynamic_price(p) for p in pagos):.3f} to
-${max(get_dynamic_price(p) for p in pagos):.2f} in USDC, settled on Base or Solana.
+${max(get_dynamic_price(p) for p in pagos):.2f} in USDC, settled on {_chains_or()}.
 No signup, no API key — your wallet answers the 402 challenge and retries.</p>
 <pre>npx agentcash fetch {base}/br-macro</pre>
 
@@ -23588,11 +23691,12 @@ No signup, no API key — your wallet answers the 402 challenge and retries.</p>
 <pre>curl {base}/try
 curl '{base}/br-macro?preview=1'</pre>
 
-<h2>Subscriptions</h2>
+<h2>Prepaid credit and time-limited passes</h2>
 <table><tr><th>Plan</th><th>Price</th><th>Term</th><th>Grants</th><th>Endpoint</th></tr>
 {linhas}</table>
-<p class="m">A subscription is what turns the catalog into an MCP server your agent
-can use continuously — live data, no per-call payment, no settlement latency.</p>
+<p class="m">A prepaid key turns the catalog into an MCP server your agent
+can use continuously — live data, no per-call payment, no settlement latency.
+Each plan below is a one-time purchase, not an automatic renewal.</p>
 
 <h2>Connect it to Claude Code or Cursor</h2>
 <pre>claude mcp add --transport http losbeto {base}/mcp \\
@@ -26283,7 +26387,7 @@ def _inject_agent_beacon(resp):
     try:
         path = _request.path or ""
         if path.startswith("/.well-known") or path in ("/favicon.ico", "/favicon.png",
-                                                        "/favicon.svg", "/robots.txt",
+                                                        "/favicon.ico", "/robots.txt",
                                                         "/sitemap.xml"):
             return resp
         base = _public_base()
@@ -26343,8 +26447,8 @@ def mcp_registry_server_json():
                     "2025-12-11/server.schema.json"),
         "name": MCP_SERVER_NAME,
         "description": (
-            "Cross-asset market data for AI agents: forex, equities, "
-            "Brazil macro (BCB/B3), crypto."),
+            "Cross-asset market data, LLM gateway and ML forecasts for AI "
+            "agents. USDC via x402 + MPP."),
         "version": _semver_clean(VERSION),
         "title": "Losbeto — Market Data for AI Agents",
         "websiteUrl": base,
@@ -28095,7 +28199,7 @@ def _render_402_html(endpoint: str) -> str:
 <meta name="viewport" content="width=device-width,initial-scale=1"></head>
 <body style="background:#0a0a0f;color:#ddd;font-family:-apple-system,Segoe UI,Roboto,sans-serif;max-width:760px;margin:0 auto;padding:32px 18px">
 <p style="color:#7af;letter-spacing:2px;font-size:12px">HTTP 402 · PAYMENT REQUIRED</p>
-<h1 style="margin:4px 0"><img src="/favicon.svg?v=2" width="30" height="30" alt="" style="vertical-align:-6px;margin-right:9px">{endpoint}</h1>
+<h1 style="margin:4px 0"><img src="/favicon.ico?v=2" width="30" height="30" alt="" style="vertical-align:-6px;margin-right:9px">{endpoint}</h1>
 <p style="color:#aaa;line-height:1.5">{desc}</p>
 <p style="font-size:28px;margin:18px 0"><b>${preco:.3f}</b> <span style="color:#888;font-size:14px">USDC · per call · {' / '.join(_chains_list())}</span></p>
 <p style="line-height:1.6">This endpoint is sold <b>machine-to-machine</b> via the
@@ -30398,7 +30502,7 @@ pre{background:#0d0f13;border:1px solid var(--line);border-radius:8px;
 .or{text-align:center;color:var(--dim);font-size:12px;margin:14px 0 4px;
     letter-spacing:.1em;text-transform:uppercase}
 </style></head><body><div class="w">
-<div class="top"><a href="/" style="display:flex;align-items:center;gap:8px"><img src="/favicon.svg?v=2" width="20" height="20" alt="" style="display:block">losbeto</a><span class="badge">one-tap USDC payment</span></div>
+<div class="top"><a href="/" style="display:flex;align-items:center;gap:8px"><img src="/favicon.ico?v=2" width="20" height="20" alt="" style="display:block">losbeto</a><span class="badge">one-tap USDC payment</span></div>
 <h1>__ENDPOINT__</h1>
 <p class="d">__DESC__</p>
 <div class="price">$__PRICE__ <span>USDC · Base · one call</span></div>
@@ -38408,7 +38512,7 @@ _ops_validate = _v4843_ops_validate
 
 _v4842_sanitize_governance()
 
-VERSION = "48.57.0-REFUNDSIGNAL"
+VERSION = "48.58.0-DISCOVERYCREDIT"
 
 
 # ============================================================================
