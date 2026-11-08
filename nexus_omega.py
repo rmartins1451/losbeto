@@ -2,7 +2,7 @@
 """
 Losbeto x402 — monolithic Flask service for Railway.
 
-Current release: 48.58.0-DISCOVERYCREDIT.
+Current release: 48.60.0-LEANML.
 Payment requirements are server-side. Delivery requires verified settlement;
 pending payments are reconciled against independent chain evidence.
 Operational history lives in CHANGELOG.md, not in executable boot output.
@@ -1631,10 +1631,13 @@ class LedgerV10:
             if not r:
                 return None
             bal = r[0]
-            if bal is None or bal < 0:  # ilimitado — nada a recreditar
+            if bal is None or bal < 0:  # ilimitado — saldo não muda, tentativa estornada sai da estatística
+                c.execute("UPDATE api_keys SET calls_used=MAX(0,calls_used-1) WHERE key=?", (key,))
                 return {"remaining": -1, "unlimited": True}
             new_bal = round(bal + amount, 6)
-            c.execute("UPDATE api_keys SET balance_usd=? WHERE key=?", (new_bal, key))
+            # calls_used mede consumo concluído, não tentativas estornadas.
+            c.execute("UPDATE api_keys SET balance_usd=?, calls_used=MAX(0,calls_used-1) WHERE key=?",
+                      (new_bal, key))
             return {"remaining": new_bal, "unlimited": False}
 
     def api_key_stats(self):
@@ -17213,10 +17216,23 @@ LLM_FREE_GLOBAL_PER_DAY = int(os.environ.get("LLM_FREE_GLOBAL_PER_DAY", "200"))
 def llm_free():
     q = (request.args.get("q") or "").strip()[:2000]
     base = _public_base()
-    if not q:
-        # Link público de avaliação: a URL sem query também deve demonstrar o
-        # produto, mantendo exatamente as mesmas quotas e o mesmo timeout.
-        q = "Give a concise, neutral overview of today's crypto market regime."
+    _default_q = not q
+    if _default_q:
+        # Link público de avaliação: a URL sem query também demonstra o produto.
+        # v48.59: a pergunta não pode exigir dado ao vivo (o modelo não tem — responder
+        # "o regime de hoje" seria inventar mercado num nó que vende dado verificado) e a
+        # resposta é compartilhada por 30 min: crawlers e links públicos custam 1 chamada
+        # de LLM por janela, não uma por visita, e não consomem a cota por IP/global.
+        q = "In two sentences, explain what the HTTP 402 status code means in the x402 payment protocol."
+        _hit = LEDGER.cache_get("llmfree:default", 1800)
+        if _hit and _hit.get("answer"):
+            return jsonify({"answer": _hit["answer"], "free_tier": True, "shared_demo": True,
+                            "note": "Shared demo answer, refreshed every 30 min. Add ?q=... for your own "
+                                    f"question ({LLM_FREE_PER_DAY}/day per IP).",
+                            "upgrade": {"paid_endpoint": f"{base}/llm?q=...",
+                                        "openai_compatible": f"{base}/v1/chat/completions",
+                                        "price_usd_per_call": LLM_PROXY_PRICE},
+                            "ts": int(time.time()), "provider": "Losbeto/LLMProxy"})
     day = time.strftime("%Y-%m-%d", time.gmtime())
     ip = (request.headers.get("X-Forwarded-For", request.remote_addr or "")).split(",")[0].strip() or "unknown"
     g = _llm_db_read(f"fg:{day}")
@@ -17237,6 +17253,11 @@ def llm_free():
         return _llm_proxy_down()
     _llm_db_bump(f"fg:{day}")
     _llm_db_bump(f"fk:{day}:{ip}")
+    if _default_q:
+        try:
+            LEDGER.cache_set("llmfree:default", {"answer": ans})
+        except Exception as e:
+            log.debug(f"llm free default cache: {e}")
     return jsonify({"answer": ans, "free_tier": True,
                     "free_calls_left_today": max(0, LLM_FREE_PER_DAY - k - 1),
                     "upgrade": {"paid_endpoint": f"{base}/llm?q=...",
@@ -18301,9 +18322,24 @@ def ml_ops_loop():
 
 
 _ML_EMB = {"model": None, "vectors": None, "paths": [], "hash": ""}
+_ML_EMB_QUANTIZED = os.environ.get("ML_QUANTIZED", "1") != "0"
 try:
     if not ML_DISABLED:
         from fastembed import TextEmbedding as _TextEmbedding
+        if _ML_EMB_QUANTIZED:
+            # Variantes oficiais INT8: reduzem centenas de MB por worker sem
+            # trocar a descoberta semântica nem exigir GPU/LLM externo.
+            from fastembed.common.model_description import PoolingType as _PoolType, ModelSource as _ModelSource
+            _TextEmbedding.add_custom_model(
+                model="losbeto/minilm-l6-quantized", pooling=_PoolType.MEAN,
+                normalization=True,
+                sources=_ModelSource(hf="Xenova/all-MiniLM-L6-v2"),
+                dim=384, model_file="onnx/model_quantized.onnx")
+            _TextEmbedding.add_custom_model(
+                model="losbeto/multilingual-minilm-l12-quantized", pooling=_PoolType.MEAN,
+                normalization=True,
+                sources=_ModelSource(hf="Xenova/paraphrase-multilingual-MiniLM-L12-v2"),
+                dim=384, model_file="onnx/model_quantized.onnx")
         _ML_EMB_OK = True
     else:
         _ML_EMB_OK = False
@@ -18408,12 +18444,17 @@ def discover():
 
 
 
-_EMB_MODELS = {"base":  "sentence-transformers/all-MiniLM-L6-v2",
-               "multi": "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"}
+_EMB_MODELS = ({"base": "losbeto/minilm-l6-quantized",
+                "multi": "losbeto/multilingual-minilm-l12-quantized"}
+               if _ML_EMB_QUANTIZED else
+               {"base": "sentence-transformers/all-MiniLM-L6-v2",
+                "multi": "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"})
 _EMB_CACHE = {k: {"model": None, "vectors": None, "paths": [], "hash": "",
                   "backoff_until": 0.0} for k in _EMB_MODELS}
 _ML_RERANK = {"model": None, "backoff_until": 0.0}
 _ML_RERANK_ON = os.environ.get("ML_RERANK", "1") != "0"
+_ML_RERANK_MODEL = ("losbeto/reranker-minilm-l6-quantized" if _ML_EMB_QUANTIZED
+                    else "Xenova/ms-marco-MiniLM-L-6-v2")
 
 
 def _emb_encode(texts, key="base"):
@@ -18516,8 +18557,17 @@ def _rerank(q, docs):
     try:
         if _ML_RERANK["model"] is None:
             from fastembed.rerank.cross_encoder import TextCrossEncoder
+            if _ML_EMB_QUANTIZED:
+                from fastembed.common.model_description import ModelSource as _ModelSource
+                try:
+                    TextCrossEncoder.add_custom_model(
+                        model=_ML_RERANK_MODEL,
+                        sources=_ModelSource(hf="Xenova/ms-marco-MiniLM-L-6-v2"),
+                        model_file="onnx/model_quantized.onnx")
+                except ValueError:
+                    pass  # modelo já registrado neste worker
             _ML_RERANK["model"] = TextCrossEncoder(
-                model_name="Xenova/ms-marco-MiniLM-L-6-v2",
+                model_name=_ML_RERANK_MODEL,
                 cache_dir=str(_ML_DIR / "fastembed_cache"))
         return list(_ML_RERANK["model"].rerank_pairs([(q, d) for d in docs]))
     except Exception as e:
@@ -19276,7 +19326,9 @@ def ml_public():
                 "algorithm": "MiniLM ONNX embeddings + optional cross-encoder rerank",
                 "mode": _ML_EMB.get("mode") or ("semantic" if _ML_EMB_OK else "keyword"),
                 "multilingual_on_demand": True,
-                "reranker": "ms-marco-MiniLM-L-6 (local ONNX)" if _ML_RERANK_ON else "off"},
+                "quantized": bool(_ML_EMB_QUANTIZED),
+                "models": _EMB_MODELS,
+                "reranker": _ML_RERANK_MODEL if _ML_RERANK_ON else "off"},
             "price_forecast": {
                 "endpoint": "/forecast?symbol=BTC&horizon=24h ($0.05)",
                 "algorithm": "quantile HistGradientBoosting p10/p50/p90, 4 horizons",
@@ -22061,24 +22113,21 @@ def erc8004_registration():
 def manifest_agent():
     base = _public_base()
     return jsonify({
-        "schemaVersion":  "0.3",
         "name":           "Losbeto",
         "description":    ("x402-paid market data + OpenAI-compatible LLM gateway for AI "
                            "agents, global in scope: forex, equities, commodities, crypto "
                            "and macro — including a signed point-in-time Brazil macro archive "
                            "(BCB/B3). USDC on Base/Solana/Algorand. Fixed public pricing."),
-        "url":            base,
+        "supportedInterfaces": [{
+            "url": f"{base}/mcp",
+            "protocolBinding": "MCP",
+            "protocolVersion": MCP_PROTOCOL_VERSION,
+        }],
         "version":        VERSION,
+        "documentationUrl": f"{base}/llms.txt",
         "provider":       {"organization": "Losbeto", "url": base},
         "capabilities":   {"streaming": False, "pushNotifications": False,
-                           "stateTransitionHistory": False, "a2aMessageSend": False},
-        "additionalInterfaces": [
-            {"name": "MCP", "transport": "streamable-http",
-             "url": f"{base}/mcp"},
-            {"name": "OpenAPI", "url": f"{base}/openapi.json"},
-        ],
-        "a2a": {"messageSend": False,
-                "reason": "A2A message:send is not implemented; use MCP JSON-RPC or x402 HTTP."},
+                           "extendedAgentCard": False, "extensions": []},
         "defaultInputModes":  ["application/json"],
         "defaultOutputModes": ["application/json"],
         "skills": [{
@@ -22895,7 +22944,7 @@ def favicon():
     r.headers["Cache-Control"] = "public, max-age=86400"
     return r
 
-@app.route("/favicon.ico")
+@app.route("/favicon.svg")
 def favicon_svg():
     r = app.response_class(_FAVICON_SVG, mimetype="image/svg+xml")
     r.headers["Cache-Control"] = "public, max-age=86400"
@@ -26387,7 +26436,7 @@ def _inject_agent_beacon(resp):
     try:
         path = _request.path or ""
         if path.startswith("/.well-known") or path in ("/favicon.ico", "/favicon.png",
-                                                        "/favicon.ico", "/robots.txt",
+                                                        "/favicon.svg", "/robots.txt",
                                                         "/sitemap.xml"):
             return resp
         base = _public_base()
@@ -38512,7 +38561,7 @@ _ops_validate = _v4843_ops_validate
 
 _v4842_sanitize_governance()
 
-VERSION = "48.58.0-DISCOVERYCREDIT"
+VERSION = "48.60.0-LEANML"
 
 
 # ============================================================================
@@ -39032,3 +39081,5 @@ def _v4856_a2a_rest_guard():
         return None
 
 # v48.56.0-A2AGUARD: /mcp/v1/message:send e caminho do binding HTTP+JSON do A2A; o alias para o handler MCP devolvia HTTP 200 + envelope JSON-RPC de erro a clientes A2A → POST sem "jsonrpc" nesse caminho agora devolve 501 explicativo; docstring do cabecalho alinhada a VERSION | base: v48.55.1-PURGEHARDEN
+
+# v48.59.0-DEMOCACHE: /favicon.svg restaurado (a troca por um 2o /favicon.ico deixava a rota SVG morta e /favicon.svg em 404) | /llm/free sem ?q= agora usa resposta de demonstracao compartilhada por 30 min (sem LLM por visita, sem gastar a cota) e pergunta que nao exige dado ao vivo | base: v48.58.0-DISCOVERYCREDIT
