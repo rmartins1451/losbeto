@@ -2,7 +2,7 @@
 """
 Losbeto x402 — monolithic Flask service for Railway.
 
-Current release: 48.61.0-CALIBRATED.
+Current release: 48.62.0-MEMORYOPT.
 Payment requirements are server-side. Delivery requires verified settlement;
 pending payments are reconciled against independent chain evidence.
 Operational history lives in CHANGELOG.md, not in executable boot output.
@@ -17,6 +17,14 @@ from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from collections import defaultdict, deque, Counter
 from typing import Any, Optional, Dict, List, Tuple
+
+# Limita pools nativos antes de importar NumPy/sklearn/ONNX. Variáveis já
+# definidas no Railway continuam soberanas; o default evita dezenas de threads
+# e arenas de alocação por worker sem remover nenhum modelo ou funcionalidade.
+for _numeric_thread_var in (
+        "OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS",
+        "VECLIB_MAXIMUM_THREADS", "NUMEXPR_NUM_THREADS"):
+    os.environ.setdefault(_numeric_thread_var, "1")
 
 
 BRAND_NAME = "Losbeto"
@@ -18355,6 +18363,10 @@ def ml_ops_loop():
 
 _ML_EMB = {"model": None, "vectors": None, "paths": [], "hash": ""}
 _ML_EMB_QUANTIZED = os.environ.get("ML_QUANTIZED", "1") != "0"
+# O MiniLM multilíngue chegou a ~1 GB por worker após vetorizar o catálogo.
+# O default econômico usa o modelo base + pistas terminológicas multilíngues;
+# ML_MULTILINGUAL=1 preserva o caminho antigo para quem aceitar esse custo.
+_ML_MULTI_ON = os.environ.get("ML_MULTILINGUAL", "0") == "1"
 try:
     if not ML_DISABLED:
         from fastembed import TextEmbedding as _TextEmbedding
@@ -18396,12 +18408,12 @@ def _discover_keyword(q: str, n: int) -> list:
 
 
 def _discover_embed(q: str, n: int) -> list:
-    """Busca vetorial 100% local. v48.13.0: modo multilingue sob demanda
-    (query PT/ES/ZH -> catalogo EN) e reranker cross-encoder re-pontuando os
-    top-k (olha query+documento juntos — muito mais preciso que cosseno)."""
+    """Busca vetorial local, com cache compartilhado e modelos pesados fora do
+    caminho padrão. Reranker inglês só intervém em consulta inglesa ambígua."""
+    _ml_idle_evict()
     if not _ML_EMB_OK:
         return []
-    key = "multi" if _needs_multi(q) else "base"
+    key = "multi" if _ML_MULTI_ON and _needs_multi(q) else "base"
     paths, vecs = _emb_catalog_async(key)
     if paths is None and key == "multi":
         key = "base"
@@ -18410,22 +18422,37 @@ def _discover_embed(q: str, n: int) -> list:
         return []
     try:
         import numpy as _np
-        qlist = _emb_encode([q], key)
+        semantic_q = _semantic_query(q) if key == "base" else q
+        variants = [semantic_q] if semantic_q == q else [semantic_q, q]
+        qlist = _emb_encode(variants, key)
         if not qlist:
             return []
-        qv = _np.array(qlist[0])
-        V = _np.array(vecs)
-        sims = (V @ qv) / (_np.linalg.norm(V, axis=1) * _np.linalg.norm(qv) + 1e-9)
+        V = _np.asarray(vecs)
+        vnorm = _np.linalg.norm(V, axis=1)
+        sims = _np.max(_np.asarray([
+            (V @ _np.asarray(qv)) / (vnorm * _np.linalg.norm(qv) + 1e-9)
+            for qv in qlist]), axis=0)
+        if key == "base":
+            positions = {p: i for i, p in enumerate(paths)}
+            for p, boost in _semantic_intent_boosts(q).items():
+                if p in positions:
+                    sims[positions[p]] += boost
         k = max(n, 8) if _ML_RERANK_ON else n
         idx = sims.argsort()[::-1][:k]
         cands = [(paths[int(i)], float(sims[int(i)])) for i in idx]
         mode = "semantic-multilingual" if key == "multi" else "semantic"
-        if _ML_RERANK_ON and len(cands) > n:
-            rk = _rerank(q, [f"{p}: {ENDPOINT_DESC.get(p, '')}" for p, _s in cands])
-            if rk:
-                order = sorted(range(len(cands)), key=lambda i: rk[i], reverse=True)
-                cands = [(cands[i][0], float(rk[i])) for i in order]
-                mode += "+rerank"
+        if semantic_q != q:
+            mode += "+hints"
+        rerank_language_ok = not _needs_multi(q) or os.environ.get("ML_RERANK_MULTILINGUAL", "0") == "1"
+        if _ML_RERANK_ON and rerank_language_ok and len(cands) > n:
+            margin = cands[0][1] - cands[1][1]
+            need_rerank = margin < _ML_RERANK_MARGIN or cands[0][1] < 0.55
+            if need_rerank:
+                rk = _rerank(semantic_q, [f"{p}: {ENDPOINT_DESC.get(p, '')}" for p, _s in cands])
+                if rk:
+                    order = sorted(range(len(cands)), key=lambda i: rk[i], reverse=True)
+                    cands = [(cands[i][0], float(rk[i])) for i in order]
+                    mode += "+rerank"
         _ML_EMB["mode"] = mode
         return [(p, round(s, 3)) for p, s in cands[:n]]
     except Exception as e:
@@ -18482,11 +18509,49 @@ _EMB_MODELS = ({"base": "losbeto/minilm-l6-quantized",
                {"base": "sentence-transformers/all-MiniLM-L6-v2",
                 "multi": "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"})
 _EMB_CACHE = {k: {"model": None, "vectors": None, "paths": [], "hash": "",
-                  "backoff_until": 0.0} for k in _EMB_MODELS}
-_ML_RERANK = {"model": None, "backoff_until": 0.0}
+                  "backoff_until": 0.0, "last_used": 0.0} for k in _EMB_MODELS}
+_ML_RERANK = {"model": None, "backoff_until": 0.0, "last_used": 0.0}
 _ML_RERANK_ON = os.environ.get("ML_RERANK", "1") != "0"
 _ML_RERANK_MODEL = ("losbeto/reranker-minilm-l6-quantized" if _ML_EMB_QUANTIZED
                     else "Xenova/ms-marco-MiniLM-L-6-v2")
+_ML_ONNX_THREADS = max(1, int(os.environ.get("ML_ONNX_THREADS", "1")))
+_ML_IDLE_EVICT_S = int(os.environ.get("ML_IDLE_EVICT_S", "1800"))
+_ML_RERANK_MARGIN = float(os.environ.get("ML_RERANK_MARGIN", "0.08"))
+
+
+def _ml_trim_memory():
+    """Devolve páginas nativas ao SO após eviction; nunca roda no caminho pago."""
+    try:
+        import ctypes
+        libc = ctypes.CDLL(None)
+        trim = getattr(libc, "malloc_trim", None)
+        if trim:
+            trim(0)
+    except Exception:
+        pass
+
+
+def _ml_idle_evict():
+    """Libera modelos ociosos. O arquivo permanece em disco para recarga rápida."""
+    if _ML_IDLE_EVICT_S <= 0:
+        return
+    now = time.time()
+    changed = False
+    for key, st in list(_EMB_CACHE.items()):
+        if (st.get("model") is not None and st.get("last_used", 0) > 0
+                and now - st["last_used"] > _ML_IDLE_EVICT_S and key not in _EMB_BUILDING):
+            st.update({"model": None, "vectors": None, "paths": [], "hash": "",
+                       "backoff_until": 0.0, "last_used": 0.0})
+            changed = True
+    if (_ML_RERANK.get("model") is not None and _ML_RERANK.get("last_used", 0) > 0
+            and now - _ML_RERANK["last_used"] > _ML_IDLE_EVICT_S):
+        _ML_RERANK["model"] = None
+        _ML_RERANK["last_used"] = 0.0
+        changed = True
+    if changed:
+        import gc
+        gc.collect()
+        _ml_trim_memory()
 
 
 def _emb_encode(texts, key="base"):
@@ -18500,7 +18565,9 @@ def _emb_encode(texts, key="base"):
     try:
         if st["model"] is None:
             st["model"] = _TextEmbedding(model_name=_EMB_MODELS[key],
-                                         cache_dir=str(_ML_DIR / "fastembed_cache"))
+                                         cache_dir=str(_ML_DIR / "fastembed_cache"),
+                                         threads=_ML_ONNX_THREADS)
+        st["last_used"] = time.time()
         return list(st["model"].embed(texts))
     except Exception as e:
         log.warning(f"🧠 emb[{key}]: {e}")
@@ -18508,22 +18575,81 @@ def _emb_encode(texts, key="base"):
         return None
 
 
-def _emb_catalog(key="base"):
-    """(paths, vetores) do catalogo no modelo `key`, com cache invalidado por
-    hash — o catalogo muda a cada versao, o cache acompanha."""
-    st = _EMB_CACHE[key]
+def _emb_catalog_meta(key):
+    """Hash inclui descrição e modelo: uma edição textual também invalida."""
     import hashlib as _hl
-    cat_hash = _hl.sha256("|".join(sorted(ENDPOINT_DESC)).encode()).hexdigest()[:16]
-    if st["hash"] != cat_hash:
-        paths = sorted(ENDPOINT_DESC)
-        docs = [f"{p}: {ENDPOINT_DESC[p]}" for p in paths]
+    paths = sorted(ENDPOINT_DESC)
+    docs = [f"{p}: {ENDPOINT_DESC[p]}" for p in paths]
+    raw = json.dumps(docs, ensure_ascii=False, separators=(",", ":"))
+    cat_hash = _hl.sha256((_EMB_MODELS[key] + "\n" + raw).encode()).hexdigest()[:24]
+    stem = _ML_DIR / f"emb_catalog_{key}_{cat_hash}"
+    return paths, docs, cat_hash, stem
+
+
+def _emb_catalog(key="base"):
+    """Cache de catálogo em disco, compartilhado entre workers e restarts.
+    O lock fica fora da requisição síncrona; np.load(mmap) reaproveita páginas."""
+    st = _EMB_CACHE[key]
+    paths, docs, cat_hash, stem = _emb_catalog_meta(key)
+    if st["hash"] == cat_hash and st["vectors"] is not None:
+        return st["paths"], st["vectors"]
+    lock_file = None
+    try:
+        try:
+            import fcntl as _fcntl
+            lock_file = open(_ML_DIR / f"emb_catalog_{key}.lock", "w")
+            _fcntl.flock(lock_file, _fcntl.LOCK_EX)
+        except Exception:
+            lock_file = None
+        npy, meta = Path(str(stem) + ".npy"), Path(str(stem) + ".json")
+        try:
+            if json.loads(meta.read_text()) == paths:
+                vecs = _NP.load(npy, mmap_mode="r", allow_pickle=False)
+                if (vecs.shape[0] == len(paths) and vecs.shape[1] > 0
+                        and bool(_NP.isfinite(vecs).all())):
+                    st.update({"vectors": vecs, "paths": paths, "hash": cat_hash})
+                    return st["paths"], st["vectors"]
+        except Exception:
+            pass
         vecs = _emb_encode(docs, key)
         if vecs is None:
             return None, None
-        st["vectors"] = vecs
-        st["paths"] = paths
-        st["hash"] = cat_hash
-    return st["paths"], st["vectors"]
+        arr = _NP.asarray(vecs, dtype=_NP.float32)
+        # JSON é o marcador de commit e só aparece depois do NPY completo.
+        tag = f"{os.getpid()}.{threading.get_ident()}"
+        npy_tmp, meta_tmp = Path(str(npy) + "." + tag + ".tmp"), Path(str(meta) + "." + tag + ".tmp")
+        try:
+            with open(npy_tmp, "wb") as fh:
+                _NP.save(fh, arr, allow_pickle=False)
+                fh.flush()
+                os.fsync(fh.fileno())
+            os.replace(npy_tmp, npy)
+            meta_tmp.write_text(json.dumps(paths, separators=(",", ":")))
+            os.replace(meta_tmp, meta)
+            try:
+                arr = _NP.load(npy, mmap_mode="r", allow_pickle=False)
+            except Exception:
+                pass
+        except Exception as e:
+            log.debug(f"emb catalog persist {key}: {e}")
+        finally:
+            for tmp in (npy_tmp, meta_tmp):
+                try:
+                    tmp.unlink()
+                except Exception:
+                    pass
+        st.update({"vectors": arr, "paths": paths, "hash": cat_hash})
+        return st["paths"], st["vectors"]
+    finally:
+        if lock_file is not None:
+            try:
+                _fcntl.flock(lock_file, _fcntl.LOCK_UN)
+            except Exception:
+                pass
+            try:
+                lock_file.close()
+            except Exception:
+                pass
 
 
 _EMB_BUILDING = set()
@@ -18539,8 +18665,7 @@ def _emb_catalog_async(key="base"):
     o build numa thread daemon e retorna (None, None) IMEDIATAMENTE, caindo no
     fallback keyword (instantaneo). Segundos depois o modo semantico assume."""
     st = _EMB_CACHE[key]
-    import hashlib as _hl
-    cat_hash = _hl.sha256("|".join(sorted(ENDPOINT_DESC)).encode()).hexdigest()[:16]
+    _paths, _docs, cat_hash, _stem = _emb_catalog_meta(key)
     if st["hash"] == cat_hash and st["vectors"] is not None:
         return st["paths"], st["vectors"]
     if key not in _EMB_BUILDING:
@@ -18557,28 +18682,83 @@ def _emb_catalog_async(key="base"):
 
 
 def _ml_boot_warm():
-    """v48.18.1-MERGE: aquece embeddings do catalogo + reranker cross-encoder
-    numa thread de boot de CADA worker — quando a 1a request semantica chegar,
-    esta tudo pronto (adeus WORKER TIMEOUT de 30s do gunicorn)."""
+    """Pré-calcula o catálogo base; com cache em disco, os demais workers não
+    carregam o modelo no boot. Reranker continua frio até busca inglesa ambígua;
+    ML_WARM_RERANK=1 restaura o aquecimento anterior sem trocar o código."""
     try:
         if _ML_EMB_OK:
             _emb_catalog("base")
+            if os.environ.get("ML_WARM_EMBEDDING", "0") != "1":
+                # O catálogo fica em disco/memmap; o modelo volta a carregar
+                # apenas para uma consulta real (medido: ~120 ms com cache).
+                st = _EMB_CACHE["base"]
+                st["model"] = None
+                st["last_used"] = 0.0
+                import gc
+                gc.collect()
+                _ml_trim_memory()
     except Exception as _e:
         log.warning(f"\U0001f9e0 warm emb: {_e}")
-    try:
-        if _ML_RERANK_ON:
-            _rerank("warmup", ["warmup: document"])
-    except Exception as _e:
-        log.warning(f"\U0001f9e0 warm rerank: {_e}")
+    if os.environ.get("ML_WARM_RERANK", "0") == "1":
+        try:
+            if _ML_RERANK_ON:
+                _rerank("warmup", ["warmup: document"])
+        except Exception as _e:
+            log.warning(f"\U0001f9e0 warm rerank: {_e}")
 
 
 def _needs_multi(q: str) -> bool:
-    """Query claramente nao-inglesa (acentos/CJK ou stopwords PT/ES) pede o
-    modelo multilingue — agente busca na lingua dele, acha o catalogo em EN."""
+    """Detecta consulta provavelmente não inglesa sem carregar outro modelo."""
     if any(ord(c) > 127 for c in q):
         return True
     return bool(re.search(r"\b(para|uma|que|com|preço|preco|validar|el|la|los|"
                           r"las|una|como|des|der|die|und|le|les|une)\b", q.lower()))
+
+
+_SEMANTIC_HINT_RULES = (
+    (r"previs|pron[oó]stic", "forecast prediction future price"),
+    (r"pre[çc]o|precio|cota[çc][aã]o|cotizaci[oó]n", "current price quote market"),
+    (r"bitcoin|\bbtc\b|cripto|crypto", "bitcoin btc cryptocurrency"),
+    (r"medo|gan[âa]ncia|miedo|codicia", "fear greed sentiment index crypto market"),
+    (r"\bcnpj\b|\bcpf\b|documento.*(empresa|fiscal)", "validate brazilian tax id company cnpj cpf"),
+    (r"\bselic\b|juros.*(brasil|brasileir)", "brazilian selic interest rate central bank"),
+    (r"\bipca\b|infla[çc][aã]o|inflaci[oó]n", "brazilian ipca inflation cpi"),
+    (r"revis|vintage|retrospectiv", "revisions vintage point in time historical data"),
+    (r"d[oó]lar|dollar", "usd dollar exchange rate forex"),
+    (r"\breal\b|reais", "brl brazilian real exchange rate"),
+    (r"clima|tempo.*(cidade|hoje)|temperatura", "weather current forecast city temperature"),
+    (r"not[íi]cia|manchete", "news headlines market"),
+    (r"carteira|endere[çc]o|billetera|direcci[oó]n", "wallet address blockchain"),
+    (r"transa[çc][aã]o|transacci[oó]n|recibo.*(chain|bloco)", "blockchain transaction receipt hash"),
+    (r"a[çc][oõ]es|bolsa|ações|acci[oó]n", "stock quote equity b3 brazilian market"),
+    (r"pagamento|pago", "x402 payment usdc settlement"),
+)
+
+
+def _semantic_query(q: str) -> str:
+    """Traduz apenas termos reconhecidos do domínio, sem fingir tradução total.
+    A consulta original também é vetorizada separadamente em _discover_embed."""
+    if not _needs_multi(q):
+        return q
+    low = q.lower()
+    hints = [en for pattern, en in _SEMANTIC_HINT_RULES if re.search(pattern, low)]
+    if not hints:
+        return q
+    return " ; ".join(dict.fromkeys(hints))[:700]
+
+
+def _semantic_intent_boosts(q: str) -> dict:
+    """Desempate de alto intento para produtos explícitos; nunca muda preço."""
+    if not _needs_multi(q):
+        return {}
+    low = q.lower()
+    boosts = {}
+    if re.search(r"medo|gan[âa]ncia|miedo|codicia", low):
+        boosts["/fear-greed"] = 0.20
+        boosts["/sentiment-consensus"] = 0.06
+    if re.search(r"revis|vintage", low):
+        boosts["/br-revisions"] = 0.20
+    return boosts
 
 
 def _rerank(q, docs):
@@ -18600,7 +18780,9 @@ def _rerank(q, docs):
                     pass  # modelo já registrado neste worker
             _ML_RERANK["model"] = TextCrossEncoder(
                 model_name=_ML_RERANK_MODEL,
-                cache_dir=str(_ML_DIR / "fastembed_cache"))
+                cache_dir=str(_ML_DIR / "fastembed_cache"),
+                threads=_ML_ONNX_THREADS)
+        _ML_RERANK["last_used"] = time.time()
         return list(_ML_RERANK["model"].rerank_pairs([(q, d) for d in docs]))
     except Exception as e:
         log.warning(f"🧠 reranker: {e}")
@@ -19357,6 +19539,7 @@ _ML_PUB = {"at": 0.0, "json": None}
 def ml_public():
     """GET /ml — transparencia: o que cada modelo local aprende, com quantos
     dados proprios e quando treinou. Quem vende IA tem que mostrar a IA."""
+    _ml_idle_evict()
     if _ML_PUB["json"] is not None and time.time() - _ML_PUB["at"] < 60:
         return _ML_PUB["json"]
     hist = []
@@ -19403,9 +19586,20 @@ def ml_public():
                 "endpoint": "/discover?q=... (free)",
                 "algorithm": "MiniLM ONNX embeddings + optional cross-encoder rerank",
                 "mode": _ML_EMB.get("mode") or ("semantic" if _ML_EMB_OK else "keyword"),
-                "multilingual_on_demand": True,
+                "multilingual_on_demand": bool(_ML_MULTI_ON),
+                "multilingual_strategy": ("legacy MiniLM multilingual opt-in" if _ML_MULTI_ON else
+                                           "base MiniLM + domain hints; legacy model off by default"),
+                "catalog_cache": "shared content-hashed NPY/JSON with atomic writes and mmap",
                 "quantized": bool(_ML_EMB_QUANTIZED),
                 "models": _EMB_MODELS,
+                "onnx_threads": _ML_ONNX_THREADS,
+                "native_thread_limits": {k: os.environ.get(k) for k in (
+                    "OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS",
+                    "VECLIB_MAXIMUM_THREADS", "NUMEXPR_NUM_THREADS")},
+                "idle_evict_s": _ML_IDLE_EVICT_S,
+                "reranker_margin": _ML_RERANK_MARGIN,
+                "warm_embedding": os.environ.get("ML_WARM_EMBEDDING", "0") == "1",
+                "warm_reranker": os.environ.get("ML_WARM_RERANK", "0") == "1",
                 "reranker": _ML_RERANK_MODEL if _ML_RERANK_ON else "off"},
             "price_forecast": {
                 "endpoint": "/forecast?symbol=BTC&horizon=24h ($0.05)",
@@ -25953,8 +26147,20 @@ def post_fork_boot():
                 _ml_boot_warm_serialized()   # v48.31.0: 1 worker aquecendo por vez (flock /data) — 4 ONNX+sklearn simultâneos seguiam matando 1 worker por deploy mesmo com a janela larga
             except Exception:
                 pass
+            # O mesmo daemon faz manutenção por worker: modelos ociosos não
+            # dependem de uma futura chamada a /discover ou /ml para serem
+            # descarregados. O intervalo é limitado para não acordar à toa.
+            if _ML_IDLE_EVICT_S <= 0:
+                return
+            interval = min(300, max(30, _ML_IDLE_EVICT_S // 6))
+            while True:
+                time.sleep(interval)
+                try:
+                    _ml_idle_evict()
+                except Exception:
+                    pass
         threading.Thread(target=_warm_worker, daemon=True,
-                         name="ml-warm-worker").start()
+                         name="ml-warm-evict-worker").start()
     except Exception:
         pass
 
@@ -34530,7 +34736,7 @@ def _ops_describe(action):
 
 
 def _ml_boot_warm_serialized():
-    """1 worker aquecendo por vez (flock em /data): 4 loads ONNX+sklearn
+    """1 worker aquecendo por vez (flock em HOME_DIR): 4 loads ONNX+sklearn
     simultâneos seguiam derrubando 1 worker por deploy mesmo com a janela
     10-100s (48.30.1, 13/out 16:55). Espera até 6min; se não conseguir, pula —
     o fallback lazy async (_emb_catalog_async) cobre as primeiras requests."""
@@ -34541,7 +34747,7 @@ def _ml_boot_warm_serialized():
         return
     lf = None
     try:
-        lf = open("/data/ml_warm.lock", "w")
+        lf = open(HOME_DIR / "ml_warm.lock", "w")
         t0 = time.time()
         got = False
         while time.time() - t0 < 360:
@@ -38640,7 +38846,7 @@ _ops_validate = _v4843_ops_validate
 
 _v4842_sanitize_governance()
 
-VERSION = "48.61.0-CALIBRATED"
+VERSION = "48.62.0-MEMORYOPT"
 
 
 # ============================================================================
