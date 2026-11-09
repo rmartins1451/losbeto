@@ -2,10 +2,12 @@
 """
 Losbeto x402 — monolithic Flask service for Railway.
 
-Current release: 48.62.0-MEMORYOPT.
+Current release: 48.63.0-DELIVERY.
 Payment requirements are server-side. Delivery requires verified settlement;
 pending payments are reconciled against independent chain evidence.
 Operational history lives in CHANGELOG.md, not in executable boot output.
+48.63 hardens post-settlement delivery/refund evidence, isolates global-rate
+upstream failures, and makes the agentic manifest lightweight and cacheable.
 """
 from __future__ import annotations
 
@@ -9643,6 +9645,106 @@ def _refund_as_credit(payer: str, amount: float, endpoint: str, tx: str = "") ->
 
 
 
+def _settled_amount(info: dict) -> float:
+    """Amount actually associated with this settled call, never a new quote."""
+    import math as _math
+    info = info if isinstance(info, dict) else {}
+    for key in ("amount_usd", "required_usd"):
+        try:
+            value = float(info.get(key, 0) or 0)
+            if _math.isfinite(value) and value > 0:
+                return round(value, 6)
+        except (TypeError, ValueError):
+            pass
+    try:
+        tx = str(info.get("tx", "") or "")
+        receipt = LEDGER.revenue_by_tx(tx) if tx else None
+        value = float((receipt or {}).get("amount", 0) or 0)
+        if _math.isfinite(value) and value > 0:
+            return round(value, 6)
+    except Exception:
+        pass
+    return 0.0
+
+
+def _attach_settlement_proof(resp, info: dict, session_token: str = ""):
+    """Preserve machine-readable settlement evidence on every paid outcome."""
+    info = info if isinstance(info, dict) else {}
+    settlement = info.get("settlement") or {
+        "success": True, "transaction": info.get("tx", ""),
+        "payer": info.get("payer", ""),
+    }
+    encoded = base64.b64encode(json.dumps(settlement, default=str).encode()).decode()
+    resp.headers["PAYMENT-RESPONSE"] = encoded
+    resp.headers["X-PAYMENT-RESPONSE"] = encoded
+    if isinstance(info, dict) and info.get("mpp_receipt"):
+        resp.headers["Payment-Receipt"] = _b64url(json.dumps(
+            info["mpp_receipt"], separators=(",", ":")).encode())
+    if session_token:
+        resp.headers["X-Session-Token"] = session_token
+        resp.headers["X-Session-TTL"] = str(JWT_TTL)
+    resp.headers["Access-Control-Expose-Headers"] = (
+        "Payment-Receipt,PAYMENT-RESPONSE,X-PAYMENT-RESPONSE,"
+        "X-Session-Token,X-Session-TTL,Retry-After")
+    return resp
+
+
+def _post_settle_failure(path: str, payer: str, info: dict, body: dict,
+                         status: int, t0: float, ip: str,
+                         session_token: str = ""):
+    """Delivery-or-refund for every post-settlement failure path.
+
+    The transaction is never retried and no new payment is requested. A refund
+    credit is idempotent by transaction and is reported as issued only when the
+    ledger actually returned a key. Plans remain excluded from credit spending.
+    """
+    info = info if isinstance(info, dict) else {}
+    public = dict(body) if isinstance(body, dict) else {}
+    amount = _settled_amount(info)
+    tx = str(info.get("tx", "") or "")
+    key = _refund_as_credit(payer, amount, path, tx) if amount > 0 else None
+    refunded = bool(key)
+    try:
+        LEDGER.log_request(path, False, int((time.time() - t0) * 1000), ip,
+                           kind="refunded" if refunded else "delivery_failed",
+                           ua=request.headers.get("User-Agent", ""),
+                           params=_clean_params())
+    except Exception:
+        pass
+    public.update({
+        "charged": True,
+        "payment_verified": bool(info.get("payment_verified", True)),
+        "delivered": False,
+        "delivery_complete": False,
+        "delivery_status": "settled_not_delivered",
+        "new_payment_required": False,
+        "transaction": tx,
+        "refunded": refunded,
+        "refund_status": "available" if refunded else ("failed" if amount > 0 else "unavailable"),
+        "refund_credit_usd": round(amount if refunded else 0.0, 6),
+        "refund_api_key": key,
+        "note": ("Payment settled but delivery failed. The refund credit is valid "
+                 "for 30 days on eligible non-plan endpoints; plans require new "
+                 "revenue and a compatible receipt." if refunded else
+                 "Payment settled but delivery failed, and an automatic refund "
+                 "credit could not be issued. Keep the transaction identifier; "
+                 "do not create another payment for this transaction."),
+    })
+    try:
+        code = int(status)
+    except Exception:
+        code = 500
+    if code < 400 or code > 599:
+        code = 500
+    resp = jsonify(public)
+    resp.status_code = code
+    retry_after = public.get("retry_after_seconds")
+    if isinstance(retry_after, (int, float)) and retry_after > 0:
+        resp.headers["Retry-After"] = str(int(retry_after))
+    return _attach_settlement_proof(resp, info, session_token)
+
+
+
 WELCOME_ENABLED   = os.environ.get("WELCOME_FREE_CALL", "1") != "0"
 WELCOME_DAILY_CAP = int(os.environ.get("WELCOME_DAILY_CAP", "40"))
 WELCOME_TTL       = int(os.environ.get("WELCOME_TTL_S", "3600"))
@@ -9960,17 +10062,21 @@ def paid_endpoint(path):
                                                 kind="refunded", ua=request.headers.get("User-Agent",""), params=_clean_params())
                             if not isinstance(result, tuple):
                                 result = (result, 502)
-                            result[0]["charged"] = False
-                            result[0]["refunded"] = True
-                            result[0]["refund_credit_usd"] = round(cost, 6)
+                            result[0]["charged"] = not bool(_rc)
+                            result[0]["refunded"] = bool(_rc)
+                            result[0]["delivery_complete"] = False
+                            result[0]["delivered"] = False
+                            result[0]["refund_credit_usd"] = round(cost if _rc else 0.0, 6)
                             result[0]["note"] = ("The endpoint did not deliver; the credit "
-                                                 "was returned to your API key balance.")
+                                                 "was returned to your API key balance." if _rc else
+                                                 "The endpoint did not deliver and the automatic "
+                                                 "credit reversal failed. Do not retry with a new key.")
                             _er = jsonify(result[0])
                             _er.status_code = result[1] if isinstance(result[1], int) else 502
                             if _rc:
                                 _er.headers["X-Credits-Remaining"] = (
                                     "unlimited" if _rc.get("unlimited") else f"{_rc['remaining']:.6f}")
-                            _er.headers["X-Credits-Cost"] = "0.000000"
+                            _er.headers["X-Credits-Cost"] = f"{0.0 if _rc else cost:.6f}"
                             return _er
                         LEDGER.log_request(path, True, int((time.time() - t0) * 1000), ip,
                                             kind="paid", ua=request.headers.get("User-Agent",""), params=_clean_params())
@@ -10004,8 +10110,36 @@ def paid_endpoint(path):
                             "X-Plan-Expires-In,X-Plan-Renew,X-Credit-Low")
                         return resp
                     except Exception as e:
-                        log.error(f"handler {path} (apikey): {e}")
-                        return jsonify({"error": str(e)}), 500
+                        log.error(f"handler {path} (apikey): {e}\n{traceback.format_exc()}")
+                        try:
+                            _rc = LEDGER.api_key_credit(api_key, cost)
+                        except Exception as _credit_error:
+                            log.error(f"credit reversal {path}: {_credit_error}")
+                            _rc = None
+                        try:
+                            LEDGER.log_request(path, False, int((time.time() - t0) * 1000), ip,
+                                               kind="refunded" if _rc else "delivery_failed",
+                                               ua=request.headers.get("User-Agent", ""),
+                                               params=_clean_params())
+                        except Exception:
+                            pass
+                        _er = jsonify({
+                            "status": "error", "error": "endpoint_failed_after_credit_debit",
+                            "charged": not bool(_rc), "refunded": bool(_rc),
+                            "delivered": False, "delivery_complete": False,
+                            "refund_credit_usd": round(cost if _rc else 0.0, 6),
+                            "note": ("The endpoint did not deliver; the credit was returned "
+                                     "to your API key balance." if _rc else
+                                     "The endpoint did not deliver and the automatic credit "
+                                     "reversal failed. Do not retry with a new key.")})
+                        _er.status_code = 500
+                        if _rc:
+                            _er.headers["X-Credits-Remaining"] = (
+                                "unlimited" if _rc.get("unlimited") else f"{_rc['remaining']:.6f}")
+                        _er.headers["X-Credits-Cost"] = f"{0.0 if _rc else cost:.6f}"
+                        _er.headers["Access-Control-Expose-Headers"] = (
+                            "X-Credits-Remaining,X-Credits-Cost")
+                        return _er
                 r = _build_402(path)
                 body = r.get_json()
                 body["error"] = ("API key inválida, expirada ou sem saldo — "
@@ -10210,48 +10344,19 @@ def paid_endpoint(path):
                 try:
                     result = handler()
                     if _is_error_result(result):
-                        if not isinstance(result, tuple):
-                            result = (result, 502)
-                        _amt = get_dynamic_price(path)
-                        _key = _refund_as_credit(payer, _amt, path, info.get("tx", ""))
-                        LEDGER.log_request(path, False, int((time.time() - t0) * 1000),
-                                           ip, kind="refunded",
-                                           ua=request.headers.get("User-Agent", ""),
-                                           params=_clean_params())
-                        result[0]["charged"] = True
-                        result[0]["refunded"] = True
-                        result[0]["refund_credit_usd"] = round(_amt, 6)
-                        result[0]["refund_api_key"] = _key
-                        result[0]["note"] = ("Payment settled but the endpoint did not "
-                            "deliver. A credit equal to the amount paid has been issued — "
-                            "send it as the X-API-Key header on any endpoint, valid 30 days.")
-                        _refunded_here = True
-                        try:
-                            _recs = _recommended_next(path, payer)
-                            if _recs and "recommended_next" not in result[0]:
-                                result[0]["recommended_next"] = _recs
-                        except Exception:
-                            pass
+                        _failure_body = result[0] if isinstance(result, tuple) else result
+                        _failure_status = (result[1] if isinstance(result, tuple) and len(result) > 1
+                                           and isinstance(result[1], int) else 502)
+                        if not isinstance(_failure_body, dict):
+                            _failure_body = {"status": "error", "error": "endpoint_failure"}
+                        return _post_settle_failure(
+                            path, payer, info, _failure_body, _failure_status,
+                            t0, ip, session_token=token)
                 except LLMUnavailable:
-                    _amt = get_dynamic_price(path)
-                    _key = _refund_as_credit(payer, _amt, path, info.get("tx", ""))
-                    LEDGER.log_request(path, False, int((time.time() - t0) * 1000), ip,
-                                       kind="refunded",
-                                       ua=request.headers.get("User-Agent", ""),
-                                       params=_clean_params())
                     _b, _c = _unavailable_body(
-                        "The AI synthesis engine failed after settlement. "
-                        "A credit equal to the amount paid has been issued.")
-                    _b["charged"] = True
-                    _b["refunded"] = True
-                    _b["refund_credit_usd"] = round(_amt, 6)
-                    _b["refund_api_key"] = _key
-                    _b["note"] = ("Send this key as the X-API-Key header to spend "
-                                  "the credit on any endpoint. Valid for 30 days.")
-                    _rr = jsonify(_b)
-                    _rr.status_code = _c
-                    _rr.headers["Retry-After"] = "300"
-                    return _rr
+                        "The AI synthesis engine failed after settlement.", 300)
+                    return _post_settle_failure(
+                        path, payer, info, _b, _c, t0, ip, session_token=token)
                 try:
                     if isinstance(result, dict):
                         try:
@@ -10335,7 +10440,10 @@ def paid_endpoint(path):
                 return resp
             except Exception as e:
                 log.error(f"handler {path}: {e}\n{traceback.format_exc()}")
-                return jsonify({"error": str(e)}), 500
+                return _post_settle_failure(
+                    path, payer, info,
+                    {"status": "error", "error": "endpoint_failed_after_settlement"},
+                    500, t0, ip, session_token=token)
         wrapped.__name__ = f"paid_{path.strip('/').replace('-','_')}"
         return wrapped
     return deco
@@ -26327,15 +26435,28 @@ def agentic_market_manifest():
     e Solana Pay.sh."""
     base = _public_base()
 
+    # Do not call LEDGER.stats() here: that dashboard aggregate scans requests,
+    # UAs, previews and demand tables. This manifest needs only two revenue facts.
+    stats_available = True
     try:
-        stats = LEDGER.stats()
+        with LEDGER._conn() as c:
+            total_row = c.execute(
+                "SELECT COALESCE(SUM(amount),0) FROM revenue").fetchone()
+            paid_24h = c.execute("SELECT COUNT(*) FROM revenue WHERE ts > ?",
+                                 (int(_time.time()) - 86400,)).fetchone()[0]
+        stats = {"paid_24h": int(paid_24h or 0),
+                 "total_usdc": float(total_row[0] or 0)}
     except Exception:
-        stats = {"paid_24h": 0, "total_revenue": 0.0}
+        stats_available = False
+        stats = {"paid_24h": None, "total_usdc": None}
+    win_available = True
     try:
         win_rate = LEDGER.win_rate()
-        poi = LEDGER.get_poi_multiplier()
+        poi = (1.5 if win_rate >= 70 else 1.2 if win_rate >= 60 else
+               1.0 if win_rate >= 50 else 0.8 if win_rate >= 40 else 0.5)
     except Exception:
-        win_rate, poi = 0.0, 1.0
+        win_available = False
+        win_rate, poi = None, None
 
     categories = {
         "inference": [], "data": [], "trading": [], "search": [],
@@ -26374,7 +26495,8 @@ def agentic_market_manifest():
             "x402":   {"version": "2", "manifest": f"{base}/.well-known/x402.json"},
             "ap2":    {"version": "1", "manifest": f"{base}/.well-known/ap2.json"},
             "mcp":    {"version": MCP_PROTOCOL_VERSION, "endpoint": f"{base}/mcp"},
-            "a2a":    {"version": "0.3", "manifest": f"{base}/.well-known/agent.json"},
+            "a2a":    {"supported": False, "agent_card": f"{base}/.well-known/agent.json",
+                       "note": "Agent card for identity/discovery only; A2A transport is not offered."},
             "web_monetization": {"supported": False},
         },
         "payment": {
@@ -26416,24 +26538,29 @@ def agentic_market_manifest():
         "trust": {
             "node_id": WALLET.node_id,
             "operator_did": f"did:key:{WALLET.solana_address}",
-            "win_rate": round(win_rate, 2),
-            "poi_multiplier": round(poi, 2),
-            "tx_count_24h": stats.get("paid_24h", 0),
-            "total_revenue_usdc": round(float(stats.get("total_revenue", 0)), 4),
+            "win_rate": round(win_rate, 2) if win_rate is not None else None,
+            "win_rate_scope": "Resolved trading signals over 30 days; not payment success.",
+            "poi_multiplier": round(poi, 2) if poi is not None else None,
+            "tx_count_24h": stats.get("paid_24h") if stats_available else None,
+            "total_revenue_usdc": (round(float(stats.get("total_usdc")), 4)
+                                   if stats_available and stats.get("total_usdc") is not None else None),
+            "total_revenue_scope": "Gross ledger receipts, including operator/self-sweeps; not organic-only revenue.",
+            "metrics_available": bool(stats_available and win_available),
             "verify_domain": f"{base}/.well-known/verify-manifest",
             "proof_of_revenue": f"{base}/.well-known/proof-of-revenue.json",
             "receipts_public": f"{base}/receipts",
         },
         "sla": {
-            "avg_response_ms": 480,
-            "p95_response_ms": 1200,
             "uptime_target": 0.995,
             "health_endpoint": f"{base}/health/providers",
+            "live_response_metrics": f"{base}/.well-known/transparency.json",
+            "note": "Targets and live telemetry are separate; no static latency is presented as a measurement."
         },
         "compliance": {
-            "ofac_sdn_screening": "/sanctions",
+            "sanctions_lookup": "/sanctions",
             "audit_trail": "sqlite+ed25519_signed",
-            "gdpr_pii_stored": False,
+            "operational_request_metadata": True,
+            "privacy_policy": f"{base}/privacy",
             "kyc_required": False,
         },
         "discovery_beacons": [
@@ -27051,7 +27178,9 @@ def version_endpoint():
     return _jsonify({
         "engine_version": VERSION,
         "discovery_layer": V27_LAYER_VERSION,
-        "protocols": ["x402/v2", "ap2/v1", f"mcp/{MCP_PROTOCOL_VERSION}", "a2a/0.3"],
+        "protocols": ["x402/v2", "ap2/v1", f"mcp/{MCP_PROTOCOL_VERSION}"],
+        "a2a_transport": False,
+        "a2a_agent_card": "/.well-known/agent.json",
         "changelog": {
             V27_LAYER_VERSION: [
                 "Unified agentic.json manifest (x402+AP2+MCP+A2A in one JSON)",
@@ -29387,120 +29516,203 @@ def _h_doc():
 
 
 def _h_global_rates():
-    """GET /global-rates — taxas de juros dos 6 maiores bancos centrais.
-    Serie oficial diaria do BIS (WS_CBPOL) + cross-check ao vivo nas fontes
-    primarias (FRED, ECB SDW, BCB SGS). Nenhum concorrente x402 tem."""
+    """GET /global-rates — official policy rates with isolated source failures.
+
+    BIS remains the headline source. FRED/ECB/BCB are independent cross-checks:
+    none of them may abort a paid call. A bounded persistent last-good snapshot
+    is used only when necessary and is always labelled with its age.
+    """
     import csv as _csv
     import io as _io
     from concurrent.futures import ThreadPoolExecutor as _TPE
+
     t0 = time.perf_counter()
     ts_now = int(time.time())
-    _BANKS = {"US": "Federal Reserve",
-              "XM": "European Central Bank",
-              "CN": "People's Bank of China (LPR 1y)",
-              "JP": "Bank of Japan",
-              "RU": "Central Bank of Russia",
-              "BR": "Banco Central do Brasil (Selic)"}
+    cache_key = "global-rates:last-good:v2"
+    cache_max_age = 7 * 86400
+    timeout = (3, 6)
+    headers = {"User-Agent": "Losbeto/48.63 (+https://api.losbeto.xyz)",
+               "Accept": "text/csv,application/json;q=0.9,*/*;q=0.1"}
+    banks = {"US": "Federal Reserve",
+             "XM": "European Central Bank",
+             "CN": "People's Bank of China (LPR 1y)",
+             "JP": "Bank of Japan",
+             "RU": "Central Bank of Russia",
+             "BR": "Banco Central do Brasil (Selic)"}
 
     def _bis():
         r = requests.get(
             "https://stats.bis.org/api/v2/data/dataflow/BIS/WS_CBPOL/1.0/"
-            "D.US+XM+CN+JP+RU+BR?format=csvfile&lastNObservations=1", timeout=10)
+            "D.US+XM+CN+JP+RU+BR?format=csvfile&lastNObservations=1",
+            timeout=timeout, headers=headers)
+        if not r.ok:
+            return {}, f"HTTP {r.status_code}"
         rows = {}
-        if r.ok:
-            for row in _csv.DictReader(_io.StringIO(r.text)):
-                a, v, per = row.get("REF_AREA"), row.get("OBS_VALUE"), row.get("TIME_PERIOD")
-                if a and v:
-                    try:
-                        rows[a] = {"rate_pct": float(v), "as_of": per}
-                    except (TypeError, ValueError):
-                        continue
-        return rows, (None if r.ok else f"HTTP {r.status_code}")
+        for row in _csv.DictReader(_io.StringIO(r.text)):
+            area, value, period = (row.get("REF_AREA"), row.get("OBS_VALUE"),
+                                   row.get("TIME_PERIOD"))
+            if not area or not value:
+                continue
+            try:
+                rate = float(value)
+            except (TypeError, ValueError):
+                continue
+            if rate == rate and abs(rate) != float("inf"):
+                rows[area] = {"rate_pct": rate, "as_of": period}
+        return rows, (None if rows else "no valid observations")
 
     def _fed():
         r = requests.get("https://fred.stlouisfed.org/graph/fredgraph.csv?id=DFEDTARU",
-                         timeout=8)
+                         timeout=timeout, headers=headers)
         if not r.ok:
             return None, f"HTTP {r.status_code}"
-        linhas = [l for l in r.text.strip().splitlines()
-                  if l and not l.startswith("DATE")]
-        if not linhas:
-            return None, "sem linhas"
-        d, v = linhas[-1].split(",")[:2]
-        return {"rate_pct": float(v), "as_of": d,
-                "series": "FRED DFEDTARU (target upper bound)"}, None
+        valid = []
+        for row in _csv.DictReader(_io.StringIO(r.text)):
+            date = row.get("DATE") or row.get("observation_date")
+            try:
+                rate = float(row.get("DFEDTARU") or "")
+            except (TypeError, ValueError):
+                continue                 # FRED uses '.' for missing observations.
+            if date:
+                valid.append({"rate_pct": rate, "as_of": date,
+                              "series": "FRED DFEDTARU (target upper bound)"})
+        return (valid[-1], None) if valid else (None, "no valid observations")
 
     def _ecb():
+        # detail=dataonly reduces bytes and parsing work; lastNObservations=1
+        # keeps the request bounded according to the official ECB API contract.
         r = requests.get("https://data-api.ecb.europa.eu/service/data/FM/"
-                         "B.U2.EUR.4F.KR.MRR_FR.LEV?lastNObservations=1&format=csvdata",
-                         timeout=8)
+                         "B.U2.EUR.4F.KR.MRR_FR.LEV?lastNObservations=1"
+                         "&format=csvdata&detail=dataonly",
+                         timeout=timeout, headers=headers)
         if not r.ok:
             return None, f"HTTP {r.status_code}"
         for row in _csv.DictReader(_io.StringIO(r.text)):
-            if row.get("OBS_VALUE"):
-                return {"rate_pct": float(row["OBS_VALUE"]),
-                        "as_of": row.get("TIME_PERIOD"),
-                        "series": "ECB SDW MRR (main refi)"}, None
-        return None, "sem observacoes"
+            try:
+                rate = float(row.get("OBS_VALUE") or "")
+            except (TypeError, ValueError):
+                continue
+            return {"rate_pct": rate, "as_of": row.get("TIME_PERIOD"),
+                    "series": "ECB FM MRR (main refinancing operations)"}, None
+        return None, "no valid observations"
 
     def _bcb():
         try:
-            r = _http_get_retry("https://api.bcb.gov.br/dados/serie/bcdata.sgs.11/"
-                                "dados/ultimos/1?formato=json", timeout=8)
+            r = _http_get_retry(
+                "https://api.bcb.gov.br/dados/serie/bcdata.sgs.11/dados/ultimos/1?formato=json",
+                tries=1, base_delay=0, timeout=timeout, headers=headers)
         except requests.exceptions.RequestException as e:
-            return None, f"rede BCB: {str(e)[:80]}"   # degrada a linha, não o handler
+            return None, f"BCB network: {type(e).__name__}"
         if not r.ok:
             return None, f"HTTP {r.status_code}"
         arr = r.json()
-        if arr:
-            return {"rate_pct_per_day": float(arr[0]["valor"]),
-                    "as_of": arr[0]["data"],
-                    "series": "BCB SGS 11 (Selic diaria %/dia)"}, None
-        return None, "sem observacoes"
+        if not isinstance(arr, list) or not arr:
+            return None, "no observations"
+        value = str(arr[0].get("valor", "")).replace(",", ".")
+        return {"rate_pct_per_day": float(value), "as_of": arr[0].get("data"),
+                "series": "BCB SGS 11 (Selic daily %/day)"}, None
 
-    rows, errs, checks = {}, {}, {}
+    rows, checks, errs = {}, {}, {}
+    primary = {area: "BIS WS_CBPOL daily (official)" for area in banks}
     with _TPE(max_workers=4) as ex:
         futs = {"bis": ex.submit(_bis), "US": ex.submit(_fed),
                 "XM": ex.submit(_ecb), "BR": ex.submit(_bcb)}
-        bis_rows, bis_err = futs["bis"].result()
-        rows.update(bis_rows)
+        try:
+            bis_rows, bis_err = futs["bis"].result()
+        except Exception as e:
+            bis_rows, bis_err = {}, f"{type(e).__name__}: {str(e)[:100]}"
+        rows.update(bis_rows or {})
         if bis_err:
             errs["bis"] = bis_err
         for area in ("US", "XM", "BR"):
-            val, err = futs[area].result()
-            if val:
-                checks[area] = val
+            try:
+                value, err = futs[area].result()
+            except Exception as e:
+                value, err = None, f"{type(e).__name__}: {str(e)[:100]}"
+            if value:
+                checks[area] = value
             if err:
                 errs[area.lower()] = err
+
+    # FRED and ECB measure the same policy-rate concepts used for their rows.
+    # BCB SGS 11 is a daily rate and is deliberately NOT substituted for an
+    # annual headline policy rate when BIS is unavailable.
+    for area in ("US", "XM"):
+        if area not in rows and checks.get(area, {}).get("rate_pct") is not None:
+            rows[area] = checks[area]
+            primary[area] = checks[area]["series"] + " (official direct fallback)"
+
+    cached = None
+    try:
+        cached = LEDGER.cache_get(cache_key, cache_max_age)
+    except Exception as e:
+        errs["cache_read"] = type(e).__name__
+    cached_rows = (cached or {}).get("rows") or {}
+    fresh_row_count = len(rows)
+    cache_fill = []
+    if cached_rows:
+        for area in banks:
+            if area not in rows and area in cached_rows:
+                rows[area] = cached_rows[area]
+                primary[area] = ((cached.get("primary") or {}).get(area)
+                                 or "BIS WS_CBPOL daily (official)")
+                cache_fill.append(area)
+
+    full_stale = fresh_row_count == 0 and bool(cached_rows)
+    if full_stale:                         # defensive; normally filled above
+        rows = dict(cached_rows)
+        primary = dict(cached.get("primary") or primary)
+        cache_fill = list(rows)
     if not rows:
         return ({"status": "unavailable", "charged": False,
-                 "error": "all rate sources failed", "detail": errs,
+                 "error": "all live rate sources failed and no valid last-good snapshot exists",
+                 "detail": errs, "delivery_complete": False,
                  "ts": ts_now, "version": VERSION}, 502)
+
+    if not full_stale and not cache_fill:
+        try:
+            LEDGER.cache_set(cache_key, {"stored_at": ts_now,
+                                         "rows": rows, "primary": primary})
+        except Exception as e:
+            errs["cache_write"] = type(e).__name__
+
+    cache_age = (max(0, ts_now - int(cached.get("stored_at", ts_now)))
+                 if cached and cache_fill else 0)
     us = rows.get("US", {}).get("rate_pct")
     out = {}
-    for area, bank in _BANKS.items():
-        r = rows.get(area)
-        if not r:
+    for area, bank in banks.items():
+        row = rows.get(area)
+        if not row:
             continue
-        item = {"bank": bank, "policy_rate_pct": r["rate_pct"],
-                "as_of": r["as_of"], "source": "BIS WS_CBPOL daily (official)"}
-        if area in checks:
+        source = primary.get(area, "BIS WS_CBPOL daily (official)")
+        if area in cache_fill:
+            source += " — last-good cache"
+        item = {"bank": bank, "policy_rate_pct": row["rate_pct"],
+                "as_of": row.get("as_of"), "source": source}
+        if area in cache_fill:
+            item["cache"] = "last_good"
+            item["cached_at"] = cached.get("stored_at")
+        if area in checks and area not in cache_fill:
             item["live_check"] = checks[area]
         if us is not None:
-            item["differential_vs_us_pp"] = round(r["rate_pct"] - us, 3)
+            item["differential_vs_us_pp"] = round(row["rate_pct"] - us, 3)
         out[area] = item
-    missing = [a for a in _BANKS if a not in out]
+
+    missing = [area for area in banks if area not in out]
+    cache_status = "last_good" if full_stale else ("partial_last_good" if cache_fill else "live")
     return {"product": "Global central bank policy rates — Fed, ECB, PBoC, BOJ, CBR, BCB",
-            "rates": out,
-            "missing": missing or None,
+            "rates": out, "missing": missing or None,
             "source_errors": errs or None,
-            "note": ("Headline rates are the BIS daily policy-rate series (official). "
-                     "Fed/ECB/BCB carry an additional live cross-check from the "
-                     "primary source (FRED, ECB SDW, BCB SGS). BIS publishes with a "
-                     "short lag; as_of dates are per-series."),
+            "cache_status": cache_status,
+            "cache_age_seconds": cache_age if cache_fill else 0,
+            "degraded": bool(errs or cache_fill),
+            "note": ("Headline rates come from BIS WS_CBPOL, with FRED/ECB as "
+                     "same-concept direct fallbacks and independent live cross-checks. "
+                     "Any last-good row is explicitly labelled; as_of is the source "
+                     "observation date. BCB SGS 11 remains a daily-rate cross-check "
+                     "and is never misrepresented as an annual policy rate."),
             "compute_ms": round((time.perf_counter() - t0) * 1000, 1),
             "ts": ts_now, "version": VERSION}
-
 
 
 _V47_PRODUCTS = {
@@ -37459,27 +37671,91 @@ try:
     _agentic_orig = app.view_functions.get("agentic_market_manifest")
     if _agentic_orig is not None:
         _agentic_store = {}
-        def _agentic_cached_view():
-            from flask import Response as _Resp, make_response as _mk
-            _now = time.time()
-            _hit = _agentic_store.get("v")
-            if _hit and _now - _hit["ts"] < 300:
-                return _Resp(_hit["body"], status=_hit["status"],
-                             content_type="application/json")
-            _resp = _agentic_orig()
+        _agentic_lock = threading.Lock()
+        _AGENTIC_CACHE_KEY = "agentic-manifest:v4863"
+
+        def _agentic_response(body, status=200, state="hit", generated_at=0):
+            resp = Response(body, status=status, content_type="application/json")
+            if status == 200:
+                digest = hashlib.sha256(body).hexdigest()
+                resp.set_etag(digest)
+                resp.cache_control.public = True
+                resp.cache_control.max_age = 60
+                resp.headers["Cache-Control"] = "public, max-age=60, stale-while-revalidate=240"
+                resp.headers["Vary"] = "Accept-Encoding"
+                resp.headers["X-Losbeto-Cache"] = state
+                if generated_at:
+                    resp.headers["X-Agentic-Generated-At"] = str(int(generated_at))
+                return resp.make_conditional(request)
+            return resp
+
+        def _agentic_local_valid(now):
+            hit = _agentic_store.get("v")
+            if hit and now - hit["local_at"] < 300:
+                return hit
+            return None
+
+        def _agentic_shared(ttl):
             try:
-                _r = _mk(_resp)
-                _agentic_store["v"] = {"ts": _now, "body": _r.get_data(),
-                                       "status": _r.status_code}
+                rec = LEDGER.cache_get(_AGENTIC_CACHE_KEY, ttl)
+                if rec and isinstance(rec.get("body"), str) and rec.get("stored_at"):
+                    return rec
             except Exception:
                 pass
-            return _resp
+            return None
+
+        def _agentic_cached_view():
+            now = time.time()
+            hit = _agentic_local_valid(now)
+            if hit:
+                return _agentic_response(hit["body"], hit["status"], "hit", hit["stored_at"])
+            with _agentic_lock:
+                now = time.time()
+                hit = _agentic_local_valid(now)       # another thread may have filled it
+                if hit:
+                    return _agentic_response(hit["body"], hit["status"], "hit", hit["stored_at"])
+                shared = _agentic_shared(300)
+                if shared:
+                    body = shared["body"].encode("utf-8")
+                    status = int(shared.get("status", 200))
+                    stored_at = int(shared["stored_at"])
+                    _agentic_store["v"] = {"local_at": now, "body": body,
+                                           "status": status, "stored_at": stored_at}
+                    return _agentic_response(body, status, "shared", stored_at)
+                stale = _agentic_shared(86400)
+                try:
+                    original = _agentic_orig()
+                    resp = app.make_response(original)
+                    body = resp.get_data()
+                    status = resp.status_code
+                    if status == 200 and body:
+                        stored_at = int(now)
+                        rec = {"stored_at": stored_at, "status": status,
+                               "body": body.decode("utf-8")}
+                        try:
+                            LEDGER.cache_set(_AGENTIC_CACHE_KEY, rec)
+                        except Exception as e:
+                            log.debug(f"agentic shared cache write: {e}")
+                        _agentic_store["v"] = {"local_at": now, "body": body,
+                                               "status": status, "stored_at": stored_at}
+                        return _agentic_response(body, status, "miss", stored_at)
+                    if stale and status >= 500:
+                        raise RuntimeError(f"manifest generation HTTP {status}")
+                    return resp
+                except Exception as e:
+                    log.warning(f"agentic manifest generation failed: {type(e).__name__}")
+                    if stale:
+                        body = stale["body"].encode("utf-8")
+                        return _agentic_response(body, int(stale.get("status", 200)),
+                                                 "stale", int(stale["stored_at"]))
+                    return jsonify({"error": "agentic_manifest_unavailable",
+                                    "ready": False, "new_payment_required": False}), 503
+
         _agentic_cached_view.__name__ = "agentic_market_manifest"
         _agentic_cached_view.__doc__ = _agentic_orig.__doc__
         app.view_functions["agentic_market_manifest"] = _agentic_cached_view
-except Exception:
-    pass
-
+except Exception as e:
+    log.warning(f"agentic cache setup: {e}")
 
 
 _V4842_PENDING_COLUMNS = {
@@ -38846,7 +39122,7 @@ _ops_validate = _v4843_ops_validate
 
 _v4842_sanitize_governance()
 
-VERSION = "48.62.0-MEMORYOPT"
+VERSION = "48.63.0-DELIVERY"
 
 
 # ============================================================================
