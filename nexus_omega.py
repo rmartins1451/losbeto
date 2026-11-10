@@ -2,7 +2,7 @@
 """
 Losbeto x402 — monolithic Flask service for Railway.
 
-Current release: 48.66.0-CONSISTENCY.
+Current release: 48.67.0-COSTGUARD.
 Payment requirements are server-side. Delivery requires verified settlement;
 pending payments are reconciled against independent chain evidence.
 Operational history lives in CHANGELOG.md, not in executable boot output.
@@ -12,8 +12,10 @@ upstream failures, and made the agentic manifest lightweight and cacheable.
 base-price-normalized split-conformal forecast calibration.
 48.65 bounded preview cardinality, aligned A2A custom bindings, retained embedding
 artifacts safely, and synchronized dynamic factory routes and OpenAPI.
-48.66 shares Solana health across workers, supports paid POST compatibility for
-agent-call and gas-price, and aligns public pricing and repository metadata.
+48.66 shared Solana health across workers, supported paid POST compatibility for
+agent-call and gas-price, and aligned public pricing and repository metadata.
+48.67 bounds deterministic invalid-payment verification retries without touching
+pending, uncertain or directly provable Solana payments.
 """
 from __future__ import annotations
 
@@ -9051,6 +9053,16 @@ def _verify_payment(endpoint: str, payment_header: str):
             pass
 
     if (FACILITATOR or CDP_FAC or GO_FAC) and payload:
+        # Deterministic invalid payloads must not burn external verify calls in a
+        # retry loop. A real Solana signature always keeps the direct chain path.
+        if not _looks_like_sol_sig(tx_sig):
+            try:
+                _bad = LEDGER.cache_get(f"verify:neg:{endpoint}:{header_hash}", 60)
+                if isinstance(_bad, dict) and "invalid_exact_" in str(_bad.get("reason", "")):
+                    log.debug(f"verify negativo em cache {endpoint}: {_bad['reason'][:100]}")
+                    return False, _bad["reason"], {"verify_cached": True}
+            except Exception:
+                pass
         accepts = _challenge_recall(endpoint, rid) if rid else None
         if rid and accepts is None:
             return False, "unknown-or-expired-challenge", {}
@@ -9177,6 +9189,11 @@ def _verify_payment(endpoint: str, payment_header: str):
                 return _finalize_facilitator_payment(endpoint, req, settle_tx, real_payer,
                                                      proof, sdata, fingerprint, header_hash, rid)
             last_reason = "; ".join(f"{k}:{v}" for k, v in fac_reasons.items()) or last_reason
+        if not _looks_like_sol_sig(tx_sig) and "invalid_exact_" in last_reason:
+            try:
+                LEDGER.cache_set(f"verify:neg:{endpoint}:{header_hash}", {"reason": last_reason})
+            except Exception:
+                pass
         log.warning(f"⚠️ Todos os accepts falharam no facilitator p/ {endpoint}: {last_reason}")
     else:
         last_reason = "facilitator-unavailable"
@@ -39348,7 +39365,7 @@ _ops_validate = _v4843_ops_validate
 
 _v4842_sanitize_governance()
 
-VERSION = "48.66.0-CONSISTENCY"
+VERSION = "48.67.0-COSTGUARD"
 
 
 # ============================================================================
