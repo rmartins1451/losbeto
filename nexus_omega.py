@@ -2,7 +2,7 @@
 """
 Losbeto x402 — monolithic Flask service for Railway.
 
-Current release: 48.67.0-COSTGUARD.
+Current release: 48.68.0-RATEGUARD.
 Payment requirements are server-side. Delivery requires verified settlement;
 pending payments are reconciled against independent chain evidence.
 Operational history lives in CHANGELOG.md, not in executable boot output.
@@ -14,8 +14,10 @@ base-price-normalized split-conformal forecast calibration.
 artifacts safely, and synchronized dynamic factory routes and OpenAPI.
 48.66 shared Solana health across workers, supported paid POST compatibility for
 agent-call and gas-price, and aligned public pricing and repository metadata.
-48.67 bounds deterministic invalid-payment verification retries without touching
+48.67 bounded deterministic invalid-payment verification retries without touching
 pending, uncertain or directly provable Solana payments.
+48.68 adds a small cross-worker invalid-payment budget with replay/pending
+precedence, direct-proof escape and an explicit 429 backoff.
 """
 from __future__ import annotations
 
@@ -9238,6 +9240,89 @@ def _verify_payment(endpoint: str, payment_header: str):
         return False, f"facilitator-verify-failed: {str(last_reason)[:220]}", {}
     return False, "unknown-chain", {}
 
+_VERIFY_PAYMENT_CORE = _verify_payment
+
+
+def _verify_header_meta(payment_header):
+    try:
+        data = json.loads(base64.b64decode(payment_header.strip()).decode())
+        if not isinstance(data, dict):
+            return {}, "", ""
+        inner = data.get("payload") if isinstance(data.get("payload"), dict) else data
+        tx_sig = (inner.get("signature") or inner.get("transaction") or inner.get("tx") or "")
+        return data, str(tx_sig or ""), _payment_fingerprint(data)
+    except Exception:
+        return {}, "", ""
+
+
+def _verify_throttle_get(endpoint, ip):
+    try:
+        rec = LEDGER.cache_get(f"verify:throttle:{endpoint}:{ip}", 90)
+        if isinstance(rec, dict) and int(rec.get("blocked_until", 0)) > int(time.time()):
+            return rec
+    except Exception:
+        pass
+    return None
+
+
+def _verify_throttle_note(endpoint, ip, reason):
+    """Atomically count deterministic failures across all four workers."""
+    key = f"verify:throttle:{endpoint}:{ip}"
+    now = int(time.time())
+    with LEDGER.lock, LEDGER._conn() as c:
+        c.execute("BEGIN IMMEDIATE")
+        row = c.execute("SELECT value FROM cache WHERE key=?", (key,)).fetchone()
+        try:
+            rec = json.loads(row[0]) if row and row[0] else {}
+        except Exception:
+            rec = {}
+        start = int(rec.get("window_start", 0) or 0)
+        if not start or now - start >= 60:
+            rec = {"window_start": now, "count": 0}
+        rec["window_start"] = int(rec.get("window_start") or now)
+        rec["count"] = int(rec.get("count", 0)) + 1
+        if rec["count"] >= 3 and not rec.get("blocked_until"):
+            rec["blocked_until"] = now + 30
+            rec["reason"] = str(reason)[:220]
+        c.execute("INSERT OR REPLACE INTO cache(key,value,ts) VALUES(?,?,?)",
+                  (key, json.dumps(rec, separators=(",", ":")), now))
+        c.commit()
+        return rec
+
+
+def _verify_payment(endpoint: str, payment_header: str):  # noqa: F811
+    # Replay/pending always win. A short IP+endpoint budget only limits NEW
+    # deterministic invalid attempts; direct Solana proof is never suppressed.
+    try:
+        ip = (request.headers.get("X-Forwarded-For", request.remote_addr) or "").split(",")[0].strip()
+    except RuntimeError:
+        ip = ""
+    if not ip:
+        return _VERIFY_PAYMENT_CORE(endpoint, payment_header)
+    data, tx_sig, fingerprint = _verify_header_meta(payment_header or "")
+    try:
+        if fingerprint and (LEDGER.payment_fingerprint_lookup(fingerprint)
+                            or LEDGER.pending_get(fingerprint)
+                            or LEDGER.replay_seen(hashlib.sha256(payment_header.strip().encode()).hexdigest())):
+            return _VERIFY_PAYMENT_CORE(endpoint, payment_header)
+    except Exception:
+        pass
+    blocked = _verify_throttle_get(endpoint, ip)
+    if blocked and not _looks_like_sol_sig(tx_sig):
+        return False, "invalid_payment_rate_limited", {
+            "verify_throttled": True,
+            "retry_after_seconds": max(1, int(blocked["blocked_until"] - int(time.time()))),
+            "charged": False, "new_payment_required": False,
+        }
+    ok, reason, info = _VERIFY_PAYMENT_CORE(endpoint, payment_header)
+    if not ok and "invalid_exact_" in str(reason) and not _looks_like_sol_sig(tx_sig):
+        try:
+            _verify_throttle_note(endpoint, ip, reason)
+        except Exception as e:
+            log.debug(f"verify throttle note: {e}")
+    return ok, reason, info
+
+
 def _notify_telegram(text: str):
     if not (TG_TOKEN and TG_CHAT): return
     try:
@@ -10317,6 +10402,15 @@ def paid_endpoint(path):
             else:
                 ok, reason, info = _verify_payment(path, sig)
             if not ok:
+                if isinstance(info, dict) and info.get("verify_throttled"):
+                    retry_after = max(1, int(info.get("retry_after_seconds", 30)))
+                    limited = jsonify({"error": "invalid_payment_rate_limited",
+                                       "charged": False, "new_payment_required": False,
+                                       "retry_after_seconds": retry_after,
+                                       "delivery_complete": False})
+                    limited.status_code = 429
+                    limited.headers["Retry-After"] = str(retry_after)
+                    return limited
                 if isinstance(info, dict) and info.get("settlement_pending"):
                     LEDGER.log_request(path, False, int((time.time() - t0) * 1000), ip,
                                         kind="settlement_pending", ua=request.headers.get("User-Agent", ""),
@@ -39365,7 +39459,7 @@ _ops_validate = _v4843_ops_validate
 
 _v4842_sanitize_governance()
 
-VERSION = "48.67.0-COSTGUARD"
+VERSION = "48.68.0-RATEGUARD"
 
 
 # ============================================================================
