@@ -4,13 +4,13 @@
 
 One USDC micropayment per call. No signup, no API keys to manage — **the payment is the auth**. USDC on Base, Solana, Algorand or Polygon.
 
-**Flagship: an OpenAI-compatible LLM gateway for agents.** `POST /v1/chat/completions` and `GET /llm` at **$0.005/call** on live backends, with a free tier at `/llm/free` and model list at `/v1/models`. Behind it, **120 endpoints** ($0.001–99.99): Base chain reads, FX, equities, commodities, macro calendar, crypto — plus Brazil's official statistics in depth, which nobody else on x402 covers.
+**Flagship: an OpenAI-compatible LLM gateway for agents.** `POST /v1/chat/completions` and `GET /llm` at **$0.005/call** on live backends, with a free tier at `/llm/free` and model list at `/v1/models`. Behind it, **125 endpoints** ($0.001–99.99): Base chain reads, FX, equities, commodities, macro calendar, crypto — plus differentiated coverage of Brazil's official statistics in depth.
 
 **Identity: registered ERC-8004 agent** — [agentId 87048 on Base](https://8004scan.io/agents/base/87048), registration file at `/.well-known/erc8004.json`, domain-verified via `/.well-known/agent-registration.json`.
 
-**Compliance: Grade A 98/100 on [x402lint](https://x402lint.com)** (PASS 23 · FAIL 0) — and listed on [x402scan](https://www.x402scan.com), [x402-list](https://x402-list.com/services/losbeto-cross-asset-market-intelligence), the [official MCP Registry](https://registry.modelcontextprotocol.io) (`io.github.rmartins1451/losbeto`), [PyPI](https://pypi.org/project/losbeto-tools/) and [npm](https://www.npmjs.com/package/losbeto-mcp).
+**Compliance: Grade A 98/100 on [x402lint](https://x402lint.com)** (PASS 21 · WARN 2 · FAIL 0) — and listed on [x402scan](https://www.x402scan.com), [x402-list](https://x402-list.com/services/losbeto-cross-asset-market-intelligence), the [official MCP Registry](https://registry.modelcontextprotocol.io) (`io.github.rmartins1451/losbeto`), [PyPI](https://pypi.org/project/losbeto-tools/) and [npm](https://www.npmjs.com/package/losbeto-mcp).
 
-**Trusted in production:** 92/100 with $278.98 settled volume (30d) on [x402-list](https://x402-list.com/services/losbeto-cross-asset-market-intelligence) · $349+ verified on-chain volume indexed by [Roundhouse](https://roundhouseai.io) · 100% uptime and 1,405 transactions (7d) on [APIHub](https://apihub.io) · 99.0% uptime (59d) on [glama.ai](https://glama.ai).
+**Live status and proof:** independently monitored uptime and protocol checks on [x402-list](https://x402-list.com/services/losbeto-cross-asset-market-intelligence), [APIHub](https://apihub.io), [Roundhouse](https://roundhouseai.io) and [glama.ai](https://glama.ai). Current receipts and operator-vs-organic breakdown are always live at [`/receipts`](https://api.losbeto.xyz/receipts) and [`/.well-known/honest-revenue.json`](https://api.losbeto.xyz/.well-known/honest-revenue.json); no static counters are presented as current metrics.
 
 ## Quick start
 
@@ -96,7 +96,7 @@ Raw chain data with an intelligence layer on top. Zero upstream cost (public RPC
 
 | Endpoint | Price | What you get |
 |---|---|---|
-| `/agent-reputation?agentId=&clients=` | $0.010 | On-chain ERC-8004 identity (owner, tokenURI) plus aggregated feedback from the Reputation Registry (`getSummary`), for **any** registered agent. First x402 endpoint serving the ERC-8004 standard |
+| `/agent-reputation?agentId=&clients=` | $0.010 | On-chain ERC-8004 identity (owner, tokenURI) plus aggregated feedback from the Reputation Registry (`getSummary`), for **any** registered agent. ERC-8004 identity and reputation served over x402 |
 | `/wallet-verdict?address=` | $0.020 | A graded verdict on any Base wallet (WHALE / STEADY / DEGEN / NEWCOMER / GHOST) with an **LLM-written roast**, idempotent via `requestKey`, plus a free shareable SVG card at `/wallet-verdict/card.svg?address=` — built to be posted |
 
 ## Plans — one payment, N calls (no settlement latency)
@@ -121,7 +121,7 @@ The problem: the IPCA number you fetch from the Banco Central API today is **not
 
 The US has ALFRED for this. Brazil has nothing public.
 
-This node has been recording Brazilian official statistics as they were published, timestamping every reading and signing each day with Ed25519 — continuously, since deploy. That archive cannot be scraped retroactively by anyone, including us.
+This node has been recording Brazilian official statistics as they were published, timestamping every reading and signing each day with Ed25519 — continuously, since deploy. This archive is built from observations recorded at publication time, not from a current-series backfill.
 
 | Endpoint | Price | What you get |
 |---|---|---|
@@ -129,7 +129,7 @@ This node has been recording Brazilian official statistics as they were publishe
 | `/br-asof?series=&date=` | $0.09 | The value as known on that date — vintage, not revised |
 | `/br-revisions?series=` | $0.19 | First print → every correction, with size and observation timestamp |
 | `/br-archive?day=` | $0.09 | Signed daily snapshot: BCB macro + Ibovespa close |
-| `/br-brief` | $0.50 | Daily Brazil macro + equity brief, in English |
+| `/br-brief` | $0.21 | Daily Brazil macro + equity brief, in English |
 
 Series tracked: `selic_meta_pct, cdi_daily_pct, ipca_12m_pct, igpm_month_pct, usd_brl_ptax, eur_brl`.
 

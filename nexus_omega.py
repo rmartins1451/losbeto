@@ -2,7 +2,7 @@
 """
 Losbeto x402 — monolithic Flask service for Railway.
 
-Current release: 48.65.0-INTEGRITY.
+Current release: 48.66.0-CONSISTENCY.
 Payment requirements are server-side. Delivery requires verified settlement;
 pending payments are reconciled against independent chain evidence.
 Operational history lives in CHANGELOG.md, not in executable boot output.
@@ -10,8 +10,10 @@ Operational history lives in CHANGELOG.md, not in executable boot output.
 upstream failures, and made the agentic manifest lightweight and cacheable.
 48.64 added protocol-demand governance, consistent MCP negotiation and versioned
 base-price-normalized split-conformal forecast calibration.
-48.65 bounds preview cardinality, aligns A2A custom bindings, retains embedding
-artifacts safely, and synchronizes dynamic factory routes and OpenAPI.
+48.65 bounded preview cardinality, aligned A2A custom bindings, retained embedding
+artifacts safely, and synchronized dynamic factory routes and OpenAPI.
+48.66 shares Solana health across workers, supports paid POST compatibility for
+agent-call and gas-price, and aligns public pricing and repository metadata.
 """
 from __future__ import annotations
 
@@ -12388,6 +12390,13 @@ def _sol_dest_ata_refresh():
 
 def _sol_dest_ata_status() -> dict:
     """Expõe idade e frescor reais, com retry limitado após falha de RPC."""
+    if not _SOL_DEST_ATA.get("ts"):
+        try:
+            _disk = _sol_dest_ata_disk_read()
+            if _disk is not None:
+                _SOL_DEST_ATA.update(_disk)
+        except Exception:
+            pass
     now = time.time()
     if (_SOL_DEST_ATA.get("checking")
             and now - float(_SOL_DEST_ATA.get("checking_since") or 0) > 150):
@@ -22526,6 +22535,9 @@ def about_operator():
     se integra quer saber quem opera, como falar, e como auditar. Num mercado que
     se recupera de wash trading, essa é exatamente a pergunta certa."""
     base = _public_base()
+    _live_prices = [get_dynamic_price(p) for p in BASE_PRICES if _sellable_now(p)]
+    _price_range = (f"${min(_live_prices):.3f} - ${max(_live_prices):.2f}"
+                    if _live_prices else "unavailable")
     return jsonify({
         "service": SERVICE_NAME,
         "operator": {
@@ -22554,8 +22566,8 @@ def about_operator():
             "cost": "0.00 USDC",
         },
         "settlement": {
-            "networks": ["eip155:8453 (Base, Coinbase CDP)", "solana (PayAI)"],
-            "asset": "USDC", "price_range": "$0.003 - $0.30",
+            "networks": _chains_list(),
+            "asset": "USDC", "price_range": _price_range,
         },
         "open_source": FEEDBACK_GITHUB,
         "version": VERSION, "ts": int(time.time()),
@@ -23149,6 +23161,14 @@ def _build_openapi():
                 }
             }
             continue
+        if p in _POST_READ_COMPAT:
+            post_op = dict(paths[p]["get"])
+            post_op["operationId"] = str(post_op.get("operationId", p.strip("/")) ) + "_post"
+            post_op["requestBody"] = {
+                "required": False,
+                "content": {"application/json": {
+                    "schema": {"type": "object", "additionalProperties": True}}}}
+            paths[p]["post"] = post_op
         if p == "/portfolio-stress":
             paths[p]["post"] = {
                 "summary":     ENDPOINT_DESC.get(p, p),
@@ -32536,6 +32556,14 @@ ENDPOINT_HANDLERS["/api/v1/best"] = _api_v1_best_handler
 app.add_url_rule("/api/v1/best", "api_v1_best",
                  paid_endpoint("/api/v1/best")(_api_v1_best_handler))
 
+# Paid POST compatibility for common agent adapters. The requirements and
+# anti-replay fingerprint remain method-bound; no free twin route is created.
+app.add_url_rule("/agent-call", "agent_call_post",
+                 paid_endpoint("/agent-call")(Brain.agent_call), methods=["POST"])
+app.add_url_rule("/gas-price", "gas_price_post",
+                 paid_endpoint("/gas-price")(_h_gas_price), methods=["POST"])
+
+
 # Protocol compatibility is free and deterministic. Credential/login scanners
 # never become paid products, and protocol probes never become product demand.
 @app.route("/mcp/sse", methods=["GET", "POST"])
@@ -37424,6 +37452,7 @@ _PARAM_REQUIRED.update({
 })
 
 
+_POST_READ_COMPAT = frozenset({"/agent-call", "/gas-price"})
 _INTENT_PATHS = {"/agent-call": "task", "/api/v1/best": "task", "/web-search": "q",
                  "/research-brief": "q", "/llm": "q"}
 
@@ -37440,6 +37469,14 @@ def _v4835_args_and_intents():
                 md = _MultiDict(request.args)
                 for k, v in add.items():
                     md[k] = v
+                request.__dict__["args"] = md
+        if request.method == "POST" and path in _POST_READ_COMPAT:
+            body = request.get_json(silent=True)
+            if isinstance(body, dict):
+                md = _MultiDict(request.args)
+                for k, v in body.items():
+                    if k not in md and isinstance(v, (str, int, float, bool)):
+                        md[k] = str(v)[:300]
                 request.__dict__["args"] = md
         if request.method == "POST":
             body = request.get_json(silent=True)
@@ -39311,7 +39348,7 @@ _ops_validate = _v4843_ops_validate
 
 _v4842_sanitize_governance()
 
-VERSION = "48.65.0-INTEGRITY"
+VERSION = "48.66.0-CONSISTENCY"
 
 
 # ============================================================================
