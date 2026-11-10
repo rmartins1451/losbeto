@@ -2,12 +2,14 @@
 """
 Losbeto x402 — monolithic Flask service for Railway.
 
-Current release: 48.63.0-DELIVERY.
+Current release: 48.64.0-TRUSTPATH.
 Payment requirements are server-side. Delivery requires verified settlement;
 pending payments are reconciled against independent chain evidence.
 Operational history lives in CHANGELOG.md, not in executable boot output.
-48.63 hardens post-settlement delivery/refund evidence, isolates global-rate
-upstream failures, and makes the agentic manifest lightweight and cacheable.
+48.63 hardened post-settlement delivery/refund evidence, isolated global-rate
+upstream failures, and made the agentic manifest lightweight and cacheable.
+48.64 adds protocol-demand governance, consistent MCP negotiation and versioned
+base-price-normalized split-conformal forecast calibration.
 """
 from __future__ import annotations
 
@@ -9339,7 +9341,8 @@ def _preview_db_put(path: str, data) -> None:
 
 def _preview_valid(path: str, data) -> bool:
     if path == "/forecast" and isinstance(data, dict) and isinstance(data.get("model"), dict):
-        return data["model"].get("raw_interval_coverage80_empirical") is not None
+        return (data["model"].get("raw_interval_coverage80_empirical") is not None
+                and data["model"].get("calibration_version") == _FC_CALIB_VERSION)
     return True
 
 
@@ -13623,7 +13626,6 @@ def agent_registration_8004():
         "image": f"{base}/favicon.png",
         "services": [
             {"name": "web",  "endpoint": f"{base}/"},
-            {"name": "A2A",  "endpoint": f"{base}/.well-known/agent-card.json", "version": "0.3.0"},
             {"name": "MCP",  "endpoint": f"{base}/mcp", "version": "2025-06-18"},
             {"name": "x402", "endpoint": f"{base}/.well-known/x402.json"},
             {"name": "OAS",  "endpoint": f"{base}/openapi.json"},
@@ -15432,7 +15434,7 @@ def manifest_x402():
     return jsonify(manifest)
 
 
-MCP_PROTOCOL_VERSION = "2024-11-05"
+MCP_PROTOCOL_VERSION = "2025-06-18"
 
 
 MCP_LEGACY_TOOLS = os.environ.get("MCP_LEGACY_TOOLS", "").strip() in ("1", "true")
@@ -16019,6 +16021,28 @@ def _mcp_handle(msg: dict):
         return _jsonrpc_result(rid, {key: []})
     return _jsonrpc_error(rid, -32601, f"Method not found: {method}")
 
+def _mcp_origin_allowed():
+    """Reject browser cross-origin/DNS-rebinding calls; non-browser MCP clients
+    normally send no Origin. Same-origin browser clients remain supported."""
+    origin = (request.headers.get("Origin") or "").strip()
+    if not origin:
+        return True
+    try:
+        actual = urllib.parse.urlparse(origin)
+        expected = urllib.parse.urlparse(_public_base())
+        return (actual.scheme.lower(), actual.netloc.lower()) == (expected.scheme.lower(), expected.netloc.lower())
+    except Exception:
+        return False
+
+
+@app.after_request
+def _mcp_negotiation_headers(resp):
+    if request.path in ("/mcp", "/mcp/jsonrpc", "/mcp/v1/message:send",
+                        "/mcp/mcp", "/api/mcp", "/mcp/v1", "/messages"):
+        resp.headers["MCP-Protocol-Version"] = MCP_PROTOCOL_VERSION
+    return resp
+
+
 @app.route("/mcp", methods=["POST", "GET", "DELETE", "OPTIONS"])
 @app.route("/mcp/jsonrpc", methods=["POST", "GET", "DELETE", "OPTIONS"])
 @app.route("/mcp/v1/message:send", methods=["POST", "GET", "DELETE", "OPTIONS"])
@@ -16027,6 +16051,8 @@ def _mcp_handle(msg: dict):
 @app.route("/mcp/v1", methods=["POST", "GET", "DELETE", "OPTIONS"])   # v48.9.17: alias — 13 reqs/10 IPs; probes MCP versionados tomavam 308 p/ /v1/chat/completions (errado: probe MCP quer JSON-RPC, não o gateway LLM)
 @app.route("/messages", methods=["POST", "OPTIONS"])                 # v48.9.9: alvo POST do SSE legado
 def mcp_streamable():
+    if not _mcp_origin_allowed():
+        return jsonify(_jsonrpc_error(None, -32020, "Invalid Origin")), 403
     if request.method == "OPTIONS":
         return ("", 204)
     if request.method == "DELETE":
@@ -16046,7 +16072,7 @@ def mcp_streamable():
             "version": VERSION,
             "status": "ok",
             "transport": "streamable-http — POST JSON-RPC 2.0 to this URL",
-            "protocolVersion": "2025-06-18",
+            "protocolVersion": MCP_PROTOCOL_VERSION,
             "capabilities": {"tools": {"listChanged": False}},
             "tools": [
                 {"name": "search_market_data", "price": "free",
@@ -16075,9 +16101,9 @@ def mcp_streamable():
         body = None
     if body is None:
         return jsonify(_jsonrpc_error(None, -32700, "Parse error")), 400
-    if isinstance(body, list):               # batch JSON-RPC
-        out = [r for r in (_mcp_handle(m) for m in body if isinstance(m, dict)) if r]
-        return (jsonify(out), 200) if out else ("", 202)
+    if isinstance(body, list):               # JSON-RPC batching was removed in 2025-06-18
+        return jsonify(_jsonrpc_error(None, -32600,
+                       "JSON-RPC batching is not supported in MCP 2025-06-18")), 400
     if not isinstance(body, dict):
         return jsonify(_jsonrpc_error(None, -32600, "Invalid Request")), 400
     resp = _mcp_handle(body)
@@ -18060,6 +18086,9 @@ _SCAN_NOISE_EXTRA = re.compile(
     r"(^|/)(?:manifest|keys?|wallet|sftp|config|secrets?|credentials?)\.json$|"
     r"(^|/)(?:auth|login|signin|logout|register)(/|$)|"
     r"(^|/)mcp/sse/?$|(^|/)li/?$|(^|/)(?:private|logs?)(/|$)|"
+    r"(^|/)a2a(?:/|$)|(^|/)sse(?:/|$)|"
+    r"(^|/)api(?:/v\d+)?/(?:jobs?|tasks?)(?:/|$)|"
+    r"(^|/)checkout_sessions/?$|(^|/)v2/?$|"
     r"(^|/)api(?:/v\d+)?/(?:me|profile|session|tokens?|keys?)(/|$)|"
     r"(^|/)api(?:/v\d+)?/(?:transactions?|profiles?|users?|accounts?|orders?)(?:/\d+)?/?$",
     re.I)
@@ -18938,6 +18967,14 @@ def _fc_skip_note(feed_ids_bad):
 _FC_HORIZONS = {"6h": 6, "24h": 24, "3d": 72, "7d": 168}
 _FC_MIN_POINTS = 300
 _FC_DIR = _ML_DIR / "forecast"
+_FC_CALIB_VERSION = 2  # base-price-normalized split-conformal + valid Winkler
+
+
+def _fc_model_file(sym):
+    # v1 files remain as backups but can never be served as v2 readiness.
+    return _FC_DIR / f"{sym}.v{_FC_CALIB_VERSION}.joblib"
+
+
 _FC_MODELS: dict = {}
 _FC_STATS = {"points": {}, "last_collect": 0, "last_train": 0}
 _FC_TABLE_OK = False
@@ -19195,7 +19232,8 @@ def _fc_eval_split(X, Y, B, h):
     actual_c = B[tr:ca] * (1.0 + Y[tr:ca])
     lo_c = B[tr:ca] * (1.0 + qs[0.1].predict(X[tr:ca]))
     hi_c = B[tr:ca] * (1.0 + qs[0.9].predict(X[tr:ca]))
-    nonconf = _NP.maximum(lo_c - actual_c, actual_c - hi_c) / _NP.maximum(actual_c, 1e-9)
+    nonconf = (_NP.maximum(lo_c - actual_c, actual_c - hi_c)
+               / _NP.maximum(B[tr:ca], 1e-9))
     scores = _NP.sort(_NP.maximum(nonconf, 0.0))
     rank = min(len(scores), max(1, int(_NP.ceil((len(scores) + 1) * 0.80))))
     radius = float(scores[rank - 1]) if len(scores) else 0.0
@@ -19205,14 +19243,15 @@ def _fc_eval_split(X, Y, B, h):
     hi_t = B[ca:] * (1.0 + qs[0.9].predict(X[ca:]))
     pred_t = B[ca:] * (1.0 + qs[0.5].predict(X[ca:]))
     raw_cov = float(_NP.mean((actual_t >= lo_t) & (actual_t <= hi_t)))
-    cal_lo = lo_t * (1.0 - radius)
-    cal_hi = hi_t * (1.0 + radius)
+    cal_lo = _NP.maximum(lo_t - radius * B[ca:], 1e-9)
+    cal_hi = hi_t + radius * B[ca:]
     cov = float(_NP.mean((actual_t >= cal_lo) & (actual_t <= cal_hi)))
     raw_width = float(_NP.mean((hi_t - lo_t) / _NP.maximum(actual_t, 1e-9)))
     width = float(_NP.mean((cal_hi - cal_lo) / _NP.maximum(actual_t, 1e-9)))
     mape = float(_NP.mean(_NP.abs(pred_t - actual_t) /
                           _NP.maximum(actual_t, 1e-9)) * 100)
-    violations = _NP.maximum(cal_lo - actual_t, actual_t - cal_hi)
+    violations = (_NP.maximum(_NP.maximum(cal_lo - actual_t, actual_t - cal_hi), 0.0)
+                  / _NP.maximum(actual_t, 1e-9))
     winkler = float(_NP.mean(width + (2.0 / 0.20) * violations))
     calib = {
         "radius_rel": round(radius, 5),
@@ -19225,7 +19264,8 @@ def _fc_eval_split(X, Y, B, h):
         "train_points": tr,
         "calibration_points": ca - tr,
         "test_points": n - ca,
-        "method": "chronological 70/15/15 train/calibration/test; split-conformal q80 finite-rank",
+        "method": "chronological 70/15/15 train/calibration/test; split-conformal q80 finite-rank; base-price normalized",
+        "conformal_scale": "base_price",
     }
     return qs, round(mape, 2), calib
 
@@ -19260,11 +19300,12 @@ def _fc_train(sym):
         if not models:
             return False
         _FC_MODELS[sym] = {"models": models, "mape": mapes, "calib": calib,
-                           "n": len(p), "trained_at": int(time.time())}
+                           "n": len(p), "trained_at": int(time.time()),
+                           "calib_version": _FC_CALIB_VERSION}
         _FC_STATS["points"][sym] = len(p)
         try:
             _FC_DIR.mkdir(parents=True, exist_ok=True)
-            _joblib.dump(_FC_MODELS[sym], _FC_DIR / f"{sym}.joblib")
+            _joblib.dump(_FC_MODELS[sym], _fc_model_file(sym))
         except Exception as e:
             log.debug(f"fc persist {sym}: {e}")
         return True
@@ -19274,15 +19315,19 @@ def _fc_train(sym):
 
 
 def _fc_ready(sym):
-    """Prontidão é memória + volume compartilhado, nunca apenas o worker atual."""
-    return bool(sym in _FC_MODELS or (_FC_DIR / f"{sym}.joblib").exists())
+    """Readiness requires the current calibration, in memory or on disk."""
+    ent = _FC_MODELS.get(sym)
+    return bool((ent and ent.get("calib_version") == _FC_CALIB_VERSION)
+                or _fc_model_file(sym).exists())
 
 
 def _fc_load(sym):
     try:
-        f = _FC_DIR / f"{sym}.joblib"
+        f = _fc_model_file(sym)
         if f.exists():
             ent = _joblib.load(f)
+            if ent.get("calib_version") != _FC_CALIB_VERSION:
+                return None
             _FC_MODELS[sym] = ent
             _FC_STATS["points"][sym] = ent.get("n", 0)
             return ent
@@ -19296,9 +19341,10 @@ def _fc_health_symbols() -> int:
     workers gunicorn, _FC_MODELS so reflete o worker que respondeu /health;
     os .joblib no volume /data sao o estado real compartilhado. Uniao dos
     dois conjuntos (max() subcontaria quando parte so existe em um lado)."""
-    syms = {s for s in _FC_FEEDS if s in _FC_MODELS}
+    syms = {s for s in _FC_FEEDS
+            if _FC_MODELS.get(s, {}).get("calib_version") == _FC_CALIB_VERSION}
     try:
-        syms |= {s for s in _FC_FEEDS if (_FC_DIR / f"{s}.joblib").exists()}
+        syms |= {s for s in _FC_FEEDS if (_fc_model_file(s)).exists()}
     except Exception:
         pass
     return len(syms)
@@ -19308,7 +19354,7 @@ def _fc_predict(sym, h):
     if not _ML_SK or _NP is None:
         return None
     ent = _FC_MODELS.get(sym) or _fc_load(sym)
-    if not ent or h not in ent.get("models", {}):
+    if not ent or ent.get("calib_version") != _FC_CALIB_VERSION or h not in ent.get("models", {}):
         return None
     rows = _fc_series(sym)
     if len(rows) < _FC_MIN_POINTS:
@@ -19334,8 +19380,8 @@ def _fc_predict(sym, h):
     p10_px = max(last * (1 + q10), 0.0)
     p50_px = max(last * (1 + q50), 0.0)
     p90_px = max(last * (1 + q90), 0.0)
-    p10_cal = round(max(p10_px * (1.0 - radius), 0.0), 6) if radius > 0 else None
-    p90_cal = round(p90_px * (1.0 + radius), 6) if radius > 0 else None
+    p10_cal = round(max(p10_px - radius * last, 0.0), 6) if radius > 0 else None
+    p90_cal = round(p90_px + radius * last, 6) if radius > 0 else None
     raw_bw = round((q90 - q10) * 100, 2)
     calibrated_bw = (round((p90_cal - p10_cal) / last * 100, 2)
                      if radius > 0 and p10_cal is not None and p90_cal is not None else raw_bw)
@@ -19361,6 +19407,7 @@ def _fc_predict(sym, h):
                       "interval_coverage80_empirical": coverage,
                       "raw_interval_coverage80_empirical": raw_coverage,
                       "conformal_radius_rel": (radius or None),
+                      "calibration_version": _FC_CALIB_VERSION,
                       "validation": calib_h,
                       "calibration": (calib_h.get("method") if radius > 0 else
                                       "uncalibrated (pre-48.61 model file — "
@@ -32418,15 +32465,45 @@ ENDPOINT_HANDLERS["/api/v1/best"] = _api_v1_best_handler
 app.add_url_rule("/api/v1/best", "api_v1_best",
                  paid_endpoint("/api/v1/best")(_api_v1_best_handler))
 
-for _alias in ("/mcp/sse", "/keys.json", "/auth/login"):
-    if _alias not in app.view_functions and not any(r.rule == _alias for r in app.url_map.iter_rules()):
-        app.add_url_rule(
-            _alias,
-            "alias" + _alias.replace("/", "_").replace("-", "_").replace(".", "_"),
-            paid_endpoint("/api/v1/best")(_api_v1_best_handler),
-            methods=["GET", "POST"],
-        )
-        log.info(f"🔗 apelido {_alias} → /api/v1/best registrado (radar de demanda)")
+# Protocol compatibility is free and deterministic. Credential/login scanners
+# never become paid products, and protocol probes never become product demand.
+@app.route("/mcp/sse", methods=["GET", "POST"])
+def mcp_sse_legacy_alias():
+    return mcp_sse_legacy_bridge()
+
+
+@app.route("/api-docs")
+def api_docs_alias():
+    return docs_redirect()
+
+
+@app.route("/contact-us")
+def contact_us_alias():
+    return about_operator()
+
+
+@app.route("/company")
+def company_alias():
+    return about_operator()
+
+
+@app.route("/a2a", methods=["GET", "POST"])
+@app.route("/a2a/<path:_a2a_rest>", methods=["GET", "POST"])
+def a2a_transport_unsupported(_a2a_rest=""):
+    base = _public_base()
+    return jsonify({
+        "error": "a2a_not_supported",
+        "status": "UNSUPPORTED_OPERATION",
+        "a2a_transport": False,
+        "agent_card": f"{base}/.well-known/agent.json",
+        "supported_interfaces": [{
+            "protocol": "MCP", "transport": "streamable-http",
+            "url": f"{base}/mcp", "protocolVersion": MCP_PROTOCOL_VERSION,
+        }],
+        "legacy_sse_bridge": f"{base}/sse",
+        "new_payment_required": False,
+        "charged": False,
+    }), 501
 
 
 
@@ -32594,14 +32671,20 @@ def _cortex_models() -> dict:
     m = {}
     try:
         m["forecast_symbols_trained"] = len(
-            [s for s in (_FC_FEEDS or {}) if (_FC_DIR / f"{s}.joblib").exists()])
+            [s for s in (_FC_FEEDS or {}) if (_fc_model_file(s)).exists()])
     except Exception:
         m["forecast_symbols_trained"] = None
     try:
         m["demand_classifier"] = ("trained" if _ML_CLF.get("model") else
+                                  "trained-file" if _ML_CLF_FILE.exists() else
                                   "heuristic-fallback")
+        m["demand_classifier_paths"] = _ML_CLF.get("n") or (
+            "file" if _ML_CLF_FILE.exists() else 0)
         m["anomaly_detector"] = ("trained" if _ML_IF.get("model") else
+                                 "trained-file" if _ML_IF_FILE.exists() else
                                  "warming-up")
+        m["anomaly_detector_hours"] = _ML_IF.get("n") or (
+            "file" if _ML_IF_FILE.exists() else 0)
     except Exception:
         pass
     return m
@@ -39122,7 +39205,7 @@ _ops_validate = _v4843_ops_validate
 
 _v4842_sanitize_governance()
 
-VERSION = "48.63.0-DELIVERY"
+VERSION = "48.64.0-TRUSTPATH"
 
 
 # ============================================================================
