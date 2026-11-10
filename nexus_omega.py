@@ -2,14 +2,16 @@
 """
 Losbeto x402 — monolithic Flask service for Railway.
 
-Current release: 48.64.0-TRUSTPATH.
+Current release: 48.65.0-INTEGRITY.
 Payment requirements are server-side. Delivery requires verified settlement;
 pending payments are reconciled against independent chain evidence.
 Operational history lives in CHANGELOG.md, not in executable boot output.
 48.63 hardened post-settlement delivery/refund evidence, isolated global-rate
 upstream failures, and made the agentic manifest lightweight and cacheable.
-48.64 adds protocol-demand governance, consistent MCP negotiation and versioned
+48.64 added protocol-demand governance, consistent MCP negotiation and versioned
 base-price-normalized split-conformal forecast calibration.
+48.65 bounds preview cardinality, aligns A2A custom bindings, retains embedding
+artifacts safely, and synchronizes dynamic factory routes and OpenAPI.
 """
 from __future__ import annotations
 
@@ -5702,9 +5704,7 @@ def _mpp_realm() -> str:
 _INLINE_SAMPLE_MAX = int(os.environ.get("INLINE_SAMPLE_MAX_CHARS", "900"))
 
 
-def _preview_key(path: str) -> str:
-    """Preview é por produto e parâmetro, não apenas por URL. Evita servir BTC
-    para quem pediu ETH/SOL ou um horizonte diferente."""
+def _preview_key(path: str) -> str:  # noqa: F811 — v48.65.0
     if path != "/forecast":
         return path
     try:
@@ -5712,7 +5712,10 @@ def _preview_key(path: str) -> str:
         hz = re.sub(r"[^a-z0-9]", "", (request.args.get("horizon") or "24h").lower())[:4] or "24h"
     except Exception:
         sym, hz = "BTC", "24h"
+    if sym not in _FC_FEEDS or hz not in _FC_HORIZONS:
+        return f"{path}?invalid"
     return f"{path}?symbol={sym}&horizon={hz}"
+
 
 
 def _inline_sample(endpoint: str) -> dict:
@@ -12408,6 +12411,17 @@ def _sol_dest_ata_status() -> dict:
     snap["age_s"] = age
     snap["fresh"] = bool(ts and not snap.get("stale") and age is not None
                          and age <= _SOL_DEST_ATA_TTL)
+    snap["expired"] = bool(ts and age is not None and age > _SOL_DEST_ATA_TTL)
+    if snap["fresh"]:
+        snap["data_state"] = "live"
+    elif snap.get("stale") and ts:
+        snap["data_state"] = "last_good_expired" if snap["expired"] else "last_good"
+    elif snap["expired"]:
+        snap["data_state"] = "expired"
+    elif ts:
+        snap["data_state"] = "current"
+    else:
+        snap["data_state"] = "unknown"
     if snap.get("stale") and ts:
         snap["stale_age_s"] = age
     return snap
@@ -15435,6 +15449,7 @@ def manifest_x402():
 
 
 MCP_PROTOCOL_VERSION = "2025-06-18"
+MCP_BINDING_URI = "https://modelcontextprotocol.io"
 
 
 MCP_LEGACY_TOOLS = os.environ.get("MCP_LEGACY_TOOLS", "").strip() in ("1", "true")
@@ -18723,6 +18738,60 @@ def _emb_catalog_meta(key):
     return paths, docs, cat_hash, stem
 
 
+def _emb_catalog_prune(key, current_stem, keep_versions=2):
+    """Keep the committed catalog, one fallback and every active memmap.
+    Runs under the per-key build lock; temporary and lock files are ignored.
+    """
+    keep_versions = max(1, int(keep_versions))
+    prefix = f"emb_catalog_{key}_"
+    current_name = Path(str(current_stem)).name
+    groups = {}
+    try:
+        candidates = list(_ML_DIR.glob(prefix + "*.npy")) + list(_ML_DIR.glob(prefix + "*.json"))
+    except Exception:
+        candidates = []
+    for path in candidates:
+        if not path.is_file() or ".tmp" in path.name:
+            continue
+        groups.setdefault(path.stem, []).append(path)
+    active = set()
+    for state in _EMB_CACHE.values():
+        try:
+            filename = getattr(state.get("vectors"), "filename", None)
+            if filename:
+                p = Path(filename).resolve()
+                if p.parent == _ML_DIR.resolve() and p.name.startswith(prefix):
+                    active.add(p.stem)
+        except Exception:
+            continue
+    def newest(stem):
+        try:
+            return max(p.stat().st_mtime for p in groups[stem])
+        except Exception:
+            return 0.0
+    keep = {current_name}
+    for stem in sorted(groups, key=newest, reverse=True):
+        if len(keep) >= keep_versions:
+            break
+        keep.add(stem)
+    keep |= active
+    deleted = []
+    for stem, paths in groups.items():
+        if stem in keep:
+            continue
+        for path in paths:
+            try:
+                path.unlink()
+                deleted.append(path.name)
+            except FileNotFoundError:
+                pass
+            except Exception as e:
+                log.debug(f"emb catalog prune {path.name}: {e}")
+    if deleted:
+        log.debug(f"emb catalog prune {key}: {len(deleted)} arquivos antigos removidos")
+    return deleted
+
+
 def _emb_catalog(key="base"):
     """Cache de catálogo em disco, compartilhado entre workers e restarts.
     O lock fica fora da requisição síncrona; np.load(mmap) reaproveita páginas."""
@@ -18763,6 +18832,7 @@ def _emb_catalog(key="base"):
             os.replace(npy_tmp, npy)
             meta_tmp.write_text(json.dumps(paths, separators=(",", ":")))
             os.replace(meta_tmp, meta)
+            _emb_catalog_prune(key, stem)
             try:
                 arr = _NP.load(npy, mmap_mode="r", allow_pickle=False)
             except Exception:
@@ -22547,7 +22617,7 @@ def manifest_agent():
                            "(BCB/B3). USDC on Base/Solana/Algorand. Fixed public pricing."),
         "supportedInterfaces": [{
             "url": f"{base}/mcp",
-            "protocolBinding": "MCP",
+            "protocolBinding": MCP_BINDING_URI,
             "protocolVersion": MCP_PROTOCOL_VERSION,
         }],
         "version":        VERSION,
@@ -22630,6 +22700,7 @@ def _cap500(s, limit=390):
 
 
 def _build_openapi():
+    _factory_reload()
     base = _public_base()
     contact_email = os.environ.get("CONTACT_EMAIL", "").strip()
 
@@ -32487,6 +32558,32 @@ def company_alias():
     return about_operator()
 
 
+@app.route("/about-us")
+def about_us_alias():
+    # Institutional pages are never paid factory products.
+    return about_operator()
+
+
+@app.route("/message", methods=["GET", "POST"])
+def message_protocol_guard():
+    return a2a_transport_unsupported()
+
+
+@app.route("/agentic_commerce/delegate_payment", methods=["GET", "POST"])
+def ap2_delegate_payment_guard():
+    base = _public_base()
+    return jsonify({
+        "error": "operation_not_supported",
+        "status": "UNSUPPORTED_OPERATION",
+        "operation": "delegate_payment",
+        "ap2_manifest": f"{base}/.well-known/ap2.json",
+        "x402_manifest": f"{base}/.well-known/x402.json",
+        "mcp_endpoint": f"{base}/mcp",
+        "new_payment_required": False,
+        "charged": False,
+    }), 501
+
+
 @app.route("/a2a", methods=["GET", "POST"])
 @app.route("/a2a/<path:_a2a_rest>", methods=["GET", "POST"])
 def a2a_transport_unsupported(_a2a_rest=""):
@@ -34749,6 +34846,7 @@ def facilitator_supported():
 _FACTORY_FILE = HOME_DIR / "factory_products.json"
 _FACTORY = {"mtime": 0.0, "items": {}, "owned": set()}
 _FACTORY_PATH_RE = re.compile(r"^/[a-z0-9][a-z0-9\-]{2,48}$")
+_FACTORY_BLOCKED_PATHS = frozenset({"/about-us"})
 FACTORY_MAX_PRODUCTS = int(os.environ.get("FACTORY_MAX_PRODUCTS", "30"))
 FACTORY_TIMEOUT_S = float(os.environ.get("FACTORY_TIMEOUT_S", "8"))
 FACTORY_MAX_BYTES = int(os.environ.get("FACTORY_MAX_BYTES", "262144"))
@@ -34888,7 +34986,7 @@ def _factory_reload(force=False):
             items = {}
         live = {p: s for p, s in items.items()
                 if isinstance(s, dict) and s.get("status") == "live"
-                and _FACTORY_PATH_RE.match(p)}
+                and _FACTORY_PATH_RE.match(p) and p not in _FACTORY_BLOCKED_PATHS}
         for p in list(_FACTORY["owned"]):
             if p not in live:
                 for d in (BASE_PRICES, ENDPOINT_DESC, ENDPOINT_HANDLERS,
@@ -34904,6 +35002,11 @@ def _factory_reload(force=False):
             ENDPOINT_HANDLERS[p] = _make_factory_handler(p)
             _FACTORY["owned"].add(p)
         _FACTORY["items"] = items
+        if st.st_mtime != _FACTORY["mtime"]:
+            try:
+                _SPEC_CACHE.clear()
+            except Exception:
+                pass
         _FACTORY["mtime"] = st.st_mtime
     except FileNotFoundError:
         _FACTORY["items"] = {}
@@ -34913,18 +35016,18 @@ def _factory_reload(force=False):
 
 @app.before_request
 def _factory_dispatch():
-    """Despachante da fábrica: path de produto vivo sem rota real → cobra e
-    executa inline via paid_endpoint (closure pura, segura por request)."""
+    """Reload by mtime on every request and dispatch a new product immediately.
+    os.stat is cheap; the previous first-hit 404 and stale OpenAPI are not.
+    """
     try:
         p = request.path
-        if p in _FACTORY["items"]:
+        _factory_reload()
+        if p in _FACTORY["items"] and p not in _FACTORY_BLOCKED_PATHS:
             spec = _FACTORY["items"].get(p) or {}
             if spec.get("status") == "live" and not _route_now_live(p):
                 h = ENDPOINT_HANDLERS.get(p)
                 if h:
                     return paid_endpoint(p)(h)()
-        elif not _route_now_live(p):
-            _factory_reload()      # enxerga produtos criados por outros workers
     except Exception:
         return None
 
@@ -38693,9 +38796,10 @@ def _v4842_factory_file_sweep():
         return {}
     changed = False
     for p, spec in list(items.items()):
-        if _is_scan_noise(p) and isinstance(spec, dict) and spec.get("status") != "quarantined":
+        if (_is_scan_noise(p) or p in _FACTORY_BLOCKED_PATHS) and isinstance(spec, dict) and spec.get("status") != "quarantined":
             spec["status"] = "quarantined"
-            spec["quarantine_reason"] = "scanner/generic protocol path is not a product"
+            spec["quarantine_reason"] = ("static public page, not a data product" if p in _FACTORY_BLOCKED_PATHS
+                                         else "scanner/generic protocol path is not a product")
             spec["quarantined_ts"] = int(time.time())
             changed = True
             log.warning(f"🧹 FACTORY QUARANTINE: {p} removido do catálogo")
@@ -38706,13 +38810,13 @@ def _v4842_factory_file_sweep():
 
 def _v4842_factory_memory_sweep():
     for p in list(_FACTORY.get("owned", set())):
-        if _is_scan_noise(p):
+        if _is_scan_noise(p) or p in _FACTORY_BLOCKED_PATHS:
             for d in (BASE_PRICES, ENDPOINT_DESC, ENDPOINT_HANDLERS, ENDPOINT_PARAM_HINTS):
                 d.pop(p, None)
             _FACTORY["owned"].discard(p)
     items = _FACTORY.get("items") or {}
     for p, spec in list(items.items()):
-        if _is_scan_noise(p) and isinstance(spec, dict):
+        if (_is_scan_noise(p) or p in _FACTORY_BLOCKED_PATHS) and isinstance(spec, dict):
             spec["status"] = "quarantined"
 
 
@@ -38738,6 +38842,8 @@ def _v4842_ops_path_guard(action):
     p = str(action.get("path") or "")
     if k in ("queue_product", "factory_product", "create_alias") and p and _is_scan_noise(p):
         return "scanner/generic protocol path is not product demand"
+    if k in ("queue_product", "factory_product") and p in _FACTORY_BLOCKED_PATHS:
+        return "static public page, not a data product"
     if k == "create_alias" and p == "/api/pricing" and action.get("target") != "/get-pricing":
         return "/api/pricing is pinned to the free pricing catalog"
     return None
@@ -39205,7 +39311,7 @@ _ops_validate = _v4843_ops_validate
 
 _v4842_sanitize_governance()
 
-VERSION = "48.64.0-TRUSTPATH"
+VERSION = "48.65.0-INTEGRITY"
 
 
 # ============================================================================
