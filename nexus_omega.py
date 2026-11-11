@@ -2,7 +2,7 @@
 """
 Losbeto x402 — monolithic Flask service for Railway.
 
-Current release: 48.70.0-GLOBALGUARD.
+Current release: 48.71.0-RATEFLOOR.
 Payment requirements are server-side. Delivery requires verified settlement;
 pending payments are reconciled against independent chain evidence.
 Operational history lives in CHANGELOG.md, not in executable boot output.
@@ -20,8 +20,10 @@ pending, uncertain or directly provable Solana payments.
 precedence, direct-proof escape and an explicit 429 backoff.
 48.69 re-armed the budget after each cooldown instead of keeping expired
 blocked_until records closed forever.
-48.70 adds an endpoint-wide deterministic invalid budget for distributed retry
+48.70 added an endpoint-wide deterministic invalid budget for distributed retry
 floods, with the same replay/pending and direct-proof precedence.
+48.71 tunes the global threshold to the observed ~3/minute flood instead of
+leaving the 10/minute budget permanently unreached.
 """
 from __future__ import annotations
 
@@ -9305,8 +9307,11 @@ def _verify_global_get(endpoint):
     return None
 
 
+GLOBAL_INVALID_BUDGET = int(os.environ.get("GLOBAL_INVALID_BUDGET", "5"))
+
+
 def _verify_global_note(endpoint, reason):
-    """Endpoint-wide budget for distributed invalid retries (10/min -> 30s)."""
+    """Endpoint-wide budget for distributed invalid retries (5/min -> 30s)."""
     key = f"verify:global:throttle:{endpoint}"
     now = int(time.time())
     with LEDGER.lock, LEDGER._conn() as c:
@@ -9321,7 +9326,7 @@ def _verify_global_note(endpoint, reason):
             rec = {"window_start": now, "count": 0}
         rec["window_start"] = int(rec.get("window_start") or now)
         rec["count"] = int(rec.get("count", 0)) + 1
-        if rec["count"] >= 10 and int(rec.get("blocked_until", 0) or 0) <= now:
+        if rec["count"] >= GLOBAL_INVALID_BUDGET and int(rec.get("blocked_until", 0) or 0) <= now:
             rec["blocked_until"] = now + 30
             rec["reason"] = str(reason)[:220]
         c.execute("INSERT OR REPLACE INTO cache(key,value,ts) VALUES(?,?,?)",
@@ -39507,7 +39512,7 @@ _ops_validate = _v4843_ops_validate
 
 _v4842_sanitize_governance()
 
-VERSION = "48.70.0-GLOBALGUARD"
+VERSION = "48.71.0-RATEFLOOR"
 
 
 # ============================================================================
