@@ -2,7 +2,7 @@
 """
 Losbeto x402 — monolithic Flask service for Railway.
 
-Current release: 48.69.0-THROTTLEFIX.
+Current release: 48.70.0-GLOBALGUARD.
 Payment requirements are server-side. Delivery requires verified settlement;
 pending payments are reconciled against independent chain evidence.
 Operational history lives in CHANGELOG.md, not in executable boot output.
@@ -18,8 +18,10 @@ agent-call and gas-price, and aligned public pricing and repository metadata.
 pending, uncertain or directly provable Solana payments.
 48.68 added a small cross-worker invalid-payment budget with replay/pending
 precedence, direct-proof escape and an explicit 429 backoff.
-48.69 re-arms the budget after each cooldown instead of keeping expired
+48.69 re-armed the budget after each cooldown instead of keeping expired
 blocked_until records closed forever.
+48.70 adds an endpoint-wide deterministic invalid budget for distributed retry
+floods, with the same replay/pending and direct-proof precedence.
 """
 from __future__ import annotations
 
@@ -9293,6 +9295,41 @@ def _verify_throttle_note(endpoint, ip, reason):
         return rec
 
 
+def _verify_global_get(endpoint):
+    try:
+        rec = LEDGER.cache_get(f"verify:global:throttle:{endpoint}", 90)
+        if isinstance(rec, dict) and int(rec.get("blocked_until", 0)) > int(time.time()):
+            return rec
+    except Exception:
+        pass
+    return None
+
+
+def _verify_global_note(endpoint, reason):
+    """Endpoint-wide budget for distributed invalid retries (10/min -> 30s)."""
+    key = f"verify:global:throttle:{endpoint}"
+    now = int(time.time())
+    with LEDGER.lock, LEDGER._conn() as c:
+        c.execute("BEGIN IMMEDIATE")
+        row = c.execute("SELECT value FROM cache WHERE key=?", (key,)).fetchone()
+        try:
+            rec = json.loads(row[0]) if row and row[0] else {}
+        except Exception:
+            rec = {}
+        start = int(rec.get("window_start", 0) or 0)
+        if not start or now - start >= 60:
+            rec = {"window_start": now, "count": 0}
+        rec["window_start"] = int(rec.get("window_start") or now)
+        rec["count"] = int(rec.get("count", 0)) + 1
+        if rec["count"] >= 10 and int(rec.get("blocked_until", 0) or 0) <= now:
+            rec["blocked_until"] = now + 30
+            rec["reason"] = str(reason)[:220]
+        c.execute("INSERT OR REPLACE INTO cache(key,value,ts) VALUES(?,?,?)",
+                  (key, json.dumps(rec, separators=(",", ":")), now))
+        c.commit()
+        return rec
+
+
 def _verify_payment(endpoint: str, payment_header: str):  # noqa: F811
     # Replay/pending always win. A short IP+endpoint budget only limits NEW
     # deterministic invalid attempts; direct Solana proof is never suppressed.
@@ -9310,7 +9347,7 @@ def _verify_payment(endpoint: str, payment_header: str):  # noqa: F811
             return _VERIFY_PAYMENT_CORE(endpoint, payment_header)
     except Exception:
         pass
-    blocked = _verify_throttle_get(endpoint, ip)
+    blocked = _verify_throttle_get(endpoint, ip) or _verify_global_get(endpoint)
     if blocked and not _looks_like_sol_sig(tx_sig):
         return False, "invalid_payment_rate_limited", {
             "verify_throttled": True,
@@ -9321,6 +9358,7 @@ def _verify_payment(endpoint: str, payment_header: str):  # noqa: F811
     if not ok and "invalid_exact_" in str(reason) and not _looks_like_sol_sig(tx_sig):
         try:
             _verify_throttle_note(endpoint, ip, reason)
+            _verify_global_note(endpoint, reason)
         except Exception as e:
             log.debug(f"verify throttle note: {e}")
     return ok, reason, info
@@ -12049,7 +12087,7 @@ def sales_agent():
              "One on-chain transaction, then dozens of calls with zero settlement latency."),
         _opt("/day-pass", "⚡", "Unlimited for a day",
              "24h unlimited across every endpoint",
-             "The cheapest way to evaluate the whole catalog before committing."),
+             "For high-volume agents that expect enough calls to break even. For light use, pay per call."),
         _opt("/starter-pack", "🚀", "Premium intelligence",
              "Flagship bundle in one call",
              "Five flagship endpoints in a single request — highest value per transaction."),
@@ -19682,6 +19720,13 @@ def _ml_also_bought(days=90):
                              "AND payer IS NOT NULL AND payer!=''", (corte,)).fetchall()
         by_payer = {}
         for payer, ep in rows:
+            # Commercial recommendations must learn from real buyers, not our own
+            # catalog sweeps or operator-funded traffic.
+            try:
+                if classify_payer(payer) != "organic":
+                    continue
+            except Exception:
+                continue
             by_payer.setdefault(payer, set()).add(ep)
         pair, solo = {}, {}
         for eps in by_payer.values():
@@ -39462,7 +39507,7 @@ _ops_validate = _v4843_ops_validate
 
 _v4842_sanitize_governance()
 
-VERSION = "48.69.0-THROTTLEFIX"
+VERSION = "48.70.0-GLOBALGUARD"
 
 
 # ============================================================================
