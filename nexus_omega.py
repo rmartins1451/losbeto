@@ -2,7 +2,7 @@
 """
 Losbeto x402 — monolithic Flask service for Railway.
 
-Current release: 48.68.0-RATEGUARD.
+Current release: 48.69.0-THROTTLEFIX.
 Payment requirements are server-side. Delivery requires verified settlement;
 pending payments are reconciled against independent chain evidence.
 Operational history lives in CHANGELOG.md, not in executable boot output.
@@ -16,8 +16,10 @@ artifacts safely, and synchronized dynamic factory routes and OpenAPI.
 agent-call and gas-price, and aligned public pricing and repository metadata.
 48.67 bounded deterministic invalid-payment verification retries without touching
 pending, uncertain or directly provable Solana payments.
-48.68 adds a small cross-worker invalid-payment budget with replay/pending
+48.68 added a small cross-worker invalid-payment budget with replay/pending
 precedence, direct-proof escape and an explicit 429 backoff.
+48.69 re-arms the budget after each cooldown instead of keeping expired
+blocked_until records closed forever.
 """
 from __future__ import annotations
 
@@ -9281,7 +9283,8 @@ def _verify_throttle_note(endpoint, ip, reason):
             rec = {"window_start": now, "count": 0}
         rec["window_start"] = int(rec.get("window_start") or now)
         rec["count"] = int(rec.get("count", 0)) + 1
-        if rec["count"] >= 3 and not rec.get("blocked_until"):
+        if rec["count"] >= 3 and int(rec.get("blocked_until", 0) or 0) <= now:
+            # Re-arm after every cooldown; expired blocks must not stay closed.
             rec["blocked_until"] = now + 30
             rec["reason"] = str(reason)[:220]
         c.execute("INSERT OR REPLACE INTO cache(key,value,ts) VALUES(?,?,?)",
@@ -39459,7 +39462,7 @@ _ops_validate = _v4843_ops_validate
 
 _v4842_sanitize_governance()
 
-VERSION = "48.68.0-RATEGUARD"
+VERSION = "48.69.0-THROTTLEFIX"
 
 
 # ============================================================================
