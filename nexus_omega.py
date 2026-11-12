@@ -2,7 +2,7 @@
 """
 Losbeto x402 — monolithic Flask service for Railway.
 
-Current release: 48.73.0-COOLDOWN120.
+Current release: 48.74.0-DISCOVERY.
 Payment requirements are server-side. Delivery requires verified settlement;
 pending payments are reconciled against independent chain evidence.
 Operational history lives in CHANGELOG.md, not in executable boot output.
@@ -26,8 +26,10 @@ floods, with the same replay/pending and direct-proof precedence.
 leaving the 10/minute budget permanently unreached.
 48.72 aligned the endpoint-wide budget with the measured 2/minute retry flood,
 triggering on the fourth attempt rather than never reaching the threshold.
-48.73 lengthens the global cooldown to 120 seconds to reduce retry churn while
+48.73 lengthened the global cooldown to 120 seconds to reduce retry churn while
 preserving every payment, replay and direct-proof invariant.
+48.74 adds a free machine-readable FAQ and a nested MCP alias, without creating
+new paid products or changing the global rate guard.
 """
 from __future__ import annotations
 
@@ -16224,7 +16226,8 @@ def _mcp_origin_allowed():
 @app.after_request
 def _mcp_negotiation_headers(resp):
     if request.path in ("/mcp", "/mcp/jsonrpc", "/mcp/v1/message:send",
-                        "/mcp/mcp", "/api/mcp", "/mcp/v1", "/messages"):
+                        "/mcp/mcp", "/api/mcp", "/api/mcp/mcp",
+                        "/mcp/v1", "/messages"):
         resp.headers["MCP-Protocol-Version"] = MCP_PROTOCOL_VERSION
     return resp
 
@@ -32781,6 +32784,57 @@ def ap2_delegate_payment_guard():
     }), 501
 
 
+@app.route("/api/mcp/mcp", methods=["POST", "GET", "DELETE", "OPTIONS"])
+def api_mcp_nested_alias():
+    return mcp_streamable()
+
+
+@app.route("/faq")
+def faq_public():
+    """Free factual onboarding for agents and human reviewers, not a paid SKU."""
+    base = _public_base()
+    return jsonify({
+        "version": VERSION,
+        "faq_version": 1,
+        "updated_at": int(time.time()),
+        "questions": [
+            {"q": "What is Losbeto?",
+             "a": "A monolithic Flask x402 service for market data and AI inference. USDC is the only payment rail; no subscription account is required."},
+            {"q": "Which networks are accepted?",
+             "a": f"USDC on {_chains_and()}. MPP/Tempo is advertised separately when enabled."},
+            {"q": "Is Pix a Losbeto payment rail?",
+             "a": "No. /br-pix-code and /br-pix-parse are utilities only. POST /api/claim-pix returns HTTP 410 pix_rail_off."},
+            {"q": "Are previews free products?",
+             "a": "Selected previews are real but delayed samples. They never grant plans, products or unlimited balances."},
+            {"q": "What is required to buy a plan?",
+             "a": "New revenue and a compatible receipt. Credits, partner keys, welcome bonus, FCB, free MCP and previews cannot purchase plans."},
+            {"q": "What does settlement_pending mean?",
+             "a": "It is not terminal. Pending with a hash requires on-chain reconciliation. Pending without a hash requires resending the original payload/requirements to the same facilitator. Timeout, 5xx, lost response and duplicate_settlement are uncertain and do not trigger a facilitator change."},
+            {"q": "What does compute_limit_instruction failure mean?",
+             "a": "The submitted Solana transaction is invalid for facilitator policy. It is not a confirmed charge or delivery. Repeated invalid attempts receive HTTP 429 under the global invalid budget."},
+            {"q": "What proves payment?",
+             "a": "A successful receipt and the exact USDC Transfer event: contract, payer, destination and amount. receipt.from may be the facilitator, so the economic payer comes from the event. Lower balance alone is not proof."},
+            {"q": "What proves delivery?",
+             "a": "The product must be delivered successfully. Payment alone does not prove delivery. Failed deliveries carry delivery_complete=false and must not be counted as organic sales."},
+            {"q": "Why does the manifest separate gross and organic revenue?",
+             "a": "Gross receipts include operator-funded tests and self-sweeps. Only external payers outside declared operator wallets count as organic demand."},
+            {"q": "How do forecast previews work?",
+             "a": "They are delayed samples keyed by symbol and horizon, limited to 32 valid combinations plus one invalid bucket. Intervals are model uncertainty, not a guarantee."},
+            {"q": "Do scanners create products, aliases or prices?",
+             "a": "No. Unknown paths are only mapped when a deterministic, safe equivalent exists. Scanners cannot create products, aliases or public price changes."},
+        ],
+        "links": {
+            "ready": f"{base}/ready",
+            "pricing": f"{base}/get-pricing",
+            "plans": f"{base}/plans",
+            "receipts": f"{base}/receipts",
+            "health": f"{base}/health/providers",
+            "mcp": f"{base}/mcp",
+            "llms": f"{base}/llms.txt",
+        },
+    })
+
+
 @app.route("/a2a", methods=["GET", "POST"])
 @app.route("/a2a/<path:_a2a_rest>", methods=["GET", "POST"])
 def a2a_transport_unsupported(_a2a_rest=""):
@@ -33038,6 +33092,25 @@ def ml_insights():
     return jsonify(build_cortex())
 
 
+def _cortex_backlog_delta(previous_rows, current_rows):
+    """Return notifications for valid new backlog rows, ignoring error payloads."""
+    old_paths = {b.get("requested_path") for b in (previous_rows or [])
+                 if isinstance(b, dict)}
+    changes = []
+    for b in (current_rows or []):
+        if not isinstance(b, dict):
+            continue
+        path = b.get("requested_path")
+        if not path or path in old_paths:
+            continue
+        changes.append(
+            f"🆕 backlog: `{path}` "
+            f"({b.get('distinct_ips', 0)} IPs, {b.get('hits_7d', 0)} hits/7d"
+            + (f" → alias p/ {b['closest_existing']}"
+               if b.get("closest_existing") else ""))
+    return changes
+
+
 def _cortex_digest_loop():
     """Digest diário: manda no Telegram o que a camada de inteligência viu de
     NOVO — backlog novo, endpoint que explodiu em demanda, quarentena mudou.
@@ -33051,16 +33124,8 @@ def _cortex_digest_loop():
                 prev = json.loads(open(_CORTEX_STATE).read())
             except Exception:
                 pass
-            mudancas = []
-            old_paths = {b.get("requested_path")
-                         for b in (prev.get("product_backlog") or [])}
-            for b in (brain.get("product_backlog") or []):
-                if b.get("requested_path") not in old_paths:
-                    mudancas.append(
-                        f"🆕 backlog: `{b['requested_path']}` "
-                        f"({b['distinct_ips']} IPs, {b['hits_7d']} hits/7d"
-                        + (f" → alias p/ {b['closest_existing']}"
-                           if b.get("closest_existing") else ""))
+            mudancas = _cortex_backlog_delta(
+                prev.get("product_backlog"), brain.get("product_backlog"))
             old_q = set(prev.get("llm_routing", {}).get("quarantined_now") or [])
             new_q = set(brain.get("llm_routing", {}).get("quarantined_now") or [])
             for p in sorted(new_q - old_q):
@@ -39517,7 +39582,7 @@ _ops_validate = _v4843_ops_validate
 
 _v4842_sanitize_governance()
 
-VERSION = "48.73.0-COOLDOWN120"
+VERSION = "48.74.0-DISCOVERY"
 
 
 # ============================================================================
