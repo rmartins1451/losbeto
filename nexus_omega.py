@@ -2,7 +2,7 @@
 """
 Losbeto x402 — monolithic Flask service for Railway.
 
-Current release: 48.72.0-RATEFLOOR3.
+Current release: 48.73.0-COOLDOWN120.
 Payment requirements are server-side. Delivery requires verified settlement;
 pending payments are reconciled against independent chain evidence.
 Operational history lives in CHANGELOG.md, not in executable boot output.
@@ -24,8 +24,10 @@ blocked_until records closed forever.
 floods, with the same replay/pending and direct-proof precedence.
 48.71 tuned the global threshold to the observed ~3/minute flood instead of
 leaving the 10/minute budget permanently unreached.
-48.72 aligns the endpoint-wide budget with the measured 2/minute retry flood,
+48.72 aligned the endpoint-wide budget with the measured 2/minute retry flood,
 triggering on the fourth attempt rather than never reaching the threshold.
+48.73 lengthens the global cooldown to 120 seconds to reduce retry churn while
+preserving every payment, replay and direct-proof invariant.
 """
 from __future__ import annotations
 
@@ -9291,7 +9293,7 @@ def _verify_throttle_note(endpoint, ip, reason):
         rec["count"] = int(rec.get("count", 0)) + 1
         if rec["count"] >= 3 and int(rec.get("blocked_until", 0) or 0) <= now:
             # Re-arm after every cooldown; expired blocks must not stay closed.
-            rec["blocked_until"] = now + 30
+            rec["blocked_until"] = now + GLOBAL_COOLDOWN_S
             rec["reason"] = str(reason)[:220]
         c.execute("INSERT OR REPLACE INTO cache(key,value,ts) VALUES(?,?,?)",
                   (key, json.dumps(rec, separators=(",", ":")), now))
@@ -9310,6 +9312,7 @@ def _verify_global_get(endpoint):
 
 
 GLOBAL_INVALID_BUDGET = int(os.environ.get("GLOBAL_INVALID_BUDGET", "3"))
+GLOBAL_COOLDOWN_S = int(os.environ.get("GLOBAL_COOLDOWN_S", "120"))
 
 
 def _verify_global_note(endpoint, reason):
@@ -9329,7 +9332,7 @@ def _verify_global_note(endpoint, reason):
         rec["window_start"] = int(rec.get("window_start") or now)
         rec["count"] = int(rec.get("count", 0)) + 1
         if rec["count"] >= GLOBAL_INVALID_BUDGET and int(rec.get("blocked_until", 0) or 0) <= now:
-            rec["blocked_until"] = now + 30
+            rec["blocked_until"] = now + GLOBAL_COOLDOWN_S
             rec["reason"] = str(reason)[:220]
         c.execute("INSERT OR REPLACE INTO cache(key,value,ts) VALUES(?,?,?)",
                   (key, json.dumps(rec, separators=(",", ":")), now))
@@ -39514,7 +39517,7 @@ _ops_validate = _v4843_ops_validate
 
 _v4842_sanitize_governance()
 
-VERSION = "48.72.0-RATEFLOOR3"
+VERSION = "48.73.0-COOLDOWN120"
 
 
 # ============================================================================
