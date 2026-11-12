@@ -2,7 +2,7 @@
 """
 Losbeto x402 — monolithic Flask service for Railway.
 
-Current release: 48.71.0-RATEFLOOR.
+Current release: 48.72.0-RATEFLOOR3.
 Payment requirements are server-side. Delivery requires verified settlement;
 pending payments are reconciled against independent chain evidence.
 Operational history lives in CHANGELOG.md, not in executable boot output.
@@ -22,8 +22,10 @@ precedence, direct-proof escape and an explicit 429 backoff.
 blocked_until records closed forever.
 48.70 added an endpoint-wide deterministic invalid budget for distributed retry
 floods, with the same replay/pending and direct-proof precedence.
-48.71 tunes the global threshold to the observed ~3/minute flood instead of
+48.71 tuned the global threshold to the observed ~3/minute flood instead of
 leaving the 10/minute budget permanently unreached.
+48.72 aligns the endpoint-wide budget with the measured 2/minute retry flood,
+triggering on the fourth attempt rather than never reaching the threshold.
 """
 from __future__ import annotations
 
@@ -9307,11 +9309,11 @@ def _verify_global_get(endpoint):
     return None
 
 
-GLOBAL_INVALID_BUDGET = int(os.environ.get("GLOBAL_INVALID_BUDGET", "5"))
+GLOBAL_INVALID_BUDGET = int(os.environ.get("GLOBAL_INVALID_BUDGET", "3"))
 
 
 def _verify_global_note(endpoint, reason):
-    """Endpoint-wide budget for distributed invalid retries (5/min -> 30s)."""
+    """Endpoint-wide budget for distributed invalid retries (3/min -> 30s)."""
     key = f"verify:global:throttle:{endpoint}"
     now = int(time.time())
     with LEDGER.lock, LEDGER._conn() as c:
@@ -39512,7 +39514,7 @@ _ops_validate = _v4843_ops_validate
 
 _v4842_sanitize_governance()
 
-VERSION = "48.71.0-RATEFLOOR"
+VERSION = "48.72.0-RATEFLOOR3"
 
 
 # ============================================================================
