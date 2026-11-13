@@ -2,7 +2,7 @@
 """
 Losbeto x402 — monolithic Flask service for Railway.
 
-Current release: 48.78.0-PANEL.
+Current release: 48.79.0-SETTLE.
 Payment requirements are server-side. Delivery requires verified settlement;
 pending payments are reconciled against independent chain evidence.
 Operational history lives in CHANGELOG.md, not in executable boot output.
@@ -38,6 +38,8 @@ in the Gunicorn preload phase or weakening last-good fallback semantics.
 and blocks unsupported causal pricing notes without changing any prices.
 48.78 makes panel decisions idempotent and redirects to a clean URL so the
 60-second refresh cannot reapply an action or overwrite it as failed.
+48.79 reconciles facilitator failures with a transaction hash before fallback
+and requires exactly one exact-amount official USDC Transfer on EVM.
 """
 from __future__ import annotations
 
@@ -9168,13 +9170,40 @@ def _verify_payment(endpoint: str, payment_header: str):
                         tx_pending = _clean_tx(sdata)
                         return _pending_payment(endpoint, fingerprint, req, tx_pending,
                                                 payer, "settlement_pending")
-                    fac_reasons[tag] = "settle:" + str(sdata.get("error", sdata))[:120]
-                    log.warning(f"⚠️ {tag}.settle falhou p/ {endpoint}: {sdata}")
-                    if tag == "CDP":
-                        _cdp_note_failure(str(sdata))
-                    elif tag == "PayAI":
-                        _payai_note_failure(str(sdata))
-                    continue
+                    failed_tx = _clean_tx(sdata)
+                    if failed_tx:
+                        ok_chain, why_chain, proof_chain = _verify_settlement_onchain(
+                            failed_tx, req)
+                        if ok_chain:
+                            # A facilitator error cannot override exact chain proof.
+                            # Continue the normal payer/finalization checks below;
+                            # never invoke another facilitator for this authorization.
+                            sdata = dict(sdata)
+                            sdata.update({"success": True, "transaction": failed_tx,
+                                          "_clean_tx": failed_tx, "network": req.get("network", ""),
+                                          "payer": proof_chain.get("payer", ""),
+                                          "reconciled_after_facilitator_error": True})
+                            settled_ok = True
+                            log.warning(f"🔗 {tag}.settle falhou, mas prova on-chain é válida "
+                                        f"p/ {endpoint} tx={failed_tx}; fallback bloqueado")
+                        elif why_chain == "tx-failed":
+                            # A confirmed failed receipt contains no valid USDC transfer.
+                            # Only this definitive state may try the next facilitator.
+                            log.info(f"🧾 {tag}.settle comprovadamente falhou on-chain "
+                                     f"p/ {endpoint} tx={failed_tx}; fallback permitido")
+                        else:
+                            # Unknown, missing, divergent or unconfirmed evidence stays
+                            # with the original operation for later reconciliation.
+                            return _pending_payment(endpoint, fingerprint, req, failed_tx,
+                                                    payer, why_chain)
+                    if not settled_ok:
+                        fac_reasons[tag] = "settle:" + str(sdata.get("error", sdata))[:120]
+                        log.warning(f"⚠️ {tag}.settle falhou p/ {endpoint}: {sdata}")
+                        if tag == "CDP":
+                            _cdp_note_failure(str(sdata))
+                        elif tag == "PayAI":
+                            _payai_note_failure(str(sdata))
+                        continue
                 if tag == "CDP":
                     _cdp_note_success()
                 elif tag == "PayAI":
@@ -12796,7 +12825,7 @@ def _evm_receipt_verify(txh: str, requirement: dict, min_confirmations: int = 0,
             return False, "tx-not-found", {}
         if str(rcpt.get("status")) != "0x1":
             return False, "tx-failed", {"settlement_seen": True}
-        payer, got, largest = "", 0, 0
+        exact_matches = []
         for lg in rcpt.get("logs") or []:
             if str(lg.get("address", "")).lower() != asset:
                 continue
@@ -12808,13 +12837,15 @@ def _evm_receipt_verify(txh: str, requirement: dict, min_confirmations: int = 0,
                 value = int(str(lg.get("data", "0x0")), 16)
             except Exception:
                 continue
-            got += value
-            if value >= largest:
-                largest = value
-                payer = "0x" + str(topics[1])[-40:]
-        if got < want_atomic:
-            return False, "insufficient-amount", {"received_atomic": got,
+            if value == want_atomic:
+                exact_matches.append({"payer": "0x" + str(topics[1])[-40:],
+                                      "value": value})
+        if len(exact_matches) != 1:
+            return False, "transfer-proof-count", {
+                    "matching_transfers": len(exact_matches),
                     "required_atomic": want_atomic, "settlement_seen": True}
+        payer = exact_matches[0]["payer"]
+        got = want_atomic
         bn = int(str(rcpt.get("blockNumber", "0x0")), 16)
         if min_confirmations:
             tip = _evm_rpc_call(network, "eth_blockNumber", [])
@@ -39678,7 +39709,7 @@ _ops_validate = _v4843_ops_validate
 
 _v4842_sanitize_governance()
 
-VERSION = "48.78.0-PANEL"
+VERSION = "48.79.0-SETTLE"
 
 
 # ============================================================================
@@ -40204,4 +40235,4 @@ def _v4856_a2a_rest_guard():
 
 # v48.56.0-A2AGUARD: /mcp/v1/message:send e caminho do binding HTTP+JSON do A2A; o alias para o handler MCP devolvia HTTP 200 + envelope JSON-RPC de erro a clientes A2A → POST sem "jsonrpc" nesse caminho agora devolve 501 explicativo; docstring do cabecalho alinhada a VERSION | base: v48.55.1-PURGEHARDEN
 
-# v48.59.0-DEMOCACHE: /favicon.svg restaurado (a troca por um 2o /favicon.ico deixava a rota SVG morta e /favicon.svg em 404) | /llm/free sem ?q= agora usa resposta de dem
+# v48.59.0-DEMOCACHE: /f
