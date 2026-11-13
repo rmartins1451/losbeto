@@ -2,7 +2,7 @@
 """
 Losbeto x402 — monolithic Flask service for Railway.
 
-Current release: 48.74.0-DISCOVERY.
+Current release: 48.75.0-SIGNAL.
 Payment requirements are server-side. Delivery requires verified settlement;
 pending payments are reconciled against independent chain evidence.
 Operational history lives in CHANGELOG.md, not in executable boot output.
@@ -30,6 +30,8 @@ triggering on the fourth attempt rather than never reaching the threshold.
 preserving every payment, replay and direct-proof invariant.
 48.74 adds a free machine-readable FAQ and a nested MCP alias, without creating
 new paid products or changing the global rate guard.
+48.75 consolidates deterministic invalid-payment logs, filters weak/scanner
+backlog signals and makes Telegram notifications plain-text reliable.
 """
 from __future__ import annotations
 
@@ -2011,9 +2013,12 @@ class FacilitatorClient:
                 return False, f"facilitator-{r.status_code}:{r.text[:300]}", {}
             data = r.json() if r.text else {}
             _ok = bool(data.get("isValid") or data.get("valid"))
-            if not _ok:
+            _invalid_reason = data.get("invalidReason") or data.get("reason") or ""
+            # Deterministic payer errors are summarized by the shared rate guard;
+            # transport, account and provider failures remain individually visible.
+            if not _ok and "invalid_exact_" not in str(_invalid_reason):
                 log.info(f"ℹ️ facilitator /verify 200 isValid=false: "
-                         f"reason={data.get('invalidReason') or data.get('reason')} "
+                         f"reason={_invalid_reason} "
                          f"msg={str(data.get('invalidMessage') or data.get('message'))[:200]} "
                          f"| req_net={requirements.get('network')} "
                          f"pay_net={payment_payload.get('network')}")
@@ -9139,7 +9144,8 @@ def _verify_payment(endpoint: str, payment_header: str):
                         break
                 if not ok:
                     fac_reasons[tag] = str(best or reason or "facilitator-rejected")[:140]
-                    log.warning(f"⚠️ {tag}.verify falhou p/ {endpoint}: {reason}")
+                    if "invalid_exact_" not in str(best or reason or ""):
+                        log.warning(f"⚠️ {tag}.verify falhou p/ {endpoint}: {reason}")
                     if tag == "CDP":
                         _cdp_note_failure(reason)
                     elif tag == "PayAI":
@@ -9208,7 +9214,8 @@ def _verify_payment(endpoint: str, payment_header: str):
                 LEDGER.cache_set(f"verify:neg:{endpoint}:{header_hash}", {"reason": last_reason})
             except Exception:
                 pass
-        log.warning(f"⚠️ Todos os accepts falharam no facilitator p/ {endpoint}: {last_reason}")
+        if "invalid_exact_" not in str(last_reason):
+            log.warning(f"⚠️ Todos os accepts falharam no facilitator p/ {endpoint}: {last_reason}")
     else:
         last_reason = "facilitator-unavailable"
 
@@ -9318,9 +9325,10 @@ GLOBAL_COOLDOWN_S = int(os.environ.get("GLOBAL_COOLDOWN_S", "120"))
 
 
 def _verify_global_note(endpoint, reason):
-    """Endpoint-wide budget for distributed invalid retries (3/min -> 30s)."""
+    """Endpoint-wide budget with one shared log summary per cooldown rearm."""
     key = f"verify:global:throttle:{endpoint}"
     now = int(time.time())
+    emit_summary = False
     with LEDGER.lock, LEDGER._conn() as c:
         c.execute("BEGIN IMMEDIATE")
         row = c.execute("SELECT value FROM cache WHERE key=?", (key,)).fetchone()
@@ -9336,10 +9344,15 @@ def _verify_global_note(endpoint, reason):
         if rec["count"] >= GLOBAL_INVALID_BUDGET and int(rec.get("blocked_until", 0) or 0) <= now:
             rec["blocked_until"] = now + GLOBAL_COOLDOWN_S
             rec["reason"] = str(reason)[:220]
+            emit_summary = True
         c.execute("INSERT OR REPLACE INTO cache(key,value,ts) VALUES(?,?,?)",
                   (key, json.dumps(rec, separators=(",", ":")), now))
         c.commit()
-        return rec
+    if emit_summary:
+        log.info(f"🧯 invalid payment guard: endpoint={endpoint} "
+                 f"attempts={rec['count']} cooldown_s={GLOBAL_COOLDOWN_S} "
+                 f"reason={rec['reason']} charged=false")
+    return rec
 
 
 def _verify_payment(endpoint: str, payment_header: str):  # noqa: F811
@@ -9376,11 +9389,18 @@ def _verify_payment(endpoint: str, payment_header: str):  # noqa: F811
     return ok, reason, info
 
 
+def _tg_plain_text(text: str) -> str:
+    """Remove Markdown presentation while preserving literal snake_case names."""
+    value = re.sub(r"\\([*_`\[\]])", r"\1", str(text))
+    value = value.replace("`", "").replace("*", "")
+    return re.sub(r"(?<!\w)_([^_\n]+)_(?!\w)", r"\1", value)
+
+
 def _notify_telegram(text: str):
     if not (TG_TOKEN and TG_CHAT): return
     try:
         requests.post(f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
-            json={"chat_id": TG_CHAT, "text": text},
+            json={"chat_id": TG_CHAT, "text": _tg_plain_text(text)},
             timeout=5)
     except Exception:
         pass
@@ -18268,6 +18288,7 @@ _SCAN_NOISE_EXTRA = re.compile(
     r"(^|/)api/v?\d*/(users?|orders?|accounts?|customers?|admin|version|config)(/|$)|"
     r"(^|/)users?/\d+(/|$)|"
     r"(^|/)(tmp|temp|old|_old|backup|backups|bak|db|dump|uploads?|files?|archive|old_site)(/|$)|"
+    r"(^|/)[^/]*\.(?:zip|rar|7z|tar|tgz|gz|bz2|xz)$|"
     r"(^|/)frontend/web/debug|(^|/)debug/|_debugbar|(^|/)telescope/requests|"
     r"(^|/)(aws|gcp|azure|firebase|supabase)\.(ya?ml|json)$|"
     r"(^|/)[^/]*\.properties$|(^|/)\.well-known/|"
@@ -32972,11 +32993,20 @@ def _cortex_demand_trend(days: int = 14, top: int = 8) -> list:
     return out[:top]
 
 
+CORTEX_BACKLOG_MIN_HITS = 5
+
+
+def _cortex_backlog_signal_eligible(path: str, hits: int, ips: int) -> bool:
+    """Only repeat, non-scanner signals may reach the Cortex planner/digest."""
+    return bool(path and not _is_scan_noise(path)
+                and int(hits) >= CORTEX_BACKLOG_MIN_HITS
+                and int(hits) > int(ips))
+
+
 def _cortex_backlog(days: int = 7, min_ips: int = 3, limit: int = 12) -> list:
-    """O que as máquinas pediram e NÃO EXISTE — filtrado pelo classificador
-    ML de demanda (scanners de credencial fora) e mapeado para o endpoint
-    existente mais próximo via busca semântica. É o roadmap escrito pelos
-    próprios compradores."""
+    """Unserved repeat demand, excluding deterministic scanners and one-hit
+    distributed probes. Raw requests stay in the ledger; only the planner and
+    digest consume this stricter shortlist. No product is created here."""
     now = int(time.time())
     d = now - days * 86400
     try:
@@ -32991,8 +33021,9 @@ def _cortex_backlog(days: int = 7, min_ips: int = 3, limit: int = 12) -> list:
         return [{"error": str(e)[:80]}]
     out = []
     for path, hits, ips in rows:
-        if path in _AUTO_ALIASES or _route_now_live(path):
-            continue  # alias/rota já atende; histórico antigo não é backlog
+        if (not _cortex_backlog_signal_eligible(path, hits, ips)
+                or path in _AUTO_ALIASES or _route_now_live(path)):
+            continue  # scanner, sinal sem repetição, alias ou rota já atendida
         try:
             cls = _demand_classify_ml(path)
             label = (cls or {}).get("kind", "")
@@ -33105,7 +33136,7 @@ def _cortex_backlog_delta(previous_rows, current_rows):
             continue
         changes.append(
             f"🆕 backlog: `{path}` "
-            f"({b.get('distinct_ips', 0)} IPs, {b.get('hits_7d', 0)} hits/7d"
+            f"({b.get('distinct_ips', 0)} IPs, {b.get('hits_7d', 0)} hits/7d)"
             + (f" → alias p/ {b['closest_existing']}"
                if b.get("closest_existing") else ""))
     return changes
@@ -34646,28 +34677,25 @@ _BUNDLE_EXCLUDED = ("/batch", "/bundle", "/starter-pack")
 
 
 def _tg_send_capture_buttons(text, buttons):
-    """sendMessage COM botões que DEVOLVE o message_id (o TG_BOT.send é
-    fogo-e-esquece; sem o id, o reply nativo na proposta não tinha para onde
-    apontar). Fallback para texto puro se o Markdown quebrar."""
+    """Send one plain-text proposal with buttons and capture its message_id.
+
+    Dynamic paths and LLM reasons no longer get a failed Markdown attempt before
+    the useful request. Identifiers and the approval workflow stay unchanged.
+    """
     if not (TG_TOKEN and TG_CHAT):
         return None
-    for payload in (
-            {"chat_id": TG_CHAT, "text": text, "parse_mode": "Markdown",
-             "disable_web_page_preview": True,
-             "reply_markup": {"inline_keyboard": buttons}},
-            {"chat_id": TG_CHAT, "text": text,
-             "disable_web_page_preview": True,
-             "reply_markup": {"inline_keyboard": buttons}}):
-        try:
-            r = requests.post(
-                f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
-                json=payload, timeout=8)
-            if r.ok:
-                return (r.json().get("result") or {}).get("message_id")
-            _lvl = log.info if "parse entities" in r.text else log.warning
-            _lvl(f"TG proposal send HTTP {r.status_code}: {r.text[:140]}")
-        except Exception as e:
-            log.warning(f"TG proposal send: {str(e).replace(TG_TOKEN or '', '***')}")
+    payload = {"chat_id": TG_CHAT, "text": _tg_plain_text(text),
+               "disable_web_page_preview": True,
+               "reply_markup": {"inline_keyboard": buttons}}
+    try:
+        r = requests.post(
+            f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
+            json=payload, timeout=8)
+        if r.ok:
+            return (r.json().get("result") or {}).get("message_id")
+        log.warning(f"TG proposal send HTTP {r.status_code}: {r.text[:140]}")
+    except Exception as e:
+        log.warning(f"TG proposal send: {str(e).replace(TG_TOKEN or '', '***')}")
     return None
 
 
@@ -39582,7 +39610,7 @@ _ops_validate = _v4843_ops_validate
 
 _v4842_sanitize_governance()
 
-VERSION = "48.74.0-DISCOVERY"
+VERSION = "48.75.0-SIGNAL"
 
 
 # ============================================================================
@@ -40108,4 +40136,4 @@ def _v4856_a2a_rest_guard():
 
 # v48.56.0-A2AGUARD: /mcp/v1/message:send e caminho do binding HTTP+JSON do A2A; o alias para o handler MCP devolvia HTTP 200 + envelope JSON-RPC de erro a clientes A2A → POST sem "jsonrpc" nesse caminho agora devolve 501 explicativo; docstring do cabecalho alinhada a VERSION | base: v48.55.1-PURGEHARDEN
 
-# v48.59.0-DEMOCACHE: /favicon.svg restaurado (a troca por um 2o /favicon.ico deixava a rota SVG morta e /favicon.svg em 404) | /llm/free sem ?q= agora usa resposta de demonstracao compartilhada por 30 min (sem LLM por visita, sem gastar a cota) e pergunta que nao exige dado ao vivo | base: v48.58.0-DISCOVERYCREDIT
+# v48.59.0-DEMOCACHE: /favicon.svg restaurado (a troca por um 2o /favicon.ico deixava a rota SVG morta e /favicon.svg em 404) | /llm/free sem ?q= agora usa resposta de dem
