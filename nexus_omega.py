@@ -2,7 +2,7 @@
 """
 Losbeto x402 — monolithic Flask service for Railway.
 
-Current release: 48.79.0-SETTLE.
+Current release: 48.80.0-SAFEGUARD.
 Payment requirements are server-side. Delivery requires verified settlement;
 pending payments are reconciled against independent chain evidence.
 Operational history lives in CHANGELOG.md, not in executable boot output.
@@ -40,6 +40,8 @@ and blocks unsupported causal pricing notes without changing any prices.
 60-second refresh cannot reapply an action or overwrite it as failed.
 48.79 reconciles facilitator failures with a transaction hash before fallback
 and requires exactly one exact-amount official USDC Transfer on EVM.
+48.80 quarantines Terraform state probes and adds a short shared Open-Meteo
+circuit so upstream failures do not create repeated paid deliveries/refunds.
 """
 from __future__ import annotations
 
@@ -4766,6 +4768,32 @@ class Brain:
             return {"symbol": symbol, "error": str(e), "ts": int(time.time())}
 
     @staticmethod
+    def _weather_upstream_remaining():
+        try:
+            rec = LEDGER.cache_get("weather:upstream:open", 7 * 86400)
+            until = float((rec or {}).get("until", 0) or 0)
+            return max(0, int(until - time.time()))
+        except Exception:
+            return 0
+
+    @staticmethod
+    def _weather_upstream_available():
+        return Brain._weather_upstream_remaining() <= 0
+
+    @staticmethod
+    def _weather_upstream_mark(success: bool):
+        try:
+            if success:
+                LEDGER.cache_set("weather:upstream:open", {"until": 0})
+            else:
+                cooldown = int(os.environ.get("WEATHER_UPSTREAM_COOLDOWN_S", "300"))
+                until = time.time() + max(30, cooldown)
+                LEDGER.cache_set("weather:upstream:open", {"until": until})
+                log.warning(f"⛈️ Open-Meteo indisponível; novas cobranças pausadas por {max(30, cooldown)}s")
+        except Exception as e:
+            log.debug(f"weather upstream circuit: {e}")
+
+    @staticmethod
     def weather():
         """GET /weather?city=São Paulo  |  ?lat=-23.55&lon=-46.63 — $0.01.
         Fonte: Open-Meteo (grade fundida de modelos nacionais — ECMWF/NOAA/
@@ -4773,6 +4801,10 @@ class Brain:
         cidade default (São Paulo) para o preview ?preview=1 nunca ficar
         preso em warming_up."""
         ts = int(time.time())
+        if not Brain._weather_upstream_available():
+            return {"error": "upstream temporarily unavailable", "source": "open-meteo",
+                    "charged": False, "retry_after_seconds": Brain._weather_upstream_remaining(),
+                    "ts": ts}
         city = (request.args.get("city") or "").strip()[:80]
         lat = (request.args.get("lat") or "").strip()[:16]
         lon = (request.args.get("lon") or "").strip()[:16]
@@ -4789,7 +4821,9 @@ class Brain:
                 g = requests.get("https://geocoding-api.open-meteo.com/v1/search",
                                  params={"name": q, "count": 1, "language": "en",
                                          "format": "json"}, timeout=8)
-                results = (g.json().get("results") or []) if g.ok else []
+                if not g.ok:
+                    raise RuntimeError(f"geocoding HTTP {g.status_code}")
+                results = g.json().get("results") or []
                 if not results:
                     return {"error": f"city '{q}' not found",
                             "hint": "check the spelling, or use ?lat=..&lon=.. "
@@ -4855,6 +4889,7 @@ class Brain:
                       "sunset": _ig(d_set, i),
                       "wind_max_kmh": _ig(d_wind, i)}
                      for i in range(len(d_time))]
+            Brain._weather_upstream_mark(True)
             return {"location": {"query": city or None, "resolved": label,
                                  "latitude": flat, "longitude": flon,
                                  "timezone": j.get("timezone") or tz_name},
@@ -4879,7 +4914,10 @@ class Brain:
                     "provider": "Losbeto/Open-Meteo",
                     "ts": ts, "version": VERSION}
         except Exception as e:
-            return {"error": str(e)[:120], "source": "open-meteo", "ts": ts}
+            Brain._weather_upstream_mark(False)
+            return {"error": str(e)[:120], "source": "open-meteo",
+                    "charged": False,
+                    "retry_after_seconds": Brain._weather_upstream_remaining(), "ts": ts}
 
     @staticmethod
     def forex_rate():
@@ -9692,6 +9730,7 @@ def _is_error_result(result) -> bool:
 
 PROVIDER_REQUIRED_ENDPOINTS = {
     "/earnings-whisper": lambda: bool(FINNHUB_KEY or ALPHAVANTAGE_KEY),
+    "/weather": lambda: Brain._weather_upstream_available(),
 }
 
 _PARAM_RULES = {
@@ -9816,6 +9855,13 @@ def _preflight_param_check(path: str, check_required: bool = False):
 
 def _preflight_unavailable(path: str):
     """Roda ANTES de qualquer 402 ou verificação de pagamento."""
+    if path == "/weather" and not Brain._weather_upstream_available():
+        retry = max(1, Brain._weather_upstream_remaining())
+        log.warning(f"⛔ pré-gate: /weather recusado sem cobrança — Open-Meteo em cooldown")
+        return _unavailable_body(
+            "Open-Meteo is temporarily unavailable. This endpoint is not being "
+            "sold right now; no payment challenge was issued and no stale weather "
+            "data will be presented as current.", retry)
     _need = PROVIDER_REQUIRED_ENDPOINTS.get(path)
     if _need and not _need():
         log.warning(f"⛔ pré-gate: {path} recusado sem cobrança — "
@@ -18330,6 +18376,7 @@ _SCAN_NOISE_EXTRA = re.compile(
     r"(^|/)users?/\d+(/|$)|"
     r"(^|/)(tmp|temp|old|_old|backup|backups|bak|db|dump|uploads?|files?|archive|old_site)(/|$)|"
     r"(^|/)[^/]*\.(?:zip|rar|7z|tar|tgz|gz|bz2|xz)$|"
+    r"(^|/)[^/]*\.tfstate(?:\..*)?$|(^|/)\.terraform(?:/|$)|(^|/)[^/]*\.tfvars$|"
     r"(^|/)frontend/web/debug|(^|/)debug/|_debugbar|(^|/)telescope/requests|"
     r"(^|/)(aws|gcp|azure|firebase|supabase)\.(ya?ml|json)$|"
     r"(^|/)[^/]*\.properties$|(^|/)\.well-known/|"
@@ -39709,7 +39756,7 @@ _ops_validate = _v4843_ops_validate
 
 _v4842_sanitize_governance()
 
-VERSION = "48.79.0-SETTLE"
+VERSION = "48.80.0-SAFEGUARD"
 
 
 # ============================================================================
