@@ -176,7 +176,9 @@ export SOLANA_WALLET_ADDRESS=...      # where payments land
 export BASE_PAYTO_EVM=0x...           # optional
 export ALGORAND_WALLET_ADDRESS=...    # optional
 export BUYER_WALLETS=...              # your own test-buyer wallets, comma separated
-gunicorn --workers 2 --threads 8 --preload --bind 0.0.0.0:$PORT nexus_omega:app
+# From the repository root: sync workers, --preload and post-fork hooks.
+# WEB_CONCURRENCY is optional and defaults to 4; PORT defaults to 8080.
+sh start.sh
 ```
 
 Useful env vars: `AI_WARMER=1`, `LLM_DAILY_GLOBAL_CAP`, `LLM_DAILY_KEY_CAP`, `PIT_INTERVAL_S`, `ALGO_ANCHOR_MNEMONIC`, `X402LIST_TOKEN`, `EVM_RPC_URLS`, `ETH_RPC_URLS`, `PRICE_CHAIN_BLOCK` … `PRICE_WALLET_VERDICT` (per-endpoint price overrides).
