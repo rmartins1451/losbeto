@@ -2,7 +2,7 @@
 """
 Losbeto x402 — monolithic Flask service for Railway.
 
-Current release: 48.76.0-FRESHNESS.
+Current release: 48.77.0-DEMAND.
 Payment requirements are server-side. Delivery requires verified settlement;
 pending payments are reconciled against independent chain evidence.
 Operational history lives in CHANGELOG.md, not in executable boot output.
@@ -34,6 +34,8 @@ new paid products or changing the global rate guard.
 backlog signals and makes Telegram notifications plain-text reliable.
 48.76 refreshes stale Solana snapshots after deploy without creating threads
 in the Gunicorn preload phase or weakening last-good fallback semantics.
+48.77 applies one repeat-demand policy to Cortex, Telegram and the dashboard,
+and blocks unsupported causal pricing notes without changing any prices.
 """
 from __future__ import annotations
 
@@ -1181,12 +1183,12 @@ class LedgerV10:
                 preview_blocked = 0
             try:  # caminhos inexistentes = pedidos de produto
                 demand_404 = [{"path": r[0], "hits": r[1], "ips": r[2], "ua": (r[3] or "")[:40],
-                               **_demand_classify_ml(r[0])}
+                               **_demand_panel_classify(r[0], r[1], r[2])}
                     for r in c.execute(
                     "SELECT endpoint, COUNT(*) n, COUNT(DISTINCT ip), "
                     "COALESCE(NULLIF(ua,''),'?') FROM requests "
-                    "WHERE ts>? AND kind='notfound' GROUP BY endpoint "
-                    "ORDER BY n DESC LIMIT 10", (now - 604800,)).fetchall()]
+                    "WHERE ts>? AND kind='notfound' AND " + _DEMAND_UA_SQL +
+                    " GROUP BY endpoint ORDER BY n DESC LIMIT 10", (now - 604800,)).fetchall()]
             except Exception:
                 demand_404 = []
             try:  # parâmetros mais pedidos = quais ativos interessam
@@ -18314,6 +18316,16 @@ def _is_scan_noise(path: str) -> bool:
     return bool(_SCAN_NOISE.search(path or "") or _SCAN_NOISE_EXTRA.search(path or ""))
 
 
+DEMAND_REPEAT_MIN_HITS = 5
+
+
+def _repeat_demand_eligible(path: str, hits: int, ips: int) -> bool:
+    """Shared anti-scanner rule for every demand alert and presentation surface."""
+    return bool(path and not _is_scan_noise(path)
+                and int(hits) >= DEMAND_REPEAT_MIN_HITS
+                and int(hits) > int(ips))
+
+
 _DEMAND_UA_SQL = """NOT (
     LOWER(COALESCE(ua,'')) LIKE '%spider%' OR
     LOWER(COALESCE(ua,'')) LIKE '%crawler%' OR
@@ -18553,6 +18565,17 @@ def _demand_classify_ml(path: str) -> dict:
         if pred[0] == "scanner_noise" and out["kind"] == "new_product" and pred[1] >= 0.85:
             out["kind"] = "scanner_noise"
             out["action"] = "Sonda de exploracao (detectada por ML; regex nao cobria)"
+    return out
+
+
+def _demand_panel_classify(path: str, hits: int, ips: int) -> dict:
+    """Keep weak signals visible without presenting them as product demand."""
+    out = _demand_classify_ml(path)
+    if (out.get("kind") not in ("resolved", "scanner_noise")
+            and not _repeat_demand_eligible(path, hits, ips)):
+        out["kind"] = "weak_signal"
+        out["action"] = ("Distributed one-hit probes or fewer than five hits; "
+                         "not eligible for planner, alerts or product proposals")
     return out
 
 
@@ -20148,6 +20171,14 @@ def _local_llm_complete(prompt, max_tokens=200):
         return ""
 
 
+def _demand_alert_classify(path: str, hits: int, ips: int):
+    """Return an alertable class only for repeat, non-scanner demand."""
+    if not _repeat_demand_eligible(path, hits, ips):
+        return None
+    cls = _demand_classify_ml(path)
+    return None if cls.get("kind") in ("resolved", "scanner_noise") else cls
+
+
 def demand_watch_loop():
     """v29.1: vigia os pedidos fora do catálogo. Quando um mesmo caminho é
     pedido por N IPs distintos, avisa o operador no Telegram. É o ciclo
@@ -20169,10 +20200,10 @@ def demand_watch_loop():
             for path, n, ips in linhas:
                 if path in avisados:
                     continue
+                cls = _demand_alert_classify(path, n, ips)
+                if cls is None:
+                    continue  # weak/scanner paths may become eligible later
                 avisados.add(path)
-                cls = _demand_classify_ml(path)
-                if cls["kind"] in ("resolved", "scanner_noise"):
-                    continue
                 _notify_telegram(
                     f"🎯 *DEMANDA DETECTADA*\n\n"
                     f"Caminho pedido: `{path}`\n"
@@ -25307,17 +25338,21 @@ async function reload(){
       const alias = d.kind === "alias_candidate";
       const resolvido = d.kind === "resolved";
       const ruido = d.kind === "scanner_noise";
+      const fraco = d.kind === "weak_signal";
       const tag = ruido
         ? `<span style="color:var(--muted)">🤖 scanner</span><br>`+
           `<span style="font-size:10px;color:var(--muted)">ruído filtrado — não é demanda</span>`
         : resolvido
         ? `<span style="color:var(--neon)">✅ já atendido</span><br>`+
           `<span style="font-size:10px;color:var(--muted)">rota existe hoje</span>`
+        : fraco
+        ? `<span style="color:var(--muted)">🟡 sinal fraco</span><br>`+
+          `<span style="font-size:10px;color:var(--muted)">sem repetição suficiente — não é elegível</span>`
         : alias
         ? `<span style="color:var(--neon)">🔗 apelido resolve</span><br>`+
           `<span style="font-size:10px;color:var(--muted)">${(d.closest||[]).map(u=>u.split('/').pop()).join(', ')}</span>`
         : `<span style="color:var(--amber)">🆕 produto novo</span>`;
-      const forte = d.ips >= 3 ? ' style="background:rgba(255,181,69,.07)"' : '';
+      const forte = d.ips >= 3 && !fraco && !ruido ? ' style="background:rgba(255,181,69,.07)"' : '';
       return `<tr${forte}><td><code style="color:var(--amber)">${d.path.replace(/</g,"&lt;")}</code></td>`+
              `<td>${d.hits}</td><td><b>${d.ips}</b></td><td>${tag}</td></tr>`;
     }).join("")
@@ -32999,14 +33034,12 @@ def _cortex_demand_trend(days: int = 14, top: int = 8) -> list:
     return out[:top]
 
 
-CORTEX_BACKLOG_MIN_HITS = 5
+CORTEX_BACKLOG_MIN_HITS = DEMAND_REPEAT_MIN_HITS
 
 
 def _cortex_backlog_signal_eligible(path: str, hits: int, ips: int) -> bool:
     """Only repeat, non-scanner signals may reach the Cortex planner/digest."""
-    return bool(path and not _is_scan_noise(path)
-                and int(hits) >= CORTEX_BACKLOG_MIN_HITS
-                and int(hits) > int(ips))
+    return _repeat_demand_eligible(path, hits, ips)
 
 
 def _cortex_backlog(days: int = 7, min_ips: int = 3, limit: int = 12) -> list:
@@ -34018,9 +34051,11 @@ def _ops_llm_planner():
         ' {"action":"note","text":"one sharp observation for the operator"}]}\n'
         "Hard rules: use ONLY paths/endpoints that appear in the telemetry; at "
         "most 5 actions; create_alias only when the close match is a real "
-        "substitute; new_price within +/-30% of current; high demand + zero "
-        "sales means LOWER the price, not raise; factory_product ONLY with a "
-        "real, well-known, KEYLESS public JSON upstream you are confident "
+        "substitute; new_price within +/-30% of current; adjust_price only "
+        "when the structured conversion signal and thresholds support it; "
+        "probes without sales never prove that price is the barrier; notes "
+        "must not claim price causality without the same reduction evidence; "
+        "factory_product ONLY with a real, well-known, KEYLESS public JSON upstream you are confident "
         "exists — the apply step probe-tests it and the product dies if the "
         "probe fails; notes must be strictly entailed by the telemetry and "
         "must never call an endpoint unpriced when price_usdc is present; "
@@ -39577,6 +39612,14 @@ def _v4843_cortex_demand_trend(days: int = 14, top: int = 8) -> list:
 _cortex_demand_trend = _v4843_cortex_demand_trend
 
 
+def _ops_price_cut_evidence(info: dict) -> bool:
+    """Structured evidence required for cuts and causal price-barrier notes."""
+    return (str((info or {}).get("signal") or "").startswith("high-demand-zero-conversion")
+            and int((info or {}).get("probes") or 0) >= 200
+            and int((info or {}).get("previews") or 0) >= 5
+            and int((info or {}).get("sales") or 0) == 0)
+
+
 _V4843_OPS_VALIDATE_ORIG = _ops_validate
 
 
@@ -39593,6 +39636,15 @@ def _v4843_ops_validate(action, candidates):
             for ep in mentioned:
                 if ep in BASE_PRICES and get_dynamic_price(ep) > 0:
                     return False, f"nota contradiz preço vivo de {ep}"
+        if re.search(r"(?:price|pricing).{0,60}(?:barrier|reason|cause)|"
+                     r"(?:barrier|reason|cause).{0,60}(?:price|pricing)", txt, re.I):
+            mentioned = re.findall(r"/[A-Za-z0-9][A-Za-z0-9._~/-]{0,59}", txt)
+            if not mentioned:
+                return False, "nota causal de preço sem evidência estruturada"
+            for ep in mentioned:
+                info = ((candidates or {}).get("endpoints") or {}).get(ep) or {}
+                if not _ops_price_cut_evidence(info):
+                    return False, f"nota causal de preço sem evidência suficiente para {ep}"
     if kind == "adjust_price":
         ep = str(action.get("endpoint") or "")
         info = ((candidates or {}).get("endpoints") or {}).get(ep) or {}
@@ -39604,8 +39656,8 @@ def _v4843_ops_validate(action, candidates):
             newp = float(action.get("new_price"))
         except Exception:
             return False, "preço inválido"
-        if newp < cur and not (probes >= 200 and previews >= 5 and organic_sales == 0):
-            return False, "redução exige >=200 probes elegíveis, >=5 previews e zero venda orgânica"
+        if newp < cur and not _ops_price_cut_evidence(info):
+            return False, "redução exige sinal estruturado, >=200 probes elegíveis, >=5 previews e zero venda orgânica"
         if newp > cur and not (organic_sales >= 5 and previews >= 3
                                and organic_sales / max(1, previews) >= 0.25):
             return False, "aumento exige conversão orgânica >=25%, >=5 vendas e >=3 previews"
@@ -39616,7 +39668,7 @@ _ops_validate = _v4843_ops_validate
 
 _v4842_sanitize_governance()
 
-VERSION = "48.76.0-FRESHNESS"
+VERSION = "48.77.0-DEMAND"
 
 
 # ============================================================================
