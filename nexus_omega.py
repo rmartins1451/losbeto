@@ -2,7 +2,7 @@
 """
 Losbeto x402 — monolithic Flask service for Railway.
 
-Current release: 48.75.0-SIGNAL.
+Current release: 48.76.0-FRESHNESS.
 Payment requirements are server-side. Delivery requires verified settlement;
 pending payments are reconciled against independent chain evidence.
 Operational history lives in CHANGELOG.md, not in executable boot output.
@@ -32,6 +32,8 @@ preserving every payment, replay and direct-proof invariant.
 new paid products or changing the global rate guard.
 48.75 consolidates deterministic invalid-payment logs, filters weak/scanner
 backlog signals and makes Telegram notifications plain-text reliable.
+48.76 refreshes stale Solana snapshots after deploy without creating threads
+in the Gunicorn preload phase or weakening last-good fallback semantics.
 """
 from __future__ import annotations
 
@@ -594,7 +596,7 @@ import netrc  # v48.25.2: pré-import na largada (single-thread, preload) — ev
 import base58
 from nacl.signing import SigningKey, VerifyKey
 from nacl.exceptions import BadSignatureError
-from flask import Flask, request, jsonify, redirect, Response
+from flask import Flask, request, jsonify, redirect, Response, has_request_context
 
 
 class SolanaWallet:
@@ -12588,7 +12590,11 @@ def _sol_dest_ata_status() -> dict:
     snap = dict(_SOL_DEST_ATA)
     expired = now - float(snap.get("ts") or 0) > _SOL_DEST_ATA_TTL
     retry_ready = now - float(snap.get("attempt_ts") or 0) >= _SOL_DEST_ATA_RETRY_S
-    if not snap.get("checking") and expired and retry_ready:
+    needs_refresh = expired or bool(snap.get("stale"))
+    # A disk snapshot is only a fallback, not a reason to wait for expiry after
+    # deploy. Refresh it in a worker request, never in the preload arbiter.
+    if (not snap.get("checking") and needs_refresh and retry_ready
+            and has_request_context()):
         _SOL_DEST_ATA.update({"checking": True, "checking_since": now,
                               "attempt_ts": now})
         try:
@@ -32385,7 +32391,7 @@ def circle_listing_helper():
     })
 
 
-_sol_dest_ata_status()  # dispara a 1ª checagem da ATA em background (daemon)
+_sol_dest_ata_status()  # carrega o fallback; o 1º health HTTP agenda refresh pós-fork
 
 
 
@@ -39610,7 +39616,7 @@ _ops_validate = _v4843_ops_validate
 
 _v4842_sanitize_governance()
 
-VERSION = "48.75.0-SIGNAL"
+VERSION = "48.76.0-FRESHNESS"
 
 
 # ============================================================================
