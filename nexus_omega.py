@@ -2,7 +2,7 @@
 """
 Losbeto x402 — monolithic Flask service for Railway.
 
-Current release: 48.77.0-DEMAND.
+Current release: 48.78.0-PANEL.
 Payment requirements are server-side. Delivery requires verified settlement;
 pending payments are reconciled against independent chain evidence.
 Operational history lives in CHANGELOG.md, not in executable boot output.
@@ -36,6 +36,8 @@ backlog signals and makes Telegram notifications plain-text reliable.
 in the Gunicorn preload phase or weakening last-good fallback semantics.
 48.77 applies one repeat-demand policy to Cortex, Telegram and the dashboard,
 and blocks unsupported causal pricing notes without changing any prices.
+48.78 makes panel decisions idempotent and redirects to a clean URL so the
+60-second refresh cannot reapply an action or overwrite it as failed.
 """
 from __future__ import annotations
 
@@ -33932,7 +33934,12 @@ def _ops_decide(pid, approve, actor="operator"):
     if not rec:
         return False, f"proposta #{pid} não existe"
     if rec.get("status") != "pending":
-        return False, f"proposta #{pid} já está {rec.get('status')}"
+        status = str(rec.get("status") or "unknown")
+        if status == "applied" and approve:
+            return True, f"✅ #{pid} já estava aplicada; nenhuma ação repetida."
+        if status == "rejected" and not approve:
+            return True, f"❌ #{pid} já estava recusada; nenhuma ação repetida."
+        return False, f"⚠ #{pid} já está {status}; decisão atual preservada."
     if int(time.time()) - int(rec.get("ts", 0)) > OPS_PROPOSAL_TTL_S:
         rec["status"] = "expired"
         _ops_proposals_save()
@@ -36704,7 +36711,7 @@ def ops_panel():
     if not _dash_token_ok(token):
         return jsonify({"error": "forbidden",
                         "hint": "GET /ops/panel?token=<DASH_TOKEN>"}), 403
-    flash = ""
+    flash = request.args.get("flash", "").strip()[:240]
     pid = request.args.get("pid", "").strip()
     decide = request.args.get("decide", "").strip()
     if pid.isdigit() and decide in ("ok", "no"):
@@ -36724,6 +36731,9 @@ def ops_panel():
                           "reply_markup": {"inline_keyboard": []}}, timeout=8)
         except Exception:
             pass
+        # PRG: the browser may refresh the clean panel, never the decision URL.
+        return redirect("/ops/panel?" + urllib.parse.urlencode({
+            "token": token, "flash": str(msgout)[:200]}), code=303)
     rows = []
     try:
         for pid_, rec in sorted(_ops_pending().items(),
@@ -39668,7 +39678,7 @@ _ops_validate = _v4843_ops_validate
 
 _v4842_sanitize_governance()
 
-VERSION = "48.77.0-DEMAND"
+VERSION = "48.78.0-PANEL"
 
 
 # ============================================================================
