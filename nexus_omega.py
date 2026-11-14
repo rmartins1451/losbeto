@@ -2,7 +2,7 @@
 """
 Losbeto x402 — monolithic Flask service for Railway.
 
-Current release: 48.80.0-SAFEGUARD.
+Current release: 48.81.0-BUNDLE.
 Payment requirements are server-side. Delivery requires verified settlement;
 pending payments are reconciled against independent chain evidence.
 Operational history lives in CHANGELOG.md, not in executable boot output.
@@ -42,6 +42,8 @@ and blocks unsupported causal pricing notes without changing any prices.
 and requires exactly one exact-amount official USDC Transfer on EVM.
 48.80 quarantines Terraform state probes and adds a short shared Open-Meteo
 circuit so upstream failures do not create repeated paid deliveries/refunds.
+48.81 applies each item's availability preflight before it enters a paid bundle,
+so a known-open upstream circuit is excluded rather than charged and refunded.
 """
 from __future__ import annotations
 
@@ -34952,6 +34954,10 @@ def _bundle_eligible(path):
             return False
         if not _sellable_now(path):
             return False
+        # The same availability gate used before a standalone payment applies
+        # before an item can enter a paid bundle. Known failures are excluded.
+        if _preflight_unavailable(path) is not None:
+            return False
         return True
     except Exception:
         return False
@@ -39756,7 +39762,7 @@ _ops_validate = _v4843_ops_validate
 
 _v4842_sanitize_governance()
 
-VERSION = "48.80.0-SAFEGUARD"
+VERSION = "48.81.0-BUNDLE"
 
 
 # ============================================================================
