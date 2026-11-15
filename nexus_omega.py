@@ -2,7 +2,7 @@
 """
 Losbeto x402 — monolithic Flask service for Railway.
 
-Current release: 48.81.0-BUNDLE.
+Current release: 48.82.0-RECOVERY.
 Payment requirements are server-side. Delivery requires verified settlement;
 pending payments are reconciled against independent chain evidence.
 Operational history lives in CHANGELOG.md, not in executable boot output.
@@ -44,6 +44,8 @@ and requires exactly one exact-amount official USDC Transfer on EVM.
 circuit so upstream failures do not create repeated paid deliveries/refunds.
 48.81 applies each item's availability preflight before it enters a paid bundle,
 so a known-open upstream circuit is excluded rather than charged and refunded.
+48.82 uses bounded exponential backoff for consecutive Open-Meteo failures and
+resets it only after real delivery, preventing repeated charge/refund cycles.
 """
 from __future__ import annotations
 
@@ -4786,12 +4788,17 @@ class Brain:
     def _weather_upstream_mark(success: bool):
         try:
             if success:
-                LEDGER.cache_set("weather:upstream:open", {"until": 0})
+                LEDGER.cache_set("weather:upstream:open", {"until": 0, "failures": 0})
             else:
-                cooldown = int(os.environ.get("WEATHER_UPSTREAM_COOLDOWN_S", "300"))
-                until = time.time() + max(30, cooldown)
-                LEDGER.cache_set("weather:upstream:open", {"until": until})
-                log.warning(f"⛈️ Open-Meteo indisponível; novas cobranças pausadas por {max(30, cooldown)}s")
+                rec = LEDGER.cache_get("weather:upstream:open", 7 * 86400) or {}
+                failures = min(32, int(rec.get("failures", 0) or 0) + 1)
+                base = max(30, int(os.environ.get("WEATHER_UPSTREAM_COOLDOWN_S", "600")))
+                ceiling = max(base, int(os.environ.get("WEATHER_UPSTREAM_MAX_COOLDOWN_S", "3600")))
+                cooldown = min(ceiling, base * (1 << min(failures - 1, 7)))
+                until = time.time() + cooldown
+                LEDGER.cache_set("weather:upstream:open", {"until": until, "failures": failures})
+                log.warning(f"⛈️ Open-Meteo indisponível; falhas consecutivas={failures}; "
+                            f"novas cobranças pausadas por {cooldown}s")
         except Exception as e:
             log.debug(f"weather upstream circuit: {e}")
 
@@ -39762,7 +39769,7 @@ _ops_validate = _v4843_ops_validate
 
 _v4842_sanitize_governance()
 
-VERSION = "48.81.0-BUNDLE"
+VERSION = "48.82.0-RECOVERY"
 
 
 # ============================================================================
