@@ -2,7 +2,7 @@
 """
 Losbeto x402 — monolithic Flask service for Railway.
 
-Current release: 48.82.0-RECOVERY.
+Current release: 48.84.0-STEADY.
 Payment requirements are server-side. Delivery requires verified settlement;
 pending payments are reconciled against independent chain evidence.
 Operational history lives in CHANGELOG.md, not in executable boot output.
@@ -46,6 +46,20 @@ circuit so upstream failures do not create repeated paid deliveries/refunds.
 so a known-open upstream circuit is excluded rather than charged and refunded.
 48.82 uses bounded exponential backoff for consecutive Open-Meteo failures and
 resets it only after real delivery, preventing repeated charge/refund cycles.
+48.83 restores the IP-scoped use of the global invalid-payment budget (a bot can
+no longer deny every new buyer; only a real flood of GLOBAL_HARD_BUDGET=30 invalid
+payments per minute, e.g. rotating IPs, re-arms the endpoint-wide block), makes
+/weather validate coordinates before any charge, stop opening its circuit on
+client typos, and probe Open-Meteo for free before selling again after a cooldown.
+It keeps an operator-approved pause until a person resumes it (the resume sweep
+used to undo it as soon as its probe delivered, from 30 minutes on), stops the
+planner from reporting live endpoints as paused, redirects paths with trailing
+markdown punctuation to the real route, makes the invalid-payment block last the
+120 s it announces and names the client in the guard log.
+48.84 answers HEAD /mcp like GET, stops counting a bandit-quarantined LLM provider
+as healthy in the pre-payment gate, shares the live Solana ATA reading across
+workers and refreshes it in the background, logs the instruction layout of a
+rejected Solana payment, and stops re-announcing old governance decisions at boot.
 """
 from __future__ import annotations
 
@@ -2696,7 +2710,17 @@ def llm_healthy() -> bool:
     cfg = llm_providers_configured()
     if not cfg:
         return False
-    return any(not _llm_is_down(p) for p in cfg)
+    # v48.84.0: o bandit tira da rota síncrona o provedor em quarentena de desempenho
+    # (Gemini em 15/nov: reward 0.185). Contá-lo como saudável fazia o pré-gate emitir
+    # 402 com o único provedor útil em cooldown: 1 timeout do Groq às 14:20 UTC deixou
+    # o worker 5 min sem ninguém para tentar ("LLM indisponível" sem nenhuma tentativa
+    # às 14:22) — uma compra de IA nessa janela seria cobrada e estornada.
+    try:
+        quar = set(_llm_bandit_quarantined()) if _LLM_BANDIT_QUAR else set()
+    except Exception:
+        quar = set()
+    usable = [p for p in cfg if p not in quar] or cfg
+    return any(not _llm_is_down(p) for p in usable)
 
 
 def llm_health_report() -> dict:
@@ -4785,7 +4809,7 @@ class Brain:
         return Brain._weather_upstream_remaining() <= 0
 
     @staticmethod
-    def _weather_upstream_mark(success: bool):
+    def _weather_upstream_mark(success: bool, reason: str = ""):
         try:
             if success:
                 LEDGER.cache_set("weather:upstream:open", {"until": 0, "failures": 0})
@@ -4796,11 +4820,75 @@ class Brain:
                 ceiling = max(base, int(os.environ.get("WEATHER_UPSTREAM_MAX_COOLDOWN_S", "3600")))
                 cooldown = min(ceiling, base * (1 << min(failures - 1, 7)))
                 until = time.time() + cooldown
-                LEDGER.cache_set("weather:upstream:open", {"until": until, "failures": failures})
-                log.warning(f"⛈️ Open-Meteo indisponível; falhas consecutivas={failures}; "
+                LEDGER.cache_set("weather:upstream:open",
+                                 {"until": until, "failures": failures,
+                                  "reason": str(reason)[:160], "ts": int(time.time())})
+                # v48.83.0: o motivo real da falha aparece no log (antes só "indisponível",
+                # sem como saber se era 429, timeout ou DNS).
+                log.warning(f"⛈️ Open-Meteo indisponível ({str(reason)[:140] or 'sem detalhe'}); "
+                            f"falhas consecutivas={failures}; "
                             f"novas cobranças pausadas por {cooldown}s")
         except Exception as e:
             log.debug(f"weather upstream circuit: {e}")
+
+    @staticmethod
+    def _weather_upstream_halfopen() -> bool:
+        """True quando o disjuntor JÁ abriu e o cooldown acabou. Nesse estado o
+        próximo comprador seria a "sonda" — e pagaria por ela (cobrado e estornado
+        a cada fim de cooldown enquanto o Open-Meteo falha: Algorand 00:58 e Base
+        01:12 em 15/nov). O backoff da v48.82 espaça esses ciclos; a sonda grátis
+        os elimina."""
+        try:
+            rec = LEDGER.cache_get("weather:upstream:open", 7 * 86400)
+            until = float((rec or {}).get("until", 0) or 0)
+            return until > 0 and until <= time.time()
+        except Exception:
+            return False
+
+    @staticmethod
+    def _weather_upstream_probe() -> bool:
+        """Sonda GRÁTIS nos dois hosts que o handler usa. Resultado em cache por
+        45 s; sucesso fecha o disjuntor, falha o reabre — sem cobrar ninguém."""
+        key = "weather:upstream:probe"
+        try:
+            rec = LEDGER.cache_get(key, 120)
+            if isinstance(rec, dict) and time.time() - float(rec.get("ts", 0) or 0) < 45:
+                return bool(rec.get("ok"))
+        except Exception:
+            pass
+        ok, why = False, ""
+        try:
+            g = requests.get("https://geocoding-api.open-meteo.com/v1/search",
+                             params={"name": "London", "count": 1, "language": "en",
+                                     "format": "json"}, timeout=(3.05, 4))
+            if not g.ok:
+                raise RuntimeError(f"geocoding HTTP {g.status_code}")
+            w = requests.get("https://api.open-meteo.com/v1/forecast",
+                             params={"latitude": 51.5, "longitude": -0.12,
+                                     "current": "temperature_2m"}, timeout=(3.05, 4))
+            if not w.ok:
+                raise RuntimeError(f"open-meteo HTTP {w.status_code}")
+            if not isinstance((w.json() or {}).get("current"), dict):
+                raise RuntimeError("open-meteo sem 'current'")
+            ok = True
+        except Exception as e:
+            why = f"{type(e).__name__}: {str(e)[:100]}"
+        try:
+            LEDGER.cache_set(key, {"ok": ok, "ts": time.time(), "why": why})
+        except Exception:
+            pass
+        if ok:
+            # fecha o disjuntor; o contador de falhas (backoff da v48.82) só zera
+            # com ENTREGA real, em _weather_upstream_mark(True)
+            try:
+                rec0 = LEDGER.cache_get("weather:upstream:open", 7 * 86400) or {}
+                LEDGER.cache_set("weather:upstream:open",
+                                 {"until": 0, "failures": int(rec0.get("failures", 0) or 0)})
+            except Exception:
+                pass
+        else:
+            Brain._weather_upstream_mark(False, "sonda: " + why)
+        return ok
 
     @staticmethod
     def weather():
@@ -4818,8 +4906,20 @@ class Brain:
         lat = (request.args.get("lat") or "").strip()[:16]
         lon = (request.args.get("lon") or "").strip()[:16]
         try:
+            if bool(lat) != bool(lon):
+                # só um dos dois: antes caía silenciosamente em São Paulo
+                return {"error": "lat and lon must be given together",
+                        "hint": "use ?lat=-23.55&lon=-46.63, or ?city=<name>", "ts": ts}
             if lat and lon:
-                flat, flon = float(lat), float(lon)
+                try:
+                    flat, flon = float(lat), float(lon)
+                except ValueError:
+                    # erro de ENTRADA do cliente: não é falha do Open-Meteo e NÃO pode
+                    # abrir o disjuntor (um "-23,55" com vírgula derrubava o /weather
+                    # para todos por 5 min).
+                    return {"error": "lat/lon must be decimal numbers",
+                            "hint": "use a dot as the decimal separator, "
+                                    "e.g. ?lat=-23.55&lon=-46.63", "ts": ts}
                 if not (-90.0 <= flat <= 90.0 and -180.0 <= flon <= 180.0):
                     return {"error": "lat/lon out of range",
                             "hint": "lat in [-90,90], lon in [-180,180]", "ts": ts}
@@ -4829,7 +4929,7 @@ class Brain:
                 q = city or "São Paulo"
                 g = requests.get("https://geocoding-api.open-meteo.com/v1/search",
                                  params={"name": q, "count": 1, "language": "en",
-                                         "format": "json"}, timeout=8)
+                                         "format": "json"}, timeout=(3.05, 6))
                 if not g.ok:
                     raise RuntimeError(f"geocoding HTTP {g.status_code}")
                 results = g.json().get("results") or []
@@ -4856,7 +4956,7 @@ class Brain:
                           "precipitation_sum,precipitation_probability_max,"
                           "sunrise,sunset,wind_speed_10m_max"),
                 "timezone": "auto", "forecast_days": 7,
-                "wind_speed_unit": "kmh"}, timeout=10)
+                "wind_speed_unit": "kmh"}, timeout=(3.05, 8))
             if not w.ok:
                 raise RuntimeError(f"open-meteo HTTP {w.status_code}")
             j = w.json()
@@ -4923,7 +5023,7 @@ class Brain:
                     "provider": "Losbeto/Open-Meteo",
                     "ts": ts, "version": VERSION}
         except Exception as e:
-            Brain._weather_upstream_mark(False)
+            Brain._weather_upstream_mark(False, f"{type(e).__name__}: {str(e)[:100]}")
             return {"error": str(e)[:120], "source": "open-meteo",
                     "charged": False,
                     "retry_after_seconds": Brain._weather_upstream_remaining(), "ts": ts}
@@ -9358,7 +9458,9 @@ def _verify_header_meta(payment_header):
 
 def _verify_throttle_get(endpoint, ip):
     try:
-        rec = LEDGER.cache_get(f"verify:throttle:{endpoint}:{ip}", 90)
+        # v48.83.0: o registro expirava do cache em 90 s — o bloqueio acabava 30 s antes
+        # do retry_after_seconds que o próprio 429 anunciava (GLOBAL_COOLDOWN_S=120).
+        rec = LEDGER.cache_get(f"verify:throttle:{endpoint}:{ip}", GLOBAL_COOLDOWN_S + 30)
         if isinstance(rec, dict) and int(rec.get("blocked_until", 0)) > int(time.time()):
             return rec
     except Exception:
@@ -9394,7 +9496,7 @@ def _verify_throttle_note(endpoint, ip, reason):
 
 def _verify_global_get(endpoint):
     try:
-        rec = LEDGER.cache_get(f"verify:global:throttle:{endpoint}", 90)
+        rec = LEDGER.cache_get(f"verify:global:throttle:{endpoint}", GLOBAL_COOLDOWN_S + 30)
         if isinstance(rec, dict) and int(rec.get("blocked_until", 0)) > int(time.time()):
             return rec
     except Exception:
@@ -9404,9 +9506,103 @@ def _verify_global_get(endpoint):
 
 GLOBAL_INVALID_BUDGET = int(os.environ.get("GLOBAL_INVALID_BUDGET", "3"))
 GLOBAL_COOLDOWN_S = int(os.environ.get("GLOBAL_COOLDOWN_S", "120"))
+# Teto duro: enchente de verdade (>= N inválidos/janela vindos de IPs "limpos", p.ex. IP
+# rotativo/forjado) volta a bloquear o endpoint inteiro. O bot medido faz ~1,4/min.
+GLOBAL_HARD_BUDGET = int(os.environ.get("GLOBAL_HARD_BUDGET", "30"))
 
 
-def _verify_global_note(endpoint, reason):
+def _verify_ip_recent_failures(endpoint, ip) -> int:
+    """Falhas determinísticas deste IP+endpoint na janela atual (0 se nenhuma)."""
+    try:
+        rec = LEDGER.cache_get(f"verify:throttle:{endpoint}:{ip}", 90)
+        if isinstance(rec, dict) and int(time.time()) - int(rec.get("window_start", 0) or 0) < 60:
+            return int(rec.get("count", 0) or 0)
+    except Exception:
+        pass
+    return 0
+
+
+def _verify_who(ip) -> str:
+    """Quem está errando o pagamento (IP + User-Agent, só ASCII imprimível) — vai no
+    resumo do guard para o operador identificar o cliente sem abrir o banco."""
+    try:
+        ua = re.sub(r"[^\x20-\x7e]", "?", request.headers.get("User-Agent", "") or "")
+    except Exception:
+        ua = ""
+    # o IP vem de cabeçalho (X-Forwarded-For): só dígitos, hex, ':' e '.' vão ao log
+    ip_s = re.sub(r"[^0-9A-Fa-f:.]", "?", str(ip))[:45]
+    return f"ip={ip_s} ua='{ua[:80].replace(chr(39), '?')}'"
+
+
+_SVM_PROG_NAMES = {
+    "ComputeBudget111111111111111111111111111111": "ComputeBudget",
+    "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA": "Token",
+    "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb": "Token2022",
+    "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL": "ATA",
+    "MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr": "Memo",
+    "Memo1UhkJRfHyvLMcVucJwxXeuD728EqVDDwQDxFMNo": "MemoV1",
+    "11111111111111111111111111111111": "System",
+    "L2TExMFKdjpN9kozasaurPirfHy9P8sbXoAN1qA3S95": "Lighthouse",
+}
+
+
+def _svm_tx_shape(payment_header, reason="") -> str:
+    """v48.84.0 — diagnóstico, nunca decisão: programa e 1º byte (discriminador) de cada
+    instrução da transação Solana que o facilitador recusou. O esquema "exact" espera
+    [ComputeBudget:2, ComputeBudget:3, Token:12] (+ATA/Memo opcionais). Assim o log diz
+    O QUE o cliente montou errado, não só que foi recusado. Qualquer erro devolve ""."""
+    if "invalid_exact_svm" not in str(reason):
+        return ""
+    try:
+        raw = str(payment_header or "").strip()
+        obj = json.loads(base64.b64decode(raw + "=" * (-len(raw) % 4)).decode())
+        inner = obj.get("payload") if isinstance(obj.get("payload"), dict) else obj
+        b64tx = str(inner.get("transaction") or "")
+        if not b64tx or len(b64tx) > 8000:
+            return ""
+        tx = base64.b64decode(b64tx + "=" * (-len(b64tx) % 4))
+        pos = 0
+
+        def _cu16():
+            nonlocal pos
+            val = shift = 0
+            for _ in range(3):
+                b = tx[pos]
+                pos += 1
+                val |= (b & 0x7F) << shift
+                if not b & 0x80:
+                    break
+                shift += 7
+            return val
+
+        nsig = _cu16()                              # (nunca "pos += f()": f também move pos)
+        pos += 64 * nsig                            # assinaturas
+        ver = "legacy"
+        if tx[pos] & 0x80:
+            ver = f"v{tx[pos] & 0x7F}"
+            pos += 1
+        pos += 3                                    # cabeçalho da mensagem
+        nkeys = _cu16()
+        keys = [tx[pos + 32 * i: pos + 32 * (i + 1)] for i in range(min(nkeys, 64))]
+        pos += 32 * nkeys + 32                      # chaves + blockhash
+        nix = _cu16()
+        out = []
+        for _ in range(min(nix, 12)):
+            pidx = tx[pos]
+            pos += 1
+            nacc = _cu16()
+            pos += nacc                             # índices de contas
+            dlen = _cu16()
+            data = tx[pos:pos + dlen]
+            pos += dlen
+            pid = base58.b58encode(keys[pidx]).decode() if pidx < len(keys) else "?"
+            out.append(f"{_SVM_PROG_NAMES.get(pid, pid[:6])}:{data[0] if data else '-'}")
+        return f" tx={ver}[{','.join(out)}]" + (f"+{nix - 12}" if nix > 12 else "")
+    except Exception:
+        return ""
+
+
+def _verify_global_note(endpoint, reason, who=""):
     """Endpoint-wide budget with one shared log summary per cooldown rearm."""
     key = f"verify:global:throttle:{endpoint}"
     now = int(time.time())
@@ -9433,7 +9629,8 @@ def _verify_global_note(endpoint, reason):
     if emit_summary:
         log.info(f"🧯 invalid payment guard: endpoint={endpoint} "
                  f"attempts={rec['count']} cooldown_s={GLOBAL_COOLDOWN_S} "
-                 f"reason={rec['reason']} charged=false")
+                 f"reason={rec['reason']} charged=false"
+                 + (f" {who}" if who else ""))
     return rec
 
 
@@ -9454,7 +9651,19 @@ def _verify_payment(endpoint: str, payment_header: str):  # noqa: F811
             return _VERIFY_PAYMENT_CORE(endpoint, payment_header)
     except Exception:
         pass
-    blocked = _verify_throttle_get(endpoint, ip) or _verify_global_get(endpoint)
+    blocked = _verify_throttle_get(endpoint, ip)
+    if not blocked:
+        # v48.83.0: o orçamento global só aperta quem JÁ falhou nesta janela.
+        # Bloquear o endpoint inteiro fazia 3 pagamentos inválidos de um bot negarem
+        # QUALQUER comprador novo ~65% do tempo (medido em 15/nov: 234 armações em 9 h
+        # no /gas-price, ~90 s de bloqueio efetivo cada) — a regressão da v48.73 sobre
+        # a v48.72-NOSELFDOS.
+        # Teto duro: >= GLOBAL_HARD_BUDGET inválidos na janela (só acontece com enchente
+        # real, p.ex. IP rotativo/XFF forjado) volta a bloquear o endpoint inteiro.
+        _g = _verify_global_get(endpoint)
+        if _g and (_verify_ip_recent_failures(endpoint, ip) >= 1
+                   or int(_g.get("count", 0) or 0) >= GLOBAL_HARD_BUDGET):
+            blocked = _g
     if blocked and not _looks_like_sol_sig(tx_sig):
         return False, "invalid_payment_rate_limited", {
             "verify_throttled": True,
@@ -9465,7 +9674,8 @@ def _verify_payment(endpoint: str, payment_header: str):  # noqa: F811
     if not ok and "invalid_exact_" in str(reason) and not _looks_like_sol_sig(tx_sig):
         try:
             _verify_throttle_note(endpoint, ip, reason)
-            _verify_global_note(endpoint, reason)
+            _verify_global_note(endpoint, reason,
+                                who=_verify_who(ip) + _svm_tx_shape(payment_header, reason))
         except Exception as e:
             log.debug(f"verify throttle note: {e}")
     return ok, reason, info
@@ -9705,6 +9915,24 @@ AI_OPTIONAL_ENDPOINTS = {
 }
 
 
+def _invalid_payment_hint(reason) -> str:
+    """Dica legível por máquina para as recusas determinísticas mais comuns."""
+    r = str(reason or "").lower()
+    if "invalid_exact_svm" in r and "compute_limit" in r:
+        return ("Solana exact payload rejected before settlement (no charge): instruction 0 must be "
+                "ComputeBudget SetComputeUnitLimit, instruction 1 SetComputeUnitPrice, then one SPL "
+                "TransferChecked of the quoted amount to the payTo token account (an optional Memo may "
+                "follow); the fee payer is the facilitator feePayer from accepts[].extra. Build it with "
+                "an x402 SVM client instead of assembling it by hand.")
+    if "invalid_exact_svm" in r:
+        return ("Solana exact payload rejected before settlement (no charge). Rebuild it from the "
+                "latest 402 accepts[] (amount, payTo, asset, feePayer) with an x402 SVM client.")
+    if "invalid_exact_evm" in r:
+        return ("EVM exact payload rejected before settlement (no charge). Re-sign the EIP-3009 "
+                "authorization from the latest 402 accepts[] (value, payTo, asset, validBefore).")
+    return ""
+
+
 def _unavailable_body(reason: str, retry_after: int = 300):
     return ({"status": "unavailable",
              "error": reason,
@@ -9789,12 +10017,47 @@ _PARAM_REQUIRED = {
                      ("target", None, "https://peer.example.com")]],
 }
 
+def _weather_coord_problem():
+    """/weather: lat/lon inválidos são recusados ANTES do 402 (sem cobrança)."""
+    lat = (request.args.get("lat") or "").strip()
+    lon = (request.args.get("lon") or "").strip()
+    if not lat and not lon:
+        return None
+    problem = ""
+    if not (lat and lon):
+        problem = "lat and lon must be given together"
+    else:
+        try:
+            a, b = float(lat[:16]), float(lon[:16])
+            if not (math.isfinite(a) and math.isfinite(b)
+                    and -90.0 <= a <= 90.0 and -180.0 <= b <= 180.0):
+                problem = "lat must be in [-90,90] and lon in [-180,180]"
+        except ValueError:
+            problem = "lat/lon must be decimal numbers (dot separator, e.g. -23.55)"
+    if not problem:
+        return None
+    base = _public_base()
+    return {"error": "invalid_param", "param": "lat,lon", "detail": problem,
+            "received": {"lat": lat[:16], "lon": lon[:16]},
+            "valid_examples": ["lat=-23.55&lon=-46.63"],
+            "how_to_call": f"GET {base}/weather?lat=-23.55&lon=-46.63",
+            "free_preview": f"{base}/weather?preview=1",
+            "charged": False,
+            "note": ("No payment challenge was issued. Fix the coordinates and retry — "
+                     f"this call costs ${get_dynamic_price('/weather'):.3f} once they are valid."),
+            "ts": int(time.time())}
+
+
 def _preflight_param_check(path: str, check_required: bool = False):
     """Roda ANTES de qualquer 402 ou verificação de pagamento.
     check_required=True habilita a barreira de obrigatórios ausentes —
     SÓ usada quando há pagamento x402 anexado e ainda não liquidado
     (v48.26.1-DISCOVERY)."""
     base = _public_base()
+    if path == "/weather":
+        _wbad = _weather_coord_problem()
+        if _wbad:
+            return _wbad, 400
     rule = _PARAM_RULES.get(path)
     if rule:
         raw = request.args.get(rule["param"])
@@ -9869,6 +10132,16 @@ def _preflight_unavailable(path: str):
         log.warning(f"⛔ pré-gate: /weather recusado sem cobrança — Open-Meteo em cooldown")
         return _unavailable_body(
             "Open-Meteo is temporarily unavailable. This endpoint is not being "
+            "sold right now; no payment challenge was issued and no stale weather "
+            "data will be presented as current.", retry)
+    if (path == "/weather" and Brain._weather_upstream_halfopen()
+            and not Brain._weather_upstream_probe()):
+        # v48.83.0: cooldown acabou mas o Open-Meteo ainda falha → NÃO vende
+        # (antes o 1º comprador após cada cooldown pagava e era estornado).
+        retry = max(1, Brain._weather_upstream_remaining())
+        log.warning("⛔ pré-gate: /weather recusado sem cobrança — sonda do Open-Meteo falhou")
+        return _unavailable_body(
+            "Open-Meteo is still failing its health probe. This endpoint is not being "
             "sold right now; no payment challenge was issued and no stale weather "
             "data will be presented as current.", retry)
     _need = PROVIDER_REQUIRED_ENDPOINTS.get(path)
@@ -10607,6 +10880,9 @@ def paid_endpoint(path):
                 r = _build_402(path)
                 body = r.get_json()
                 body["error"] = f"Payment invalid: {reason}"
+                _hint = _invalid_payment_hint(reason)
+                if _hint:
+                    body["hint"] = _hint
                 r.set_data(json.dumps(body))
                 return r
 
@@ -12581,9 +12857,10 @@ def _sol_ata_of(owner_b58: str, mint_b58: str) -> Optional[str]:
 
 _SOL_DEST_ATA = {"ts": 0.0, "ata": None, "exists": None, "balance": None,
                  "checking": False, "checking_since": 0.0, "attempt_ts": 0.0,
-                 "stale": False}
+                 "stale": False, "failed_at": 0.0}
 _SOL_DEST_ATA_TTL = int(os.environ.get("SOL_DEST_ATA_TTL", "21600"))  # 6h
 _SOL_DEST_ATA_RETRY_S = int(os.environ.get("SOL_DEST_ATA_RETRY_S", "60"))
+_SOL_DEST_ATA_BOOT_TS = time.time()   # preload: igual para os 4 workers
 
 
 def _sol_dest_ata_disk_read():
@@ -12621,7 +12898,8 @@ def _sol_dest_ata_refresh():
         ata = _sol_ata_of(RECEIVE_ADDRESS, USDC_MINT)
         _SOL_DEST_ATA["ata"] = ata
         if not ata:
-            _SOL_DEST_ATA.update({"exists": None, "balance": None, "stale": True})
+            _SOL_DEST_ATA.update({"exists": None, "balance": None, "stale": True,
+                                  "failed_at": time.time()})
             return
         for url in _SOL_BAL_RPCS[:4]:
             if time.time() - t0 > 25:
@@ -12639,6 +12917,7 @@ def _sol_dest_ata_refresh():
                     _SOL_DEST_ATA.update({"ts": time.time(), "exists": True,
                                           "balance": (info.get("tokenAmount") or {}).get("uiAmount"),
                                           "stale": False})
+                _SOL_DEST_ATA["failed_at"] = 0.0
                 _sol_dest_ata_disk_write()
                 log.info(f"🔗 sol_dest_ata: exists={_SOL_DEST_ATA['exists']} "
                          f"balance={_SOL_DEST_ATA['balance']}")
@@ -12654,12 +12933,32 @@ def _sol_dest_ata_refresh():
                 _SOL_DEST_ATA.update({"exists": None, "balance": None})
             _SOL_DEST_ATA["stale"] = True
             log.info("🔗 sol_dest_ata: RPCs mudos — leitura não confirmada")
+        _SOL_DEST_ATA["failed_at"] = time.time()
     except Exception:
         if not (_SOL_DEST_ATA.get("ts") and _SOL_DEST_ATA.get("exists") is not None):
             _SOL_DEST_ATA.update({"exists": None, "balance": None})
         _SOL_DEST_ATA["stale"] = True
+        _SOL_DEST_ATA["failed_at"] = time.time()
     finally:
         _SOL_DEST_ATA["checking"] = False
+
+
+def _sol_dest_ata_tick():
+    """v48.84.0: renova o ATA no laço de fundo (um worker só), sem depender de um
+    /health cair em cada worker. Renova na metade do TTL: o /health não chega a stale."""
+    try:
+        st = dict(_SOL_DEST_ATA)
+        now = time.time()
+        if st.get("checking") and now - float(st.get("checking_since") or 0) <= 150:
+            return
+        if not st.get("stale") and now - float(st.get("ts") or 0) < _SOL_DEST_ATA_TTL / 2:
+            return
+        if now - float(st.get("attempt_ts") or 0) < _SOL_DEST_ATA_RETRY_S:
+            return
+        _SOL_DEST_ATA.update({"checking": True, "checking_since": now})
+        _sol_dest_ata_refresh()
+    except Exception as e:
+        log.debug(f"sol_dest_ata tick: {e}")
 
 
 def _sol_dest_ata_status() -> dict:
@@ -12675,6 +12974,21 @@ def _sol_dest_ata_status() -> dict:
     if (_SOL_DEST_ATA.get("checking")
             and now - float(_SOL_DEST_ATA.get("checking_since") or 0) > 150):
         _SOL_DEST_ATA["checking"] = False
+    # v48.84.0: cada worker tem a sua cópia em memória. Leitura boa que OUTRO worker
+    # gravou em disco depois deste boot vale como leitura viva aqui também — antes o
+    # /health dizia "stale" ou "live" conforme o worker que atendia (15/nov 17:04 UTC:
+    # stale com 6 h de idade, 3 h depois do deploy).
+    try:
+        _mem_ts = float(_SOL_DEST_ATA.get("ts") or 0)
+        if _SOL_DEST_ATA.get("stale") or now - _mem_ts > _SOL_DEST_ATA_TTL:
+            _disk = _sol_dest_ata_disk_read()
+            if (_disk is not None and _disk["ts"] >= _SOL_DEST_ATA_BOOT_TS
+                    and _disk["ts"] >= _mem_ts and now - _disk["ts"] <= _SOL_DEST_ATA_TTL
+                    and _disk["ts"] > float(_SOL_DEST_ATA.get("failed_at") or 0.0)):
+                _SOL_DEST_ATA.update({"exists": _disk["exists"], "balance": _disk["balance"],
+                                      "ts": _disk["ts"], "stale": False})
+    except Exception:
+        pass
     snap = dict(_SOL_DEST_ATA)
     expired = now - float(snap.get("ts") or 0) > _SOL_DEST_ATA_TTL
     retry_ready = now - float(snap.get("attempt_ts") or 0) >= _SOL_DEST_ATA_RETRY_S
@@ -12693,6 +13007,7 @@ def _sol_dest_ata_status() -> dict:
     snap.pop("checking", None)
     snap.pop("checking_since", None)
     snap.pop("attempt_ts", None)
+    snap.pop("failed_at", None)
     ts = float(snap.get("ts") or 0)
     age = max(0, int(now - ts)) if ts else None
     snap["age_s"] = age
@@ -16362,7 +16677,10 @@ def mcp_streamable():
         return ("", 204)
     if request.method == "DELETE":
         return ("", 204)                     # encerra "sessão" (stateless aqui)
-    if request.method == "GET":
+    # v48.84.0: HEAD é o GET sem corpo. Antes caía no parser JSON-RPC do POST e
+    # devolvia 400 — 4 HEAD /mcp → 400 no log HTTP de 15/nov (checagem de vida de
+    # diretório/monitor MCP).
+    if request.method in ("GET", "HEAD"):
         _acc = (request.headers.get("Accept") or "")
         if "text/event-stream" in _acc:
             r = app.response_class(json.dumps({"jsonrpc": "2.0", "error": {
@@ -18478,6 +18796,10 @@ def _preview_group_ok(ua: str, hits: int, ips: int) -> bool:
         pass
     return True
 
+# v48.83.0: pontuação que extratores de URL colam no fim do caminho (markdown/JSON)
+_PATH_TRAIL_JUNK = "`'\"*,;:!|)]}>\\ \t.’”"
+
+
 def _route_now_live(path: str) -> bool:
     """v44.1.0: a rota pedida EXISTE hoje? O radar é janela de 7 dias — um
     caminho que era 404 quando registrado pode ter sido construído depois
@@ -18493,7 +18815,9 @@ def _route_now_live(path: str) -> bool:
     try:
         from werkzeug.routing import RequestRedirect
         adapter = app.url_map.bind("radar.local")
-        for cand in (p, p.rstrip("/")):
+        # v48.83.0: "/receipts." é a rota /receipts com pontuação colada (308 no
+        # _slash_redirect) — não é demanda nova nem candidato a produto.
+        for cand in (p, p.rstrip("/"), p.rstrip(_PATH_TRAIL_JUNK + "/")):
             if not cand:
                 continue
             try:
@@ -20389,8 +20713,13 @@ def _slash_redirect():
     slash-stripped path is a real route for this method, answer with a
     308 redirect (method-preserving) instead of a 404."""
     p = request.path or ""
-    if len(p) > 1 and p.endswith("/"):
+    if len(p) > 1 and (p.endswith("/") or p[-1] in _PATH_TRAIL_JUNK):
         stripped = p.rstrip("/")
+        if stripped and stripped[-1] in _PATH_TRAIL_JUNK:
+            # v48.83.0: extratores de URL colam pontuação de markdown no fim do caminho
+            # ("/analise`" e "/sentiment-consensus`" no log HTTP de 15/nov; "/receipts."
+            # chegou a virar proposta de produto). Mesma cortesia da barra final.
+            stripped = stripped.rstrip(_PATH_TRAIL_JUNK + "/")
         if stripped:
             try:
                 for r in app.url_map.iter_rules():
@@ -26174,6 +26503,7 @@ def preview_warm_loop():
     log.info(f"🔥 Autopilot warmer (dados): {len(AUTOPILOT_WARM)} endpoints "
              f"a cada {AUTOPILOT_WARM_SECS}s")
     while True:
+        _sol_dest_ata_tick()
         _warm_once(_demand_rank(AUTOPILOT_WARM), "dados")
         time.sleep(AUTOPILOT_WARM_SECS)
 
@@ -26224,7 +26554,7 @@ def premium_brief_loop():
                                                            "data": preview_payload}
                 _preview_db_put("/global-morning-brief", preview_payload)
         except Exception as e:
-            log.warning(f"premium_brief_loop: {e}")
+            log.warning(f"premium_brief_loop: {type(e).__name__}: {e}")
         time.sleep(3600)  # re-checa a cada hora (gera só na virada do dia UTC)
 
 def _state_get(key: str, default: float = 0.0) -> float:
@@ -29534,7 +29864,7 @@ _AGENTS_FLOWS = [
      "actions": [{"id": "br_brief", "source_id": "losbeto-api",
                   "path": "/br-brief", "method": "GET", "parameters": []}]},
     {"id": "discover-full-catalog",
-     "name": "Discover all ~88 priced endpoints (free)",
+     "name": "Discover the full priced catalog (free)",
      "description": ("Machine-readable catalog with prices, descriptions and "
                      "free samples. Free."),
      "actions": [{"id": "catalog", "source_id": "losbeto-api",
@@ -33594,7 +33924,17 @@ def _ops_control_reload():
         return
     d = _ops_read_json(_OPS_CONTROL_FILE, {})
     if isinstance(d, dict) and isinstance(d.get("paused"), dict):
-        _OPS_CONTROL = {"paused": d["paused"], "mtime": st.st_mtime}
+        paused = d["paused"]
+        upgraded = False
+        if OPS_OPERATOR_PAUSE_HOLD:
+            for rec in paused.values():
+                if (isinstance(rec, dict) and not rec.get("hold")
+                        and str(rec.get("by") or "") in _OPS_HUMAN_ACTORS):
+                    rec["hold"] = True  # decisão humana anterior ao campo hold
+                    upgraded = True
+        _OPS_CONTROL = {"paused": paused, "mtime": st.st_mtime}
+        if upgraded:
+            _ops_control_save()
 
 
 def _ops_control_save():
@@ -33688,21 +34028,106 @@ def _ops_audit_recent(n=10):
         return []
 
 
+# v48.83.0-HOLD: pausa decidida por PESSOA (/ops pause, botão do Telegram ou painel
+# web) fica até uma pessoa retomar. Antes a varredura de retomada tratava toda pausa
+# como falha de entrega e a desfazia a partir de 30 min, assim que a sonda entregava:
+# em 15/nov /thesis-engine e /fetch respondiam 402 (à venda) com o painel listando as
+# duas pausas como "applied", e o planner tinha mandado 4 notas "remain paused" ao
+# operador com os dois à venda.
+# OPS_OPERATOR_PAUSE_HOLD=0 devolve o comportamento antigo (pausa = 30 min + sonda).
+OPS_OPERATOR_PAUSE_HOLD = os.environ.get("OPS_OPERATOR_PAUSE_HOLD", "1").strip() != "0"
+_OPS_HUMAN_ACTORS = frozenset({"operator", "web-panel"})
+
+
+def _ops_pause_ended_tag(d, paused_now) -> str:
+    """Decisão 'pause_endpoint X -> applied' NÃO prova que X segue pausado."""
+    try:
+        if (d.get("action") == "pause_endpoint" and d.get("status") == "applied"
+                and d.get("target") not in paused_now):
+            return " (pause ENDED - endpoint is live now)"
+    except Exception:
+        pass
+    return ""
+
+
+_OPS_NOTE_PAUSED_RE = re.compile(
+    r"\b(?:remain|remains|still|stay|stays|are|is|keep|keeps|currently|already)\s+"
+    r"(?:(?:both|all|still|currently|temporarily|now)\s+){0,2}paused\b"
+    r"|\bpaused\s+endpoints?\b", re.I)
+# no mesmo trecho da frase, antes do verbo: negação, condição ou recomendação
+_OPS_NOTE_NOT_CLAIM_RE = re.compile(
+    r"\b(?:no|none|neither|nothing|not|never|if|whether|unless|should|could|would|"
+    r"may|might|must|recommend\w*|consider\w*|suggest\w*)\b|n't", re.I)
+_OPS_NOTE_CLAUSE_RE = re.compile(r"[.;:,\n]|\b(?:and|but|while|so)\b", re.I)
+_OPS_NOTE_NONE_AFTER_RE = re.compile(r"\s*[:=–—-]?\s*(?:none|no\b|0\b|zero|nil|empty)", re.I)
+
+
+def _ops_note_false_pause(text) -> bool:
+    """True quando a nota AFIRMA, no presente, que um endpoint está/segue pausado e o
+    control plane não confirma. Negação ("no endpoints are paused"), condição,
+    recomendação e passado ("was paused") não são afirmação. Nota do planner tem de
+    ser consequência da telemetria."""
+    try:
+        t = str(text or "")
+        # parênteses não quebram a frase: "(/a, /b) remain paused"
+        flat = re.sub(r"\([^()]*\)", lambda m_: " " * len(m_.group(0)), t)
+        claim = False
+        for m_ in _OPS_NOTE_PAUSED_RE.finditer(flat):
+            head = flat[:m_.start()]
+            cuts = [x.end() for x in _OPS_NOTE_CLAUSE_RE.finditer(head)]
+            if _OPS_NOTE_NOT_CLAIM_RE.search(head[(cuts[-1] if cuts else 0):]):
+                continue
+            if (m_.group(0).lower().startswith("paused")
+                    and _OPS_NOTE_NONE_AFTER_RE.match(flat[m_.end():m_.end() + 24])):
+                continue          # "paused endpoints: none"
+            claim = True
+            break
+        if not claim:
+            return False
+        paused_now = set(_ops_paused())
+        named = {n for n in (x.rstrip("/.,;:)") for x in
+                             re.findall(r"/[a-z0-9][a-z0-9/_.-]*", t.lower()))
+                 if n in BASE_PRICES}
+        if named:
+            return not (named & paused_now)
+        return not paused_now
+    except Exception:
+        return False
+
+
 def _ops_pause(endpoint, reason, by, refunds_1h=0, cooldown_s=None):
     cd = int(cooldown_s or OPS_PAUSE_COOLDOWN_S)
     now = int(time.time())
     _ops_control_reload()
     paused = _OPS_CONTROL.setdefault("paused", {})
+    hold = bool(OPS_OPERATOR_PAUSE_HOLD and str(by) in _OPS_HUMAN_ACTORS)
     if endpoint in paused:
+        rec = paused[endpoint] if isinstance(paused[endpoint], dict) else {}
+        if hold and not rec.get("hold"):
+            # pausa automática em curso + ordem de pessoa = passa a ser pausa do operador
+            rec.update({"hold": True, "by": by,
+                        "reason": str(reason)[:160] or rec.get("reason", "")})
+            paused[endpoint] = rec
+            _ops_control_save()
+            _ops_audit(by, "pause_endpoint", endpoint,
+                       {"reason": str(reason)[:160], "hold": True,
+                        "upgraded_from_auto": True}, "applied")
+            log.warning(f"⏸ OPS-PAUSE: {endpoint} já estava em pausa automática — agora é "
+                        f"pausa do operador ({reason}) — by {by}")
+            return True, "já estava em pausa automática; agora fica até você retomar"
         return False, "já pausado"
     paused[endpoint] = {"ts": now, "reason": str(reason)[:160], "by": by,
                         "refunds_1h": int(refunds_1h),
-                        "probe_after": now + cd, "backoff_s": cd}
+                        "probe_after": now + cd, "backoff_s": cd, "hold": hold}
     _ops_control_save()
     _ops_audit(by, "pause_endpoint", endpoint,
-               {"reason": str(reason)[:160], "refunds_1h": refunds_1h}, "applied")
-    log.warning(f"⏸ OPS-PAUSE: {endpoint} fora da vitrine ({reason}) — by {by}")
-    return True, "pausado"
+               {"reason": str(reason)[:160], "refunds_1h": refunds_1h,
+                "hold": hold}, "applied")
+    log.warning(f"⏸ OPS-PAUSE: {endpoint} fora da vitrine ({reason}) — by {by}"
+                + (" — pausa do operador: só volta com /ops resume ou pelo painel"
+                   if hold else ""))
+    return True, ("pausado até você retomar (/ops resume ou painel)" if hold
+                  else "pausado")
 
 
 def _ops_probe(endpoint):
@@ -33726,6 +34151,10 @@ def _ops_resume(endpoint, actor, probe=True):
     _ops_control_reload()
     if endpoint not in (_OPS_CONTROL.get("paused") or {}):
         return False, "não está pausado"
+    if ((_OPS_CONTROL["paused"].get(endpoint) or {}).get("hold")
+            and str(actor) not in _OPS_HUMAN_ACTORS):
+        # v48.83.0: pausa do operador só é desfeita por pessoa (Telegram ou painel)
+        return False, "pausa do operador — só o operador retoma"
     if probe:
         ok, msg = _ops_probe(endpoint)
         if not ok:
@@ -33743,6 +34172,8 @@ def _ops_resume_sweep():
     now = time.time()
     for ep, rec in list(_ops_paused().items()):
         try:
+            if rec.get("hold"):
+                continue          # v48.83.0: pausa do operador não volta sozinha
             if now < float(rec.get("probe_after", 0)):
                 continue
             ok, msg = _ops_probe(ep)
@@ -33777,16 +34208,19 @@ def _sellability_block(path):
     try:
         p = _ops_paused().get(path)
         if p is not None:
+            _held = bool(p.get("hold"))
             return {
                 "status": "unavailable",
-                "error": ("temporarily paused by the node's autonomous ops "
-                          "layer — it refunds nothing because nothing is "
-                          "charged while paused"),
+                "error": (("paused by the node operator — nothing is charged "
+                           "while paused") if _held else
+                          ("temporarily paused by the node's autonomous ops "
+                           "layer — it refunds nothing because nothing is "
+                           "charged while paused")),
                 "endpoint": path,
                 "paused_at": p.get("ts"),
                 "reason": p.get("reason"),
-                "retry_after_seconds": max(
-                    60, int(float(p.get("probe_after", 0)) - time.time())),
+                "retry_after_seconds": (3600 if _held else max(
+                    60, int(float(p.get("probe_after", 0)) - time.time()))),
                 "transparency": f"{_public_base()}/ops/status",
             }
     except Exception:
@@ -33901,6 +34335,9 @@ def _ops_validate(action, candidates):
     k = action.get("action")
     if k == "note":
         txt = str(action.get("text", "")).strip()
+        if txt and _ops_note_false_pause(txt):
+            # v48.83.0: "(/thesis-engine, /fetch) remain paused" com os dois à venda
+            return False, "nota afirma pausa que o control plane não confirma"
         return (bool(txt), "note") if txt else (False, "nota vazia")
     if k == "create_alias":
         path = str(action.get("path", ""))
@@ -33953,6 +34390,9 @@ def _ops_validate(action, candidates):
         ep = str(action.get("endpoint", ""))
         if ep not in _ops_paused():
             return False, "não está pausado"
+        if (_ops_paused().get(ep) or {}).get("hold"):
+            # v48.83.0: o planner não propõe desfazer uma decisão do operador
+            return False, "pausa do operador — só o operador retoma"
         return True, "approval"
     if k == "queue_product":
         path = str(action.get("path", ""))
@@ -34123,7 +34563,10 @@ def _ops_llm_planner():
              "demand_trend": (brain.get("demand_trend") or [])[:6],
              "llm_quarantined": (brain.get("llm_routing") or {}).get(
                  "quarantined_now") or [],
-             "paused_now": {e: p.get("reason") for e, p in paused.items()}}
+             "paused_now": {e: (str(p.get("reason") or "")
+                                + (" [operator hold: never propose resume]"
+                                   if p.get("hold") else ""))
+                            for e, p in paused.items()}}
     prompt = (
         "You are the autonomous operations planner of a pay-per-call API node "
         "(x402 machine commerce; buyers are AI agents). Read the live telemetry "
@@ -34224,7 +34667,9 @@ def _ops_tg_status():
         for ep, p in paused.items():
             mins = (int(time.time()) - int(p.get("ts", 0))) // 60
             lines.append(f"• `{TelegramBot.esc(ep)}` há {mins}min — "
-                         f"{TelegramBot.esc(str(p.get('reason', ''))[:90])}")
+                         f"{TelegramBot.esc(str(p.get('reason', ''))[:90])}"
+                         + (" — pausa do operador (só volta com /ops resume)"
+                            if p.get("hold") else ""))
     else:
         lines.append("▶ Nenhum endpoint pausado.")
     lines.append("")
@@ -34275,7 +34720,9 @@ def _ops_tg_command(bot, msg, text):
             return
         reason = " ".join(cmd[2:])[:140] or "pausa manual do operador"
         ok, m = _ops_pause(ep, reason, "operator")
-        bot.send(chat_id, (f"⏸ `{TelegramBot.esc(ep)}` fora da vitrine." if ok
+        bot.send(chat_id, ((f"⏸ `{TelegramBot.esc(ep)}` fora da vitrine."
+                            + (f" Fica pausado até `/ops resume {TelegramBot.esc(ep)}`."
+                               if OPS_OPERATOR_PAUSE_HOLD else "")) if ok
                            else f"⚠ {TelegramBot.esc(m)}"))
         return
     if verb == "resume" and len(cmd) >= 2:
@@ -34347,7 +34794,9 @@ def ops_status_public():
         "paused_endpoints": [{"endpoint": e,
                               "reason": p.get("reason"),
                               "since": p.get("ts"),
-                              "next_probe_at": p.get("probe_after")}
+                              "held_by_operator": bool(p.get("hold")),
+                              "next_probe_at": (None if p.get("hold")
+                                                else p.get("probe_after"))}
                              for e, p in paused.items()],
         "pending_proposals": len(_ops_pending()),
         "recent_actions": _ops_audit_recent(8),
@@ -36341,10 +36790,17 @@ def _ops_planner_memory_text():
         parts = []
         dec = _ops_decisions()[-25:]
         if dec:
+            # v48.83.0: sem a marca abaixo o planner lia "pause_endpoint X -> applied"
+            # e escrevia ao operador que X "remain paused" — com X à venda.
+            paused_now = set(_ops_paused())
             parts.append(
                 "Already decided (NEVER re-propose the same action+target): "
                 + "; ".join(f"{d.get('action')} {d.get('target')} "
-                            f"-> {d.get('status')}" for d in dec))
+                            f"-> {d.get('status')}"
+                            + _ops_pause_ended_tag(d, paused_now) for d in dec))
+            parts.append(
+                "An endpoint is paused ONLY if it is listed in telemetry.paused_now; "
+                "never state that an endpoint is or remains paused otherwise.")
         q = _ops_read_json(_OPS_PRODUCT_QUEUE, [])
         paths = [str(i.get("path")) for i in q if isinstance(i, dict)][-12:]
         if paths:
@@ -36745,7 +37201,7 @@ def _ops_tg_command(bot, msg, text):  # noqa: F811 — camada 48.32.1
     return _OPS_TG_CMD_48320(bot, msg, text)
 
 
-def _ops_panel_html(flash, rows, decisions, token):
+def _ops_panel_html(flash, rows, decisions, token, paused=None):
     def esc(s):
         return (str(s).replace("&", "&amp;").replace("<", "&lt;")
                       .replace(">", "&gt;").replace('"', "&quot;"))
@@ -36782,13 +37238,28 @@ a{color:#7dd3fc}
             f'<a class="btn ok" href="/ops/panel?token={esc(token)}&decide=ok&pid={pid_}">✅ Aplicar</a>'
             f'<a class="btn no" href="/ops/panel?token={esc(token)}&decide=no&pid={pid_}">❌ Recusar</a>'
             f'</div>')
+    # v48.83.0: o que está pausado AGORA, com retomada em um toque
+    for ep_, p_ in sorted((paused or {}).items()):
+        mins = int((time.time() - float(p_.get("ts", 0) or 0)) // 60)
+        kind = ("pausa do operador — só volta quando você retomar" if p_.get("hold")
+                else "pausa automática — a sonda retoma sozinha quando entregar")
+        body.append(
+            f'<div class="card"><div class="pid">⏸ PAUSADO · há {mins} min · '
+            f'{esc(kind)}</div><div class="txt">{esc(ep_)} — '
+            f'{esc(str(p_.get("reason", ""))[:160])}</div>'
+            f'<a class="btn ok" href="/ops/panel?token={esc(token)}&resume='
+            f'{esc(urllib.parse.quote(str(ep_), safe="/"))}">▶ Retomar</a></div>')
     if decisions:
         body.append('<div class="hist"><b>Últimas decisões:</b>')
         for d_ in decisions[-8:][::-1]:
             age = int((time.time() - float(d_.get("ts", 0) or 0)) // 3600)
+            ended = (paused is not None and d_.get("action") == "pause_endpoint"
+                     and d_.get("status") == "applied"
+                     and d_.get("target") not in paused)
             body.append(f"<div>{esc(d_.get('status'))} · "
                         f"{esc(d_.get('action'))} {esc(d_.get('target'))} "
-                        f"· há {age}h · {esc(d_.get('by'))}</div>")
+                        f"· há {age}h · {esc(d_.get('by'))}"
+                        + (" · já retomado (à venda)" if ended else "") + "</div>")
         body.append("</div>")
     body.append("</body></html>")
     return "".join(body)
@@ -36805,6 +37276,15 @@ def ops_panel():
     flash = request.args.get("flash", "").strip()[:240]
     pid = request.args.get("pid", "").strip()
     decide = request.args.get("decide", "").strip()
+    resume_ep = request.args.get("resume", "").strip()[:80]
+    if resume_ep:
+        # v48.83.0: retomada pelo painel (a sonda real precisa entregar)
+        ok, msgout = _ops_resume(resume_ep, "web-panel", probe=True)
+        log.info(f"🌐 ops-panel: resume {resume_ep} → ok={ok} {msgout}")
+        return redirect("/ops/panel?" + urllib.parse.urlencode({
+            "token": token,
+            "flash": (("✅ " if ok else "⚠ ") + f"{resume_ep}: {msgout}")[:200]}),
+            code=303)
     if pid.isdigit() and decide in ("ok", "no"):
         ok, msgout = _ops_decide(int(pid), decide == "ok", actor="web-panel")
         flash = ("✅ " if ok else "⚠ ") + str(msgout)
@@ -36839,8 +37319,12 @@ def ops_panel():
         decisions = _ops_decisions()
     except Exception:
         decisions = []
+    try:
+        paused_now = _ops_paused()
+    except Exception:
+        paused_now = None
     return app.response_class(
-        _ops_panel_html(flash, rows, decisions, token),
+        _ops_panel_html(flash, rows, decisions, token, paused=paused_now),
         mimetype="text/html")
 
 
@@ -39345,7 +39829,9 @@ def _v4842_sanitize_governance():
             rec["result"] = "v48.42: scanner/generic protocol path; not organic product demand"
             rec["quarantined_ts"] = int(time.time())
             props_changed = True
-        changed_paths.append(p)
+            # v48.84.0: só registra o que MUDOU. Antes toda proposta já quarentenada
+            # voltava a ser anunciada a cada boot (30 avisos + 2 linhas de auditoria).
+            changed_paths.append(p)
     if props_changed:
         _ops_write_json(_OPS_PROPOSALS_FILE, props)
 
@@ -39534,6 +40020,9 @@ def _v4844_pyth_backoff_clear(feed_ids):
             log.warning(f"Pyth shared backoff clear {fid[:12]}: {str(e)[:100]}")
 
 
+_PYTH_QUIET = {"ts": 0.0}
+
+
 def _v4843_pyth_latest(feed_ids):
     ids, seen = [], set()
     for value in feed_ids or []:
@@ -39546,8 +40035,11 @@ def _v4843_pyth_latest(feed_ids):
     permanent = {fid for fid in ids if fid in _FC_SKIP}
     eligible = [fid for fid in ids if fid not in blocked and fid not in permanent]
     if not eligible:
-        log.info(f"🧠 Pyth: nenhum feed elegível; nenhuma chamada HTTP — "
-                 f"fallback CoinGecko (backoff={len(blocked)}, invalid={len(permanent)})")
+        # v48.84.0: 1 linha a cada 15 min por processo (eram ~16/h, 1/4 do log)
+        if now - _PYTH_QUIET.get("ts", 0.0) >= 900:
+            _PYTH_QUIET["ts"] = now
+            log.info(f"🧠 Pyth: nenhum feed elegível; nenhuma chamada HTTP — "
+                     f"fallback CoinGecko (backoff={len(blocked)}, invalid={len(permanent)})")
         return {}
     if not PYTH_API_KEY:
         raise RuntimeError("pyth: PYTH_API_KEY ausente")
@@ -39769,7 +40261,7 @@ _ops_validate = _v4843_ops_validate
 
 _v4842_sanitize_governance()
 
-VERSION = "48.82.0-RECOVERY"
+VERSION = "48.84.0-STEADY"
 
 
 # ============================================================================
@@ -40295,4 +40787,9 @@ def _v4856_a2a_rest_guard():
 
 # v48.56.0-A2AGUARD: /mcp/v1/message:send e caminho do binding HTTP+JSON do A2A; o alias para o handler MCP devolvia HTTP 200 + envelope JSON-RPC de erro a clientes A2A → POST sem "jsonrpc" nesse caminho agora devolve 501 explicativo; docstring do cabecalho alinhada a VERSION | base: v48.55.1-PURGEHARDEN
 
-# v48.59.0-DEMOCACHE: /f
+# v48.59.0-DEMOCACHE: /favicon.svg restaurado; /llm/free sem ?q= usa resposta de demonstracao compartilhada por 30 min.
+
+# v48.83.0-HOLD: (1) o orcamento GLOBAL de pagamentos invalidos voltou a so apertar IPs que ja falharam (a v48.73 o tinha feito bloquear o endpoint inteiro: ~65% do tempo o /gas-price recusava compradores novos por causa de um bot de Solana com a instrucao compute_limit invalida; so uma enchente real, >= GLOBAL_HARD_BUDGET=30 invalidos/min, volta a bloquear o endpoint inteiro); o bloqueio dura os 120 s anunciados (o cache expirava em 90 s) e o log traz ip e user-agent do cliente; (2) /weather valida lat/lon antes do 402, erro de digitacao do cliente nao abre mais o disjuntor, o motivo real da falha do Open-Meteo aparece no log e, apos cada cooldown do backoff da v48.82, uma sonda gratis decide se volta a vender (antes o 1o comprador pagava e era estornado); (3) 402 de pagamento invalido traz hint acionavel; (4) pausa aprovada por pessoa (painel, botao ou /ops pause) fica ate uma pessoa retomar - a varredura de retomada a desfazia a partir de 30 min; o painel lista os pausados com botao Retomar; nota do planner que afirma pausa inexistente e descartada; (5) caminho com pontuacao colada no fim redireciona 308 para a rota real em vez de 404 | base: v48.82.0-RECOVERY
+
+
+# v48.84.0-STEADY: (1) HEAD /mcp responde como GET (dava 400); (2) llm_healthy so conta provedor que a rota sincrona tentaria (provedor em quarentena do bandit nao segura mais o pre-gate aberto com o unico provedor util em cooldown); (3) sol_dest_ata: a leitura viva gravada por um worker vale para os outros e o laco do warmer renova na metade do TTL; (4) o resumo do guard traz a forma da transacao Solana recusada (programa:discriminador por instrucao); (5) governanca so anuncia o que mudou, log do Pyth em backoff espacado, e
