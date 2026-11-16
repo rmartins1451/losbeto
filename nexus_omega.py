@@ -2,7 +2,7 @@
 """
 Losbeto x402 — monolithic Flask service for Railway.
 
-Current release: 48.84.0-STEADY.
+Current release: 48.85.0-CLEAR.
 Payment requirements are server-side. Delivery requires verified settlement;
 pending payments are reconciled against independent chain evidence.
 Operational history lives in CHANGELOG.md, not in executable boot output.
@@ -9550,7 +9550,11 @@ def _svm_tx_shape(payment_header, reason="") -> str:
     """v48.84.0 — diagnóstico, nunca decisão: programa e 1º byte (discriminador) de cada
     instrução da transação Solana que o facilitador recusou. O esquema "exact" espera
     [ComputeBudget:2, ComputeBudget:3, Token:12] (+ATA/Memo opcionais). Assim o log diz
-    O QUE o cliente montou errado, não só que foi recusado. Qualquer erro devolve ""."""
+    O QUE o cliente montou errado, não só que foi recusado. Qualquer erro devolve "".
+    v48.85.0: acrescenta ix=[tamanho/contas + units|price|amount], sigs=assinadas/total,
+    sig0 (a vaga do fee payer deve vir vazia) e fp (6 primeiros caracteres do fee payer):
+    em 15/nov o bot Solana chegou com a ordem certa [CB:2, CB:3, Token:12] e mesmo assim
+    foi recusado em compute_limit_instruction — o defeito está dentro dos dados."""
     if "invalid_exact_svm" not in str(reason):
         return ""
     try:
@@ -9576,6 +9580,10 @@ def _svm_tx_shape(payment_header, reason="") -> str:
             return val
 
         nsig = _cu16()                              # (nunca "pos += f()": f também move pos)
+        _zero = b"\x00" * 64
+        _sigs = [tx[pos + 64 * i: pos + 64 * (i + 1)] for i in range(min(nsig, 8))]
+        assinadas = sum(1 for _s in _sigs if _s != _zero)
+        sig0_vazia = bool(_sigs) and _sigs[0] == _zero
         pos += 64 * nsig                            # assinaturas
         ver = "legacy"
         if tx[pos] & 0x80:
@@ -9584,9 +9592,10 @@ def _svm_tx_shape(payment_header, reason="") -> str:
         pos += 3                                    # cabeçalho da mensagem
         nkeys = _cu16()
         keys = [tx[pos + 32 * i: pos + 32 * (i + 1)] for i in range(min(nkeys, 64))]
+        fee_payer = base58.b58encode(keys[0]).decode()[:6] if keys else "?"
         pos += 32 * nkeys + 32                      # chaves + blockhash
         nix = _cu16()
-        out = []
+        out, det = [], []
         for _ in range(min(nix, 12)):
             pidx = tx[pos]
             pos += 1
@@ -9596,8 +9605,25 @@ def _svm_tx_shape(payment_header, reason="") -> str:
             data = tx[pos:pos + dlen]
             pos += dlen
             pid = base58.b58encode(keys[pidx]).decode() if pidx < len(keys) else "?"
-            out.append(f"{_SVM_PROG_NAMES.get(pid, pid[:6])}:{data[0] if data else '-'}")
-        return f" tx={ver}[{','.join(out)}]" + (f"+{nix - 12}" if nix > 12 else "")
+            nome = _SVM_PROG_NAMES.get(pid, pid[:6])
+            d0 = data[0] if data else '-'
+            out.append(f"{nome}:{d0}")
+            # v48.85.0: acertar o 1º byte não basta — o facilitador também confere o tamanho
+            # dos dados e os valores (units/price/amount). Só números; nada sensível.
+            item = f"{len(data)}B/{nacc}a"
+            try:
+                if nome == "ComputeBudget" and d0 == 2 and len(data) >= 5:
+                    item += f" units={int.from_bytes(data[1:5], 'little')}"
+                elif nome == "ComputeBudget" and d0 == 3 and len(data) >= 9:
+                    item += f" price={int.from_bytes(data[1:9], 'little')}"
+                elif nome in ("Token", "Token2022") and d0 == 12 and len(data) >= 10:
+                    item += f" amount={int.from_bytes(data[1:9], 'little')} dec={data[9]}"
+            except Exception:
+                pass
+            det.append(item)
+        extra = (f" ix=[{', '.join(det)}] sigs={assinadas}/{nsig} "
+                 f"sig0={'vazia' if sig0_vazia else 'preenchida'} fp={fee_payer}")
+        return (f" tx={ver}[{','.join(out)}]" + (f"+{nix - 12}" if nix > 12 else "") + extra)
     except Exception:
         return ""
 
@@ -9920,10 +9946,12 @@ def _invalid_payment_hint(reason) -> str:
     r = str(reason or "").lower()
     if "invalid_exact_svm" in r and "compute_limit" in r:
         return ("Solana exact payload rejected before settlement (no charge): instruction 0 must be "
-                "ComputeBudget SetComputeUnitLimit, instruction 1 SetComputeUnitPrice, then one SPL "
+                "ComputeBudget SetComputeUnitLimit (data = 0x02 + u32 LE units, exactly 5 bytes, no "
+                "accounts), instruction 1 SetComputeUnitPrice (0x03 + u64 LE, 9 bytes), then one SPL "
                 "TransferChecked of the quoted amount to the payTo token account (an optional Memo may "
-                "follow); the fee payer is the facilitator feePayer from accepts[].extra. Build it with "
-                "an x402 SVM client instead of assembling it by hand.")
+                "follow); the fee payer is the facilitator feePayer from accepts[].extra and its "
+                "signature slot stays empty. Build it with an x402 SVM client instead of assembling "
+                "it by hand.")
     if "invalid_exact_svm" in r:
         return ("Solana exact payload rejected before settlement (no charge). Rebuild it from the "
                 "latest 402 accepts[] (amount, payTo, asset, feePayer) with an x402 SVM client.")
@@ -19112,7 +19140,9 @@ def _ml_score_current_hour() -> dict:
                     f"• requests: {cur[0]} · IPs: {cur[1]}\n"
                     f"• vendas: {cur[2]} · receita: ${cur[3]:.4f} · pagadores: {cur[4]}\n\n"
                     f"IsolationForest treinado em {_ML_IF['n']}h do proprio node.")
-            log.warning(f"🧠 ANOMALIA: {out}")
+            # v48.85.0: hora fora do padrão causada SÓ por carteira da casa (varredura de
+            # indexação do operador: 141 vendas / $7 numa hora) não é alerta: INFO.
+            (log.info if sev == "house" else log.warning)(f"🧠 ANOMALIA: {out}")
         return out
     except Exception as e:
         log.debug(f"🧠 ML anomalia score: {e}")
@@ -40261,7 +40291,7 @@ _ops_validate = _v4843_ops_validate
 
 _v4842_sanitize_governance()
 
-VERSION = "48.84.0-STEADY"
+VERSION = "48.85.0-CLEAR"
 
 
 # ============================================================================
@@ -40785,6 +40815,36 @@ def _v4856_a2a_rest_guard():
         log.debug(f"a2a guard: {e}")
         return None
 
+
+# ============================================================================
+# v48.85.0-CLEAR — detector de arquivo truncado
+#
+# O arquivo voltou cortado no meio do comentário final três vezes (v48.81, v48.82 e
+# v48.84). Cortar comentário é inofensivo; cortar código não seria, e ninguém notaria.
+# A última linha não vazia do arquivo é "# EOF-LOSBETO ..." e o nó confere isso no boot:
+# sem o marcador, um WARNING. Nunca derruba o boot.
+# ============================================================================
+def _v4885_tail_check(path=None):
+    """True: a última linha é o marcador. False: arquivo cortado. None: não deu para ler."""
+    try:
+        p = path or os.path.abspath(__file__)
+        with open(p, "rb") as fh:
+            fh.seek(0, 2)
+            size = fh.tell()
+            fh.seek(max(0, size - 600))
+            tail = fh.read().decode("utf-8", "replace")
+        linhas = [ln for ln in tail.splitlines() if ln.strip()]
+        return bool(linhas) and linhas[-1].startswith("# EOF-LOSBETO")
+    except Exception:
+        return None
+
+
+_NEXUS_TAIL_OK = _v4885_tail_check()
+if _NEXUS_TAIL_OK is False:
+    log.warning("⚠️ nexus_omega.py termina sem o marcador '# EOF-LOSBETO' — o arquivo parece "
+                "TRUNCADO (a cópia/colagem cortou o final). Confira o arquivo no GitHub antes "
+                "do próximo deploy.")
+
 # v48.56.0-A2AGUARD: /mcp/v1/message:send e caminho do binding HTTP+JSON do A2A; o alias para o handler MCP devolvia HTTP 200 + envelope JSON-RPC de erro a clientes A2A → POST sem "jsonrpc" nesse caminho agora devolve 501 explicativo; docstring do cabecalho alinhada a VERSION | base: v48.55.1-PURGEHARDEN
 
 # v48.59.0-DEMOCACHE: /favicon.svg restaurado; /llm/free sem ?q= usa resposta de demonstracao compartilhada por 30 min.
@@ -40792,4 +40852,8 @@ def _v4856_a2a_rest_guard():
 # v48.83.0-HOLD: (1) o orcamento GLOBAL de pagamentos invalidos voltou a so apertar IPs que ja falharam (a v48.73 o tinha feito bloquear o endpoint inteiro: ~65% do tempo o /gas-price recusava compradores novos por causa de um bot de Solana com a instrucao compute_limit invalida; so uma enchente real, >= GLOBAL_HARD_BUDGET=30 invalidos/min, volta a bloquear o endpoint inteiro); o bloqueio dura os 120 s anunciados (o cache expirava em 90 s) e o log traz ip e user-agent do cliente; (2) /weather valida lat/lon antes do 402, erro de digitacao do cliente nao abre mais o disjuntor, o motivo real da falha do Open-Meteo aparece no log e, apos cada cooldown do backoff da v48.82, uma sonda gratis decide se volta a vender (antes o 1o comprador pagava e era estornado); (3) 402 de pagamento invalido traz hint acionavel; (4) pausa aprovada por pessoa (painel, botao ou /ops pause) fica ate uma pessoa retomar - a varredura de retomada a desfazia a partir de 30 min; o painel lista os pausados com botao Retomar; nota do planner que afirma pausa inexistente e descartada; (5) caminho com pontuacao colada no fim redireciona 308 para a rota real em vez de 404 | base: v48.82.0-RECOVERY
 
 
-# v48.84.0-STEADY: (1) HEAD /mcp responde como GET (dava 400); (2) llm_healthy so conta provedor que a rota sincrona tentaria (provedor em quarentena do bandit nao segura mais o pre-gate aberto com o unico provedor util em cooldown); (3) sol_dest_ata: a leitura viva gravada por um worker vale para os outros e o laco do warmer renova na metade do TTL; (4) o resumo do guard traz a forma da transacao Solana recusada (programa:discriminador por instrucao); (5) governanca so anuncia o que mudou, log do Pyth em backoff espacado, e
+# v48.84.0-STEADY: (1) HEAD /mcp responde como GET (dava 400); (2) llm_healthy so conta provedor que a rota sincrona tentaria (provedor em quarentena do bandit nao segura mais o pre-gate aberto com o unico provedor util em cooldown); (3) sol_dest_ata: a leitura viva gravada por um worker vale para os outros e o laco do warmer renova na metade do TTL; (4) o resumo do guard traz a forma da transacao Solana recusada (programa:discriminador por instrucao); (5) governanca so anuncia o que mudou, log do Pyth em backoff espacado, excecao do premium_brief_loop com tipo | base: v48.83.0-HOLD
+
+
+# v48.85.0-CLEAR: (1) o log do guard traz o que ha DENTRO da transacao Solana recusada (tamanho dos dados e contas por instrucao, units/price/amount, assinaturas e fee payer): o bot de 15/nov chegou com a ordem certa [ComputeBudget:2, ComputeBudget:3, Token:12] e ainda assim foi recusado em compute_limit_instruction, entao o defeito esta nos dados; o hint do 402 diz os tamanhos exatos; (2) hora fora do padrao causada so por carteira da casa (varredura de indexacao do operador) vira INFO em vez de WARNING; (3) o arquivo ganha o marcador final '# EOF-LOSBETO' e o no avisa no boot se ele faltar (arquivo cortado ao copiar); o rodape 48.84, que veio cortado, foi restaurado | base: v48.84.0-STEADY com os ajustes do operador (failed_at no sol_dest_ata; pausas humanas antigas viram hold)
+# EOF-LOSBETO 48.85.0-CLEAR — fim do arquivo (se esta linha faltar, a copia foi cortada)
