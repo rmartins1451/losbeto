@@ -2,7 +2,7 @@
 """
 Losbeto x402 — monolithic Flask service for Railway.
 
-Current release: 48.86.0-CEILING.
+Current release: 48.87.0-QUIET.
 Payment requirements are server-side. Delivery requires verified settlement;
 pending payments are reconciled against independent chain evidence.
 Operational history lives in CHANGELOG.md, not in executable boot output.
@@ -60,6 +60,8 @@ markdown punctuation to the real route, makes the invalid-payment block last the
 as healthy in the pre-payment gate, shares the live Solana ATA reading across
 workers and refreshes it in the background, logs the instruction layout of a
 rejected Solana payment, and stops re-announcing old governance decisions at boot.
+48.87 rate-limits repetitive weather-circuit warnings without changing the 503,
+payment, bundle or recovery behavior.
 """
 from __future__ import annotations
 
@@ -10215,11 +10217,25 @@ def _preflight_param_check(path: str, check_required: bool = False):
     return None
 
 
+_WEATHER_PREFLIGHT_LOG_AT = {"cooldown": 0.0, "probe": 0.0}
+
+
+def _weather_preflight_log(kind: str) -> bool:
+    """One weather warning per process/kind/15 min; HTTP behavior is unchanged."""
+    now = time.monotonic()
+    quiet_s = max(60, int(os.environ.get("WEATHER_LOG_QUIET_S", "900")))
+    if now - _WEATHER_PREFLIGHT_LOG_AT.get(kind, 0.0) < quiet_s:
+        return False
+    _WEATHER_PREFLIGHT_LOG_AT[kind] = now
+    return True
+
+
 def _preflight_unavailable(path: str):
     """Roda ANTES de qualquer 402 ou verificação de pagamento."""
     if path == "/weather" and not Brain._weather_upstream_available():
         retry = max(1, Brain._weather_upstream_remaining())
-        log.warning(f"⛔ pré-gate: /weather recusado sem cobrança — Open-Meteo em cooldown")
+        if _weather_preflight_log("cooldown"):
+            log.warning(f"⛔ pré-gate: /weather recusado sem cobrança — Open-Meteo em cooldown")
         return _unavailable_body(
             "Open-Meteo is temporarily unavailable. This endpoint is not being "
             "sold right now; no payment challenge was issued and no stale weather "
@@ -10229,7 +10245,8 @@ def _preflight_unavailable(path: str):
         # v48.83.0: cooldown acabou mas o Open-Meteo ainda falha → NÃO vende
         # (antes o 1º comprador após cada cooldown pagava e era estornado).
         retry = max(1, Brain._weather_upstream_remaining())
-        log.warning("⛔ pré-gate: /weather recusado sem cobrança — sonda do Open-Meteo falhou")
+        if _weather_preflight_log("probe"):
+            log.warning("⛔ pré-gate: /weather recusado sem cobrança — sonda do Open-Meteo falhou")
         return _unavailable_body(
             "Open-Meteo is still failing its health probe. This endpoint is not being "
             "sold right now; no payment challenge was issued and no stale weather "
@@ -40451,7 +40468,7 @@ _ops_validate = _v4843_ops_validate
 
 _v4842_sanitize_governance()
 
-VERSION = "48.86.0-CEILING"
+VERSION = "48.87.0-QUIET"
 
 
 # ============================================================================
@@ -41018,5 +41035,6 @@ if _NEXUS_TAIL_OK is False:
 # v48.85.0-CLEAR: (1) o log do guard traz o que ha DENTRO da transacao Solana recusada (tamanho dos dados e contas por instrucao, units/price/amount, assinaturas e fee payer): o bot de 15/nov chegou com a ordem certa [ComputeBudget:2, ComputeBudget:3, Token:12] e ainda assim foi recusado em compute_limit_instruction, entao o defeito esta nos dados; o hint do 402 diz os tamanhos exatos; (2) hora fora do padrao causada so por carteira da casa (varredura de indexacao do operador) vira INFO em vez de WARNING; (3) o arquivo ganha o marcador final '# EOF-LOSBETO' e o no avisa no boot se ele faltar (arquivo cortado ao copiar); o rodape 48.84, que veio cortado, foi restaurado | base: v48.84.0-STEADY com os ajustes do operador (failed_at no sol_dest_ata; pausas humanas antigas viram hold)
 
 
-# v48.86.0-CEILING: (1) bot Solana de 15-16/nov: o log do guard agora diz a causa em palavras (diag=cu_limit_acima_do_teto(200000>50000)) e o hint do 402 abre com 'Cause: your SetComputeUnitLimit is 200000 ... set it to about 30000' — so diagnostico, o no nunca recusa por causa disso; (2) alerta ANOMALIA: hora dominada pela casa (>=90% das vendas e da receita: varredura do operador com 2 vendas de um comprador de fora no meio) vira severity house (INFO, sem Telegram) e hora com poucas vendas (<20 e <US$1) vira volume (WARNING, sem Telegram); (3) /weather: UMA retentativa quando a rede falha antes de haver resposta (handshake/conexao do Open-Meteo), nunca depois de resposta HTTP nem de leitura lenta; (4) Bazaar: o schema de lista passa a ser a uniao dos elementos (inteiro e decimal na mesma lista reprovava o proprio exemplo e a CDP respondia 'invalid discovery configuration' no /cross-chain) | base: v48.85.0-CLEAR identico ao arquivo do operador
-# EOF-LOSBETO 48.86.0-CEILING — fim do arquivo (se esta linha faltar, a copia foi cortada)
+# v48.87.0-QUIET: (1) bot Solana de 15-16/nov: o log do guard agora diz a causa em palavras (diag=cu_limit_acima_do_teto(200000>50000)) e o hint do 402 abre com 'Cause: your SetComputeUnitLimit is 200000 ... set it to about 30000' — so diagnostico, o no nunca recusa por causa disso; (2) alerta ANOMALIA: hora dominada pela casa (>=90% das vendas e da receita: varredura do operador com 2 vendas de um comprador de fora no meio) vira severity house (INFO, sem Telegram) e hora com poucas vendas (<20 e <US$1) vira volume (WARNING, sem Telegram); (3) /weather: UMA retentativa quando a rede falha antes de haver resposta (handshake/conexao do Open-Meteo), nunca depois de resposta HTTP nem de leitura lenta; (4) Bazaar: o schema de lista passa a ser a uniao dos elementos (inteiro e decimal na mesma lista reprovava o proprio exemplo e a CDP respondia 'invalid discovery configuration' no /cross-chain) | base: v48.85.0-CLEAR identico ao arquivo do operador
+# v48.87.0-QUIET: warnings do preflight de /weather limitados a 1 por processo/tipo/15min; respostas 503, circuito, bundle e pagamento inalterados | base: v48.86.0-CEILING
+# EOF-LOSBETO 48.87.0-QUIET — fim do arquivo (se esta linha faltar, a copia foi cortada)
