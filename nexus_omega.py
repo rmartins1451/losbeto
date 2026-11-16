@@ -2,7 +2,7 @@
 """
 Losbeto x402 — monolithic Flask service for Railway.
 
-Current release: 48.85.0-CLEAR.
+Current release: 48.86.0-CEILING.
 Payment requirements are server-side. Delivery requires verified settlement;
 pending payments are reconciled against independent chain evidence.
 Operational history lives in CHANGELOG.md, not in executable boot output.
@@ -4891,6 +4891,27 @@ class Brain:
         return ok
 
     @staticmethod
+    def _wx_get(url, params=None, timeout=(3.05, 8)):
+        """requests.get ao Open-Meteo com UMA retentativa, só para falha de REDE antes de haver
+        resposta (handshake/conexão que estoura, recusa, reset, DNS). Em 16/nov 03:45 UTC o 1º contato
+        com api.open-meteo.com passou de 3,05 s no handshake (o urllib3 rotula isso de "Read timed
+        out (read timeout=3.05)"): o comprador já tinha pago, virou estorno em crédito e o /weather
+        ficou 10 min fora do ar por UMA falha. Não repete: resposta HTTP (429/5xx contam como falha
+        real) nem leitura lenta (>= 4,5 s: já gastou a folga). A 2ª tentativa dá 5 s ao connect."""
+        t0 = time.monotonic()
+        try:
+            return requests.get(url, params=params, timeout=timeout)
+        except (requests.exceptions.ConnectionError, requests.exceptions.Timeout):
+            if time.monotonic() - t0 >= 4.5:
+                raise
+            time.sleep(0.2)
+            try:
+                read_s = timeout[1] if isinstance(timeout, (tuple, list)) else timeout
+            except Exception:
+                read_s = 8
+            return requests.get(url, params=params, timeout=(5.0, read_s))
+
+    @staticmethod
     def weather():
         """GET /weather?city=São Paulo  |  ?lat=-23.55&lon=-46.63 — $0.01.
         Fonte: Open-Meteo (grade fundida de modelos nacionais — ECMWF/NOAA/
@@ -4927,9 +4948,9 @@ class Brain:
                 tz_name = "auto"
             else:
                 q = city or "São Paulo"
-                g = requests.get("https://geocoding-api.open-meteo.com/v1/search",
-                                 params={"name": q, "count": 1, "language": "en",
-                                         "format": "json"}, timeout=(3.05, 6))
+                g = Brain._wx_get("https://geocoding-api.open-meteo.com/v1/search",
+                                  params={"name": q, "count": 1, "language": "en",
+                                          "format": "json"}, timeout=(3.05, 6))
                 if not g.ok:
                     raise RuntimeError(f"geocoding HTTP {g.status_code}")
                 results = g.json().get("results") or []
@@ -4945,7 +4966,7 @@ class Brain:
                 if top.get("country"):
                     label += ", " + top["country"]
                 tz_name = top.get("timezone") or "auto"
-            w = requests.get("https://api.open-meteo.com/v1/forecast", params={
+            w = Brain._wx_get("https://api.open-meteo.com/v1/forecast", params={
                 "latitude": flat, "longitude": flon,
                 "current": ("temperature_2m,relative_humidity_2m,"
                             "apparent_temperature,precipitation,weather_code,"
@@ -9545,6 +9566,16 @@ _SVM_PROG_NAMES = {
     "L2TExMFKdjpN9kozasaurPirfHy9P8sbXoAN1qA3S95": "Lighthouse",
 }
 
+# v48.86.0: teto de SetComputeUnitLimit que os facilitadores hospedados aceitam no esquema "exact"
+# da Solana. Serve SÓ para diagnóstico (log do guard e hint do 402): o nó nunca recusa um pagamento
+# nem altera accepts[] por causa dele. Relatos públicos (PayAI docs #85; x402 #3268/#3351; cdp-sdk
+# #795): até ~50 mil passa; 80 mil, 100 mil e 200 mil (o padrão da Solana) voltam como
+# ..._compute_limit_instruction. A página /pay deste nó monta a transação com 30.000 unidades.
+try:
+    _SVM_CU_LIMIT_CEILING = max(10000, int(os.environ.get("SVM_CU_LIMIT_CEILING", "50000")))
+except Exception:
+    _SVM_CU_LIMIT_CEILING = 50000
+
 
 def _svm_tx_shape(payment_header, reason="") -> str:
     """v48.84.0 — diagnóstico, nunca decisão: programa e 1º byte (discriminador) de cada
@@ -9554,7 +9585,10 @@ def _svm_tx_shape(payment_header, reason="") -> str:
     v48.85.0: acrescenta ix=[tamanho/contas + units|price|amount], sigs=assinadas/total,
     sig0 (a vaga do fee payer deve vir vazia) e fp (6 primeiros caracteres do fee payer):
     em 15/nov o bot Solana chegou com a ordem certa [CB:2, CB:3, Token:12] e mesmo assim
-    foi recusado em compute_limit_instruction — o defeito está dentro dos dados."""
+    foi recusado em compute_limit_instruction — o defeito está dentro dos dados.
+    v48.86.0: se o motivo é compute_limit e units passa de _SVM_CU_LIMIT_CEILING, acrescenta
+    diag=cu_limit_acima_do_teto(units>teto) — a causa do bot de 15/nov (units=200000, o padrão da
+    Solana; os facilitadores só aceitam até ~50 mil)."""
     if "invalid_exact_svm" not in str(reason):
         return ""
     try:
@@ -9596,6 +9630,7 @@ def _svm_tx_shape(payment_header, reason="") -> str:
         pos += 32 * nkeys + 32                      # chaves + blockhash
         nix = _cu16()
         out, det = [], []
+        cu_units = 0
         for _ in range(min(nix, 12)):
             pidx = tx[pos]
             pos += 1
@@ -9613,7 +9648,8 @@ def _svm_tx_shape(payment_header, reason="") -> str:
             item = f"{len(data)}B/{nacc}a"
             try:
                 if nome == "ComputeBudget" and d0 == 2 and len(data) >= 5:
-                    item += f" units={int.from_bytes(data[1:5], 'little')}"
+                    cu_units = int.from_bytes(data[1:5], 'little')
+                    item += f" units={cu_units}"
                 elif nome == "ComputeBudget" and d0 == 3 and len(data) >= 9:
                     item += f" price={int.from_bytes(data[1:9], 'little')}"
                 elif nome in ("Token", "Token2022") and d0 == 12 and len(data) >= 10:
@@ -9623,6 +9659,8 @@ def _svm_tx_shape(payment_header, reason="") -> str:
             det.append(item)
         extra = (f" ix=[{', '.join(det)}] sigs={assinadas}/{nsig} "
                  f"sig0={'vazia' if sig0_vazia else 'preenchida'} fp={fee_payer}")
+        if cu_units > _SVM_CU_LIMIT_CEILING and "compute_limit" in str(reason):
+            extra += f" diag=cu_limit_acima_do_teto({cu_units}>{_SVM_CU_LIMIT_CEILING})"
         return (f" tx={ver}[{','.join(out)}]" + (f"+{nix - 12}" if nix > 12 else "") + extra)
     except Exception:
         return ""
@@ -9941,11 +9979,35 @@ AI_OPTIONAL_ENDPOINTS = {
 }
 
 
-def _invalid_payment_hint(reason) -> str:
-    """Dica legível por máquina para as recusas determinísticas mais comuns."""
+def _svm_cu_limit_lead(payment_header, reason) -> str:
+    """v48.86.0: frase de abertura do hint quando o SetComputeUnitLimit do cliente passa do teto que
+    os facilitadores hospedados aceitam. "" se não houver cabeçalho legível ou se o valor estiver
+    dentro do teto (aí vale só o texto de formato)."""
+    try:
+        if not payment_header:
+            return ""
+        _m = re.search(r"\bunits=(\d+)", _svm_tx_shape(payment_header, reason))
+        _u = int(_m.group(1)) if _m else 0
+        if _u <= _SVM_CU_LIMIT_CEILING:
+            return ""
+        _dflt = " (the Solana default)" if _u == 200000 else ""
+        return (f"Cause: your SetComputeUnitLimit is {_u}{_dflt}, higher than hosted x402 "
+                f"facilitators accept for the exact scheme (about {_SVM_CU_LIMIT_CEILING} units at "
+                f"most). Set it to about 30000 (this node's /pay page builds its Solana payment with "
+                f"30000 units and a 1000 microlamport price), then rebuild and re-sign the "
+                f"transaction. ")
+    except Exception:
+        return ""
+
+
+def _invalid_payment_hint(reason, payment_header=None) -> str:
+    """Dica legível por máquina para as recusas determinísticas mais comuns.
+    v48.86.0: com o cabeçalho X-PAYMENT, o hint de compute_limit abre dizendo a CAUSA quando o
+    SetComputeUnitLimit passa do teto (um agente que lê o corpo do 402 consegue se corrigir)."""
     r = str(reason or "").lower()
     if "invalid_exact_svm" in r and "compute_limit" in r:
-        return ("Solana exact payload rejected before settlement (no charge): instruction 0 must be "
+        return (_svm_cu_limit_lead(payment_header, reason) +
+                "Solana exact payload rejected before settlement (no charge): instruction 0 must be "
                 "ComputeBudget SetComputeUnitLimit (data = 0x02 + u32 LE units, exactly 5 bytes, no "
                 "accounts), instruction 1 SetComputeUnitPrice (0x03 + u64 LE, 9 bytes), then one SPL "
                 "TransferChecked of the quoted amount to the payTo token account (an optional Memo may "
@@ -10908,7 +10970,7 @@ def paid_endpoint(path):
                 r = _build_402(path)
                 body = r.get_json()
                 body["error"] = f"Payment invalid: {reason}"
-                _hint = _invalid_payment_hint(reason)
+                _hint = _invalid_payment_hint(reason, sig)
                 if _hint:
                     body["hint"] = _hint
                 r.set_data(json.dumps(body))
@@ -19100,6 +19162,56 @@ def _ml_hour_house_only(hour_epoch: int = 0) -> bool:
         return False
 
 
+try:
+    _ML_HOUSE_DOMINANT = min(1.0, max(0.5, float(os.environ.get("ML_HOUSE_DOMINANT_SHARE", "0.90"))))
+    _ML_BUYER_MIN_SALES = max(1, int(os.environ.get("ML_BUYER_ALERT_MIN_SALES", "20")))
+    _ML_BUYER_MIN_USD = max(0.0, float(os.environ.get("ML_BUYER_ALERT_MIN_USD", "1.0")))
+except Exception:
+    _ML_HOUSE_DOMINANT, _ML_BUYER_MIN_SALES, _ML_BUYER_MIN_USD = 0.90, 20, 1.0
+
+
+def _ml_hour_house_share(hour_epoch: int = 0) -> dict:
+    """v48.86.0: quanto da hora fechada é da CASA — vendas e receita de carteira do operador
+    (operator-test) ou de varredura de catálogo (self-sweep), pela MESMA classify_payer do dashboard.
+    {} se a hora não tem venda ou se não deu para medir. Caso real (16/nov, hora das 00h UTC): 224
+    vendas / $13.38 / 3 pagadores — 222 eram a varredura do operador e 2 de um comprador de fora;
+    _ml_hour_house_only() exige ZERO compradores de fora e por isso o alerta 'buyer' foi ao Telegram."""
+    try:
+        h = hour_epoch or (int(time.time()) // 3600 - 1) * 3600
+        with LEDGER._conn() as c:
+            rows = c.execute("SELECT amount, payer, source, tx_sig FROM revenue "
+                             "WHERE ts>=? AND ts<?", (h, h + 3600)).fetchall()
+        if not rows:
+            return {}
+        n_h, v_h, v_all = 0, 0.0, 0.0
+        for amount, payer, source, tx in rows:
+            a = float(amount or 0.0)
+            v_all += a
+            if classify_payer(payer or "", source or "", tx or "") in ("operator-test", "self-sweep"):
+                n_h += 1
+                v_h += a
+        return {"sales": len(rows), "house_sales": n_h,
+                "revenue": round(v_all, 6), "house_revenue": round(v_h, 6)}
+    except Exception as e:
+        log.debug(f"🧠 ML house-share: {e}")
+        return {}
+
+
+def _ml_house_dominates(hs: dict, limit=None) -> bool:
+    """True quando a casa responde por >= limit (padrão 90%) das vendas E da receita da hora."""
+    try:
+        lim = _ML_HOUSE_DOMINANT if limit is None else float(limit)
+        n = int((hs or {}).get("sales", 0) or 0)
+        if n <= 0:
+            return False
+        s_share = int(hs.get("house_sales", 0) or 0) / n
+        rev = float(hs.get("revenue", 0.0) or 0.0)
+        r_share = (float(hs.get("house_revenue", 0.0) or 0.0) / rev) if rev > 0 else s_share
+        return s_share >= lim and r_share >= lim
+    except Exception:
+        return False
+
+
 def _ml_score_current_hour() -> dict:
     """Pontua a ultima hora COMPLETA; anomalia -> log + arquivo + Telegram (1/6h)."""
     if not _ML_SK:
@@ -19126,8 +19238,24 @@ def _ml_score_current_hour() -> dict:
                 except Exception:
                     hist = []
             sev = "buyer" if (cur[2] > 0 or cur[3] > 0 or cur[4] > 0) else "volume"
-            if sev == "buyer" and _ml_hour_house_only():
-                sev = "house"
+            if sev == "buyer":
+                _hs = {}
+                if _ml_hour_house_only():
+                    sev = "house"
+                else:
+                    # v48.86.0: hora DOMINADA pela casa (>= 90% das vendas e da receita) também é
+                    # varredura do operador: 1-2 vendas de comprador de fora no meio dela não a
+                    # tornam alerta de comprador (16/nov 01:17 UTC: 222 de 224 eram da casa).
+                    _hs = _ml_hour_house_share()
+                    if _ml_house_dominates(_hs):
+                        sev = "house"
+                        out["house_share"] = {"sales": f"{_hs['house_sales']}/{_hs['sales']}",
+                                              "revenue": f"{_hs['house_revenue']:.4f}/{_hs['revenue']:.4f}"}
+                    elif cur[2] < _ML_BUYER_MIN_SALES and cur[3] < _ML_BUYER_MIN_USD:
+                        # poucas vendas (<20 e <US$1): o que fugiu do padrão foi o TRÁFEGO, não
+                        # compradores (16/nov 02:17 UTC: 4 vendas / $0.009 virou 'buyer' e só não
+                        # foi ao Telegram porque o falso alarme das 01:17 ocupava a janela de 6 h)
+                        sev = "volume"
             out["severity"] = sev
             hist.append({"ts": int(time.time()), **out})
             _ML_ANOM_FILE.write_text(json.dumps(hist[-50:]))
@@ -38493,6 +38621,28 @@ def _v4835_store_delivered(resp):
     return resp
 
 
+def _merge_schema(a, b):
+    """v48.86.0: schema que valida TUDO o que a OU b validam (união conservadora; {} = qualquer valor)."""
+    if a == b:
+        return a
+    if not a or not b:
+        return {}
+    ta, tb = a.get("type"), b.get("type")
+    if ta == "object" and tb == "object":
+        pa, pb = a.get("properties"), b.get("properties")
+        if pa is None or pb is None:
+            return {"type": "object"}
+        props = {k: (_merge_schema(pa[k], pb[k]) if k in pa and k in pb else (pa[k] if k in pa else pb[k]))
+                 for k in list(pa) + [k for k in pb if k not in pa]}
+        return {"type": "object", "properties": dict(list(props.items())[:40])}
+    if ta == "array" and tb == "array":
+        ia, ib = a.get("items"), b.get("items")
+        return {"type": "array", "items": (_merge_schema(ia, ib) if ia is not None and ib is not None else {})}
+    if ta in ("integer", "number") and tb in ("integer", "number"):
+        return {"type": "number"}
+    return {}
+
+
 def _infer_schema(v, depth: int = 0):
     if isinstance(v, bool):
         return {"type": "boolean"}
@@ -38505,7 +38655,17 @@ def _infer_schema(v, depth: int = 0):
     if v is None:
         return {}
     if isinstance(v, list):
-        return {"type": "array", "items": (_infer_schema(v[0], depth + 1) if v and depth < 3 else {})}
+        # v48.86.0: o schema de `items` vinha só do 1º elemento; lista com inteiro no 1º e decimal
+        # depois (coingecko_usd: 97123 e 142.35 no /cross-chain) gerava um schema que reprovava o
+        # próprio exemplo, e a CDP respondeu "rejected: invalid discovery configuration" (16/nov
+        # 00:46). Agora o schema é a união de até 20 elementos.
+        if not v or depth >= 3:
+            return {"type": "array", "items": {}}
+        _it = None
+        for _x in v[:20]:
+            _sx = _infer_schema(_x, depth + 1)
+            _it = _sx if _it is None else _merge_schema(_it, _sx)
+        return {"type": "array", "items": _it}
     if isinstance(v, dict):
         if depth >= 3:
             return {"type": "object"}
@@ -40291,7 +40451,7 @@ _ops_validate = _v4843_ops_validate
 
 _v4842_sanitize_governance()
 
-VERSION = "48.85.0-CLEAR"
+VERSION = "48.86.0-CEILING"
 
 
 # ============================================================================
@@ -40856,4 +41016,7 @@ if _NEXUS_TAIL_OK is False:
 
 
 # v48.85.0-CLEAR: (1) o log do guard traz o que ha DENTRO da transacao Solana recusada (tamanho dos dados e contas por instrucao, units/price/amount, assinaturas e fee payer): o bot de 15/nov chegou com a ordem certa [ComputeBudget:2, ComputeBudget:3, Token:12] e ainda assim foi recusado em compute_limit_instruction, entao o defeito esta nos dados; o hint do 402 diz os tamanhos exatos; (2) hora fora do padrao causada so por carteira da casa (varredura de indexacao do operador) vira INFO em vez de WARNING; (3) o arquivo ganha o marcador final '# EOF-LOSBETO' e o no avisa no boot se ele faltar (arquivo cortado ao copiar); o rodape 48.84, que veio cortado, foi restaurado | base: v48.84.0-STEADY com os ajustes do operador (failed_at no sol_dest_ata; pausas humanas antigas viram hold)
-# EOF-LOSBETO 48.85.0-CLEAR — fim do arquivo (se esta linha faltar, a copia foi cortada)
+
+
+# v48.86.0-CEILING: (1) bot Solana de 15-16/nov: o log do guard agora diz a causa em palavras (diag=cu_limit_acima_do_teto(200000>50000)) e o hint do 402 abre com 'Cause: your SetComputeUnitLimit is 200000 ... set it to about 30000' — so diagnostico, o no nunca recusa por causa disso; (2) alerta ANOMALIA: hora dominada pela casa (>=90% das vendas e da receita: varredura do operador com 2 vendas de um comprador de fora no meio) vira severity house (INFO, sem Telegram) e hora com poucas vendas (<20 e <US$1) vira volume (WARNING, sem Telegram); (3) /weather: UMA retentativa quando a rede falha antes de haver resposta (handshake/conexao do Open-Meteo), nunca depois de resposta HTTP nem de leitura lenta; (4) Bazaar: o schema de lista passa a ser a uniao dos elementos (inteiro e decimal na mesma lista reprovava o proprio exemplo e a CDP respondia 'invalid discovery configuration' no /cross-chain) | base: v48.85.0-CLEAR identico ao arquivo do operador
+# EOF-LOSBETO 48.86.0-CEILING — fim do arquivo (se esta linha faltar, a copia foi cortada)
