@@ -2,7 +2,7 @@
 """
 Losbeto x402 — monolithic Flask service for Railway.
 
-Current release: 48.87.0-QUIET.
+Current release: 48.88.0-RESTORE.
 Payment requirements are server-side. Delivery requires verified settlement;
 pending payments are reconciled against independent chain evidence.
 Operational history lives in CHANGELOG.md, not in executable boot output.
@@ -62,6 +62,8 @@ workers and refreshes it in the background, logs the instruction layout of a
 rejected Solana payment, and stops re-announcing old governance decisions at boot.
 48.87 rate-limits repetitive weather-circuit warnings without changing the 503,
 payment, bundle or recovery behavior.
+48.88 keeps weather registered across deploys, hides it only while its circuit is
+open and restores catalog visibility automatically after real recovery.
 """
 from __future__ import annotations
 
@@ -18811,6 +18813,7 @@ _SCAN_NOISE_EXTRA = re.compile(
     r"(^|/)(tmp|temp|old|_old|backup|backups|bak|db|dump|uploads?|files?|archive|old_site)(/|$)|"
     r"(^|/)[^/]*\.(?:zip|rar|7z|tar|tgz|gz|bz2|xz)$|"
     r"(^|/)[^/]*\.tfstate(?:\..*)?$|(^|/)\.terraform(?:/|$)|(^|/)[^/]*\.tfvars$|"
+    r"(^|/)app/etc/local\.xml$|(^|/)\.codex(?:/|$)|"
     r"(^|/)frontend/web/debug|(^|/)debug/|_debugbar|(^|/)telescope/requests|"
     r"(^|/)(aws|gcp|azure|firebase|supabase)\.(ya?ml|json)$|"
     r"(^|/)[^/]*\.properties$|(^|/)\.well-known/|"
@@ -28173,6 +28176,10 @@ for _ep, _p in _V32_REPRICE.items():
 _assert_plan_ladder()
 
 for _ep, _precisa in list(PROVIDER_REQUIRED_ENDPOINTS.items()):
+    # /weather usa circuito temporário, não ausência permanente de chave. O
+    # registro fica intacto; a vitrine dinâmica o esconde só durante a falha.
+    if _ep == "/weather":
+        continue
     if _ep in BASE_PRICES and not _precisa():
         BASE_PRICES.pop(_ep, None)
         ENDPOINT_HANDLERS.pop(_ep, None)
@@ -34400,6 +34407,13 @@ def _sellability_block(path):
             }
     except Exception:
         pass
+    if path == "/weather" and not Brain._weather_upstream_available():
+        body, _status = _unavailable_body(
+            "Open-Meteo is temporarily unavailable; no payment is requested "
+            "and no stale weather data is presented as current.",
+            max(1, Brain._weather_upstream_remaining()))
+        body["endpoint"] = path
+        return body
     try:
         return _SELLABILITY_BLOCK_ORIG(path)
     except Exception:
@@ -40468,7 +40482,7 @@ _ops_validate = _v4843_ops_validate
 
 _v4842_sanitize_governance()
 
-VERSION = "48.87.0-QUIET"
+VERSION = "48.88.0-RESTORE"
 
 
 # ============================================================================
@@ -41035,6 +41049,6 @@ if _NEXUS_TAIL_OK is False:
 # v48.85.0-CLEAR: (1) o log do guard traz o que ha DENTRO da transacao Solana recusada (tamanho dos dados e contas por instrucao, units/price/amount, assinaturas e fee payer): o bot de 15/nov chegou com a ordem certa [ComputeBudget:2, ComputeBudget:3, Token:12] e ainda assim foi recusado em compute_limit_instruction, entao o defeito esta nos dados; o hint do 402 diz os tamanhos exatos; (2) hora fora do padrao causada so por carteira da casa (varredura de indexacao do operador) vira INFO em vez de WARNING; (3) o arquivo ganha o marcador final '# EOF-LOSBETO' e o no avisa no boot se ele faltar (arquivo cortado ao copiar); o rodape 48.84, que veio cortado, foi restaurado | base: v48.84.0-STEADY com os ajustes do operador (failed_at no sol_dest_ata; pausas humanas antigas viram hold)
 
 
-# v48.87.0-QUIET: (1) bot Solana de 15-16/nov: o log do guard agora diz a causa em palavras (diag=cu_limit_acima_do_teto(200000>50000)) e o hint do 402 abre com 'Cause: your SetComputeUnitLimit is 200000 ... set it to about 30000' — so diagnostico, o no nunca recusa por causa disso; (2) alerta ANOMALIA: hora dominada pela casa (>=90% das vendas e da receita: varredura do operador com 2 vendas de um comprador de fora no meio) vira severity house (INFO, sem Telegram) e hora com poucas vendas (<20 e <US$1) vira volume (WARNING, sem Telegram); (3) /weather: UMA retentativa quando a rede falha antes de haver resposta (handshake/conexao do Open-Meteo), nunca depois de resposta HTTP nem de leitura lenta; (4) Bazaar: o schema de lista passa a ser a uniao dos elementos (inteiro e decimal na mesma lista reprovava o proprio exemplo e a CDP respondia 'invalid discovery configuration' no /cross-chain) | base: v48.85.0-CLEAR identico ao arquivo do operador
-# v48.87.0-QUIET: warnings do preflight de /weather limitados a 1 por processo/tipo/15min; respostas 503, circuito, bundle e pagamento inalterados | base: v48.86.0-CEILING
-# EOF-LOSBETO 48.87.0-QUIET — fim do arquivo (se esta linha faltar, a copia foi cortada)
+# v48.86.0-CEILING: (1) bot Solana de 15-16/nov: o log do guard agora diz a causa em palavras (diag=cu_limit_acima_do_teto(200000>50000)) e o hint do 402 abre com 'Cause: your SetComputeUnitLimit is 200000 ... set it to about 30000' — so diagnostico, o no nunca recusa por causa disso; (2) alerta ANOMALIA: hora dominada pela casa (>=90% das vendas e da receita: varredura do operador com 2 vendas de um comprador de fora no meio) vira severity house (INFO, sem Telegram) e hora com poucas vendas (<20 e <US$1) vira volume (WARNING, sem Telegram); (3) /weather: UMA retentativa quando a rede falha antes de haver resposta (handshake/conexao do Open-Meteo), nunca depois de resposta HTTP nem de leitura lenta; (4) Bazaar: o schema de lista passa a ser a uniao dos elementos (inteiro e decimal na mesma lista reprovava o proprio exemplo e a CDP respondia 'invalid discovery configuration' no /cross-chain) | base: v48.85.0-CLEAR identico ao arquivo do operador
+# v48.88.0-RESTORE: /weather nunca é removido permanentemente no boot; catálogo dinâmico oculta durante circuito aberto e restaura após recuperação; Magento local.xml e .codex/auth.json viram scanner | base: v48.87.0-QUIET
+# EOF-LOSBETO 48.88.0-RESTORE — fim do arquivo (se esta linha faltar, a copia foi cortada)
