@@ -1,13 +1,13 @@
 {
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
   "name": "io.github.rmartins1451/losbeto",
+  "description": "Cross-asset market data, LLM gateway and ML forecasts for AI agents. USDC via x402 + MPP.",
   "title": "Losbeto — Market Data for AI Agents",
-  "description": "Cross-asset market data and LLM inference for AI agents. Pay-per-call in USDC via x402.",
-  "version": "48.9.7",
   "repository": {
-    "source": "github",
-    "url": "https://github.com/rmartins1451/losbeto"
+    "url": "https://github.com/rmartins1451/losbeto",
+    "source": "github"
   },
+  "version": "48.92.0",
   "websiteUrl": "https://api.losbeto.xyz",
   "icons": [
     {
