@@ -2,7 +2,7 @@
 """
 Losbeto x402 — monolithic Flask service for Railway.
 
-Current release: 48.90.0-PROOFLEAN.
+Current release: 48.92.0-ATOMICBOOT.
 Payment requirements are server-side. Delivery requires verified settlement;
 pending payments are reconciled against independent chain evidence.
 Operational history lives in CHANGELOG.md, not in executable boot output.
@@ -10886,18 +10886,9 @@ def paid_endpoint(path):
             if sig and not _rl_check(ip):
                 return jsonify({"error": "rate-limit", "limit_rpm": RL_RPM_IP}), 429
 
-            _pre = _preflight_unavailable(path)
-            if _pre is not None:
-                LEDGER.log_request(path, False, int((time.time() - t0) * 1000), ip,
-                                   kind="unavailable",
-                                   ua=request.headers.get("User-Agent", ""),
-                                   params=_clean_params())
-                _body, _code = _pre
-                _r = jsonify(_body)
-                _r.status_code = _code
-                _r.headers["Retry-After"] = str(_body["retry_after_seconds"])
-                return _r
-
+            # Validação estática não depende de rede e deve ser determinística:
+            # parâmetro inválido é 400 mesmo se o provedor estiver fora. Continua
+            # ANTES de qualquer 402, verificação de pagamento ou execução paga.
             _pbad = _preflight_param_check(
                 path, check_required=bool(sig) and sig != "mpp-tempo")
             if _pbad is not None:
@@ -10908,6 +10899,18 @@ def paid_endpoint(path):
                 _b, _c = _pbad
                 _r = jsonify(_b)
                 _r.status_code = _c
+                return _r
+
+            _pre = _preflight_unavailable(path)
+            if _pre is not None:
+                LEDGER.log_request(path, False, int((time.time() - t0) * 1000), ip,
+                                   kind="unavailable",
+                                   ua=request.headers.get("User-Agent", ""),
+                                   params=_clean_params())
+                _body, _code = _pre
+                _r = jsonify(_body)
+                _r.status_code = _code
+                _r.headers["Retry-After"] = str(_body["retry_after_seconds"])
                 return _r
 
             if not sig:
@@ -18845,6 +18848,10 @@ _SCAN_NOISE_EXTRA = re.compile(
     # js/config.js e o /metrics de raspadores Prometheus
     r"(^|/)\.azure(?:/|$)|(^|/)serverless\.ya?ml$|(^|/)settings\.py$|(^|/)(?:js/)?config\.js$|"
     r"(^|/)metrics/?$|(^|/)(?:access|refresh)tokens?\.json$|(^|/)azureprofile\.json$|"
+    # v48.91.0: mais caça a config de deploy/registro que o radar chamou de "produto novo" (17/nov):
+    # vercel.json, netlify.toml, parameters.yml (Symfony), /v2/_catalog (Docker Registry), .pypirc
+    r"(^|/)vercel\.json$|(^|/)netlify\.toml$|(^|/)parameters\.ya?ml$|(^|/)v2/_catalog/?$|"
+    r"(^|/)\.(?:pypirc|npmrc|yarnrc|dockerignore)$|(^|/)docker-compose[^/]*\.ya?ml$|(^|/)appsettings[^/]*\.json$|"
     r"(^|/)frontend/web/debug|(^|/)debug/|_debugbar|(^|/)telescope/requests|"
     r"(^|/)(aws|gcp|azure|firebase|supabase)\.(ya?ml|json)$|"
     r"(^|/)[^/]*\.properties$|(^|/)\.well-known/|"
@@ -36643,31 +36650,47 @@ _start_background_once = _start_background_once
 
 
 _TG_BOOT_FILE = HOME_DIR / "tg_boot.json"
+_TG_BOOT_LOCK_FILE = HOME_DIR / "tg_boot.lock"
 
 _TG_PING_WORDS = {"ok", "ping", "pong", "teste", "test", "oi", "ola", "olá",
                   "testando", "sim", "funciona", "no ar", "no-ar"}
 
 
 def _tg_boot_ping():
-    """Mensagem de boot com botão de auto-teste — 1x por container (flock)."""
+    """Boot-ping deduplicado no volume compartilhado, não apenas na sequência local.
+
+    O lock fecha a corrida ler→enviar→gravar entre containers. Só uma resposta com
+    message_id grava o dedupe: timeout/502 não pode fingir envio nem silenciar o próximo.
+    """
     if not (TG_TOKEN and TG_CHAT):
         return
     try:
-        pend = _ops_pending()
-        linhas = [f"✅ *v{VERSION} online* — canal de comando no ar.", ""]
-        if pend:
-            linhas.append(f"📋 *{len(pend)} proposta(s) aguardando decisão* "
-                          "— botões ✅/❌ nelas, ou `/ops ok N`.")
-            linhas.append("")
-        linhas.append("🏓 *Teste o canal em 2s*: toque no botão abaixo ou "
-                      "responda ESTA mensagem com `ok`.")
-        linhas.append("_Tudo que chegar vira rastro no tg_inbox do /ops/log._")
-        mid = _tg_send_capture_buttons(
-            "\n".join(linhas),
-            [[{"text": "🏓 Testar canal", "callback_data": "/ops ping"}]])
-        _ops_write_json(_TG_BOOT_FILE, {"ts": int(time.time()),
-                                        "msg_id": mid, "version": VERSION})
-        log.info(f"🏓 boot-ping enviado (msg_id={mid}) — canal auto-testável")
+        import fcntl as _tg_fcntl
+        with open(_TG_BOOT_LOCK_FILE, "a+") as _boot_lock:
+            _tg_fcntl.flock(_boot_lock, _tg_fcntl.LOCK_EX)
+            _prev = _ops_read_json(_TG_BOOT_FILE, {}) or {}
+            if (_prev.get("version") == VERSION
+                    and time.time() - float(_prev.get("ts", 0) or 0) < 900):
+                log.info("🏓 boot-ping já enviado para esta versão há menos de 15 min — não repete")
+                return
+            pend = _ops_pending()
+            linhas = [f"✅ *v{VERSION} online* — canal de comando no ar.", ""]
+            if pend:
+                linhas.append(f"📋 *{len(pend)} proposta(s) aguardando decisão* "
+                              "— botões ✅/❌ nelas, ou `/ops ok N`.")
+                linhas.append("")
+            linhas.append("🏓 *Teste o canal em 2s*: toque no botão abaixo ou "
+                          "responda ESTA mensagem com `ok`.")
+            linhas.append("_Tudo que chegar vira rastro no tg_inbox do /ops/log._")
+            mid = _tg_send_capture_buttons(
+                "\n".join(linhas),
+                [[{"text": "🏓 Testar canal", "callback_data": "/ops ping"}]])
+            if not mid:
+                log.warning("🏓 boot-ping NÃO confirmado pelo Telegram; dedupe não gravado")
+                return
+            _ops_write_json(_TG_BOOT_FILE, {"ts": int(time.time()),
+                                            "msg_id": mid, "version": VERSION})
+            log.info(f"🏓 boot-ping enviado (msg_id={mid}) — canal auto-testável")
     except Exception as e:
         log.warning(f"boot ping: {e}")
 
@@ -40514,7 +40537,7 @@ _ops_validate = _v4843_ops_validate
 
 _v4842_sanitize_governance()
 
-VERSION = "48.90.0-PROOFLEAN"
+VERSION = "48.92.0-ATOMICBOOT"
 
 
 # ============================================================================
@@ -41634,4 +41657,6 @@ if _NEXUS_TAIL_OK is False:
 # v48.88.0-RESTORE: /weather nunca é removido permanentemente no boot; catálogo dinâmico oculta durante circuito aberto e restaura após recuperação; Magento local.xml e .codex/auth.json viram scanner | base: v48.87.0-QUIET
 # v48.89.0-LEAN: (1) gzip na saida (middleware WSGI; 402, manifestos e paginas encolhem 70-88%; GZIP_DISABLED=1 desliga); (2) /weather ganha segunda fonte MET Norway (uso comercial com credito CC BY 4.0) quando o Open-Meteo bloqueia o IP do Railway | base: v48.88.0-RESTORE
 # v48.90.0-PROOFLEAN: revisão independente da 48.89 — gzip interpreta q=0/*, adiciona Vary às variantes elegíveis e preserva streaming; /weather usa MET Norway por padrão (Open-Meteo somente com OPEN_METEO_COMMERCIAL=1), respeita Expires/If-Modified-Since, rejeita cidade fora do gazetteer antes do 402 e mantém filtros de scanner | base: v48.89.0-LEAN
-# EOF-LOSBETO 48.90.0-PROOFLEAN — fim do arquivo (se esta linha faltar, a copia foi cortada)
+# v48.91.0-QUIETBOOT: radar trata vercel.json/netlify.toml/parameters.yml/v2/_catalog/.pypirc como scanner; boot-ping do Telegram nao repete a mesma versao em 15 min (deploy com dois containers) | base: v48.90.0-PROOFLEAN
+# v48.92.0-ATOMICBOOT: revisão independente da 48.91 — lock flock compartilhado fecha a corrida do boot-ping; 502/timeout sem message_id não grava dedupe nem finge envio; parâmetros inválidos são validados antes da disponibilidade de rede; filtros novos de scanner preservados | base: v48.91.0-QUIETBOOT
+# EOF-LOSBETO 48.92.0-ATOMICBOOT — fim do arquivo (se esta linha faltar, a copia foi cortada)
