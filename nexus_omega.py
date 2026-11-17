@@ -2,7 +2,7 @@
 """
 Losbeto x402 — monolithic Flask service for Railway.
 
-Current release: 48.88.0-RESTORE.
+Current release: 48.90.0-PROOFLEAN.
 Payment requirements are server-side. Delivery requires verified settlement;
 pending payments are reconciled against independent chain evidence.
 Operational history lives in CHANGELOG.md, not in executable boot output.
@@ -449,7 +449,7 @@ PRICE_OVERRIDES = _load_price_overrides()
 ENDPOINT_DESC = {
 
     "/pyth-price":      "Real-time SOL/USD from the Pyth Network oracle with its confidence interval and publish slot. Sub-second freshness, straight from the on-chain price account.",
-    "/weather":         "Live weather for any city or lat/lon on Earth: WMO-decoded current conditions, next 24h hourly and 7-day daily forecast with precipitation probability, sunrise/sunset and wind — from Open-Meteo's fused national-model grid (ECMWF/NOAA/DWD), no API key on your side.",
+    "/weather":         "Live forecast for major cities or any lat/lon: current nowcast, next 24h and up to 7 days with precipitation and wind. MET Norway Locationforecast with CC BY 4.0 attribution; Open-Meteo is used only when commercial access is explicitly configured.",
     "/fear-greed":      "Is the crowd greedy or fearful right now? The Fear & Greed Index (0-100) at this exact instant, with classification — a point-in-time reading your model's training data cannot contain.",
     "/trust-hash":      "SHA-256 proof-of-data hash for audit trails: a verifiable cryptographic receipt of any Losbeto response, for agents that must prove what they were told and when.",
     "/agent-market":    "Machine-readable commercial map of this catalog: featured endpoints, cheapest calls, the free tier and the credit plans, so an agent can plan a budget in one request.",
@@ -4923,6 +4923,22 @@ class Brain:
         cidade default (São Paulo) para o preview ?preview=1 nunca ficar
         preso em warming_up."""
         ts = int(time.time())
+        _alt = globals().get("_V4889_WEATHER_ALT")
+        # v48.90: MET Norway é o provedor padrão porque a API gratuita do
+        # Open-Meteo não licencia esta revenda comercial. O provedor antigo só
+        # entra com OPEN_METEO_COMMERCIAL=1, declaração explícita do operador.
+        if globals().get("_V4890_MET_PRIMARY") and not _v4890_open_commercial():
+            _r = _alt() if _alt else None
+            if _r:
+                return _r
+            return {"error": "licensed weather provider temporarily unavailable",
+                    "source": "met-no", "charged": False,
+                    "retry_after_seconds": _v4890_weather_retry(), "ts": ts}
+        # Com assinatura comercial explícita: Open-Meteo em cooldown -> MET Norway.
+        if _alt and Brain._weather_upstream_remaining() > 0:
+            _r = _alt()
+            if _r:
+                return _r
         if not Brain._weather_upstream_available():
             return {"error": "upstream temporarily unavailable", "source": "open-meteo",
                     "charged": False, "retry_after_seconds": Brain._weather_upstream_remaining(),
@@ -5049,6 +5065,10 @@ class Brain:
                     "ts": ts, "version": VERSION}
         except Exception as e:
             Brain._weather_upstream_mark(False, f"{type(e).__name__}: {str(e)[:100]}")
+            _alt = globals().get("_V4889_WEATHER_ALT")
+            _r = _alt() if _alt else None
+            if _r:
+                return _r
             return {"error": str(e)[:120], "source": "open-meteo",
                     "charged": False,
                     "retry_after_seconds": Brain._weather_upstream_remaining(), "ts": ts}
@@ -10152,6 +10172,10 @@ def _preflight_param_check(path: str, check_required: bool = False):
         _wbad = _weather_coord_problem()
         if _wbad:
             return _wbad, 400
+        _city_check = globals().get("_v4890_city_precheck")
+        _wcbad = _city_check() if _city_check else None
+        if _wcbad:
+            return _wcbad, 400
     rule = _PARAM_RULES.get(path)
     if rule:
         raw = request.args.get(rule["param"])
@@ -10235,24 +10259,26 @@ def _weather_preflight_log(kind: str) -> bool:
 def _preflight_unavailable(path: str):
     """Roda ANTES de qualquer 402 ou verificação de pagamento."""
     if path == "/weather" and not Brain._weather_upstream_available():
-        retry = max(1, Brain._weather_upstream_remaining())
+        _retry_fn = globals().get("_v4890_weather_retry")
+        retry = max(1, _retry_fn() if _retry_fn else Brain._weather_upstream_remaining())
         if _weather_preflight_log("cooldown"):
-            log.warning(f"⛔ pré-gate: /weather recusado sem cobrança — Open-Meteo em cooldown")
+            log.warning(f"⛔ pré-gate: /weather recusado sem cobrança — provedor licenciado em cooldown")
         return _unavailable_body(
-            "Open-Meteo is temporarily unavailable. This endpoint is not being "
-            "sold right now; no payment challenge was issued and no stale weather "
-            "data will be presented as current.", retry)
+            "The licensed weather provider is temporarily unavailable. This endpoint "
+            "is not being sold right now; no payment challenge was issued and no "
+            "stale weather data will be presented as current.", retry)
     if (path == "/weather" and Brain._weather_upstream_halfopen()
             and not Brain._weather_upstream_probe()):
         # v48.83.0: cooldown acabou mas o Open-Meteo ainda falha → NÃO vende
         # (antes o 1º comprador após cada cooldown pagava e era estornado).
-        retry = max(1, Brain._weather_upstream_remaining())
+        _retry_fn = globals().get("_v4890_weather_retry")
+        retry = max(1, _retry_fn() if _retry_fn else Brain._weather_upstream_remaining())
         if _weather_preflight_log("probe"):
-            log.warning("⛔ pré-gate: /weather recusado sem cobrança — sonda do Open-Meteo falhou")
+            log.warning("⛔ pré-gate: /weather recusado sem cobrança — sonda do provedor licenciado falhou")
         return _unavailable_body(
-            "Open-Meteo is still failing its health probe. This endpoint is not being "
-            "sold right now; no payment challenge was issued and no stale weather "
-            "data will be presented as current.", retry)
+            "The weather provider is still failing its health probe. This endpoint "
+            "is not being sold right now; no payment challenge was issued and no "
+            "stale weather data will be presented as current.", retry)
     _need = PROVIDER_REQUIRED_ENDPOINTS.get(path)
     if _need and not _need():
         log.warning(f"⛔ pré-gate: {path} recusado sem cobrança — "
@@ -18814,6 +18840,11 @@ _SCAN_NOISE_EXTRA = re.compile(
     r"(^|/)[^/]*\.(?:zip|rar|7z|tar|tgz|gz|bz2|xz)$|"
     r"(^|/)[^/]*\.tfstate(?:\..*)?$|(^|/)\.terraform(?:/|$)|(^|/)[^/]*\.tfvars$|"
     r"(^|/)app/etc/local\.xml$|(^|/)\.codex(?:/|$)|"
+    # v48.89.0: caça a credenciais/config que o radar chamava de "produto novo" e mandava ao
+    # Telegram ("DEMANDA DETECTADA /settings.py", 17/nov): .azure/*, serverless.yml, settings.py,
+    # js/config.js e o /metrics de raspadores Prometheus
+    r"(^|/)\.azure(?:/|$)|(^|/)serverless\.ya?ml$|(^|/)settings\.py$|(^|/)(?:js/)?config\.js$|"
+    r"(^|/)metrics/?$|(^|/)(?:access|refresh)tokens?\.json$|(^|/)azureprofile\.json$|"
     r"(^|/)frontend/web/debug|(^|/)debug/|_debugbar|(^|/)telescope/requests|"
     r"(^|/)(aws|gcp|azure|firebase|supabase)\.(ya?ml|json)$|"
     r"(^|/)[^/]*\.properties$|(^|/)\.well-known/|"
@@ -34408,10 +34439,11 @@ def _sellability_block(path):
     except Exception:
         pass
     if path == "/weather" and not Brain._weather_upstream_available():
+        _retry_fn = globals().get("_v4890_weather_retry")
         body, _status = _unavailable_body(
-            "Open-Meteo is temporarily unavailable; no payment is requested "
-            "and no stale weather data is presented as current.",
-            max(1, Brain._weather_upstream_remaining()))
+            "The licensed weather provider is temporarily unavailable; no payment "
+            "is requested and no stale weather data is presented as current.",
+            max(1, _retry_fn() if _retry_fn else Brain._weather_upstream_remaining()))
         body["endpoint"] = path
         return body
     try:
@@ -40482,7 +40514,7 @@ _ops_validate = _v4843_ops_validate
 
 _v4842_sanitize_governance()
 
-VERSION = "48.88.0-RESTORE"
+VERSION = "48.90.0-PROOFLEAN"
 
 
 # ============================================================================
@@ -41008,6 +41040,555 @@ def _v4856_a2a_rest_guard():
 
 
 # ============================================================================
+# v48.90.0-PROOFLEAN — gzip no container + clima licenciado e verificável
+#
+# (1) A borda do Railway já comprime para o cliente, mas a resposta oficial no fórum
+#     informa que o egress é medido antes dessa compressão. O middleware WSGI reduz o
+#     corpo que sai do container sem mudar o protocolo. Respeita q=0/*, Vary em ambas
+#     as variantes, ETag fraco, HEAD, SSE, no-transform e corpo < 1 KB. Roda depois dos
+#     after_request (inclusive o grant de entrega). GZIP_DISABLED=1 desliga sem deploy.
+#
+# (2) A API gratuita do Open-Meteo não licencia esta revenda comercial. MET Norway é
+#     portanto o padrão; OPEN_METEO_COMMERCIAL=1 só deve ser usado após assinatura real.
+#     O cache obedece Expires e revalida com If-Modified-Since; falha não promove dado
+#     velho. Cidades usam gazetteer explícito e qualquer ponto aceita lat/lon. Cidade
+#     desconhecida é 400 antes do 402, não pagamento seguido de crédito interno. A saída
+#     e os buckets diários da MET são UTC, sem fusos fixos quebrando no horário de verão.
+# ============================================================================
+import gzip as _v4889_gzip
+import unicodedata as _v4889_ud
+
+
+class _V4889Gzip:
+    MIN_BYTES = 1024
+    TYPES = ("application/json", "text/", "application/javascript", "application/xml",
+             "application/ld+json", "application/manifest+json", "image/svg+xml",
+             "application/x-ndjson", "application/problem+json")
+
+    def __init__(self, wsgi):
+        self.wsgi = wsgi
+        self.stats = {"compressed": 0, "bytes_in": 0, "bytes_out": 0, "skipped": 0}
+
+    @staticmethod
+    def _hdr(headers, name):
+        n = name.lower()
+        for k, v in headers:
+            if k.lower() == n:
+                return v
+        return None
+
+    def _eligible(self, status, headers):
+        try:
+            code = int(str(status).split(" ", 1)[0])
+        except Exception:
+            return False
+        if code < 200 or code in (204, 206, 304):
+            return False
+        if self._hdr(headers, "Content-Encoding"):
+            return False
+        ctype = (self._hdr(headers, "Content-Type") or "").lower()
+        if "text/event-stream" in ctype or not any(ctype.startswith(t) for t in self.TYPES):
+            return False
+        if "no-transform" in (self._hdr(headers, "Cache-Control") or "").lower():
+            return False
+        cl = self._hdr(headers, "Content-Length")
+        if cl is not None:
+            try:
+                if int(cl) < self.MIN_BYTES:
+                    return False
+            except ValueError:
+                return False
+        return True
+
+    @staticmethod
+    def _accepts_gzip(value):
+        """Negociação HTTP real: `gzip;q=0` e `*` com q=0 são recusa, não aceite."""
+        wildcard = None
+        exact = None
+        for item in str(value or "").lower().split(","):
+            parts = [p.strip() for p in item.split(";")]
+            coding = parts[0]
+            if coding not in ("gzip", "*"):
+                continue
+            q = 1.0
+            for p in parts[1:]:
+                if p.startswith("q="):
+                    try:
+                        q = float(p[2:])
+                    except ValueError:
+                        q = 0.0
+            q = q if 0.0 <= q <= 1.0 else 0.0
+            if coding == "gzip":
+                exact = q
+            else:
+                wildcard = q
+        q = exact if exact is not None else wildcard
+        return q is not None and q > 0.0
+
+    @staticmethod
+    def _with_vary(headers):
+        """Toda variante potencialmente comprimível declara Vary, inclusive identity."""
+        out = []
+        found = False
+        for k, v in headers:
+            if k.lower() == "vary":
+                found = True
+                tokens = [p.strip() for p in str(v).split(",") if p.strip()]
+                if not any(p.lower() == "accept-encoding" for p in tokens):
+                    tokens.append("Accept-Encoding")
+                v = ", ".join(tokens)
+            out.append((k, v))
+        if not found:
+            out.append(("Vary", "Accept-Encoding"))
+        return out
+
+    def __call__(self, environ, start_response):
+        ae = environ.get("HTTP_ACCEPT_ENCODING") or ""
+        if environ.get("REQUEST_METHOD") == "HEAD" or os.environ.get("GZIP_DISABLED", "") == "1":
+            return self.wsgi(environ, start_response)
+        captured = {}
+
+        def _capture(status, headers, exc_info=None):
+            captured["args"] = (status, headers, exc_info)
+            return lambda data: captured.setdefault("writes", []).append(data)
+
+        app_iter = self.wsgi(environ, _capture)
+        if "args" not in captured or captured.get("writes"):
+            # app sem start_response síncrono ou usando write(): repassa intacto
+            status, headers, exc_info = captured.get("args", ("500 INTERNAL SERVER ERROR", [], None))
+            write = start_response(status, headers, exc_info)
+            for d in captured.get("writes", []):
+                write(d)
+            return app_iter
+        status, headers, exc_info = captured["args"]
+        if not self._eligible(status, headers):
+            self.stats["skipped"] += 1
+            start_response(status, headers, exc_info)
+            return app_iter
+        # Também a resposta identity precisa de Vary; caso contrário um cache pode
+        # reutilizá-la para um cliente gzip (ou o contrário) fora da RFC 9110.
+        headers = self._with_vary(headers)
+        if not self._accepts_gzip(ae):
+            self.stats["skipped"] += 1
+            start_response(status, headers, exc_info)
+            return app_iter
+        try:
+            body = b"".join(app_iter)
+        finally:
+            if hasattr(app_iter, "close"):
+                app_iter.close()
+        if len(body) < self.MIN_BYTES:
+            start_response(status, headers, exc_info)
+            return [body]
+        packed = _v4889_gzip.compress(body, compresslevel=5)
+        if len(packed) >= len(body):
+            start_response(status, headers, exc_info)
+            return [body]
+        new_headers = []
+        for k, v in headers:
+            kl = k.lower()
+            if kl in ("content-length", "content-md5", "digest"):
+                continue
+            if kl == "etag" and not v.startswith("W/"):
+                v = "W/" + v
+            new_headers.append((k, v))
+        new_headers.append(("Content-Encoding", "gzip"))
+        new_headers.append(("Content-Length", str(len(packed))))
+        self.stats["compressed"] += 1
+        self.stats["bytes_in"] += len(body)
+        self.stats["bytes_out"] += len(packed)
+        start_response(status, new_headers, exc_info)
+        return [packed]
+
+
+if not isinstance(app.wsgi_app, _V4889Gzip):
+    app.wsgi_app = _V4889Gzip(app.wsgi_app)
+_V4889_GZIP = app.wsgi_app
+
+
+# ---------------------------------------------------------------- MET Norway
+_V4889_METNO_URL = "https://api.met.no/weatherapi/locationforecast/2.0/compact"
+_V4889_METNO_UA = os.environ.get(
+    "METNO_USER_AGENT",
+    f"Losbeto/{VERSION} (+https://api.losbeto.xyz; weather resale with MET Norway credit)")
+_V4889_METNO_ON = os.environ.get("METNO_FALLBACK", "1") != "0"
+
+# cidade -> (lat, lon, país, fuso UTC padrão em horas). As mais pedidas no radar + capitais.
+_V4889_CITIES = {
+    "sao paulo": (-23.5505, -46.6333, "Brazil", -3), "rio de janeiro": (-22.9068, -43.1729, "Brazil", -3),
+    "brasilia": (-15.7939, -47.8828, "Brazil", -3), "belo horizonte": (-19.9167, -43.9345, "Brazil", -3),
+    "porto alegre": (-30.0346, -51.2177, "Brazil", -3), "curitiba": (-25.4284, -49.2733, "Brazil", -3),
+    "salvador": (-12.9777, -38.5016, "Brazil", -3), "recife": (-8.0476, -34.8770, "Brazil", -3),
+    "fortaleza": (-3.7319, -38.5267, "Brazil", -3), "manaus": (-3.1190, -60.0217, "Brazil", -4),
+    "tokyo": (35.6762, 139.6503, "Japan", 9), "osaka": (34.6937, 135.5023, "Japan", 9),
+    "seoul": (37.5665, 126.9780, "South Korea", 9), "beijing": (39.9042, 116.4074, "China", 8),
+    "shanghai": (31.2304, 121.4737, "China", 8), "hong kong": (22.3193, 114.1694, "Hong Kong", 8),
+    "singapore": (1.3521, 103.8198, "Singapore", 8), "taipei": (25.0330, 121.5654, "Taiwan", 8),
+    "bangkok": (13.7563, 100.5018, "Thailand", 7), "jakarta": (-6.2088, 106.8456, "Indonesia", 7),
+    "mumbai": (19.0760, 72.8777, "India", 5.5), "delhi": (28.7041, 77.1025, "India", 5.5),
+    "new delhi": (28.6139, 77.2090, "India", 5.5), "bangalore": (12.9716, 77.5946, "India", 5.5),
+    "dubai": (25.2048, 55.2708, "United Arab Emirates", 4), "istanbul": (41.0082, 28.9784, "Turkey", 3),
+    "moscow": (55.7558, 37.6173, "Russia", 3), "tel aviv": (32.0853, 34.7818, "Israel", 2),
+    "cairo": (30.0444, 31.2357, "Egypt", 2), "johannesburg": (-26.2041, 28.0473, "South Africa", 2),
+    "lagos": (6.5244, 3.3792, "Nigeria", 1), "nairobi": (-1.2921, 36.8219, "Kenya", 3),
+    "london": (51.5074, -0.1278, "United Kingdom", 0), "dublin": (53.3498, -6.2603, "Ireland", 0),
+    "lisbon": (38.7223, -9.1393, "Portugal", 0), "madrid": (40.4168, -3.7038, "Spain", 1),
+    "barcelona": (41.3874, 2.1686, "Spain", 1), "paris": (48.8566, 2.3522, "France", 1),
+    "berlin": (52.5200, 13.4050, "Germany", 1), "frankfurt": (50.1109, 8.6821, "Germany", 1),
+    "munich": (48.1351, 11.5820, "Germany", 1), "amsterdam": (52.3676, 4.9041, "Netherlands", 1),
+    "brussels": (50.8503, 4.3517, "Belgium", 1), "zurich": (47.3769, 8.5417, "Switzerland", 1),
+    "rome": (41.9028, 12.4964, "Italy", 1), "milan": (45.4642, 9.1900, "Italy", 1),
+    "vienna": (48.2082, 16.3738, "Austria", 1), "warsaw": (52.2297, 21.0122, "Poland", 1),
+    "stockholm": (59.3293, 18.0686, "Sweden", 1), "oslo": (59.9139, 10.7522, "Norway", 1),
+    "copenhagen": (55.6761, 12.5683, "Denmark", 1), "helsinki": (60.1699, 24.9384, "Finland", 2),
+    "kyiv": (50.4501, 30.5234, "Ukraine", 2), "athens": (37.9838, 23.7275, "Greece", 2),
+    "new york": (40.7128, -74.0060, "United States", -5), "boston": (42.3601, -71.0589, "United States", -5),
+    "washington": (38.9072, -77.0369, "United States", -5), "miami": (25.7617, -80.1918, "United States", -5),
+    "chicago": (41.8781, -87.6298, "United States", -6), "dallas": (32.7767, -96.7970, "United States", -6),
+    "houston": (29.7604, -95.3698, "United States", -6), "denver": (39.7392, -104.9903, "United States", -7),
+    "los angeles": (34.0522, -118.2437, "United States", -8), "san francisco": (37.7749, -122.4194, "United States", -8),
+    "seattle": (47.6062, -122.3321, "United States", -8), "toronto": (43.6532, -79.3832, "Canada", -5),
+    "vancouver": (49.2827, -123.1207, "Canada", -8), "mexico city": (19.4326, -99.1332, "Mexico", -6),
+    "buenos aires": (-34.6037, -58.3816, "Argentina", -3), "santiago": (-33.4489, -70.6693, "Chile", -4),
+    "lima": (-12.0464, -77.0428, "Peru", -5), "bogota": (4.7110, -74.0721, "Colombia", -5),
+    "montevideo": (-34.9011, -56.1645, "Uruguay", -3), "sydney": (-33.8688, 151.2093, "Australia", 10),
+    "melbourne": (-37.8136, 144.9631, "Australia", 10), "auckland": (-36.8485, 174.7633, "New Zealand", 12),
+}
+_V4889_CITY_ALIAS = {"sp": "sao paulo", "rio": "rio de janeiro", "nyc": "new york",
+                     "new york city": "new york", "la": "los angeles", "sf": "san francisco",
+                     "bombay": "mumbai", "peking": "beijing", "kiev": "kyiv", "cdmx": "mexico city",
+                     "washington dc": "washington", "washington d.c.": "washington"}
+
+_V4889_SYMBOL_TEXT = {
+    "clearsky": "Clear sky", "fair": "Mainly clear", "partlycloudy": "Partly cloudy",
+    "cloudy": "Overcast", "fog": "Fog", "lightrain": "Light rain", "rain": "Rain",
+    "heavyrain": "Heavy rain", "lightrainshowers": "Light rain showers", "rainshowers": "Rain showers",
+    "heavyrainshowers": "Heavy rain showers", "lightsleet": "Light sleet", "sleet": "Sleet",
+    "heavysleet": "Heavy sleet", "lightsnow": "Light snow", "snow": "Snow", "heavysnow": "Heavy snow",
+    "lightsnowshowers": "Light snow showers", "snowshowers": "Snow showers",
+    "heavysnowshowers": "Heavy snow showers", "rainandthunder": "Rain and thunder",
+    "lightrainandthunder": "Light rain and thunder", "heavyrainandthunder": "Heavy rain and thunder",
+    "rainshowersandthunder": "Rain showers and thunder",
+    "lightrainshowersandthunder": "Light rain showers and thunder",
+    "heavyrainshowersandthunder": "Heavy rain showers and thunder",
+}
+
+
+def _v4889_norm_city(q):
+    s = _v4889_ud.normalize("NFKD", str(q or "")).encode("ascii", "ignore").decode().lower()
+    s = re.sub(r"[^a-z0-9. ]+", " ", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    s = s.split(",")[0].strip()
+    return _V4889_CITY_ALIAS.get(s, s)
+
+
+def _v4889_symbol_text(code):
+    base = str(code or "").split("_")[0]
+    return _V4889_SYMBOL_TEXT.get(base, base.replace("and", " and ").strip().capitalize() or None)
+
+
+def _v4890_http_ts(value, default):
+    try:
+        from email.utils import parsedate_to_datetime
+        dt = parsedate_to_datetime(str(value))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return float(dt.timestamp())
+    except Exception:
+        return float(default)
+
+
+def _v4889_metno_fetch(lat, lon, use_cache=True):
+    """Locationforecast compact com cache pela validade HTTP real.
+
+    Os termos atuais da MET proíbem repetir a mesma chamada antes de `Expires` e
+    pedem `If-Modified-Since` depois disso. Um TTL fixo de 10 min não cumpre isso.
+    Nunca servimos o snapshot após falha de revalidação: dado velho não vira atual.
+    """
+    lat4, lon4 = round(float(lat), 4), round(float(lon), 4)
+    if not (math.isfinite(lat4) and math.isfinite(lon4)
+            and -90.0 <= lat4 <= 90.0 and -180.0 <= lon4 <= 180.0):
+        raise ValueError("invalid MET Norway coordinates")
+    key = f"metno:v2:{lat4:.4f},{lon4:.4f}"
+    now = time.time()
+    rec = None
+    try:
+        rec = LEDGER.cache_get(key, 7 * 86400) if use_cache else None
+        if isinstance(rec, dict):
+            data = rec.get("data")
+            if isinstance(data, dict) and data.get("properties") and now < float(rec.get("expires", 0)):
+                return data
+    except Exception:
+        rec = None
+    headers = {"User-Agent": _V4889_METNO_UA, "Accept": "application/json",
+               "Accept-Encoding": "gzip"}
+    if isinstance(rec, dict) and rec.get("last_modified"):
+        headers["If-Modified-Since"] = str(rec["last_modified"])
+    r = requests.get(_V4889_METNO_URL, params={"lat": f"{lat4:.4f}", "lon": f"{lon4:.4f}"},
+                     headers=headers, timeout=(3.05, 8))
+    rh = getattr(r, "headers", None) or {}
+    if r.status_code == 304 and isinstance(rec, dict) and isinstance(rec.get("data"), dict):
+        exp = _v4890_http_ts(rh.get("Expires"), now + 300) if rh.get("Expires") else now + 300
+        rec["expires"] = max(now + 30, exp)
+        if rh.get("Last-Modified"):
+            rec["last_modified"] = str(rh["Last-Modified"])
+        LEDGER.cache_set(key, rec)
+        return rec["data"]
+    if r.status_code not in (200, 203):
+        raise RuntimeError(f"met.no HTTP {r.status_code}")
+    if r.status_code == 203:
+        log.warning("🌦️ MET Norway Locationforecast respondeu 203 (versão em depreciação)")
+    j = r.json()
+    if not isinstance(j, dict) or not ((j.get("properties") or {}).get("timeseries")):
+        raise RuntimeError("met.no sem timeseries")
+    exp = _v4890_http_ts(rh.get("Expires"), now + 300) if rh.get("Expires") else now + 300
+    rec = {"data": j, "expires": max(now + 30, exp),
+           "last_modified": str(rh.get("Last-Modified") or "")}
+    try:
+        LEDGER.cache_set(key, rec)
+    except Exception:
+        pass
+    return j
+
+
+def _v4889_metno_ok():
+    """Saúde da MET Norway, em cache (5 min se ok, 2 min se falhou). Só é consultada
+    quando o Open-Meteo já está com o disjuntor aberto."""
+    if not _V4889_METNO_ON:
+        return False
+    try:
+        rec = LEDGER.cache_get("weather:metno:probe", 600)
+        if isinstance(rec, dict):
+            age = time.time() - float(rec.get("ts", 0) or 0)
+            if (rec.get("ok") and age < 300) or (not rec.get("ok") and age < 120):
+                return bool(rec.get("ok"))
+    except Exception:
+        pass
+    ok, why = False, ""
+    try:
+        _v4889_metno_fetch(51.5074, -0.1278, use_cache=False)   # sonda de verdade, sem cache
+        ok = True
+    except Exception as e:
+        why = f"{type(e).__name__}: {str(e)[:100]}"
+    try:
+        LEDGER.cache_set("weather:metno:probe", {"ok": ok, "ts": time.time(), "why": why})
+    except Exception:
+        pass
+    return ok
+
+
+def _v4889_metno_weather(city, lat, lon, ts):
+    """Mesmo formato de resposta do /weather, montado com a MET Norway. None se não der."""
+    if not _V4889_METNO_ON:
+        return None
+    label, country, tz_h = None, None, None
+    if lat and lon:
+        try:
+            flat, flon = float(lat), float(lon)
+        except ValueError:
+            return None
+        label = f"{flat:.4f},{flon:.4f}"
+    else:
+        q = city or "São Paulo"
+        rec = _V4889_CITIES.get(_v4889_norm_city(q))
+        if not rec:
+            return {"error": f"city '{q}' is not in the offline gazetteer while the primary "
+                             f"geocoder is unavailable",
+                    "hint": "use ?lat=..&lon=.. for exact coordinates; no charge was kept",
+                    "charged": False, "ts": ts}
+        flat, flon, country, tz_h = rec
+        label = q.strip().title() + (", " + country if country else "")
+    if tz_h is None:
+        tz_h = round(flon / 15.0)
+    j = _v4889_metno_fetch(flat, flon)
+    series = (j.get("properties") or {}).get("timeseries") or []
+    # UTC explícito evita fusos fixos errados quando uma cidade entra/sai de DST.
+    # Os buckets diários também são UTC; nenhuma hora local é presumida.
+    off = timedelta(hours=0)
+
+    def _t(s):
+        return datetime.strptime(s, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+
+    now = datetime.now(timezone.utc)
+    rows = []
+    for i, it in enumerate(series):
+        try:
+            t = _t(it["time"])
+        except Exception:
+            continue
+        data = it.get("data") or {}
+        det = (data.get("instant") or {}).get("details") or {}
+        n1 = data.get("next_1_hours") or {}
+        n6 = data.get("next_6_hours") or {}
+        nxt = None
+        if i + 1 < len(series):
+            try:
+                nxt = _t(series[i + 1]["time"])
+            except Exception:
+                nxt = None
+        hourly = nxt is not None and (nxt - t) <= timedelta(hours=1)
+        blk = n1 if (hourly and n1) else (n6 or n1)
+        rows.append({"t": t, "det": det, "sym": (blk.get("summary") or {}).get("symbol_code"),
+                     "prec": (blk.get("details") or {}).get("precipitation_amount"),
+                     "hourly": hourly})
+    rows = [r for r in rows if r["t"] >= now - timedelta(minutes=59)]
+    if not rows:
+        raise RuntimeError("met.no sem pontos atuais; recusando série antiga")
+
+    def _kmh(v):
+        return round(float(v) * 3.6, 1) if v is not None else None
+
+    def _loc(t):
+        return (t + off).strftime("%Y-%m-%dT%H:%M")
+
+    c0 = rows[0]
+    cd = c0["det"]
+    next24 = [{"time": _loc(r["t"]), "temp_c": r["det"].get("air_temperature"),
+               "precip_prob_pct": None, "precip_mm": r["prec"],
+               "condition": _v4889_symbol_text(r["sym"])}
+              for r in rows[:24]]
+    days = {}
+    for r in rows:
+        d = (r["t"] + off).strftime("%Y-%m-%d")
+        rec = days.setdefault(d, {"temps": [], "prec": 0.0, "syms": [], "wind": []})
+        tc = r["det"].get("air_temperature")
+        if tc is not None:
+            rec["temps"].append(float(tc))
+        if r["prec"] is not None and (r["hourly"] or r["sym"] is not None):
+            rec["prec"] += float(r["prec"])
+        if r["sym"]:
+            rec["syms"].append(str(r["sym"]).split("_")[0])
+        if r["det"].get("wind_speed") is not None:
+            rec["wind"].append(float(r["det"]["wind_speed"]))
+    next7 = []
+    for d in sorted(days)[:7]:
+        rec = days[d]
+        sym = Counter(rec["syms"]).most_common(1)[0][0] if rec["syms"] else None
+        next7.append({"date": d, "condition": _v4889_symbol_text(sym),
+                      "temp_max_c": max(rec["temps"]) if rec["temps"] else None,
+                      "temp_min_c": min(rec["temps"]) if rec["temps"] else None,
+                      "precip_mm": round(rec["prec"], 1),
+                      "precip_prob_max_pct": None, "sunrise": None, "sunset": None,
+                      "wind_max_kmh": _kmh(max(rec["wind"])) if rec["wind"] else None})
+    tz_label = "UTC"
+    return {"location": {"query": city or None, "resolved": label,
+                         "latitude": flat, "longitude": flon, "timezone": tz_label},
+            "current": {"temp_c": cd.get("air_temperature"), "feels_like_c": None,
+                        "humidity_pct": cd.get("relative_humidity"),
+                        "condition": _v4889_symbol_text(c0["sym"]), "wmo_code": None,
+                        "symbol_code": c0["sym"],
+                        "cloud_cover_pct": cd.get("cloud_area_fraction"),
+                        "precip_mm": c0["prec"], "wind_kmh": _kmh(cd.get("wind_speed")),
+                        "wind_dir_deg": cd.get("wind_from_direction"),
+                        "pressure_hpa": cd.get("air_pressure_at_sea_level"),
+                        "is_day": None, "observed_at": _loc(c0["t"]),
+                        "note": "nowcast step of the MET Norway forecast (not a station observation)"},
+            "next_24h": next24, "next_7d": next7, "daily_bucket": "UTC",
+            "units": {"temperature": "°C", "wind": "km/h", "precipitation": "mm", "pressure": "hPa"},
+            "source": ("MET Norway Locationforecast 2.0 — https://api.met.no/ ; data © MET Norway, "
+                       "CC BY 4.0 — https://creativecommons.org/licenses/by/4.0/ ; "
+                       "Losbeto converted units and aggregated hourly/daily fields"),
+            "fallback": _v4890_open_commercial(),
+            "provider": "Losbeto/MET Norway",
+            "attribution": {"provider": "MET Norway", "license": "CC BY 4.0",
+                            "license_url": "https://creativecommons.org/licenses/by/4.0/",
+                            "changes": "unit conversion, time selection and daily aggregation"},
+            "updated_at": (j.get("properties") or {}).get("meta", {}).get("updated_at"),
+            "ts": ts, "version": VERSION}
+
+
+def _v4889_weather_alt():
+    """Chamado de dentro do Brain.weather quando o Open-Meteo está fora. None = sem
+    alternativa (o handler devolve o erro de sempre, com estorno)."""
+    ts = int(time.time())
+    try:
+        city = (request.args.get("city") or "").strip()[:80]
+        lat = (request.args.get("lat") or "").strip()[:16]
+        lon = (request.args.get("lon") or "").strip()[:16]
+        out = _v4889_metno_weather(city, lat, lon, ts)
+        if out and not out.get("error"):
+            log.info(f"🌦️ /weather servido pela MET Norway: {out['location']['resolved']}")
+        return out
+    except Exception as e:
+        try:
+            LEDGER.cache_set("weather:metno:probe", {"ok": False, "ts": time.time(),
+                                                     "why": f"{type(e).__name__}: {str(e)[:100]}"})
+        except Exception:
+            pass
+        log.info(f"🌦️ MET Norway também falhou: {type(e).__name__}: {str(e)[:100]}")
+        return None
+
+
+def _v4890_open_commercial():
+    """Open-Meteo gratuito não é licenciado para este serviço pago.
+
+    Só uma declaração operacional explícita de assinatura comercial habilita o
+    provedor antigo. Ausência da variável = MET Norway, nunca presumir licença.
+    """
+    return os.environ.get("OPEN_METEO_COMMERCIAL", "0") == "1"
+
+
+def _v4890_city_precheck():
+    """Recusa cidade fora do gazetteer ANTES do 402 quando só a MET pode atender.
+
+    O candidato 48.89 sondava Londres, liberava o pagamento para uma cidade
+    desconhecida e só depois devolvia erro/estorno. Crédito interno não reverte a
+    transferência on-chain; a barreira correta é anterior a qualquer desafio.
+    """
+    lat = (request.args.get("lat") or "").strip()
+    lon = (request.args.get("lon") or "").strip()
+    if lat or lon:
+        return None
+    if _v4890_open_commercial() and Brain._weather_upstream_remaining() <= 0:
+        return None
+    q = (request.args.get("city") or "São Paulo").strip()[:80]
+    if _v4889_norm_city(q) in _V4889_CITIES:
+        return None
+    base = _public_base()
+    return {"error": "invalid_param", "param": "city",
+            "detail": "city is not in the offline gazetteer used by the licensed weather provider",
+            "received": q, "valid_examples": ["Tokyo", "London", "São Paulo"],
+            "how_to_call": f"GET {base}/weather?lat=-23.55&lon=-46.63",
+            "charged": False,
+            "note": "No payment challenge was issued. Use a listed city or exact lat/lon coordinates.",
+            "ts": int(time.time())}
+
+
+def _v4890_weather_retry():
+    if _v4890_open_commercial():
+        return max(1, Brain._weather_upstream_remaining())
+    try:
+        rec = LEDGER.cache_get("weather:metno:probe", 600) or {}
+        if rec and not rec.get("ok"):
+            return max(1, int(120 - (time.time() - float(rec.get("ts", 0) or 0))))
+    except Exception:
+        pass
+    return 120
+
+
+_V4889_WX_AVAIL_ORIG = Brain._weather_upstream_available
+_V4889_WX_PROBE_ORIG = Brain._weather_upstream_probe
+
+
+def _v4889_wx_available():
+    if not _v4890_open_commercial():
+        return _v4889_metno_ok()
+    return bool(_V4889_WX_AVAIL_ORIG()) or _v4889_metno_ok()
+
+
+def _v4889_wx_probe():
+    if not _v4890_open_commercial():
+        return _v4889_metno_ok()
+    return bool(_V4889_WX_PROBE_ORIG()) or _v4889_metno_ok()
+
+
+Brain._weather_upstream_available = staticmethod(_v4889_wx_available)
+Brain._weather_upstream_probe = staticmethod(_v4889_wx_probe)
+_V4889_WEATHER_ALT = _v4889_weather_alt
+_V4890_MET_PRIMARY = True
+
+
+# ============================================================================
 # v48.85.0-CLEAR — detector de arquivo truncado
 #
 # O arquivo voltou cortado no meio do comentário final três vezes (v48.81, v48.82 e
@@ -41051,4 +41632,6 @@ if _NEXUS_TAIL_OK is False:
 
 # v48.86.0-CEILING: (1) bot Solana de 15-16/nov: o log do guard agora diz a causa em palavras (diag=cu_limit_acima_do_teto(200000>50000)) e o hint do 402 abre com 'Cause: your SetComputeUnitLimit is 200000 ... set it to about 30000' — so diagnostico, o no nunca recusa por causa disso; (2) alerta ANOMALIA: hora dominada pela casa (>=90% das vendas e da receita: varredura do operador com 2 vendas de um comprador de fora no meio) vira severity house (INFO, sem Telegram) e hora com poucas vendas (<20 e <US$1) vira volume (WARNING, sem Telegram); (3) /weather: UMA retentativa quando a rede falha antes de haver resposta (handshake/conexao do Open-Meteo), nunca depois de resposta HTTP nem de leitura lenta; (4) Bazaar: o schema de lista passa a ser a uniao dos elementos (inteiro e decimal na mesma lista reprovava o proprio exemplo e a CDP respondia 'invalid discovery configuration' no /cross-chain) | base: v48.85.0-CLEAR identico ao arquivo do operador
 # v48.88.0-RESTORE: /weather nunca é removido permanentemente no boot; catálogo dinâmico oculta durante circuito aberto e restaura após recuperação; Magento local.xml e .codex/auth.json viram scanner | base: v48.87.0-QUIET
-# EOF-LOSBETO 48.88.0-RESTORE — fim do arquivo (se esta linha faltar, a copia foi cortada)
+# v48.89.0-LEAN: (1) gzip na saida (middleware WSGI; 402, manifestos e paginas encolhem 70-88%; GZIP_DISABLED=1 desliga); (2) /weather ganha segunda fonte MET Norway (uso comercial com credito CC BY 4.0) quando o Open-Meteo bloqueia o IP do Railway | base: v48.88.0-RESTORE
+# v48.90.0-PROOFLEAN: revisão independente da 48.89 — gzip interpreta q=0/*, adiciona Vary às variantes elegíveis e preserva streaming; /weather usa MET Norway por padrão (Open-Meteo somente com OPEN_METEO_COMMERCIAL=1), respeita Expires/If-Modified-Since, rejeita cidade fora do gazetteer antes do 402 e mantém filtros de scanner | base: v48.89.0-LEAN
+# EOF-LOSBETO 48.90.0-PROOFLEAN — fim do arquivo (se esta linha faltar, a copia foi cortada)
