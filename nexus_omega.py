@@ -2,7 +2,7 @@
 """
 Losbeto x402 — monolithic Flask service for Railway.
 
-Current release: 48.94.0-WATCHGUARD.
+Current release: 48.96.0-PRICESAFE.
 Payment requirements are server-side. Delivery requires verified settlement;
 pending payments are reconciled against independent chain evidence.
 Operational history lives in CHANGELOG.md, not in executable boot output.
@@ -1747,7 +1747,7 @@ def _v4893_kind_index() -> str:
         t0 = time.time()
         with LEDGER.lock, LEDGER._conn() as c:
             c.execute("CREATE INDEX IF NOT EXISTS idx_req_kind_ts ON requests(kind, ts)")
-        log.info(f"🗂 índice requests(kind, ts) criado em {time.time() - t0:.1f}s (~{n} linhas)")
+        log.info(f"🗂 índice requests(kind, ts) criado em {time.time() - t0:.1f}s (rowid máx {n})")
         return "created"
     except Exception as e:
         log.warning(f"🗂 índice requests(kind, ts) não criado: {e}")
@@ -3041,6 +3041,25 @@ def _llm_bandit_update(provider: str, ok: bool, lat_s: float) -> None:
         pass
 
 
+def _llm_demote_quarantined(cands) -> list:
+    """v48.95.0-TRUEPRICE (2): provedor em quarentena nunca atende PRIMEIRO um pedido síncrono.
+    A exploração ε (2%) embaralhava a lista inteira e as ordens explícitas (model "deepseek"/
+    "kimi" no /v1/chat/completions, profile=premium) punham o Gemini antes do Groq: em 18/nov
+    13:24 um /llm pago esperou o timeout de 25 s do Gemini (8 ok/12 falhas, 21 s de latência
+    média) antes de o Groq responder. A quarentena vai para o FIM da fila: só responde se os
+    saudáveis falharem — e é aí que testá-la de novo faz sentido."""
+    lst = list(cands or [])
+    if len(lst) < 2:
+        return lst
+    try:
+        q = set(_llm_bandit_quarantined())
+    except Exception:
+        return lst
+    if not q:
+        return lst
+    return [p for p in lst if p not in q] + [p for p in lst if p in q]
+
+
 def _llm_bandit_order(cands: List[str]) -> List[str]:
     """ε-greedy sobre a camada recebida: explora (embaralha) com prob. ε,
     senão explota (ordena pela recompensa aprendida, maior primeiro)."""
@@ -3050,7 +3069,7 @@ def _llm_bandit_order(cands: List[str]) -> List[str]:
         if random.random() < _llm_bandit_eps_eff():   # v48.17.0: ε decai com a experiência
             c = list(cands)
             random.shuffle(c)
-            return c
+            return _llm_demote_quarantined(c)   # v48.95.0: explora sem pôr quarentena na frente
         with _LLM_BANDIT_LOCK:
             snap = dict(_LLM_BANDIT)
         ordered = sorted(cands, key=lambda p: -float(snap.get(p, {}).get(
@@ -3298,7 +3317,7 @@ class LLM:
                      "ollama":   (_try_ollama,   OLLAMA_URL if OLLAMA_ENABLED else ""),
                      "local":    (_try_local,    "1" if _LOCAL_LLM_ON else "")}
 
-        for _prov in list(order or _llm_chain(max_tokens)) + ["local"]:
+        for _prov in _llm_demote_quarantined(list(order or _llm_chain(max_tokens))) + ["local"]:
             _fn, _cred = _CHAMADAS.get(_prov, (None, None))
             if not _fn or not _cred or _llm_is_down(_prov):
                 continue
@@ -9056,8 +9075,7 @@ def _ml_price_advisor():
                 PRICE_OVERRIDES[ep] = round(np_, 4)
                 saved[ep] = {"price": round(np_, 4), "ts": now}
                 applied.append((ep, sg["current_usd"], round(np_, 4)))
-            with open(_ML_PRICE_FILE, "w") as f:
-                json.dump(saved, f, indent=1)
+            _ops_write_json(_ML_PRICE_FILE, saved)
         except Exception as e:
             log.warning(f"price advisor apply: {e}")
     lines = []
@@ -9218,7 +9236,13 @@ def _finalize_facilitator_payment(endpoint: str, requirement: dict, tx_sig: str,
             log.info(f"🔗 funil fechado: 402→settle rid={rid} {endpoint} ({chain})")
     except Exception:
         pass
-    _notify_telegram(f"💰 ${received:.6f} USDC em {endpoint} ({chain}, via facilitator)\nTX: {tx_sig}")
+    # v48.95.0: a rodada de indexação do operador (111 compras em Base + 28 em Algorand, 18/nov)
+    # gerou 139 mensagens "💰" seguidas; venda orgânica sumia no meio. Carteira de OPERATOR_WALLETS
+    # não dispara Telegram por venda (o ledger, /receipts e o relatório diário seguem contando).
+    # TG_NOTIFY_OPERATOR_SALES=1 restaura.
+    if ((payer or "").lower() not in OPERATOR_WALLETS
+            or os.environ.get("TG_NOTIFY_OPERATOR_SALES", "0") == "1"):
+        _notify_telegram(f"💰 ${received:.6f} USDC em {endpoint} ({chain}, via facilitator)\nTX: {tx_sig}")
     return True, "ok-facilitator", _verified_payment_info(
         endpoint, requirement, tx_sig, payer, proof, settlement)
 
@@ -19133,6 +19157,31 @@ def _demand_fleet_map(force: bool = False) -> dict:
     return _DEMAND_FLEET["map"]
 
 
+# v48.95.0-TRUEPRICE (3): /api/withdraw, /api/payout, /api/config, /api/info e /api/data (5-7
+# pedidos de 2 IPs, 18/nov) eram "🔗 apelido resolve → /api/v1/best" no painel e "alias exists" no
+# /dash público — o único token em comum era "api". Token estrutural não nomeia produto: o
+# sugeridor de apelido passa a ignorá-lo, caminho feito só de tokens genéricos é ruído e verbo de
+# backend financeiro/admin (withdraw, payout, config, settings, debug, console) é sonda.
+# /api/search segue "apelido resolve → /web-search". Só classificação: a captura não muda.
+_DEMAND_GENERIC_TOKENS = frozenset(
+    "api apis v1 v2 v3 v4 rest public www ai json xml txt html htm php "
+    "info data index home test default main app web site page status".split())
+_DEMAND_PROBE_SEGMENT = re.compile(
+    r"^(?:withdraw(?:al)?s?|payouts?|config(?:uration)?s?|settings?|debug|console)$", re.I)
+
+
+def _demand_generic_probe(path: str) -> str:
+    segs = [x.lower() for x in (path or "").split("/") if x]
+    if not segs:
+        return ""
+    if any(_DEMAND_PROBE_SEGMENT.match(x) for x in segs):
+        return "Sonda de backend/admin (withdraw/payout/config/settings/debug) — não é produto"
+    toks = set(re.split(r"[^a-z0-9]+", "/".join(segs))) - {""}
+    if toks and toks <= _DEMAND_GENERIC_TOKENS:
+        return "Caminho genérico (/api, /v1, /info, /data...) sem nome de produto"
+    return ""
+
+
 def _demand_classify(path: str) -> dict:
     """v29.1: separa pedido que já dá para atender AGORA de pedido que exige
     fonte de dados nova. A primeira categoria é ganho barato — um apelido de
@@ -19147,6 +19196,10 @@ def _demand_classify(path: str) -> dict:
         return {"kind": "resolved",
                 "action": "Já atendido — a rota existe hoje",
                 "closest": []}
+    generico = _demand_generic_probe(path)   # v48.95.0 (3): /api/info, /api/withdraw...
+    if generico:
+        return {"kind": "scanner_noise", "action": generico, "closest": [],
+                "rule": "generic_probe"}
     arquivo = _demand_file_probe(path)   # v48.93.0 (1): arquivo nunca é produto
     if arquivo == "hard":
         return {"kind": "scanner_noise",
@@ -21208,12 +21261,13 @@ def _suggest_paths(path: str, n: int = 3) -> list:
     """Sugestão por similaridade de tokens — ajuda o agente a achar o
     endpoint certo quando errou o nome."""
     try:
-        alvo = set(re.split(r"[^a-z0-9]+", (path or "").lower()) ) - {""}
+        _stop = _DEMAND_GENERIC_TOKENS      # v48.95.0: "api"/"v1"/"ai" não nomeiam produto
+        alvo = set(re.split(r"[^a-z0-9]+", (path or "").lower()) ) - {""} - _stop
         if not alvo:
             return []
         pontos = []
         for ep in BASE_PRICES:
-            toks = set(re.split(r"[^a-z0-9]+", ep.lower())) - {""}
+            toks = set(re.split(r"[^a-z0-9]+", ep.lower())) - {""} - _stop
             inter = len(alvo & toks)
             if inter:
                 pontos.append((inter / max(1, len(alvo | toks)), ep))
@@ -21394,7 +21448,7 @@ async function tick(){
 
     document.getElementById('dm').querySelector('tbody').innerHTML=
       (s.demand_404||[]).slice(0,6).map(function(d){
-        var tag=d.kind==='resolved'?'<span class="ok">live now</span>':(d.kind==='alias_candidate'?'alias exists':(d.kind==='scanner_noise'?'filtered noise':'not built'));
+        var tag=d.kind==='resolved'?'<span class="ok">live now</span>':(d.kind==='alias_candidate'?'similar endpoint':(d.kind==='scanner_noise'?'filtered noise':'not built'));
         return '<tr><td>'+esc(d.path)+'</td><td>'+d.ips+' ip \u00b7 '+tag+'</td></tr>';
       }).join('')||'<tr><td>nothing requested outside the catalog</td><td></td></tr>';
 
@@ -23560,7 +23614,8 @@ def _live_api_build():
         pass
     publico["demand_404"] = [{"path": d.get("path"), "ips": d.get("ips"),
                               "kind": d.get("kind")}
-                             for d in (st.get("demand_404") or [])[:8]]
+                             for d in (st.get("demand_404") or [])
+                             if d.get("kind") != "scanner_noise"][:8]   # v48.95.0: ruído não é demanda
     try:
         with app.test_request_context("/health/providers"):
             saude = health_providers().get_json()
@@ -26361,6 +26416,7 @@ class TelegramBot:
                 self._handle(msg)
         except Exception as e:
             log.warning(f"TG poll: {str(e).replace(self.token, '***')}")
+            time.sleep(5)
 
     def _handle_button(self, cq):
         try:
@@ -30242,9 +30298,8 @@ try:
             _d = ENDPOINT_DESC[_ep]
             if "Commodity wrapper" not in _d:
                 ENDPOINT_DESC[_ep] = (
-                    _d.rstrip() + f" [Wrapper over a free public source "
-                    f"({_src}) — you pay for one schema, one payment rail, "
-                    f"signed receipts and monitored uptime.]")
+                    _d.rstrip() + f" [Upstream: {_src} — you pay for one schema, "
+                    f"one payment rail, signed receipts and monitored uptime.]")
         if _ep in FEATURED_ENDPOINTS:
             FEATURED_ENDPOINTS.remove(_ep)
     log.info(f"🏷 v46: {len(COMMODITY_ENDPOINTS)} endpoints marcados como "
@@ -36306,6 +36361,30 @@ def _make_factory_handler(path):
     return _h_factory
 
 
+# v48.95.0-TRUEPRICE (5): a fábrica aceitava qualquer API "keyless" — inclusive a gratuita do
+# Open-Meteo, que a 48.89/48.90 tirou do /weather porque NÃO licencia revenda comercial. O esquema
+# do /horizon (temperature_2m, windspeed_10m, precipitation, time; lat/lon) é o formato do
+# Open-Meteo. Mesma política do /weather: sem OPEN_METEO_COMMERCIAL=1, produto de fábrica com
+# upstream *.open-meteo.com sai do catálogo (em vez de cobrar e estornar) e proposta nova é
+# recusada. customer-api.open-meteo.com (plano pago, com apikey) passa.
+_V4895_FACTORY_WARNED = set()
+_V4896_FACTORY_RETIRED = {}
+
+
+def _v4895_factory_license_block(url) -> str:
+    try:
+        from urllib.parse import urlparse
+        host = (urlparse(str(url or "")).hostname or "").lower()
+    except Exception:
+        return ""
+    if ((host == "open-meteo.com" or host.endswith(".open-meteo.com"))
+            and host != "customer-api.open-meteo.com"
+            and os.environ.get("OPEN_METEO_COMMERCIAL", "0") != "1"):
+        return ("Open-Meteo gratuito não licencia revenda comercial "
+                "(OPEN_METEO_COMMERCIAL=1 só com assinatura)")
+    return ""
+
+
 def _factory_reload(force=False):
     """Sincroniza os dicts-vitrine com /data/factory_products.json (mtime —
     um worker cria, todos enxergam no próximo request)."""
@@ -36319,6 +36398,18 @@ def _factory_reload(force=False):
         live = {p: s for p, s in items.items()
                 if isinstance(s, dict) and s.get("status") == "live"
                 and _FACTORY_PATH_RE.match(p) and p not in _FACTORY_BLOCKED_PATHS}
+        retired = {}
+        for p in list(live):
+            why = _v4895_factory_license_block(live[p].get("upstream"))
+            if why:
+                live.pop(p)
+                retired[p] = {"ts": int((_V4896_FACTORY_RETIRED.get(p) or {}).get("ts", time.time())),
+                              "reason": why}
+                if p not in _V4895_FACTORY_WARNED:
+                    _V4895_FACTORY_WARNED.add(p)
+                    log.warning(f"🏭 {p} fora do catálogo: {why}")
+        _V4896_FACTORY_RETIRED.clear()
+        _V4896_FACTORY_RETIRED.update(retired)
         for p in list(_FACTORY["owned"]):
             if p not in live:
                 for d in (BASE_PRICES, ENDPOINT_DESC, ENDPOINT_HANDLERS,
@@ -36342,6 +36433,7 @@ def _factory_reload(force=False):
         _FACTORY["mtime"] = st.st_mtime
     except FileNotFoundError:
         _FACTORY["items"] = {}
+        _V4896_FACTORY_RETIRED.clear()
     except Exception as e:
         log.debug(f"factory reload: {e}")
 
@@ -36354,6 +36446,19 @@ def _factory_dispatch():
     try:
         p = request.path
         _factory_reload()
+        retired = _V4896_FACTORY_RETIRED.get(p)
+        if retired:
+            from email.utils import formatdate
+            successor = _public_base() + "/weather"
+            ts = int(retired["ts"])
+            r = jsonify({"error": "gone", "status": "retired", "charged": False,
+                         "message": "This product was retired; no payment is requested.",
+                         "successor": successor})
+            r.status_code = 410
+            r.headers["Sunset"] = formatdate(ts, usegmt=True)
+            r.headers["Deprecation"] = f"@{ts}"
+            r.headers["Link"] = f'<{successor}>; rel="successor-version"'
+            return r
         if p in _FACTORY["items"] and p not in _FACTORY_BLOCKED_PATHS:
             spec = _FACTORY["items"].get(p) or {}
             if spec.get("status") == "live" and not _route_now_live(p):
@@ -36393,6 +36498,9 @@ def _ops_validate(action, candidates):
         if not (FACTORY_MIN_PRICE <= price <= FACTORY_MAX_PRICE):
             return False, (f"preço fora da faixa {FACTORY_MIN_PRICE}-"
                            f"{FACTORY_MAX_PRICE}")
+        why_l = _v4895_factory_license_block(action.get("upstream"))
+        if why_l:
+            return False, f"upstream: {why_l}"
         ok_u, why_u = _factory_upstream_ok(action.get("upstream"))
         if not ok_u:
             return False, f"upstream: {why_u}"
@@ -40763,7 +40871,7 @@ _ops_validate = _v4843_ops_validate
 
 _v4842_sanitize_governance()
 
-VERSION = "48.94.0-WATCHGUARD"
+VERSION = "48.96.0-PRICESAFE"
 
 
 # ============================================================================
@@ -41838,6 +41946,134 @@ _V4890_MET_PRIMARY = True
 
 
 # ============================================================================
+# v48.95.0-TRUEPRICE (1) — preço anunciado = preço cobrado
+#
+# O 402 cobra get_dynamic_price(): PRICE_OVERRIDES (env PRICE_* e os 8 preços do price-advisor
+# restaurados de /data no boot). Mas ~15 superfícies leem BASE_PRICES direto — agents.txt,
+# llms.txt, llms-full.txt, SKILL.md, /catalog, /.well-known/x402.sig, mpp.json, /what-agents-buy,
+# /recommend e o "Agents also bought" do /pay. Em produção o /pay/br-doc mostrava /pyth-price
+# $0.010 com o 402 pedindo $0.006; com override para CIMA o agente lê um preço e o 402 pede outro
+# maior — cliente que confere o anúncio contra o desafio recusa. Agora BASE_PRICES espelha os
+# overrides, e mudança feita em UM worker (ops adjust_price, price-advisor) chega aos outros em
+# <=5 s pelo mtime do arquivo (antes só no próximo deploy). A cobrança não muda.
+# ============================================================================
+_V4895_LIST_PRICE = {}
+
+
+def _v4895_sync_prices() -> int:
+    n = 0
+    for ep, original in list(_V4895_LIST_PRICE.items()):
+        if ep not in PRICE_OVERRIDES:
+            if ep in BASE_PRICES:
+                BASE_PRICES[ep] = original
+            _V4895_LIST_PRICE.pop(ep, None)
+            n += 1
+    for ep, p in list(PRICE_OVERRIDES.items()):
+        try:
+            p = round(float(p), 4)
+        except Exception:
+            continue
+        if ep in BASE_PRICES and p > 0 and BASE_PRICES.get(ep) != p:
+            _V4895_LIST_PRICE.setdefault(ep, BASE_PRICES.get(ep))
+            BASE_PRICES[ep] = p
+            n += 1
+    return n
+
+
+def _v4895_price_file_mtime():
+    try:
+        return os.stat(_ML_PRICE_FILE).st_mtime
+    except OSError:
+        return None
+
+
+_V4895_PRICE_SEEN = {"mtime": _v4895_price_file_mtime(), "checked": 0.0}
+
+
+def _v4895_price_refresh(force: bool = False) -> bool:
+    now = time.time()
+    if not force and now - _V4895_PRICE_SEEN["checked"] < 5.0:
+        return False
+    _V4895_PRICE_SEEN["checked"] = now
+    mt = _v4895_price_file_mtime()
+    if mt == _V4895_PRICE_SEEN["mtime"] and not force:
+        return False
+    if mt is None:
+        saved = {}
+    else:
+        try:
+            saved = json.loads(open(_ML_PRICE_FILE).read()) or {}
+        except Exception:
+            return False  # não consome o mtime; tenta de novo após o cooldown
+        if not isinstance(saved, dict):
+            return False
+    desired = {}
+    for ep, rec in saved.items():
+        if _price_env_key(ep) in os.environ:
+            continue
+        try:
+            p = round(float((rec or {}).get("price")), 4)
+            if p <= 0 or ep not in BASE_PRICES:
+                raise ValueError("invalid override")
+            desired[ep] = p
+        except Exception:
+            if ep in PRICE_OVERRIDES:
+                desired[ep] = PRICE_OVERRIDES[ep]
+    changed = False
+    for ep in list(PRICE_OVERRIDES):
+        if _price_env_key(ep) not in os.environ and ep not in desired:
+            PRICE_OVERRIDES.pop(ep, None)
+            changed = True
+    for ep, p in desired.items():
+        if PRICE_OVERRIDES.get(ep) != p:
+            PRICE_OVERRIDES[ep] = p
+            changed = True
+    _V4895_PRICE_SEEN["mtime"] = mt
+    if _v4895_sync_prices() or changed:
+        try:
+            _SPEC_CACHE.clear()
+        except Exception:
+            pass
+        try:
+            with _chal_lock:
+                _chal_cache.clear()
+        except Exception:
+            pass
+        return True
+    return False
+
+
+@app.before_request
+def _v4895_price_refresh_hook():
+    try:
+        _v4895_price_refresh()
+    except Exception:
+        pass
+    return None
+
+
+_V4895_SYNCED = _v4895_sync_prices()
+if _V4895_SYNCED:
+    log.info(f"💲 preço anunciado = preço cobrado: {_V4895_SYNCED} endpoint(s) com override "
+             "espelhados em catálogos, llms.txt e /pay")
+
+
+@app.route("/ai.txt")
+def ai_txt():
+    """v48.95.0: /ai.txt foi pedido por 5 IPs em 7 dias (crawlers de IA procuram a política no
+    formato ai.txt, irmão do robots.txt). Mesma política do robots: tudo liberado."""
+    base = _public_base()
+    return app.response_class(
+        "# ai.txt — Losbeto\n"
+        "User-Agent: *\nAllow: /\n\n"
+        f"# Guidance for LLM agents: {base}/llms.txt (long form: {base}/llms-full.txt)\n"
+        f"# Paid data answers HTTP 402 (x402). Discovery: {base}/.well-known/x402.json "
+        f"and {base}/openapi.json\n"
+        f"# Crawl license terms: {base}/.well-known/rsl.xml\n",
+        mimetype="text/plain")
+
+
+# ============================================================================
 # v48.85.0-CLEAR — detector de arquivo truncado
 #
 # O arquivo voltou cortado no meio do comentário final três vezes (v48.81, v48.82 e
@@ -41887,4 +42123,6 @@ if _NEXUS_TAIL_OK is False:
 # v48.92.0-ATOMICBOOT: revisão independente da 48.91 — lock flock compartilhado fecha a corrida do boot-ping; 502/timeout sem message_id não grava dedupe nem finge envio; parâmetros inválidos são validados antes da disponibilidade de rede; filtros novos de scanner preservados | base: v48.91.0-QUIETBOOT
 # v48.93.0-FLEETRADAR: radar de demanda com duas regras estruturais — arquivo de repo/CI/config (/compose.yaml, /Jenkinsfile, /.travis.yml, /__ENV.js...) e frota de varredura (>=60% dos IPs com >=8 caminhos inexistentes, ~1 vez cada) deixam de ser "produto novo" no painel, no Telegram, no CORTEX e no rótulo do ML; vigia de demanda olha 40 linhas (antes 5: ruído escondia demanda real) e não repete alerta após deploy; radar não cria alias semântico para scanner; painel lista sinal real antes do ruído; x402-watch mede cada URL 1x por ciclo; ops-planner sem ação loga INFO; /dash público mostra >99.9%/<0.1% em vez de 100.0%/0.0%; índice requests(kind, ts) (consulta de 404 em 7d ~1 s -> ~15 ms; só com folga de disco; LEDGER_KIND_INDEX=0 desliga) | base: v48.92.0-ATOMICBOOT
 # v48.94.0-WATCHGUARD: vigia sem teto de 40 linhas; alerta só persiste após envio confirmado; watch com exceção mede 1x/URL; textos Pyth e relatório de IA honestos | base: v48.93.0-FLEETRADAR
-# EOF-LOSBETO 48.94.0-WATCHGUARD — fim do arquivo (se esta linha faltar, a copia foi cortada)
+# v48.95.0-TRUEPRICE: preço anunciado = preço cobrado (BASE_PRICES espelha PRICE_OVERRIDES: agents.txt, llms.txt, SKILL.md, /catalog, x402.sig, mpp.json, /recommend e o 'Agents also bought' do /pay mostravam o preço de tabela; troca de preço chega aos outros workers em <=5 s); LLM em quarentena nunca atende primeiro (exploração e ordens explícitas); radar ignora tokens genéricos (api/v1/ai...) e trata /api/withdraw, /api/payout, /api/config, /api/info como sonda; /dash público sem ruído e 'similar endpoint'; /ai.txt; fábrica não revende Open-Meteo gratuito; compra da carteira do operador não dispara 1 Telegram por venda | base: v48.94.0-WATCHGUARD
+# v48.96.0-PRICESAFE: rollback de overrides e retry após JSON inválido; escrita atômica; fábrica aposentada responde 410 Sunset; polling do Telegram com backoff | base: v48.95.0-TRUEPRICE
+# EOF-LOSBETO 48.96.0-PRICESAFE — fim do arquivo (se esta linha faltar, a copia foi cortada)
