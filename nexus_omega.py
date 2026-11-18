@@ -2,7 +2,7 @@
 """
 Losbeto x402 — monolithic Flask service for Railway.
 
-Current release: 48.92.0-ATOMICBOOT.
+Current release: 48.94.0-WATCHGUARD.
 Payment requirements are server-side. Delivery requires verified settlement;
 pending payments are reconciled against independent chain evidence.
 Operational history lives in CHANGELOG.md, not in executable boot output.
@@ -448,7 +448,7 @@ PRICE_OVERRIDES = _load_price_overrides()
 
 ENDPOINT_DESC = {
 
-    "/pyth-price":      "Real-time SOL/USD from the Pyth Network oracle with its confidence interval and publish slot. Sub-second freshness, straight from the on-chain price account.",
+    "/pyth-price":      "Real-time SOL/BTC/ETH USD price with Pyth confidence and publish slot when available; CoinGecko fallback is explicitly labeled in every response.",
     "/weather":         "Live forecast for major cities or any lat/lon: current nowcast, next 24h and up to 7 days with precipitation and wind. MET Norway Locationforecast with CC BY 4.0 attribution; Open-Meteo is used only when commercial access is explicitly configured.",
     "/fear-greed":      "Is the crowd greedy or fearful right now? The Fear & Greed Index (0-100) at this exact instant, with classification — a point-in-time reading your model's training data cannot contain.",
     "/trust-hash":      "SHA-256 proof-of-data hash for audit trails: a verifiable cryptographic receipt of any Losbeto response, for agents that must prove what they were told and when.",
@@ -1216,7 +1216,10 @@ class LedgerV10:
                     "SELECT endpoint, COUNT(*) n, COUNT(DISTINCT ip), "
                     "COALESCE(NULLIF(ua,''),'?') FROM requests "
                     "WHERE ts>? AND kind='notfound' AND " + _DEMAND_UA_SQL +
-                    " GROUP BY endpoint ORDER BY n DESC LIMIT 10", (now - 604800,)).fetchall()]
+                    " GROUP BY endpoint ORDER BY n DESC LIMIT 30", (now - 604800,)).fetchall()]
+                # v48.93.0: sinal real primeiro; ruído de scanner só completa o top-10
+                demand_404 = sorted(demand_404,
+                                    key=lambda d: d.get("kind") == "scanner_noise")[:10]
             except Exception:
                 demand_404 = []
             try:  # parâmetros mais pedidos = quais ativos interessam
@@ -1715,6 +1718,43 @@ class LedgerV10:
         return {"keys_total": total, "keys_active": active, "calls_via_credits": calls}
 
 LEDGER = LedgerV10(DB_PATH)
+
+
+# v48.93.0: índice (kind, ts) em requests. Radar, painel, vigia, CORTEX e /live/api filtram
+# kind='notfound'/'preview' numa janela de 24h/7d; só com idx(ts) o SQLite lia TODAS as ~800 mil
+# sondagens da janela (~1 s por consulta num banco de 1 M de linhas; o /live/api ganhou cache de
+# 15 s na 48.18 por isso). Com (kind, ts): ~15 ms. Custo: ~20 MB por milhão de linhas e ~1 s para
+# criar, uma vez. Só cria com folga de disco; banco novo (sem a coluna kind ainda) cria no
+# próximo boot. LEDGER_KIND_INDEX=0 desliga.
+def _v4893_kind_index() -> str:
+    if os.environ.get("LEDGER_KIND_INDEX", "1") == "0":
+        return "off"
+    try:
+        with LEDGER._conn() as c:
+            if c.execute("SELECT 1 FROM sqlite_master WHERE type='index' "
+                         "AND name='idx_req_kind_ts'").fetchone():
+                return "exists"
+            cols = {r[1] for r in c.execute("PRAGMA table_info(requests)").fetchall()}
+            if "kind" not in cols:
+                return "sem-coluna-kind"
+            n = int(c.execute("SELECT MAX(rowid) FROM requests").fetchone()[0] or 0)
+        need = n * 40 + 50_000_000          # índice estimado com folga + 50 MB de margem
+        free = shutil.disk_usage(str(DB_PATH.parent)).free
+        if free < need:
+            log.warning(f"🗂 índice requests(kind, ts) adiado: {free / 1e6:.0f} MB livres, "
+                        f"precisa de ~{need / 1e6:.0f} MB")
+            return "disco-baixo"
+        t0 = time.time()
+        with LEDGER.lock, LEDGER._conn() as c:
+            c.execute("CREATE INDEX IF NOT EXISTS idx_req_kind_ts ON requests(kind, ts)")
+        log.info(f"🗂 índice requests(kind, ts) criado em {time.time() - t0:.1f}s (~{n} linhas)")
+        return "created"
+    except Exception as e:
+        log.warning(f"🗂 índice requests(kind, ts) não criado: {e}")
+        return "erro"
+
+
+_V4893_KIND_INDEX = _v4893_kind_index()
 
 
 class SolanaClientV10:
@@ -9777,13 +9817,14 @@ def _tg_plain_text(text: str) -> str:
 
 
 def _notify_telegram(text: str):
-    if not (TG_TOKEN and TG_CHAT): return
+    if not (TG_TOKEN and TG_CHAT):
+        return False
     try:
-        requests.post(f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
-            json={"chat_id": TG_CHAT, "text": _tg_plain_text(text)},
-            timeout=5)
+        r = requests.post(f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
+            json={"chat_id": TG_CHAT, "text": _tg_plain_text(text)}, timeout=5)
+        return bool(r.ok)
     except Exception:
-        pass
+        return False
 
 _PREVIEW_CACHE: dict = {}  # v24.1: última resposta paga por endpoint (modelo delayed)
 
@@ -18979,6 +19020,119 @@ def _route_now_live(path: str) -> bool:
         pass
     return False
 
+# v48.93.0-FLEETRADAR — o radar chamava de "🆕 produto novo" (e mandava "🎯 DEMANDA DETECTADA"
+# ao Telegram) arquivos de CI/infra que uma frota de scanner varre: /compose.yaml,
+# /bitbucket-pipelines.yml, /azure-pipelines.yml, /__ENV.js, /Jenkinsfile, /.travis.yml,
+# /.drone.yml — 10 pedidos de 9 IPs cada (18/nov). Em vez de mais um nome no regex a cada
+# rodada, duas regras estruturais. Nenhuma mexe na captura/telemetria nem em rota existente.
+#  (1) ARQUIVO, NÃO PRODUTO: último segmento com extensão de código/config/segredo/backup/
+#      estático (a lista que o planner já descarta desde a 48.33.6, ampliada), dotfile ou
+#      dot-diretório, ou nome de build/CI (Jenkinsfile, Dockerfile, Makefile...). Formato de
+#      dado (.json .xml .csv .txt .html .md) só é ruído se nem o apelido do catálogo casar
+#      (/api/price.json continua "apelido resolve"). Ficam de fora os documentos de descoberta
+#      de agente (llms*, openapi, swagger, agent(s), ai-plugin, x402, mcp, pricing, rss/feed...)
+#      e "<rota>.json" de produto/alias/rota que existe.
+#  (2) FROTA DE VARREDURA (comportamental, só sobre o que seria "produto novo"): >= 4 IPs e
+#      >= 60% deles pediram também >= 8 caminhos inexistentes DIFERENTES na janela de 7d,
+#      ~1 vez cada (pedidos <= 1,5x IPs; quem precisa de um produto repete). Pega a próxima
+#      lista de nomes da mesma frota sem regex nova. DEMAND_FLEET=0 desliga; erro de banco =
+#      regra inerte.
+_DEMAND_FILE_EXT = frozenset("""
+    js mjs cjs ts tsx jsx vue svelte py pyc rb pl pm php phtml asp aspx jsp jspx cfm cgi go rs
+    java class jar war ear kt scala cs vb swift c h cpp hpp lua dart ex exs erl sh bash zsh
+    ksh fish ps1 psm1 bat cmd vbs yml yaml toml ini cfg conf cnf config env properties plist
+    lock gradle tf tfvars tfstate hcl tpl j2 dist sample example inc local pem key crt cer der
+    csr p12 pfx jks keystore ppk pub asc gpg kdbx ovpn rdp sql db sqlite sqlite3 mdb dump
+    bak backup old orig save swp swo tmp temp log out err zip gz tgz tar bz2 xz rar 7z
+    css map png jpg jpeg gif ico svg webp woff woff2 ttf eot pdf mp4 webmanifest
+""".split())
+_DEMAND_DATA_EXT = frozenset("json xml csv tsv txt html htm md rst".split())
+_DEMAND_DISCOVERY_STEMS = frozenset((
+    "llms", "agents", "agent", "agent-card", "ai-plugin", "ai-catalog", "openapi", "swagger",
+    "asyncapi", "api", "api-docs", "apidocs", "x402", "mcp", "server-card", "pricing",
+    "prices", "catalog", "bazaar", "rss", "feed", "atom", "docs"))
+_DEMAND_DISCOVERY_PREFIX = ("llms-", "llms_", "openapi", "swagger", "asyncapi", "agent-",
+                            "x402", "mcp-", "ai-plugin", "ai-catalog")
+_DEMAND_BUILD_FILE = re.compile(
+    r"^(?:jenkinsfile|dockerfile|containerfile|makefile|gnumakefile|vagrantfile|procfile|"
+    r"gemfile|rakefile|pipfile|brewfile|caddyfile|justfile|taskfile|earthfile|tiltfile|"
+    r"podfile|guardfile|capfile|dangerfile|berksfile|cartfile|gruntfile|gulpfile|"
+    r"snakefile|codeowners|cmakelists)(?:[._-][a-z0-9._-]*)?$", re.I)
+
+
+def _demand_file_probe(path: str) -> str:
+    """(1) O caminho pede um ARQUIVO, não um produto de dados? "hard" = código/config/segredo
+    (decide antes do apelido); "soft" = formato de dado (só é ruído sem apelido); "" = não."""
+    segs = [s for s in (path or "").strip().split("/") if s]
+    if not segs:
+        return ""
+    if any(s.startswith(".") and s.lower() != ".well-known" for s in segs):
+        return "hard"                    # dotfile/dot-diretório: /.travis.yml, /.github/...
+    last = segs[-1].rstrip(_PATH_TRAIL_JUNK)
+    if not last:
+        return ""
+    if _DEMAND_BUILD_FILE.match(last):
+        return "hard"                    # Jenkinsfile, Dockerfile.prod, Makefile...
+    if "." not in last:
+        return ""
+    stem, ext = last.split(".", 1)[0], last.rsplit(".", 1)[-1].lower()
+    if ext not in _DEMAND_FILE_EXT and ext not in _DEMAND_DATA_EXT:
+        return ""                        # PETR4.SA, BRK.B, EUR.USD, vitalik.eth: não é arquivo
+    low = stem.lower()
+    if low in _DEMAND_DISCOVERY_STEMS or low.startswith(_DEMAND_DISCOVERY_PREFIX):
+        return ""                        # documento de descoberta de agente: fluxo normal decide
+    base = "/" + "/".join(segs[:-1] + [stem])
+    if stem and (base in BASE_PRICES or base in globals().get("_AUTO_ALIASES", {})
+                 or _route_now_live(base)):
+        return ""                        # /gas-price.json de produto/alias/rota que existe
+    return "soft" if ext in _DEMAND_DATA_EXT else "hard"
+
+
+DEMAND_FLEET_ON = os.environ.get("DEMAND_FLEET", "1") != "0"
+DEMAND_FLEET_MIN_PATHS = max(3, int(os.environ.get("DEMAND_FLEET_MIN_PATHS", "8") or 8))
+DEMAND_FLEET_SHARE = min(1.0, max(0.3, float(os.environ.get("DEMAND_FLEET_SHARE", "0.6") or 0.6)))
+_DEMAND_FLEET = {"at": 0.0, "map": {}}
+_DEMAND_FLEET_LOCK = threading.Lock()
+
+
+def _demand_fleet_map(force: bool = False) -> dict:
+    """(2) {caminho: {ips, sweepers, hits}} dos 404 varridos por frota (7d). Uma consulta
+    agregada por (endpoint, ip), cache de 10 min por worker. Erro → mapa anterior (vazio)."""
+    if not DEMAND_FLEET_ON:
+        return {}
+    now = time.time()
+    if not force and now - _DEMAND_FLEET["at"] < 600:
+        return _DEMAND_FLEET["map"]
+    if not _DEMAND_FLEET_LOCK.acquire(blocking=False):
+        return _DEMAND_FLEET["map"]
+    try:
+        _DEMAND_FLEET["at"] = now
+        with LEDGER._conn() as c:
+            rows = c.execute(
+                "SELECT endpoint, ip, COUNT(*) FROM requests "
+                "WHERE ts>? AND kind='notfound' AND " + _DEMAND_UA_SQL +
+                " GROUP BY endpoint, ip", (int(now) - 7 * 86400,)).fetchall()
+        per_ip, by_path = {}, {}
+        for ep, ip, n in rows:
+            per_ip[ip] = per_ip.get(ip, 0) + 1
+            by_path.setdefault(ep, []).append((ip, int(n or 0)))
+        out = {}
+        for ep, lst in by_path.items():
+            ips = len(lst)
+            if ips < 4:
+                continue
+            hits = sum(n for _ip, n in lst)
+            sweepers = sum(1 for ip, _n in lst if per_ip.get(ip, 0) >= DEMAND_FLEET_MIN_PATHS)
+            if sweepers >= 4 and sweepers >= DEMAND_FLEET_SHARE * ips and hits <= 1.5 * ips:
+                out[ep] = {"ips": ips, "sweepers": sweepers, "hits": hits}
+        _DEMAND_FLEET["map"] = out
+    except Exception as e:
+        log.debug(f"demand fleet: {e}")
+    finally:
+        _DEMAND_FLEET_LOCK.release()
+    return _DEMAND_FLEET["map"]
+
+
 def _demand_classify(path: str) -> dict:
     """v29.1: separa pedido que já dá para atender AGORA de pedido que exige
     fonte de dados nova. A primeira categoria é ganho barato — um apelido de
@@ -18993,11 +19147,26 @@ def _demand_classify(path: str) -> dict:
         return {"kind": "resolved",
                 "action": "Já atendido — a rota existe hoje",
                 "closest": []}
+    arquivo = _demand_file_probe(path)   # v48.93.0 (1): arquivo nunca é produto
+    if arquivo == "hard":
+        return {"kind": "scanner_noise",
+                "action": "Arquivo de repositório/CI/config — produto x402 é dado, não arquivo",
+                "closest": [], "rule": "file_probe"}
     sug = _suggest_paths(path, n=2)
     if sug:
         return {"kind": "alias_candidate",
                 "action": "Rota equivalente já existe — criar apelido resolve",
                 "closest": sug}
+    if arquivo:
+        return {"kind": "scanner_noise",
+                "action": "Arquivo (formato de dado) sem produto equivalente no catálogo",
+                "closest": [], "rule": "file_probe"}
+    fleet = _demand_fleet_map().get(path)   # v48.93.0 (2): frota de varredura
+    if fleet:
+        return {"kind": "scanner_noise",
+                "action": (f"Varredura de frota: {fleet['sweepers']} de {fleet['ips']} IPs "
+                           f"pediram ≥{DEMAND_FLEET_MIN_PATHS} caminhos inexistentes, ~1 vez cada"),
+                "closest": [], "rule": "fleet_sweep"}
     return {"kind": "new_product",
             "action": "Nada equivalente no catálogo — exige fonte de dados nova",
             "closest": []}
@@ -20815,35 +20984,68 @@ def demand_watch_loop():
     NÃO cria endpoint sozinho de propósito: servir dado que não se tem é
     exatamente o erro que nos custou a rejeição no x402-list."""
     time.sleep(300)
-    avisados = set()
+    avisados = _demand_alerted_load()
     limiar = int(os.environ.get("DEMAND_ALERT_IPS", "3"))
     while True:
         try:
-            with LEDGER._conn() as c:
-                linhas = c.execute(
-                    "SELECT endpoint, COUNT(*) n, COUNT(DISTINCT ip) ips "
-                    "FROM requests WHERE ts>? AND kind='notfound' AND " +
-                    _DEMAND_UA_SQL +
-                    " GROUP BY endpoint HAVING ips >= ? ORDER BY ips DESC LIMIT 5",
-                    (int(time.time()) - 7 * 86400, limiar)).fetchall()
-            for path, n, ips in linhas:
-                if path in avisados:
-                    continue
-                cls = _demand_alert_classify(path, n, ips)
-                if cls is None:
-                    continue  # weak/scanner paths may become eligible later
-                avisados.add(path)
-                _notify_telegram(
-                    f"🎯 *DEMANDA DETECTADA*\n\n"
-                    f"Caminho pedido: `{path}`\n"
-                    f"{n} pedidos de {ips} IPs distintos (7d)\n\n"
-                    f"Classificação: *{cls['kind']}*\n{cls['action']}\n"
-                    + (f"Mais próximo: {', '.join(cls['closest'])}\n" if cls['closest'] else "")
-                    + f"\nPainel: {_public_base()}/dash")
-                log.info(f"🎯 demanda: {path} ({ips} IPs) -> {cls['kind']}")
+            _demand_watch_cycle(avisados, limiar)
         except Exception as e:
             log.debug(f"demand_watch: {e}")
         time.sleep(3600)
+
+
+# v48.93.0: (a) o vigia olhava só as 5 linhas com mais IPs; com ruído de scanner no topo
+# (/.my.cnf 13 IPs, /metrics 10...) um pedido real com 3-4 IPs nunca chegava a ser avaliado.
+# Agora avalia 40 e avisa no máximo 3 por ciclo. (b) "já avisado" era um set em memória:
+# cada deploy ou reciclagem do worker (--max-requests) zerava e o mesmo alerta podia voltar.
+# Agora fica em disco por 7 dias (a janela do radar).
+_DEMAND_ALERTED_FILE = HOME_DIR / "demand_alerted.json"
+DEMAND_ALERT_TTL = 7 * 86400
+DEMAND_ALERT_MAX_PER_CYCLE = 3
+
+
+def _demand_alerted_load() -> dict:
+    corte = time.time() - DEMAND_ALERT_TTL
+    d = _ops_read_json(_DEMAND_ALERTED_FILE, {})
+    return {str(k): int(v) for k, v in d.items()
+            if isinstance(v, (int, float)) and v > corte}
+
+
+def _demand_watch_cycle(avisados: dict, limiar: int) -> list:
+    """Um ciclo do vigia (sem o sleep, testável). Devolve os caminhos avisados agora."""
+    with LEDGER._conn() as c:
+        linhas = c.execute(
+            "SELECT endpoint, COUNT(*) n, COUNT(DISTINCT ip) ips "
+            "FROM requests WHERE ts>? AND kind='notfound' AND " +
+            _DEMAND_UA_SQL +
+            " GROUP BY endpoint HAVING ips >= ? ORDER BY ips DESC",
+            (int(time.time()) - 7 * 86400, limiar)).fetchall()
+    enviados = []
+    for path, n, ips in linhas:
+        now = time.time()
+        if now - float(avisados.get(path, 0) or 0) < DEMAND_ALERT_TTL:
+            continue
+        cls = _demand_alert_classify(path, n, ips)
+        if cls is None:
+            continue  # weak/scanner paths may become eligible later
+        delivered = _notify_telegram(
+            f"🎯 *DEMANDA DETECTADA*\n\n"
+            f"Caminho pedido: `{path}`\n"
+            f"{n} pedidos de {ips} IPs distintos (7d)\n\n"
+            f"Classificação: *{cls['kind']}*\n{cls['action']}\n"
+            + (f"Mais próximo: {', '.join(cls['closest'])}\n" if cls['closest'] else "")
+            + f"\nPainel: {_public_base()}/dash")
+        if not delivered:
+            continue
+        avisados[path] = int(now)
+        for k in [k for k, v in avisados.items() if now - float(v or 0) >= DEMAND_ALERT_TTL]:
+            avisados.pop(k, None)
+        _ops_write_json(_DEMAND_ALERTED_FILE, avisados)
+        log.info(f"🎯 demanda: {path} ({ips} IPs) -> {cls['kind']}")
+        enviados.append(path)
+        if len(enviados) >= DEMAND_ALERT_MAX_PER_CYCLE:
+            break
+    return enviados
 
 def lead_watch_loop():
     """v48.6.0-REGISTER — o demand_watch vigia 404 (produto que NÃO temos);
@@ -21182,7 +21384,7 @@ async function tick(){
       var w=Math.max(0.5,x[1]/tot*100);
       return '<i style="width:'+w+'%;background:'+x[2]+'" title="'+x[0]+': '+x[1]+'"></i>';}).join('');
     document.getElementById('mixnote').innerHTML=
-      seg.map(function(x){return '<b>'+x[0]+'</b> '+x[1]+' ('+(x[1]/tot*100).toFixed(1)+'%)';}).join(' \u00b7 ')
+      seg.map(function(x){var p=x[1]/tot*100;return '<b>'+x[0]+'</b> '+x[1]+' ('+((p>0&&p<0.1)?'&lt;0.1':(p>99.9&&p<100)?'&gt;99.9':p.toFixed(1))+'%)';}).join(' \u00b7 ')
       + ' — probes are catalog scanners and QoS monitors; they never buy.';
 
     document.getElementById('pv').querySelector('tbody').innerHTML=
@@ -25912,7 +26114,7 @@ async function reload(){
   // v24.5: classifica cada user-agent — scanner conhecido × cliente potencial
   const KNOWN = [
     [/losbeto-x402/i,                                       "🏠 próprio (x402-watch/audit)", "muted"],
-    [/x402scan|x402station|agentrank|canary|fuchs|x402-observer|x402-trust|trust-prober|forum-labs|carbonmonitor|uptime|pingdom|monitor|healthcheck|preflight402|probe/i,
+    [/x402scan|x402station|agentrank|canary|fuchs|x402-observer|x402-trust|trust-prober|forum-labs|carbonmonitor|uptime|pingdom|monitor|healthcheck|preflight402|probe|conformance|mekler|x402lint|agent402/i,
                                                             "🤖 scanner/monitor de QoS", "muted"],
     [/coinbase|cdp|bazaar|payai|facilitator|agentcash/i,    "🏪 catálogo/facilitator", "muted"],
     [/semrush|ahrefs|bytespider|gptbot|ccbot|amazonbot|meta-externalagent|crawler|spider|scrapy|zerobot|heritrix|hermes-contact|barkrowler|babbar|dotbot|dataforseo|blexbot|mj12bot|petalbot|bingbot|googlebot|duckduckbot|yandex|sogou|exabot|ia_archiver/i,
@@ -25975,7 +26177,7 @@ async function reload(){
       const fraco = d.kind === "weak_signal";
       const tag = ruido
         ? `<span style="color:var(--muted)">🤖 scanner</span><br>`+
-          `<span style="font-size:10px;color:var(--muted)">ruído filtrado — não é demanda</span>`
+          `<span style="font-size:10px;color:var(--muted)">${d.rule==="fleet_sweep" ? "frota de varredura — não é demanda" : d.rule==="file_probe" ? "arquivo de repo/CI — não é demanda" : "ruído filtrado — não é demanda"}</span>`
         : resolvido
         ? `<span style="color:var(--neon)">✅ já atendido</span><br>`+
           `<span style="font-size:10px;color:var(--muted)">rota existe hoje</span>`
@@ -26789,6 +26991,18 @@ def _state_put(key: str, value: float) -> None:
         log.debug(f"state {key}: {e}")
 
 
+def _llm_daily_summary(health: dict) -> str:
+    try:
+        degraded = set(health.get("quarantined", {})) | set(_llm_bandit_quarantined())
+    except Exception:
+        degraded = set(health.get("quarantined", {}))
+    if not health.get("healthy"):
+        return f"🚨 IA FORA — {sorted(degraded)}"
+    if degraded:
+        return "IA: operacional; quarentena: " + ", ".join(sorted(degraded))
+    return "IA: todos os provedores respondendo"
+
+
 def autopilot_report_loop():
     """Auto-relatório diário no Telegram.
 
@@ -26814,9 +27028,7 @@ def autopilot_report_loop():
                 top_prev = ", ".join(f"{k}×{v}"
                                      for k, v in _PREVIEW_SERVED.most_common(3)) or "—"
                 health = llm_health_report()
-                ai_line = ("IA: todos os provedores respondendo"
-                           if health.get("healthy") else
-                           f"🚨 IA FORA — {list(health.get('quarantined', {}))}")
+                ai_line = _llm_daily_summary(health)
                 sem_venda = ""
                 try:
                     ultima = float(stats.get("last_sale_ts") or 0)
@@ -29180,7 +29392,7 @@ def why_buy():
         "positioning": V45_POSITIONING,
         "honest_answer": {
             "do_not_buy": [
-                f"{base}/pyth-price — Pyth Hermes is public and free",
+                f"{base}/pyth-price — Pyth requires an entitled API key; CoinGecko fallback is labeled",
                 f"{base}/fear-greed — alternative.me is public and free",
                 f"{base}/forex-rate — exchangerate-api has a free tier",
             ],
@@ -30016,7 +30228,7 @@ def challenge_entry_json():
 
 
 COMMODITY_ENDPOINTS = {
-    "/pyth-price": "https://hermes.pyth.network (public, free)",
+    "/pyth-price": "https://hermes.pyth.network (entitled API key; labeled CoinGecko fallback)",
     "/fear-greed": "https://api.alternative.me/fng/ (public, free)",
     "/forex-rate": "https://exchangerate-api.com (free tier)",
     "/commodity-price": "Yahoo Finance (public)",
@@ -30962,9 +31174,18 @@ def x402_watch_loop():
                                  "FROM watches WHERE expires>?", (now,)).fetchall()
                 c.execute("DELETE FROM watches WHERE expires<?",
                           (now - 7 * 86400,))
+            medidas = {}   # v48.93.0: watches da MESMA URL compartilham 1 medição por ciclo
             for wid, url, webhook, st0, pr0 in rows:
+                nova = url not in medidas
                 try:
-                    m = _watch_measure(url)
+                    if nova:
+                        try:
+                            medidas[url] = _watch_measure(url)
+                        except Exception as e:
+                            medidas[url] = e
+                    m = medidas[url]
+                    if isinstance(m, Exception):
+                        raise m
                     changed = ((m["up"] != (st0 is not None and st0 < 500))
                                or (str(m.get("price_usdc") or "") != (pr0 or "")))
                     with LEDGER.lock, LEDGER._conn() as c:
@@ -30985,7 +31206,8 @@ def x402_watch_loop():
                                 pass
                 except Exception as e:
                     log.debug(f"watch {wid}: {e}")
-                time.sleep(2)
+                if nova:
+                    time.sleep(2)
         except Exception as e:
             log.warning(f"x402_watch_loop: {e}")
         time.sleep(1800)
@@ -31692,6 +31914,8 @@ def _radar_autofulfill_cycle() -> list:
             if _route_now_live(path):
                 continue          # já existe rota de verdade — não sombrear
             cls = _demand_classify(path)
+            if cls.get("kind") == "scanner_noise":
+                continue          # v48.93.0: arquivo/frota de scanner nunca ganha alias semântico
             if cls["kind"] != "alias_candidate" or not cls["closest"]:
                 _sem = _radar_semantic_target(path)
                 if not _sem:
@@ -34882,8 +35106,10 @@ def _ops_llm_planner():
     if notes:
         _notify_telegram("🤖 *OPS PLANNER — observações*\n\n"
                          + "\n".join(f"• {TelegramBot.esc(n)}" for n in notes[:3]))
-    log.warning(f"🤖 ops-planner: {applied} auto-aplicadas, "
-                f"{proposed} propostas, {len(notes)} notas")
+    # v48.93.0: ciclo sem nada aplicado nem proposto é rotina (INFO), não alerta
+    (log.warning if (applied or proposed) else log.info)(
+        f"🤖 ops-planner: {applied} auto-aplicadas, "
+        f"{proposed} propostas, {len(notes)} notas")
 
 
 def _ops_tg_status():
@@ -40537,7 +40763,7 @@ _ops_validate = _v4843_ops_validate
 
 _v4842_sanitize_governance()
 
-VERSION = "48.92.0-ATOMICBOOT"
+VERSION = "48.94.0-WATCHGUARD"
 
 
 # ============================================================================
@@ -41659,4 +41885,6 @@ if _NEXUS_TAIL_OK is False:
 # v48.90.0-PROOFLEAN: revisão independente da 48.89 — gzip interpreta q=0/*, adiciona Vary às variantes elegíveis e preserva streaming; /weather usa MET Norway por padrão (Open-Meteo somente com OPEN_METEO_COMMERCIAL=1), respeita Expires/If-Modified-Since, rejeita cidade fora do gazetteer antes do 402 e mantém filtros de scanner | base: v48.89.0-LEAN
 # v48.91.0-QUIETBOOT: radar trata vercel.json/netlify.toml/parameters.yml/v2/_catalog/.pypirc como scanner; boot-ping do Telegram nao repete a mesma versao em 15 min (deploy com dois containers) | base: v48.90.0-PROOFLEAN
 # v48.92.0-ATOMICBOOT: revisão independente da 48.91 — lock flock compartilhado fecha a corrida do boot-ping; 502/timeout sem message_id não grava dedupe nem finge envio; parâmetros inválidos são validados antes da disponibilidade de rede; filtros novos de scanner preservados | base: v48.91.0-QUIETBOOT
-# EOF-LOSBETO 48.92.0-ATOMICBOOT — fim do arquivo (se esta linha faltar, a copia foi cortada)
+# v48.93.0-FLEETRADAR: radar de demanda com duas regras estruturais — arquivo de repo/CI/config (/compose.yaml, /Jenkinsfile, /.travis.yml, /__ENV.js...) e frota de varredura (>=60% dos IPs com >=8 caminhos inexistentes, ~1 vez cada) deixam de ser "produto novo" no painel, no Telegram, no CORTEX e no rótulo do ML; vigia de demanda olha 40 linhas (antes 5: ruído escondia demanda real) e não repete alerta após deploy; radar não cria alias semântico para scanner; painel lista sinal real antes do ruído; x402-watch mede cada URL 1x por ciclo; ops-planner sem ação loga INFO; /dash público mostra >99.9%/<0.1% em vez de 100.0%/0.0%; índice requests(kind, ts) (consulta de 404 em 7d ~1 s -> ~15 ms; só com folga de disco; LEDGER_KIND_INDEX=0 desliga) | base: v48.92.0-ATOMICBOOT
+# v48.94.0-WATCHGUARD: vigia sem teto de 40 linhas; alerta só persiste após envio confirmado; watch com exceção mede 1x/URL; textos Pyth e relatório de IA honestos | base: v48.93.0-FLEETRADAR
+# EOF-LOSBETO 48.94.0-WATCHGUARD — fim do arquivo (se esta linha faltar, a copia foi cortada)
