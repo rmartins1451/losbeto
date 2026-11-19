@@ -2,7 +2,7 @@
 """
 Losbeto x402 — monolithic Flask service for Railway.
 
-Current release: 48.96.0-PRICESAFE.
+Current release: 48.98.0-CLAIMGUARD.
 Payment requirements are server-side. Delivery requires verified settlement;
 pending payments are reconciled against independent chain evidence.
 Operational history lives in CHANGELOG.md, not in executable boot output.
@@ -215,6 +215,48 @@ _OW_DEFAULT = ("0xcc83159a6513e56778da45a2981f55f44ef8e9e2,6Q1Sx7tWBKPF1aHBSGMyK
                "ifcmom5dnbqoafxi664j6jzhfffo5suucn7m6mrb2bwnepy3xbjwcoietq")
 OPERATOR_WALLETS = {w.strip().lower() for w in
     (os.environ.get("OPERATOR_WALLETS") or _OW_DEFAULT).split(",") if w.strip()}
+
+
+def _is_house_payer(payer) -> bool:
+    """v48.97.0: carteira da casa = OPERATOR_WALLETS + BUYER_WALLETS + os payTo do próprio nó.
+    Em 18/nov a rodada Algorand do operador (pagadora = ALGO_PAYTO: o USDC sai e volta para a
+    mesma conta) passou pelo filtro só-OPERATOR_WALLETS do Telegram — dezenas de "💰" seguidas.
+    O dashboard e o /receipts já usavam classify_payer/_self_pay_wallets e acertavam; este é o
+    mesmo critério (sem a heurística de varredura) para os avisos de venda e de novo comprador."""
+    p = str(payer or "").strip().lower()
+    if not p:
+        return False
+    if p in OPERATOR_WALLETS:
+        return True
+    g = globals()
+    for a in list(g.get("BUYER_WALLETS") or ()):
+        if p == str(a).strip().lower():
+            return True
+    for name in ("RECEIVE_ADDRESS", "BASE_PAYTO_EVM", "ALGO_PAYTO"):
+        a = g.get(name)
+        if a and p == str(a).strip().lower():
+            return True
+    try:
+        a = getattr(g.get("WALLET"), "solana_address", "") or ""
+        return bool(a) and p == str(a).strip().lower()
+    except Exception:
+        return False
+
+
+def _usd3(p, min_dec: int = 3) -> str:
+    """v48.97.0: preço com 3 casas (2 onde pedido) e a 4ª quando ela existe. Antes o /pay, a amostra
+    grátis e a página 402 do navegador anunciavam /trust-hash a $0.006 com o 402 cobrando 6400
+    (= $0.0064); o /api/for-you mostrava /forex-rate ($0.012) como 0.01."""
+    try:
+        s = f"{float(p):.4f}"
+    except Exception:
+        return "0." + "0" * min_dec
+    keep = s.index(".") + 1 + min_dec
+    while len(s) > keep and s.endswith("0"):
+        s = s[:-1]
+    return s
+
+
 CDP_API_KEY_ID     = os.environ.get("CDP_API_KEY_ID", "").strip()
 CDP_API_KEY_SECRET = os.environ.get("CDP_API_KEY_SECRET", "").strip()
 FACILITATOR_URL = os.environ.get("X402_FACILITATOR", "https://facilitator.payai.network").strip()
@@ -1074,7 +1116,7 @@ class LedgerV10:
                 _new_buyer = False
         if _inserted and _new_buyer and payer and source != "bootstrap":
             try:
-                _is_op = (payer or "").lower() in OPERATOR_WALLETS
+                _is_op = _is_house_payer(payer)
             except Exception:
                 _is_op = False
             if not _is_op:
@@ -1616,7 +1658,7 @@ class LedgerV10:
                 return False, "ledger-error"
         if _new_buyer and payer and source != "bootstrap":
             try:
-                if payer.lower() not in OPERATOR_WALLETS:
+                if not _is_house_payer(payer):
                     _notify_telegram(f"🆕 NOVO COMPRADOR ORGÂNICO\nCarteira: {payer[:24]}...\n"
                                      f"Primeira compra: {endpoint} — ${amount:.4f} ({chain})")
             except Exception:
@@ -3953,7 +3995,7 @@ class Brain:
                              "it is not being sold right now",
                              retry_after_seconds=300)
             if _price_of(explicit) > cap + 1e-9:
-                return _fail(f"'{explicit}' costs ${_price_of(explicit):.3f} — above this "
+                return _fail(f"'{explicit}' costs ${_usd3(_price_of(explicit))} — above this "
                              f"call's ${cap:.3f} budget. Buy it directly instead.",
                              premium_match=_alt_item(explicit))
             target = explicit
@@ -3981,7 +4023,7 @@ class Brain:
             if target is None:
                 if premium is not None:
                     return _fail(f"best match '{premium}' costs "
-                                 f"${_price_of(premium):.3f} — above this call's "
+                                 f"${_usd3(_price_of(premium))} — above this call's "
                                  f"${cap:.3f} budget. Buy it directly instead.",
                                  premium_match=_alt_item(premium))
                 return _fail("no endpoint matched this task well enough to execute",
@@ -9085,7 +9127,7 @@ def _ml_price_advisor():
                          f"{sg['previews_7d']} previews/{sg['sales_7d']} organic sales — "
                          "review product/distribution, not discount")
         else:
-            lines.append(f"• `{sg['endpoint']}` ${sg['current_usd']:.3f} → ${sg['suggested_usd']:.3f} "
+            lines.append(f"• `{sg['endpoint']}` ${_usd3(sg['current_usd'])} → ${_usd3(sg['suggested_usd'])} "
                          f"({sg['why']})")
     _notify_telegram(
         f"🧠💲 *PRICE ADVISOR (semanal)*\n\n" + "\n".join(lines) +
@@ -9239,8 +9281,9 @@ def _finalize_facilitator_payment(endpoint: str, requirement: dict, tx_sig: str,
     # v48.95.0: a rodada de indexação do operador (111 compras em Base + 28 em Algorand, 18/nov)
     # gerou 139 mensagens "💰" seguidas; venda orgânica sumia no meio. Carteira de OPERATOR_WALLETS
     # não dispara Telegram por venda (o ledger, /receipts e o relatório diário seguem contando).
-    # TG_NOTIFY_OPERATOR_SALES=1 restaura.
-    if ((payer or "").lower() not in OPERATOR_WALLETS
+    # TG_NOTIFY_OPERATOR_SALES=1 restaura. v48.97.0: vale para toda carteira da casa
+    # (_is_house_payer) — a rodada Algorand paga de ALGO_PAYTO para ALGO_PAYTO.
+    if (not _is_house_payer(payer)
             or os.environ.get("TG_NOTIFY_OPERATOR_SALES", "0") == "1"):
         _notify_telegram(f"💰 ${received:.6f} USDC em {endpoint} ({chain}, via facilitator)\nTX: {tx_sig}")
     return True, "ok-facilitator", _verified_payment_info(
@@ -10223,7 +10266,7 @@ def _weather_coord_problem():
             "free_preview": f"{base}/weather?preview=1",
             "charged": False,
             "note": ("No payment challenge was issued. Fix the coordinates and retry — "
-                     f"this call costs ${get_dynamic_price('/weather'):.3f} once they are valid."),
+                     f"this call costs ${_usd3(get_dynamic_price('/weather'))} once they are valid."),
             "ts": int(time.time())}
 
 
@@ -10254,7 +10297,7 @@ def _preflight_param_check(path: str, check_required: bool = False):
                          "free_preview": f"{base}{path}?preview=1",
                          "charged": False,
                          "note": ("No payment challenge was issued. Fix the parameter and "
-                                  f"retry — this call costs ${get_dynamic_price(path):.3f} "
+                                  f"retry — this call costs ${_usd3(get_dynamic_price(path))} "
                                   "once the parameter is valid."),
                          "ts": int(time.time())}, 400)
     if not check_required:
@@ -10289,7 +10332,7 @@ def _preflight_param_check(path: str, check_required: bool = False):
                      "free_preview": f"{base}{path}?preview=1",
                      "charged": False,
                      "note": ("No payment challenge was issued. Fix the parameter and "
-                              f"retry — this call costs ${get_dynamic_price(path):.3f} "
+                              f"retry — this call costs ${_usd3(get_dynamic_price(path))} "
                               "once the parameter is valid."),
                      "ts": int(time.time())}, 400)
         names = [g[0] for g in group]
@@ -10302,7 +10345,7 @@ def _preflight_param_check(path: str, check_required: bool = False):
                  "charged": False,
                  "note": ("No payment challenge was issued — this endpoint requires "
                           "the parameter(s) above (one per group). Add it and the "
-                          f"402 challenge comes next (${get_dynamic_price(path):.3f}). "
+                          f"402 challenge comes next (${_usd3(get_dynamic_price(path))}). "
                           "You were not charged."),
                  "ts": int(time.time())}, 400)
     return None
@@ -10715,7 +10758,7 @@ def paid_endpoint(path):
                         "delayed_data": cached["data"],
                         "building_something": _building_block(),
                         "fresh_version": {"endpoint": path,
-                            "price_usd": f"{get_dynamic_price(path):.3f}",
+                            "price_usd": _usd3(get_dynamic_price(path)),
                             "how": "same URL without preview=1, pay via x402"},
                         "note": "Delayed sample (Bloomberg model). Pay for real-time.", "pay_ready": _preview_payready(path, ip)})
                 try:
@@ -10735,7 +10778,7 @@ def paid_endpoint(path):
                 if time.time() - _last < PREVIEW_GEN_COOLDOWN:
                     return jsonify({"preview": True, "status": "warming_up",
                         "note": "Sample being generated — retry in a few seconds.",
-                        "price_usd": f"{get_dynamic_price(path):.3f}"}), 200
+                        "price_usd": _usd3(get_dynamic_price(path))}), 200
                 _PREVIEW_GEN_AT[preview_key] = time.time()
                 try:
                     fresh = _call_handler_sanitized(path, handler)   # v48.54.0: isolamento
@@ -10750,14 +10793,14 @@ def paid_endpoint(path):
                             "delayed_data": payload,
                             "building_something": _building_block(),
                             "fresh_version": {"endpoint": path,
-                                "price_usd": f"{get_dynamic_price(path):.3f}",
+                                "price_usd": _usd3(get_dynamic_price(path)),
                                 "how": "same URL without preview=1, pay via x402"},
                             "note": "Free sample generated on demand. Pay for real-time.", "pay_ready": _preview_payready(path, ip)})
                 except Exception as e:
                     log.debug(f"preview on-demand {path}: {e}")
                 return jsonify({"preview": True, "status": "warming_up",
                     "note": "Sample being generated — retry in a few seconds.",
-                    "price_usd": f"{get_dynamic_price(path):.3f}"}), 200
+                    "price_usd": _usd3(get_dynamic_price(path))}), 200
 
             _wtok = (request.headers.get("X-Welcome-Token") or "").strip()
             if _wtok:
@@ -13206,6 +13249,13 @@ def _sol_dest_ata_status() -> dict:
             threading.Thread(target=_sol_dest_ata_refresh, daemon=True).start()
         except Exception:
             _SOL_DEST_ATA["checking"] = False
+    if not _SOL_DEST_ATA.get("ata"):
+        # v48.97.0: o worker que adotou a leitura do disco nunca derivava o endereço
+        # ("ata": null no /health de 18/nov). Derivação local (PDA), sem rede.
+        try:
+            _SOL_DEST_ATA["ata"] = _sol_ata_of(RECEIVE_ADDRESS, USDC_MINT)
+        except Exception:
+            pass
     snap = dict(_SOL_DEST_ATA)
     snap.pop("checking", None)
     snap.pop("checking_since", None)
@@ -13632,16 +13682,31 @@ def api_claim_transfer():
     try:
         with app.test_request_context(raw_ep):
             result = handler()
+        if (isinstance(result, tuple) and len(result) > 1
+                and isinstance(result[1], int) and result[1] >= 400):
+            raise RuntimeError("endpoint returned HTTP error")
+        if _is_error_result(result):
+            raise RuntimeError("endpoint returned an error payload")
         if isinstance(result, tuple):
             result = result[0]
         if isinstance(result, dict):
+            if result.get("error") or result.get("status") in ("unavailable", "error"):
+                raise RuntimeError("endpoint did not deliver")
             data = result
         else:
             data = json.loads(result.get_data(as_text=True))
     except Exception as e:
         log.warning(f"claim-transfer handler {path}: {e}")
-        data = {"status": "paid",
-                "note": "payment verified — re-fetch the endpoint for fresh data"}
+        try:
+            refund_key = _refund_as_credit(str(info.get("payer") or ""),
+                                           float(info.get("usd") or get_dynamic_price(path)),
+                                           path, txh)
+        except Exception:
+            refund_key = None
+        return jsonify({"ok": False, "error": "endpoint-delivery-failed",
+                        "charged": True, "payment_verified": True,
+                        "refund_key": refund_key,
+                        "note": "Payment remains on-chain; the refund is an internal credit, not an on-chain reversal."}), 503
     return jsonify({"ok": True, "endpoint": path,
                     "payer": info.get("payer"), "tx": txh,
                     "usd": info.get("usd"), "data": data})
@@ -14126,7 +14191,7 @@ def api_for_you():
             desc = desc[:110].rsplit(" ", 1)[0].rstrip(" ,;:—-(") + "…"
         preco = get_dynamic_price(ep)
         item = {"endpoint": ep, "url": f"{base}{ep}",
-                "price_usdc": f"{preco:.2f}" if preco >= 0.01 else f"{preco:.3f}",
+                "price_usdc": _usd3(preco, 2),
                 "desc": desc}
         if ep not in _PREVIEW_REQUIRE_PAYMENT:
             item["free_sample"] = f"{base}{ep}?preview=1"
@@ -29943,7 +30008,7 @@ def _render_402_html(endpoint: str) -> str:
 <p style="color:#7af;letter-spacing:2px;font-size:12px">HTTP 402 · PAYMENT REQUIRED</p>
 <h1 style="margin:4px 0"><img src="/favicon.ico?v=2" width="30" height="30" alt="" style="vertical-align:-6px;margin-right:9px">{endpoint}</h1>
 <p style="color:#aaa;line-height:1.5">{desc}</p>
-<p style="font-size:28px;margin:18px 0"><b>${preco:.3f}</b> <span style="color:#888;font-size:14px">USDC · per call · {' / '.join(_chains_list())}</span></p>
+<p style="font-size:28px;margin:18px 0"><b>${_usd3(preco)}</b> <span style="color:#888;font-size:14px">USDC · per call · {' / '.join(_chains_list())}</span></p>
 <p style="line-height:1.6">This endpoint is sold <b>machine-to-machine</b> via the
 <a style="color:#7af" href="https://www.x402.org">x402 protocol</a> — an AI agent pays
 and receives the data in the same HTTP exchange. Browsers cannot sign that payment,
@@ -32351,6 +32416,7 @@ __PARAM_CARD__
   <div id="warnBox" class="status err" style="margin:0 0 12px"></div>
   <div id="walletPick" style="display:none;margin:0 0 12px"></div>
   <button id="btnConnect">Pay with browser wallet</button>
+  <button id="btnXfer" style="display:none;background:#f59e0b;color:#1f1300">Pay with a USDC transfer from this wallet — works with smart wallets</button>
   <div id="status" class="status"></div>
 </div>
 
@@ -32408,6 +32474,9 @@ __ALSO_HTML__
 the same thing any x402 client library does. Losbeto never asks for your private
 key and never holds custody of funds; the signed authorization only works for this
 exact amount, this exact endpoint, and expires in a few minutes if unused.
+Smart-account wallets (contract or EIP-7702) cannot produce that authorization, so they pay
+with a plain USDC transfer of the same amount to the address shown, confirmed in your wallet
+and verified on-chain before delivery.
 Prefer an AI agent? <a href="/pricing">See the agent flow</a>.</p>
 </div>
 <script>
@@ -32543,6 +32612,32 @@ if (!anyCard) {
 }
 
 function setStatus(msg, cls){ statusEl.textContent=msg; statusEl.className='status'+(cls?(' '+cls):''); }
+// v48.97.0-ANYWALLET: utilitarios do checkout.
+function shortAddr(a){ a = String(a || ''); return a.length > 12 ? a.slice(0, 6) + '\u2026' + a.slice(-4) : a; }
+function escHtml(s){ return String(s).replace(/[&<>"']/g, function(c){
+  return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]; }); }
+// resultado pago entra como TEXTO: /fetch, /extract & cia. devolvem HTML de terceiros
+function showResult(obj){ resultEl.innerHTML = '<pre>' + escHtml(JSON.stringify(obj, null, 2).slice(0, 4000)) + '</pre>'; }
+// erro EIP-1193 -> instrucao acionavel (antes: texto cru da carteira, ex. o 4100 do Phantom em 18/nov)
+function walletErrMsg(e, net){
+  net = net || 'Base';
+  const code = e && (e.code !== undefined ? e.code : (e.data && e.data.code));
+  const raw = (e && e.message) ? e.message : String(e);
+  if (code === 4001 || /user (rejected|denied|cancel)/i.test(raw))
+    return 'You cancelled the request in your wallet \u2014 nothing was charged. Tap the button to try again.';
+  if (code === 4100 || /not been authori[sz]ed/i.test(raw))
+    return 'Your wallet has not authorized this site for this account (code 4100). Open the wallet, select the account ' +
+           'that holds USDC on ' + net + ', connect it to ' + location.host + ' (Phantom: Settings \u2192 Connected apps) and tap ' +
+           'Pay again \u2014 or use the plain-transfer card below.';
+  if (code === -32002)
+    return 'Your wallet already has a request open \u2014 finish or close it in the wallet, then retry.';
+  if (code === 4900 || code === 4901)
+    return 'Your wallet is not connected to the ' + net + ' network right now \u2014 switch it to ' + net + ' and retry.';
+  if (net === 'Base' && /insufficient funds|exceeds balance|gas required/i.test(raw))
+    return 'Your wallet cannot cover the Base network fee \u2014 add a few cents of ETH on Base and retry, ' +
+           'or use the plain-transfer card below.';
+  return 'Error: ' + raw;
+}
 function hex32(){ const b=new Uint8Array(32); crypto.getRandomValues(b);
   return '0x'+Array.from(b).map(x=>x.toString(16).padStart(2,'0')).join(''); }
 
@@ -32569,13 +32664,24 @@ async function baseRpc(method, params){
 }
 async function preflightWallet(from){
   const warns = [];
-  let insufficient = false;
+  let insufficient = false, contract = false, delegated = false, noGas = false;
+  const who = shortAddr(from);
+  const wb0 = document.getElementById('warnBox');
+  if(wb0) wb0.textContent = '';
   try{
     const code = await baseRpc('eth_getCode',[from,'latest']);
     if(code && code !== '0x'){
-      warns.push('This is a SMART CONTRACT wallet (e.g. Coinbase Smart Wallet / passkey). '+
-        'Many x402 facilitators still reject contract signatures (known ecosystem issue x402#623). '+
-        'If the payment fails, retry from a regular MetaMask/Rabby account (EOA) with USDC on Base.');
+      contract = true;
+      // v48.97.0: EIP-7702 = EOA com designador de delegacao 0xef0100 + endereco (23 bytes)
+      delegated = /^0xef0100[0-9a-f]{40}$/i.test(String(code));
+      warns.push((delegated
+          ? 'This account (' + who + ') is an EOA upgraded to a smart account (EIP-7702 delegation). '
+          : 'This is a SMART CONTRACT wallet (' + who + ', e.g. Coinbase Smart Wallet / passkey). ') +
+        'x402 facilitators reject USDC payment signatures from contract accounts (known ecosystem issue x402#623)' +
+        (IS_CREDIT
+          ? ' \u2014 credit plans need that signature: pay from a regular MetaMask/Rabby account (EOA) with USDC on Base.'
+          : ' \u2014 so this checkout pays with a plain USDC transfer from your wallet instead: two confirmations, ' +
+            'data delivered automatically.'));
     }
   }catch(e){}
   try{
@@ -32586,19 +32692,31 @@ async function preflightWallet(from){
       const need = Number(BigInt(ACCEPT.amount))/1e6;
       if(bal < need){
         insufficient = true;
-        warns.push('USDC balance on Base: '+bal.toFixed(4)+' — this payment needs '+need.toFixed(4)+'. '+
-          'Top up first: card via Coinbase Onramp (pay.coinbase.com), or buy USDC on any '+
+        warns.push('USDC balance on Base in ' + who + ': ' + bal.toFixed(4) + ' \u2014 this payment needs ' +
+          need.toFixed(4) + '. If your USDC is in another account or wallet, switch to it in the wallet and tap ' +
+          'Pay again. To top up: card via Coinbase Onramp (pay.coinbase.com), or buy USDC on any ' +
           'exchange and withdraw choosing the BASE network. A short balance reverts on-chain.');
       }
     }
   }catch(e){}
+  if(contract && !insufficient && !IS_CREDIT){
+    try{
+      const wei = await baseRpc('eth_getBalance',[from,'latest']);
+      if(wei && BigInt(wei) === 0n){
+        noGas = true;
+        warns.push('No ETH on Base in ' + who + ' for the network fee of the transfer (usually under $0.01). ' +
+          'If your wallet does not sponsor gas, add a few cents of ETH on Base first \u2014 or pay from another ' +
+          'wallet or an exchange with the plain-transfer card below.');
+      }
+    }catch(e){}
+  }
   if(warns.length){
     const wb = document.getElementById('warnBox');
-    if(wb) wb.textContent = '⚠ '+warns.join('\n\n⚠ ');
+    if(wb) wb.textContent = '\u26a0 '+warns.join('\n\n\u26a0 ');
     const mc = document.getElementById('manualCard');
     if(mc && !IS_CREDIT) mc.style.border = '2px solid #f59e0b';
   }
-  return { ok: warns.length === 0, insufficient };
+  return { ok: warns.length === 0, insufficient, contract, delegated, noGas };
 }
 
 // ============================================================================
@@ -32795,11 +32913,11 @@ async function paySolana(){
         '# use it on any endpoint:\ncurl -H "X-API-Key: ' + body.api_key + '" ' +
         ENDPOINT_URL.replace('/buy-credits', '/<endpoint>') + '</pre>';
     } else {
-      resultEl.innerHTML = '<pre>' + JSON.stringify(body, null, 2).slice(0, 4000) + '</pre>';
+      showResult(body);
     }
     btnS.textContent = 'Pay again'; btnS.disabled = false;
   }catch(e){
-    setS('Error: ' + (e && e.message ? e.message : e), 'err');
+    setS(walletErrMsg(e, 'Solana'), 'err');
     btnS.disabled = false;
   }
 }
@@ -32810,6 +32928,55 @@ document.getElementById('manualPayTo').textContent = ACCEPT.payTo;
 if(SOL_ACCEPT){ document.getElementById('manualPayToSol').textContent = SOL_ACCEPT.payTo; }
 else { const _sl = document.getElementById('solPayToLine'); if(_sl) _sl.style.display = 'none'; }
 if(IS_CREDIT){ document.getElementById('manualCard').style.display = 'none'; }
+// v48.97.0-ANYWALLET: reivindicacao com espera automatica. O cartao manual pedia "aguarde ~10 s e
+// tente de novo"; a pagina agora repete sozinha enquanto a resposta for transitoria (402/429/rede).
+const CLAIM_MSGS = {
+  'tx-not-found': 'Transfer not visible on Base yet',
+  'insufficient-confirmations': 'Waiting for 2 confirmations on Base',
+  'rpc-error': 'The network is slow to answer',
+  'block-not-found': 'Waiting for the block on Base',
+  'network': 'Connection hiccup',
+  'rate_limited': 'Too many attempts \u2014 pausing a few seconds',
+  'tx-too-old': 'That transfer is too old \u2014 send a fresh one and use the new hash/signature.',
+  'insufficient-amount': 'Transfer found, but the amount is below the price. Send the exact amount and submit the new hash.',
+  'transfer-proof-count': 'That transaction has no single USDC transfer of exactly the price to the payment address. ' +
+                          'Send exactly the price shown and submit the new hash.',
+  'replay': 'This transaction hash was already claimed.',
+  'tx-failed': 'That transaction reverted on-chain \u2014 no funds moved.',
+  'bad_tx_hash': 'Paste a valid Base tx hash (0x + 64 hex) or a Solana signature.',
+  'credit_plan': 'Credit plans need the signed checkout above.',
+  'unknown_endpoint': 'This endpoint is not sold here.'};
+const CLAIM_TRANSIENT = {'tx-not-found': 1, 'insufficient-confirmations': 1, 'rpc-error': 1,
+                         'block-not-found': 1, 'network': 1, 'rate_limited': 1};
+function claimEndpoint(){ return location.pathname.replace(/^\/pay/, '') + (location.search || qsFromInputs()); }
+async function claimOnce(ep, tx){
+  try{
+    const r = await fetch('/api/claim-transfer', { method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ endpoint: ep, tx: tx }) });
+    const j = await r.json().catch(() => ({}));
+    return { status: r.status, j: j || {} };
+  }catch(e){ return { status: 0, j: { error: 'network' } }; }
+}
+async function claimLoop(tx, say, tries){
+  const ep = claimEndpoint();
+  const max = tries || 45;
+  for(let i = 1; i <= max; i++){
+    const res = await claimOnce(ep, tx);
+    if(res.j && res.j.ok) return res.j;
+    const err = String((res.j && res.j.error) || res.status);
+    if(!CLAIM_TRANSIENT[err]){
+      const refund = res.j && res.j.refund_key ? '\nCredit key: ' + res.j.refund_key : '';
+      say('\u26a0 ' + (CLAIM_MSGS[err] || ('Not accepted: ' + err)) + refund + '\nTransaction: ' + tx, 'err');
+      return null;
+    }
+    say((CLAIM_MSGS[err] || 'Waiting for the transfer on Base') +
+        ' \u2014 checking again automatically (' + i + '/' + max + ')\u2026');
+    await new Promise(function(r){ setTimeout(r, err === 'rate_limited' ? 15000 : 4000); });
+  }
+  say('\u26a0 Not confirmed after the automatic checks. Keep this hash/signature and paste it below in a moment: ' + tx, 'err');
+  return null;
+}
 async function claimTransfer(){
   const st = document.getElementById('statusClaim');
   const setC = (m, c) => { st.textContent = m; st.className = 'status' + (c ? ' ' + c : ''); };
@@ -32817,37 +32984,70 @@ async function claimTransfer(){
   if(!/^0x[0-9a-fA-F]{64}$/.test(tx) && !/^[1-9A-HJ-NP-Za-km-z]{80,90}$/.test(tx)){
     setC('\u26a0 Paste a valid Base tx hash (0x + 64 hex) or a Solana signature.', 'err'); return;
   }
-  const btn = document.getElementById('btnClaim');
-  btn.disabled = true;
-  setC('Verifying the transfer on-chain…');
+  const btnC = document.getElementById('btnClaim');
+  btnC.disabled = true;
+  setC('Verifying the transfer on-chain\u2026');
   try{
-    const ep = location.pathname.replace(/^\/pay/, '') + (location.search || qsFromInputs());
-    const r = await fetch('/api/claim-transfer', { method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ endpoint: ep, tx: tx }) });
-    const j = await r.json().catch(() => ({}));
-    if(!r.ok || !j.ok){
-      const msgs = {
-        'tx-not-found': 'Transfer not found yet — wait ~10 seconds and retry.',
-        'tx-too-old': 'That transfer is too old — send a fresh one and paste the new hash/signature.',
-        'insufficient-confirmations': 'Almost there — waiting for 2 confirmations. Retry in a few seconds.',
-        'insufficient-amount': 'Transfer found, but the amount is below the price. Send the exact amount and submit the new hash.',
-        'replay': 'This transaction hash was already claimed.',
-        'tx-failed': 'That transaction reverted on-chain — no funds moved.',
-        'rpc-error': 'Could not reach the Base network right now — retry in a few seconds.',
-        'rate_limited': 'Too many attempts — wait a minute.'};
-      setC('\u26a0 ' + (msgs[j.error] || ('Not accepted: ' + (j.error || r.status))), 'err');
-      btn.disabled = false; return;
+    const j = await claimLoop(tx, setC);
+    if(j && j.ok){
+      setC('Paid \u2713 \u2014 direct transfer verified on-chain.', 'ok');
+      showResult(j.data);
+      btnC.textContent = 'Verified \u2713';
+      return;
     }
-    setC('Paid ✓ — direct transfer verified on-chain.', 'ok');
-    resultEl.innerHTML = '<pre>' + JSON.stringify(j.data, null, 2).slice(0, 4000) + '</pre>';
-    btn.textContent = 'Verified ✓';
   }catch(e){
     setC('Error: ' + (e && e.message ? e.message : e), 'err');
-    btn.disabled = false;
   }
+  btnC.disabled = false;
 }
-document.getElementById('btnClaim').addEventListener('click', claimTransfer);
+document.getElementById('btnClaim').addEventListener('click', function(){ return claimTransfer(); });
+
+// v48.97.0-ANYWALLET: conta com codigo (smart wallet ou EOA delegada por EIP-7702). O USDC valida a
+// assinatura EIP-3009 dessas contas via ERC-1271 e a simulacao reverte no facilitador (18/nov
+// 22:30 UTC: CDP "invalid_exact_evm_payload_signature", PayAI "invalid_exact_evm_signature").
+// Transferencia comum funciona em qualquer carteira: a propria carteira envia
+// USDC.transfer(payTo, valor exato) e a pagina reivindica o hash em /api/claim-transfer — a mesma
+// verificacao on-chain do cartao manual (valor exato, 2 confirmacoes, hash de uso unico).
+function transferCalldata(){
+  const to = String(ACCEPT.payTo).toLowerCase().replace(/^0x/, '');
+  const amt = BigInt(ACCEPT.amount).toString(16);
+  return '0xa9059cbb' + to.padStart(64, '0') + amt.padStart(64, '0');
+}
+let XFER = null;
+function showXfer(w, from){
+  XFER = { w: w, from: from };
+  const b = document.getElementById('btnXfer');
+  if(b && !IS_CREDIT) b.style.display = 'block';
+}
+async function payByTransfer(w, from){
+  const b = document.getElementById('btnXfer');
+  if(b) b.disabled = true;
+  btn.disabled = true;
+  try{
+    const need = (Number(BigInt(ACCEPT.amount)) / 1e6).toFixed(4);
+    setStatus('Confirm in your wallet: send ' + need + ' USDC on Base to ' + shortAddr(ACCEPT.payTo) +
+              ' \u2014 a plain transfer, no signature (network fee in ETH, usually under $0.01)\u2026');
+    const txh = String(await w.request({ method: 'eth_sendTransaction', params: [{
+      from: from, to: ACCEPT.asset, data: transferCalldata(), value: '0x0' }] }));
+    const ti = document.getElementById('txHashIn');
+    if(ti) ti.value = txh;   // fica visivel e recuperavel no cartao manual
+    setStatus('Transfer sent (' + txh.slice(0, 12) + '\u2026) \u2014 waiting for Base confirmations, then delivering your data\u2026');
+    const j = await claimLoop(txh, setStatus);
+    if(j && j.ok){
+      setStatus('Paid \u2713 \u2014 USDC transfer verified on-chain.', 'ok');
+      showResult(j.data);
+      btn.textContent = 'Pay again';
+    }
+  }catch(e){
+    setStatus(walletErrMsg(e), 'err');
+  }
+  btn.disabled = false;
+  if(b) b.disabled = false;
+}
+(function(){
+  const b = document.getElementById('btnXfer');
+  if(b) b.addEventListener('click', function(){ if(XFER) return payByTransfer(XFER.w, XFER.from); });
+})();
 
 
 async function ensureBaseChain(chainIdHex, w){
@@ -32859,27 +33059,33 @@ async function ensureBaseChain(chainIdHex, w){
   else { throw e; } }
 }
 
-async function payAndFetch(){
+async function payAndFetch(retried){
   const w = evmProvider();
   if(!w){ renderWalletPicker(); return; }
   btn.disabled = true;
   if (!requiredFilled()){ setStatus(PAYGATE_MSG, 'err'); btn.disabled = false; return; }
   if (!(await ensureFresh(setStatus))) return;   // v48.16.5: aba velha nunca mais assina
   try{
-    setStatus('Requesting wallet connection…');
+    setStatus('Requesting wallet connection\u2026');
     const accounts = await w.request({method:'eth_requestAccounts'});
     const from = accounts[0];
     const chainId = parseInt(String(ACCEPT.network).split(':')[1],10);
     const chainIdHex = '0x'+chainId.toString(16);
-    setStatus('Switching to Base network…');
+    setStatus('Switching to Base network\u2026');
     await ensureBaseChain(chainIdHex, w);
-    setStatus('Checking wallet compatibility and USDC balance…');
+    setStatus('Connected ' + shortAddr(from) + ' \u2014 checking wallet compatibility and USDC balance on Base\u2026');
     const pre = await preflightWallet(from);
     if (pre && pre.insufficient){
-      setStatus('Payment stopped before signature: insufficient USDC on Base. '+
-                'Top up first, then use this checkout or the plain-transfer option below.','err');
+      setStatus('Payment stopped before signature: insufficient USDC on Base in ' + shortAddr(from) + '. ' +
+                'Top up, or switch to the account that holds your USDC and tap Pay again \u2014 ' +
+                'or use the plain-transfer option below.','err');
       btn.disabled = false;
       return;
+    }
+    if (pre && pre.contract && !IS_CREDIT){
+      // v48.97.0: assinatura de conta-contrato e recusada pelos facilitadores -> transferencia
+      showXfer(w, from);
+      return await payByTransfer(w, from);
     }
     const validBefore = String(Math.floor(Date.now()/1000)+(ACCEPT.maxTimeoutSeconds||300));
     const authorization = {from,to:ACCEPT.payTo,value:ACCEPT.amount,validAfter:"0",validBefore,nonce:hex32()};
@@ -32893,20 +33099,28 @@ async function payAndFetch(){
                     {name:'value',type:'uint256'},{name:'validAfter',type:'uint256'},
                     {name:'validBefore',type:'uint256'},{name:'nonce',type:'bytes32'}]},
       primaryType:'TransferWithAuthorization',domain,message:authorization};
-    setStatus('Waiting for signature in your wallet…');
+    setStatus('Waiting for signature in your wallet\u2026');
     const signature = await w.request({method:'eth_signTypedData_v4',
       params:[from,JSON.stringify(typedData)]});
     const paymentPayload = {x402Version:2,scheme:'exact',network:ACCEPT.network,
       payload:{signature,authorization},accepted:ACCEPT};
     const header = btoa(JSON.stringify(paymentPayload));
-    setStatus('Signature captured. Settling payment and fetching your data…');
+    setStatus('Signature captured. Settling payment and fetching your data\u2026');
     const resp = await fetch(endpointWithParams(),{headers:{'X-PAYMENT':header,'Accept':'application/json'}});
     const body = await resp.json().catch(()=>({}));
     if(!resp.ok){
-      setStatus('Payment not accepted: '+(body.reason||body.error||resp.status)+
-                '\nNo funds moved if this failed before settlement — you can retry.','err');
+      const reason = String(body.reason||body.error||resp.status);
+      let msg = 'Payment not accepted: ' + reason +
+                '\nNo funds moved if this failed before settlement \u2014 you can retry.';
+      if(!IS_CREDIT && /invalid_exact_evm(?:_[a-z]+)*_signature/i.test(reason)){
+        // v48.97.0: a assinatura foi recusada -> o mesmo pagamento como transferencia comum
+        showXfer(w, from);
+        msg += '\nThe facilitator rejected this wallet signature \u2014 tap the orange button above to pay ' +
+               'the same price with a plain USDC transfer (two confirmations, no signature).';
+      }
+      setStatus(msg,'err');
       btn.disabled=false; return; }
-    setStatus('Paid ✓ — settled on Base.','ok');
+    setStatus('Paid \u2713 \u2014 settled on Base.','ok');
     if(IS_CREDIT && body.api_key){
       resultEl.innerHTML='<pre>X-API-Key: '+body.api_key+
         '<span class="copy" onclick="navigator.clipboard.writeText(\''+body.api_key+'\')">copy</span>\n\n'+
@@ -32914,12 +33128,21 @@ async function payAndFetch(){
         '\n\n# or in Claude Code / Cursor:\nclaude mcp add --transport http losbeto '+
         ENDPOINT_URL.replace('/buy-credits','/mcp')+' --header "X-API-Key: '+body.api_key+'"</pre>';
     } else {
-      resultEl.innerHTML='<pre>'+JSON.stringify(body,null,2).slice(0,4000)+'</pre>';
+      showResult(body);
     }
     btn.textContent='Pay again'; btn.disabled=false;
-  }catch(e){ setStatus('Error: '+(e&&e.message?e.message:e),'err'); btn.disabled=false; }
+  }catch(e){
+    if(!retried && e && e.code === 4100){
+      // v48.97.0: 4100 = conta/metodo nao autorizado (Phantom, 18/nov). Pede a autorizacao de novo
+      // e refaz o fluxo UMA vez; ate aqui nada foi assinado nem cobrado.
+      setStatus('Your wallet needs to re-authorize this site \u2014 approve the connection request\u2026');
+      try{ await w.request({method:'wallet_requestPermissions', params:[{eth_accounts:{}}]}); }catch(_){}
+      btn.disabled = false;
+      return payAndFetch(true);
+    }
+    setStatus(walletErrMsg(e),'err'); btn.disabled=false; }
 }
-btn.addEventListener('click', payAndFetch);
+btn.addEventListener('click', function(){ return payAndFetch(false); });
 </script></body></html>"""
 
 
@@ -32997,7 +33220,7 @@ def _pay_also_html(ep: str) -> str:
             f'<a href="/pay{a["endpoint"]}" style="color:#7dd3fc">'
             f'{a["endpoint"]}</a> '
             f'<span style="color:var(--dim)">'
-            f'${float(a.get("price_usd") or 0):.3f}</span><br>'
+            f'${_usd3(a.get("price_usd") or 0)}</span><br>'
             for a in recs)
         return ('<div class="card" style="font-size:13px;color:var(--dim)">'
                 '<b style="color:#e5e7eb">Agents also bought:</b><br>'
@@ -39748,7 +39971,7 @@ def _v4842_commit_payment(self, endpoint: str, amount: float, tx_sig: str,
             return False, "ledger-error"
     if new_buyer and payer and source != "bootstrap":
         try:
-            if payer.lower() not in OPERATOR_WALLETS:
+            if not _is_house_payer(payer):
                 _notify_telegram(f"🆕 NOVO COMPRADOR ORGÂNICO\nCarteira: {payer[:24]}...\n"
                                  f"Primeira compra: {endpoint} — ${amount:.4f} ({chain})")
         except Exception:
@@ -40871,7 +41094,7 @@ _ops_validate = _v4843_ops_validate
 
 _v4842_sanitize_governance()
 
-VERSION = "48.96.0-PRICESAFE"
+VERSION = "48.98.0-CLAIMGUARD"
 
 
 # ============================================================================
@@ -42074,6 +42297,55 @@ def ai_txt():
 
 
 # ============================================================================
+# v48.97.0-ANYWALLET — manifesto x402 servido de memória
+#
+# /.well-known/x402.json monta um desafio 402 por endpoint (~124) a cada pedido; o slim
+# /.well-known/x402 chama o mesmo construtor. HTTP log de 18/nov: 691 ms e 748 ms por pedido
+# (o /openapi.json, que já tem cache, sai em 15-34 ms). Diretórios e avaliadores leem esse
+# documento o tempo todo. Agora: 60 s por worker (MANIFEST_CACHE_S), chave = catálogo e preços
+# (troca de preço/produto da fábrica invalida na hora). MANIFEST_CACHE_S=0 desliga.
+# ============================================================================
+_V4897_MANIFEST = {"key": None, "ts": 0.0, "body": None}
+try:
+    _V4897_MANIFEST_TTL = float(os.environ.get("MANIFEST_CACHE_S", "60") or 0)
+except Exception:
+    _V4897_MANIFEST_TTL = 60.0
+_v4897_manifest_build = manifest_x402
+
+
+def _v4897_manifest_key():
+    try:
+        return (VERSION, tuple(sorted((str(k), round(float(v), 6))
+                                      for k, v in BASE_PRICES.items())))
+    except Exception:
+        return None
+
+
+def manifest_x402_cached():
+    """v48.97.0: mesmo documento de manifest_x402(), servido de memória por até 60 s."""
+    now = time.time()
+    key = _v4897_manifest_key()
+    c = _V4897_MANIFEST
+    if (_V4897_MANIFEST_TTL > 0 and key is not None and c["body"] is not None
+            and c["key"] == key and now - c["ts"] < _V4897_MANIFEST_TTL):
+        r = app.response_class(c["body"], mimetype="application/json")
+        r.headers["X-Manifest-Cache"] = "hit"
+        return r
+    resp = _v4897_manifest_build()
+    try:
+        if _V4897_MANIFEST_TTL > 0 and key is not None and getattr(resp, "status_code", 200) == 200:
+            c.update({"key": key, "ts": time.time(), "body": resp.get_data()})   # validade conta do fim da montagem
+            resp.headers["X-Manifest-Cache"] = "miss"
+    except Exception:
+        pass
+    return resp
+
+
+app.view_functions["manifest_x402"] = manifest_x402_cached
+manifest_x402 = manifest_x402_cached   # /.well-known/x402, /x402.json e o alias chamam pelo nome
+
+
+# ============================================================================
 # v48.85.0-CLEAR — detector de arquivo truncado
 #
 # O arquivo voltou cortado no meio do comentário final três vezes (v48.81, v48.82 e
@@ -42125,4 +42397,6 @@ if _NEXUS_TAIL_OK is False:
 # v48.94.0-WATCHGUARD: vigia sem teto de 40 linhas; alerta só persiste após envio confirmado; watch com exceção mede 1x/URL; textos Pyth e relatório de IA honestos | base: v48.93.0-FLEETRADAR
 # v48.95.0-TRUEPRICE: preço anunciado = preço cobrado (BASE_PRICES espelha PRICE_OVERRIDES: agents.txt, llms.txt, SKILL.md, /catalog, x402.sig, mpp.json, /recommend e o 'Agents also bought' do /pay mostravam o preço de tabela; troca de preço chega aos outros workers em <=5 s); LLM em quarentena nunca atende primeiro (exploração e ordens explícitas); radar ignora tokens genéricos (api/v1/ai...) e trata /api/withdraw, /api/payout, /api/config, /api/info como sonda; /dash público sem ruído e 'similar endpoint'; /ai.txt; fábrica não revende Open-Meteo gratuito; compra da carteira do operador não dispara 1 Telegram por venda | base: v48.94.0-WATCHGUARD
 # v48.96.0-PRICESAFE: rollback de overrides e retry após JSON inválido; escrita atômica; fábrica aposentada responde 410 Sunset; polling do Telegram com backoff | base: v48.95.0-TRUEPRICE
-# EOF-LOSBETO 48.96.0-PRICESAFE — fim do arquivo (se esta linha faltar, a copia foi cortada)
+# v48.97.0-ANYWALLET: checkout /pay com conta-contrato (smart wallet / EIP-7702) paga por transferência USDC de 1 clique com reivindicação automática; botão de transferência após recusa de assinatura; 4100 refaz a autorização 1x; avisos mostram a conta conectada; resultado pago renderizado como texto; reivindicação manual repete sozinha; aviso de venda/novo comprador no Telegram ignora toda carteira da casa (inclui os payTo do nó); preço com 4ª casa ($0.0064) no /pay, amostra, página 402 e /api/for-you; manifesto x402 em cache de 60 s; /health deriva o ATA Solana | base: v48.96.0-PRICESAFE
+# v48.98.0-CLAIMGUARD: claim repete só falhas transitórias; timeout de facilitador não oferece nova cobrança; UI usa duas confirmações; falha do handler após transferência vira crédito idempotente | base: v48.97.0-ANYWALLET
+# EOF-LOSBETO 48.98.0-CLAIMGUARD — fim do arquivo (se esta linha faltar, a copia foi cortada)
