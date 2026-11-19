@@ -2,7 +2,7 @@
 """
 Losbeto x402 — monolithic Flask service for Railway.
 
-Current release: 48.98.0-CLAIMGUARD.
+Current release: 48.100.0-CLAIMRESET.
 Payment requirements are server-side. Delivery requires verified settlement;
 pending payments are reconciled against independent chain evidence.
 Operational history lives in CHANGELOG.md, not in executable boot output.
@@ -236,6 +236,13 @@ def _is_house_payer(payer) -> bool:
         a = g.get(name)
         if a and p == str(a).strip().lower():
             return True
+    fn = g.get("_house_file_wallets")      # v48.99.0: carteiras marcadas pelo operador (/casa)
+    if fn:
+        try:
+            if p in fn():
+                return True
+        except Exception:
+            pass
     try:
         a = getattr(g.get("WALLET"), "solana_address", "") or ""
         return bool(a) and p == str(a).strip().lower()
@@ -1121,7 +1128,8 @@ class LedgerV10:
                 _is_op = False
             if not _is_op:
                 try:
-                    _notify_telegram(
+                    _tg_new_buyer(
+                        payer,
                         f"🆕 NOVO COMPRADOR ORGÂNICO\n"
                         f"Carteira: {payer[:24]}...\n"
                         f"Primeira compra: {endpoint} — ${amount:.4f} ({chain})\n"
@@ -1659,8 +1667,8 @@ class LedgerV10:
         if _new_buyer and payer and source != "bootstrap":
             try:
                 if not _is_house_payer(payer):
-                    _notify_telegram(f"🆕 NOVO COMPRADOR ORGÂNICO\nCarteira: {payer[:24]}...\n"
-                                     f"Primeira compra: {endpoint} — ${amount:.4f} ({chain})")
+                    _tg_new_buyer(payer, f"🆕 NOVO COMPRADOR ORGÂNICO\nCarteira: {payer[:24]}...\n"
+                                         f"Primeira compra: {endpoint} — ${amount:.4f} ({chain})")
             except Exception:
                 pass
         return True, "ok"
@@ -9893,6 +9901,27 @@ def _notify_telegram(text: str):
     except Exception:
         return False
 
+
+def _tg_new_buyer(payer: str, text: str) -> bool:
+    """v48.99.0: "🆕 NOVO COMPRADOR ORGÂNICO" com o botão 🏠. Em 19/nov a carteira Phantom do
+    próprio operador (testando o /pay) entrou como compradora orgânica; um toque grava a
+    carteira como da casa (/casa) e ela sai da receita orgânica, retroativamente."""
+    if not (TG_TOKEN and TG_CHAT):
+        return False
+    p = str(payer or "").strip()
+    payload = {"chat_id": TG_CHAT, "text": _tg_plain_text(text)}
+    if p and len(("/casa " + p).encode()) <= 64:          # limite do callback_data
+        payload["reply_markup"] = {"inline_keyboard": [[
+            {"text": "🏠 É minha — não contar como orgânica", "callback_data": "/casa " + p}]]}
+    try:
+        r = requests.post(f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
+                          json=payload, timeout=5)
+        if r.ok:
+            return True
+    except Exception:
+        pass
+    return _notify_telegram(text)
+
 _PREVIEW_CACHE: dict = {}  # v24.1: última resposta paga por endpoint (modelo delayed)
 
 PREVIEW_DB_PATH = HOME_DIR / "preview_cache.db"
@@ -13941,6 +13970,77 @@ def _ai_probe_cached():
     _AI_PROBE_CACHE.update({"ts": now, "probe": probe, "live": live})
     return probe, live
 
+# ============================================================================
+# v48.99.0-HOUSEKEY — fontes de mercado do /health/providers sem bloquear o pedido
+#
+# Cada GET /health/providers chamava Finnhub, Yahoo e exchangerate-api na hora (3 a 7
+# requisições externas; HTTP log de 19/nov: 323–782 ms em 8 de 8 chamadas). O /live/api
+# usa a mesma função (21 s numa chamada fria) e o checkout /pay a chamava a cada clique.
+# Agora: a primeira leitura do worker mede na hora; depois a resposta sai do cache e,
+# passados HEALTH_MD_TTL s (120), UMA thread mede de novo em segundo plano. HEALTH_MD_TTL=0
+# volta ao comportamento antigo.
+# ============================================================================
+_V4899_MD = {"ts": 0.0, "checks": None, "busy": False}
+_V4899_MD_LOCK = threading.Lock()
+try:
+    _V4899_MD_TTL = float(os.environ.get("HEALTH_MD_TTL", "120") or 0)
+except Exception:
+    _V4899_MD_TTL = 120.0
+
+
+def _v4899_market_checks_compute() -> dict:
+    checks = {}
+    for path, fn in (("/stock-quote", Brain.stock_quote),
+                     ("/commodity-price", Brain.commodity_price),
+                     ("/forex-rate", Brain.forex_rate)):
+        try:
+            with app.test_request_context(path):
+                r = fn()
+            val = None
+            if isinstance(r, dict):
+                val = r.get("price") if r.get("price") is not None else r.get("rate")
+            stale = bool(isinstance(r, dict) and
+                         str(r.get("source", "")).startswith("fallback"))
+            checks[path] = {"live": bool(val and not (isinstance(r, dict) and r.get("status"))
+                                         and not stale),
+                            "source": (r.get("source") or r.get("status")) if isinstance(r, dict) else "n/a"}
+        except Exception as e:
+            checks[path] = {"live": False, "source": f"error: {str(e)[:40]}"}
+    return checks
+
+
+def _v4899_market_checks_refresh():
+    try:
+        res = _v4899_market_checks_compute()
+        _V4899_MD.update({"checks": res, "ts": time.time()})
+    except Exception as e:
+        log.debug(f"health md refresh: {e}")
+    finally:
+        _V4899_MD["busy"] = False
+
+
+def _v4899_market_checks():
+    """(checks, idade_s). Fria: mede na hora (1x por worker). Quente: devolve o cache e,
+    vencido o TTL, dispara uma única atualização em segundo plano."""
+    if _V4899_MD_TTL <= 0:
+        return _v4899_market_checks_compute(), 0
+    c = _V4899_MD
+    if c["checks"] is None:
+        with _V4899_MD_LOCK:
+            if c["checks"] is None:
+                c.update({"checks": _v4899_market_checks_compute(), "ts": time.time()})
+    elif time.time() - c["ts"] >= _V4899_MD_TTL and not c["busy"]:
+        with _V4899_MD_LOCK:
+            if not c["busy"]:
+                c["busy"] = True
+                try:
+                    threading.Thread(target=_v4899_market_checks_refresh, daemon=True).start()
+                except Exception:
+                    c["busy"] = False
+    return ({k: dict(v) for k, v in (c["checks"] or {}).items()},
+            max(0, int(time.time() - c["ts"])))
+
+
 @app.route("/health/providers")
 def health_providers():
     """v25.3: autodiagnóstico público das fontes que sustentam as promessas do
@@ -13968,24 +14068,9 @@ def health_providers():
                  "public_status": "/ml",
                  "mpp_tempo": ("on" if MPP_TEMPO else "off"),
                  "price_advisor": ("auto" if PRICE_AUTO else "advisory")}
-    checks = {}
-    for path, fn in (("/stock-quote", Brain.stock_quote),
-                     ("/commodity-price", Brain.commodity_price),
-                     ("/forex-rate", Brain.forex_rate)):
-        try:
-            with app.test_request_context(path):
-                r = fn()
-            val = None
-            if isinstance(r, dict):
-                val = r.get("price") if r.get("price") is not None else r.get("rate")
-            stale = bool(isinstance(r, dict) and
-                         str(r.get("source", "")).startswith("fallback"))
-            checks[path] = {"live": bool(val and not (isinstance(r, dict) and r.get("status"))
-                                         and not stale),
-                            "source": (r.get("source") or r.get("status")) if isinstance(r, dict) else "n/a"}
-        except Exception as e:
-            checks[path] = {"live": False, "source": f"error: {str(e)[:40]}"}
+    checks, md_age = _v4899_market_checks()       # v48.99.0: cache + atualização em 2º plano
     out["market_data"] = checks
+    out["market_data_age_s"] = md_age
     out["premium_ready"] = ai_live and all(v["live"] for v in checks.values())
     try:
         out["sol_dest_ata"] = _sol_dest_ata_status()
@@ -32490,7 +32575,7 @@ const PAY_VERSION = '__PAY_VERSION__';
 // recarrega sozinha em vez de falhar no facilitator com codigo defasado.
 async function ensureFresh(notify){
   try{
-    const r = await fetch('/health/providers', { cache: 'no-store' });
+    const r = await fetch('/health', { cache: 'no-store' });   // v48.99.0: /health/providers custava 0,3–0,8 s por clique
     const j = await r.json();
     if (j && j.version && j.version !== PAY_VERSION){
       notify('This checkout was just updated — refreshing to the latest version…');
@@ -32680,8 +32765,8 @@ async function preflightWallet(from){
         'x402 facilitators reject USDC payment signatures from contract accounts (known ecosystem issue x402#623)' +
         (IS_CREDIT
           ? ' \u2014 credit plans need that signature: pay from a regular MetaMask/Rabby account (EOA) with USDC on Base.'
-          : ' \u2014 so this checkout pays with a plain USDC transfer from your wallet instead: two confirmations, ' +
-            'data delivered automatically.'));
+          : ' \u2014 so this checkout pays with a plain USDC transfer from your wallet instead: one approval in ' +
+            'your wallet, data delivered automatically after 2 Base confirmations.'));
     }
   }catch(e){}
   try{
@@ -32941,7 +33026,8 @@ const CLAIM_MSGS = {
   'insufficient-amount': 'Transfer found, but the amount is below the price. Send the exact amount and submit the new hash.',
   'transfer-proof-count': 'That transaction has no single USDC transfer of exactly the price to the payment address. ' +
                           'Send exactly the price shown and submit the new hash.',
-  'replay': 'This transaction hash was already claimed.',
+  'replay': 'This transfer was already verified and its data delivered \u2014 each payment unlocks one call. ' +
+            'To call again, send a new payment.',
   'tx-failed': 'That transaction reverted on-chain \u2014 no funds moved.',
   'bad_tx_hash': 'Paste a valid Base tx hash (0x + 64 hex) or a Solana signature.',
   'credit_plan': 'Credit plans need the signed checkout above.',
@@ -32992,7 +33078,8 @@ async function claimTransfer(){
     if(j && j.ok){
       setC('Paid \u2713 \u2014 direct transfer verified on-chain.', 'ok');
       showResult(j.data);
-      btnC.textContent = 'Verified \u2713';
+      markClaimed(tx);
+      setC('Paid \u2713 — direct transfer verified on-chain.', 'ok');
       return;
     }
   }catch(e){
@@ -33001,6 +33088,34 @@ async function claimTransfer(){
   btnC.disabled = false;
 }
 document.getElementById('btnClaim').addEventListener('click', function(){ return claimTransfer(); });
+// v48.99.0: hash entregue = cartão manual travado com aviso verde; colar outro hash destrava
+let CLAIMED_TX = '';
+function claimKey(tx){
+  const s = String(tx || '').trim();
+  return /^0x/i.test(s) ? s.toLowerCase() : s;
+}
+function markClaimed(tx){
+  CLAIMED_TX = claimKey(tx);
+  const st = document.getElementById('statusClaim');
+  if(st){
+    st.textContent = '\u2713 This transfer was verified and its data delivered above \u2014 each payment unlocks one call.';
+    st.className = 'status ok';
+  }
+  const bc = document.getElementById('btnClaim');
+  if(bc){ bc.disabled = true; bc.textContent = 'Verified \u2713'; }
+}
+(function(){
+  const ti = document.getElementById('txHashIn');
+  if(ti) ti.addEventListener('input', function(){
+    const bc = document.getElementById('btnClaim');
+    if(!bc || !CLAIMED_TX) return;
+    if(claimKey(ti.value) !== CLAIMED_TX){
+      bc.disabled = false; bc.textContent = 'Verify & get my data';
+      const st = document.getElementById('statusClaim');
+      if(st){ st.textContent = ''; st.className = 'status'; }
+    }
+  });
+})();
 
 // v48.97.0-ANYWALLET: conta com codigo (smart wallet ou EOA delegada por EIP-7702). O USDC valida a
 // assinatura EIP-3009 dessas contas via ERC-1271 e a simulacao reverte no facilitador (18/nov
@@ -33037,6 +33152,7 @@ async function payByTransfer(w, from){
       setStatus('Paid \u2713 \u2014 USDC transfer verified on-chain.', 'ok');
       showResult(j.data);
       btn.textContent = 'Pay again';
+      markClaimed(txh);
     }
   }catch(e){
     setStatus(walletErrMsg(e), 'err');
@@ -33116,7 +33232,7 @@ async function payAndFetch(retried){
         // v48.97.0: a assinatura foi recusada -> o mesmo pagamento como transferencia comum
         showXfer(w, from);
         msg += '\nThe facilitator rejected this wallet signature \u2014 tap the orange button above to pay ' +
-               'the same price with a plain USDC transfer (two confirmations, no signature).';
+               'the same price with a plain USDC transfer (one wallet approval, no signature; delivered after 2 Base confirmations).';
       }
       setStatus(msg,'err');
       btn.disabled=false; return; }
@@ -39972,8 +40088,8 @@ def _v4842_commit_payment(self, endpoint: str, amount: float, tx_sig: str,
     if new_buyer and payer and source != "bootstrap":
         try:
             if not _is_house_payer(payer):
-                _notify_telegram(f"🆕 NOVO COMPRADOR ORGÂNICO\nCarteira: {payer[:24]}...\n"
-                                 f"Primeira compra: {endpoint} — ${amount:.4f} ({chain})")
+                _tg_new_buyer(payer, f"🆕 NOVO COMPRADOR ORGÂNICO\nCarteira: {payer[:24]}...\n"
+                                     f"Primeira compra: {endpoint} — ${amount:.4f} ({chain})")
         except Exception:
             pass
     return True, "ok"
@@ -41094,7 +41210,7 @@ _ops_validate = _v4843_ops_validate
 
 _v4842_sanitize_governance()
 
-VERSION = "48.98.0-CLAIMGUARD"
+VERSION = "48.100.0-CLAIMRESET"
 
 
 # ============================================================================
@@ -42346,6 +42462,120 @@ manifest_x402 = manifest_x402_cached   # /.well-known/x402, /x402.json e o alias
 
 
 # ============================================================================
+# v48.99.0-HOUSEKEY — carteiras da casa marcadas pelo operador
+#
+# 19/nov: o operador testou o /pay com a própria carteira Phantom (0xe822…1581) e ela
+# entrou como "🆕 NOVO COMPRADOR ORGÂNICO"; 4 compras de teste foram para a receita orgânica
+# do painel e do /live. OPERATOR_WALLETS só muda com deploy. Agora o aviso de novo comprador
+# traz o botão 🏠 e o comando /casa grava a carteira em HOME_DIR/house_wallets.json — lido
+# por todos os workers (mtime), por _is_house_payer (avisos) e por _self_pay_wallets
+# (receita orgânica, /live, /receipts), retroativo porque a classificação é feita na leitura.
+#   /casa                 lista    ·   /casa <endereço>   marca    ·   /casa rm <endereço>
+# Só o chat do operador (TELEGRAM_CHAT_ID) altera o arquivo.
+# ============================================================================
+_V4899_HOUSE_FILE = HOME_DIR / "house_wallets.json"
+_V4899_HOUSE = {"mtime": None, "set": frozenset()}
+_V4899_HOUSE_LOCK = threading.Lock()
+_V4899_ADDR_RE = re.compile(r"^(0x[0-9a-fA-F]{40}|[1-9A-HJ-NP-Za-km-z]{32,44}|[A-Za-z2-7]{58})$")
+
+
+def _house_file_read() -> dict:
+    try:
+        d = json.loads(_V4899_HOUSE_FILE.read_text())
+        w = d.get("wallets") if isinstance(d, dict) else None
+        return w if isinstance(w, dict) else {}
+    except Exception:
+        return {}
+
+
+def _house_file_wallets() -> frozenset:
+    """Conjunto (minúsculas) do arquivo; relido quando o mtime muda."""
+    try:
+        mt = _V4899_HOUSE_FILE.stat().st_mtime
+    except FileNotFoundError:
+        _V4899_HOUSE.update({"mtime": None, "set": frozenset()})
+        return _V4899_HOUSE["set"]
+    except Exception:
+        return _V4899_HOUSE["set"]
+    if mt != _V4899_HOUSE["mtime"]:
+        w = _house_file_read()
+        _V4899_HOUSE.update({"mtime": mt,
+                             "set": frozenset(str(a).strip().lower() for a in w if str(a).strip())})
+    return _V4899_HOUSE["set"]
+
+
+def _house_file_set(addr: str, add: bool = True) -> bool:
+    a = str(addr or "").strip()
+    if not _V4899_ADDR_RE.match(a):
+        return False
+    with _V4899_HOUSE_LOCK:
+        w = _house_file_read()
+        key = a.lower()
+        if add:
+            w[key] = {"address": a, "ts": int(time.time()), "by": "telegram"}
+        else:
+            w.pop(key, None)
+        ok = _ops_write_json(_V4899_HOUSE_FILE, {"wallets": w})
+    _V4899_HOUSE["mtime"] = None          # força releitura neste worker
+    return bool(ok)
+
+
+_SELF_PAY_4899 = _self_pay_wallets
+
+
+def _self_pay_wallets():  # noqa: F811 — camada 48.99.0
+    s = set(_SELF_PAY_4899())
+    try:
+        s |= set(_house_file_wallets())
+    except Exception:
+        pass
+    return s
+
+
+_TG_HANDLE_4899 = TelegramBot._handle
+
+
+def _tg_handle_house(self, msg):
+    text = (msg.get("text") or "").strip()
+    if not (text == "/casa" or text.startswith("/casa ")):
+        return _TG_HANDLE_4899(self, msg)
+    chat_id = (msg.get("chat") or {}).get("id")
+    if not TG_CHAT or str(chat_id) != str(TG_CHAT):
+        log.warning(f"🏠 /casa ignorado: chat {chat_id} não é o do operador")
+        return None
+    try:
+        parts = text.split()
+        if len(parts) == 1:
+            w = _house_file_read()
+            linhas = [f"🏠 *Carteiras da casa* — arquivo: {len(w)} · OPERATOR\\_WALLETS (env): "
+                      f"{len(OPERATOR_WALLETS)}"]
+            for k, v in sorted(w.items(), key=lambda kv: -int((kv[1] or {}).get("ts", 0)))[:20]:
+                linhas.append(f"• `{(v or {}).get('address') or k}`")
+            linhas.append("Marcar: `/casa <endereço>` · desfazer: `/casa rm <endereço>`")
+            self.send(chat_id, "\n".join(linhas))
+            return None
+        remove = parts[1].lower() in ("rm", "del", "remover", "tirar") and len(parts) >= 3
+        addr = parts[2] if remove else parts[1]
+        if not _house_file_set(addr, add=not remove):
+            self.send(chat_id, "⚠️ Endereço inválido. Uso: `/casa <endereço>` (Base 0x…, Solana ou "
+                               "Algorand) · `/casa rm <endereço>` · `/casa` lista.")
+            return None
+        if remove:
+            self.send(chat_id, f"🏠 `{addr}` voltou a contar como compradora externa.")
+        else:
+            self.send(chat_id, f"🏠 `{addr}` agora é carteira da casa: as compras dela saem da "
+                               "receita orgânica (painel, /live, /receipts) e não geram aviso de "
+                               f"novo comprador. Desfazer: `/casa rm {addr}`")
+        log.info(f"🏠 /casa {'rm' if remove else 'add'} {addr[:12]}…")
+    except Exception as e:
+        log.warning(f"🏠 /casa: {e}")
+    return None
+
+
+TelegramBot._handle = _tg_handle_house
+
+
+# ============================================================================
 # v48.85.0-CLEAR — detector de arquivo truncado
 #
 # O arquivo voltou cortado no meio do comentário final três vezes (v48.81, v48.82 e
@@ -42399,4 +42629,6 @@ if _NEXUS_TAIL_OK is False:
 # v48.96.0-PRICESAFE: rollback de overrides e retry após JSON inválido; escrita atômica; fábrica aposentada responde 410 Sunset; polling do Telegram com backoff | base: v48.95.0-TRUEPRICE
 # v48.97.0-ANYWALLET: checkout /pay com conta-contrato (smart wallet / EIP-7702) paga por transferência USDC de 1 clique com reivindicação automática; botão de transferência após recusa de assinatura; 4100 refaz a autorização 1x; avisos mostram a conta conectada; resultado pago renderizado como texto; reivindicação manual repete sozinha; aviso de venda/novo comprador no Telegram ignora toda carteira da casa (inclui os payTo do nó); preço com 4ª casa ($0.0064) no /pay, amostra, página 402 e /api/for-you; manifesto x402 em cache de 60 s; /health deriva o ATA Solana | base: v48.96.0-PRICESAFE
 # v48.98.0-CLAIMGUARD: claim repete só falhas transitórias; timeout de facilitador não oferece nova cobrança; UI usa duas confirmações; falha do handler após transferência vira crédito idempotente | base: v48.97.0-ANYWALLET
-# EOF-LOSBETO 48.98.0-CLAIMGUARD — fim do arquivo (se esta linha faltar, a copia foi cortada)
+# v48.99.0-HOUSEKEY: botão 🏠 no aviso de novo comprador e comando /casa no Telegram (carteira de teste do operador sai da receita orgânica, retroativo, sem deploy); /health/providers mede Finnhub/Yahoo/exchangerate em segundo plano (cache 120 s) — também acelera o /live/api frio; o /pay confere a versão no /health barato; depois da entrega automática o cartão manual mostra o hash como já usado em vez de devolver "already claimed"; texto da transferência: 1 aceite na carteira, 2 confirmações da rede | base: v48.98.0-CLAIMGUARD
+# v48.100.0-CLAIMRESET: claim manual também marca entrega e destrava com outro hash; Base58 não é normalizado para minúsculas | base: v48.99.0-HOUSEKEY
+# EOF-LOSBETO 48.100.0-CLAIMRESET — fim do arquivo (se esta linha faltar, a copia foi cortada)
