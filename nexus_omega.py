@@ -2,7 +2,7 @@
 """
 Losbeto x402 — monolithic Flask service for Railway.
 
-Current release: 48.100.0-CLAIMRESET.
+Current release: 48.101.0-ONETAP.
 Payment requirements are server-side. Delivery requires verified settlement;
 pending payments are reconciled against independent chain evidence.
 Operational history lives in CHANGELOG.md, not in executable boot output.
@@ -9293,7 +9293,7 @@ def _finalize_facilitator_payment(endpoint: str, requirement: dict, tx_sig: str,
     # (_is_house_payer) — a rodada Algorand paga de ALGO_PAYTO para ALGO_PAYTO.
     if (not _is_house_payer(payer)
             or os.environ.get("TG_NOTIFY_OPERATOR_SALES", "0") == "1"):
-        _notify_telegram(f"💰 ${received:.6f} USDC em {endpoint} ({chain}, via facilitator)\nTX: {tx_sig}")
+        _tg_sale(payer, f"💰 ${received:.6f} USDC em {endpoint} ({chain}, via facilitator)\nTX: {tx_sig}")
     return True, "ok-facilitator", _verified_payment_info(
         endpoint, requirement, tx_sig, payer, proof, settlement)
 
@@ -9920,6 +9920,15 @@ def _tg_new_buyer(payer: str, text: str) -> bool:
             return True
     except Exception:
         pass
+    return _notify_telegram(text)
+
+
+def _tg_sale(payer: str, text: str) -> bool:
+    """v48.101.0: "💰" de venda com o botão 🏠 quando o pagador não é da casa. Em 19/nov a
+    carteira Phantom do operador já não era "nova" (o botão da 48.99 só aparece na 1ª compra)
+    e 7 compras de teste seguiram contando como receita orgânica — $0.062 de $0.104 nas 24 h."""
+    if payer and not _is_house_payer(payer):
+        return _tg_new_buyer(payer, text)
     return _notify_telegram(text)
 
 _PREVIEW_CACHE: dict = {}  # v24.1: última resposta paga por endpoint (modelo delayed)
@@ -13629,7 +13638,7 @@ def _base_direct_verify(endpoint: str, txh: str):
     if not LEDGER.add_revenue(endpoint, usd, txh, payer, source="direct", chain="base"):
         return False, "replay", {}
     log.info(f"💰 BASE/direto ${usd:.4f} em {endpoint} de {payer[:14]}… tx {txh[:18]}…")
-    _notify_telegram(f"💰 ${usd:.6f} USDC em {endpoint} (Base direct)\nTX: {txh}")
+    _tg_sale(payer, f"💰 ${usd:.6f} USDC em {endpoint} (Base direct)\nTX: {txh}")
     return True, "direct", {"payer": payer, "tx": txh, "usd": usd,
                             "payment_verified": True, "amount_usd": usd,
                             "required_usd": _requirement_amount_atomic(req) / 1_000_000}
@@ -13666,7 +13675,7 @@ def _sol_direct_verify(endpoint: str, sig: str):
     if not LEDGER.add_revenue(endpoint, usd, sig, payer, source="direct", chain="solana"):
         return False, "replay", {}
     log.info(f"💰 SOL/direto ${usd:.4f} em {endpoint} de {(payer or '?')[:14]}… sig {sig[:18]}…")
-    _notify_telegram(f"💰 ${usd:.6f} USDC em {endpoint} (Solana direct)\nTX: {sig}")
+    _tg_sale(payer, f"💰 ${usd:.6f} USDC em {endpoint} (Solana direct)\nTX: {sig}")
     return True, "direct", {"payer": payer, "tx": sig, "usd": usd,
                             "payment_verified": True, "amount_usd": usd,
                             "required_usd": want}
@@ -14009,10 +14018,40 @@ def _v4899_market_checks_compute() -> dict:
     return checks
 
 
+# v48.101.0: em 19/nov o /health/providers respondeu market_data_age_s=13298 — o worker que
+# atendeu não recebia /health/providers desde as 18:04 UTC e o "devolve o cache e atualiza em
+# 2º plano" entregou uma medição de 3,7 h como atual. Agora: (1) a medição mais nova de
+# QUALQUER worker vale para todos (cache do ledger); (2) acima de HEALTH_MD_MAX_STALE (600 s)
+# mede na hora; (3) entre o TTL (120 s) e esse teto, cache + atualização em 2º plano.
+try:
+    _V4101_MD_MAX_STALE = max(_V4899_MD_TTL, float(os.environ.get("HEALTH_MD_MAX_STALE", "600") or 600))
+except Exception:
+    _V4101_MD_MAX_STALE = 600.0
+_V4101_MD_KEY = "health:md:v1"
+
+
+def _v4101_md_shared_get():
+    try:
+        rec = LEDGER.cache_get(_V4101_MD_KEY, int(_V4101_MD_MAX_STALE) + 60)
+        if isinstance(rec, dict) and isinstance(rec.get("checks"), dict) and rec.get("ts"):
+            return rec
+    except Exception:
+        pass
+    return None
+
+
+def _v4101_md_store(res: dict):
+    ts = time.time()
+    _V4899_MD.update({"checks": res, "ts": ts})
+    try:
+        LEDGER.cache_set(_V4101_MD_KEY, {"checks": res, "ts": ts})
+    except Exception:
+        pass
+
+
 def _v4899_market_checks_refresh():
     try:
-        res = _v4899_market_checks_compute()
-        _V4899_MD.update({"checks": res, "ts": time.time()})
+        _v4101_md_store(_v4899_market_checks_compute())
     except Exception as e:
         log.debug(f"health md refresh: {e}")
     finally:
@@ -14020,15 +14059,18 @@ def _v4899_market_checks_refresh():
 
 
 def _v4899_market_checks():
-    """(checks, idade_s). Fria: mede na hora (1x por worker). Quente: devolve o cache e,
-    vencido o TTL, dispara uma única atualização em segundo plano."""
+    """(checks, idade_s): medição compartilhada; vencida além do teto mede na hora;
+    entre TTL e teto devolve o cache e dispara UMA atualização em segundo plano."""
     if _V4899_MD_TTL <= 0:
         return _v4899_market_checks_compute(), 0
     c = _V4899_MD
-    if c["checks"] is None:
+    rec = _v4101_md_shared_get()
+    if rec and float(rec["ts"]) > float(c["ts"] or 0):
+        c.update({"checks": rec["checks"], "ts": float(rec["ts"])})
+    if c["checks"] is None or time.time() - c["ts"] >= _V4101_MD_MAX_STALE:
         with _V4899_MD_LOCK:
-            if c["checks"] is None:
-                c.update({"checks": _v4899_market_checks_compute(), "ts": time.time()})
+            if c["checks"] is None or time.time() - c["ts"] >= _V4101_MD_MAX_STALE:
+                _v4101_md_store(_v4899_market_checks_compute())
     elif time.time() - c["ts"] >= _V4899_MD_TTL and not c["busy"]:
         with _V4899_MD_LOCK:
             if not c["busy"]:
@@ -41210,7 +41252,7 @@ _ops_validate = _v4843_ops_validate
 
 _v4842_sanitize_governance()
 
-VERSION = "48.100.0-CLAIMRESET"
+VERSION = "48.101.0-ONETAP"
 
 
 # ============================================================================
@@ -42418,21 +42460,26 @@ def ai_txt():
 # /.well-known/x402.json monta um desafio 402 por endpoint (~124) a cada pedido; o slim
 # /.well-known/x402 chama o mesmo construtor. HTTP log de 18/nov: 691 ms e 748 ms por pedido
 # (o /openapi.json, que já tem cache, sai em 15-34 ms). Diretórios e avaliadores leem esse
-# documento o tempo todo. Agora: 60 s por worker (MANIFEST_CACHE_S), chave = catálogo e preços
-# (troca de preço/produto da fábrica invalida na hora). MANIFEST_CACHE_S=0 desliga.
+# documento o tempo todo. Agora: cache por worker (MANIFEST_CACHE_S; 900 s desde a 48.101),
+# chave = catálogo, preços e endpoints invendáveis no momento (troca de preço, produto da
+# fábrica ou dependência fora do ar invalida na hora). MANIFEST_CACHE_S=0 desliga.
 # ============================================================================
 _V4897_MANIFEST = {"key": None, "ts": 0.0, "body": None}
 try:
-    _V4897_MANIFEST_TTL = float(os.environ.get("MANIFEST_CACHE_S", "60") or 0)
+    # v48.101.0: 60 s quase nunca acertava (HTTP log de 19/nov: 956 ms e 301 ms — cada worker
+    # recebe o manifesto a cada vários minutos). A chave agora inclui o que está invendável,
+    # então a validade longa não deixa endpoint parado na vitrine (x402lint P6).
+    _V4897_MANIFEST_TTL = float(os.environ.get("MANIFEST_CACHE_S", "900") or 0)
 except Exception:
-    _V4897_MANIFEST_TTL = 60.0
+    _V4897_MANIFEST_TTL = 900.0
 _v4897_manifest_build = manifest_x402
 
 
 def _v4897_manifest_key():
     try:
         return (VERSION, tuple(sorted((str(k), round(float(v), 6))
-                                      for k, v in BASE_PRICES.items())))
+                                      for k, v in BASE_PRICES.items())),
+                tuple(sorted(p for p in BASE_PRICES if not _sellable_now(p))))   # v48.101.0
     except Exception:
         return None
 
@@ -42631,4 +42678,5 @@ if _NEXUS_TAIL_OK is False:
 # v48.98.0-CLAIMGUARD: claim repete só falhas transitórias; timeout de facilitador não oferece nova cobrança; UI usa duas confirmações; falha do handler após transferência vira crédito idempotente | base: v48.97.0-ANYWALLET
 # v48.99.0-HOUSEKEY: botão 🏠 no aviso de novo comprador e comando /casa no Telegram (carteira de teste do operador sai da receita orgânica, retroativo, sem deploy); /health/providers mede Finnhub/Yahoo/exchangerate em segundo plano (cache 120 s) — também acelera o /live/api frio; o /pay confere a versão no /health barato; depois da entrega automática o cartão manual mostra o hash como já usado em vez de devolver "already claimed"; texto da transferência: 1 aceite na carteira, 2 confirmações da rede | base: v48.98.0-CLAIMGUARD
 # v48.100.0-CLAIMRESET: claim manual também marca entrega e destrava com outro hash; Base58 não é normalizado para minúsculas | base: v48.99.0-HOUSEKEY
-# EOF-LOSBETO 48.100.0-CLAIMRESET — fim do arquivo (se esta linha faltar, a copia foi cortada)
+# v48.101.0-ONETAP: botão 🏠 também nas mensagens 💰 de venda (facilitador, Base e Solana diretas) quando o pagador não é da casa; /health/providers usa a medição mais nova de qualquer worker e mede na hora acima de 600 s (era possível responder com 3,7 h); manifesto x402 com validade de 15 min e chave que inclui o que está invendável | base: v48.100.0-CLAIMRESET
+# EOF-LOSBETO 48.101.0-ONETAP — fim do arquivo (se esta linha faltar, a copia foi cortada)
