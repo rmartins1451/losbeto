@@ -2,7 +2,7 @@
 """
 Losbeto x402 — monolithic Flask service for Railway.
 
-Current release: 48.101.0-ONETAP.
+Current release: 48.103.0-PREGATEPRICE.
 Payment requirements are server-side. Delivery requires verified settlement;
 pending payments are reconciled against independent chain evidence.
 Operational history lives in CHANGELOG.md, not in executable boot output.
@@ -497,7 +497,7 @@ PRICE_OVERRIDES = _load_price_overrides()
 
 ENDPOINT_DESC = {
 
-    "/pyth-price":      "Real-time SOL/BTC/ETH USD price with Pyth confidence and publish slot when available; CoinGecko fallback is explicitly labeled in every response.",
+    "/pyth-price":      "Real-time USD price for SOL, BTC, ETH, BNB, XRP, DOGE, ADA or LINK (?symbol=SOL): Pyth with confidence when entitled, else CoinGecko, then Coinbase or Kraken spot. The source is labeled in every response; unsupported symbols are refused before payment.",
     "/weather":         "Live forecast for major cities or any lat/lon: current nowcast, next 24h and up to 7 days with precipitation and wind. MET Norway Locationforecast with CC BY 4.0 attribution; Open-Meteo is used only when commercial access is explicitly configured.",
     "/fear-greed":      "Is the crowd greedy or fearful right now? The Fear & Greed Index (0-100) at this exact instant, with classification — a point-in-time reading your model's training data cannot contain.",
     "/trust-hash":      "SHA-256 proof-of-data hash for audit trails: a verifiable cryptographic receipt of any Losbeto response, for agents that must prove what they were told and when.",
@@ -4893,18 +4893,28 @@ class Brain:
 
     @staticmethod
     def pyth_price():
-        symbol = request.args.get("symbol", "SOL").upper()
-        feeds = {
-            "SOL": "0xef0d8b6fda2ceba41da15d4095d1da392a0d2f8ed0c6c7bc0f4cfac8c280b56d",
-            "BTC": "0xe62df6c8b4a85fe1a67db44dc12de5db330f7ac66b72dc658afedf0f4a415b43",
-            "ETH": "0xff61491a931112ddf1bd8147cd1b641375f79f5825126d665480874634fd0ace",
-        }
-        feed_id = feeds.get(symbol, feeds["SOL"])
+        # v48.102.0: o símbolo pedido é o símbolo vendido. Até a 48.101, tudo fora de
+        # SOL/BTC/ETH devolvia o preço do SOL com o rótulo pedido (?symbol=DOGE -> preço do
+        # SOL rotulado "DOGE", cobrado). Agora: os símbolos de _FC_FEEDS (SOL, BTC, ETH, BNB,
+        # XRP, DOGE, ADA, LINK) e apelidos (BITCOIN, XBT, SOL-USD...); o resto é recusado — o
+        # pré-gate (_PARAM_RULES) responde 400 antes do 402, sem cobrança.
+        raw = request.args.get("symbol", "SOL")
+        symbol = _v4102_px_symbol(raw)
+        if symbol is None:
+            return {"error": "unsupported_symbol",
+                    "symbol": re.sub(r"\s+", "", str(raw or ""))[:16].upper(),
+                    "supported": _v4102_px_supported(),
+                    "ts": int(time.time())}
         try:
-            px = _sym_price(symbol if symbol in feeds else "SOL")
-            return {"symbol": symbol, "price_usd": round(px["price"], 6),
-                    "confidence": px.get("conf"), "source": px["source"],
-                    "ts": int(time.time()), "provider": f"Losbeto/{px['source']}"}
+            from flask import g as _g
+            px = _g.get("losbeto_pyth_preflight") or _sym_price(symbol)
+            out = {"symbol": symbol, "price_usd": round(px["price"], 6),
+                   "confidence": px.get("conf"), "source": px["source"],
+                   "ts": int(time.time()), "provider": f"Losbeto/{px['source']}"}
+            if px.get("stale"):
+                out["stale"] = True
+                out["price_age_s"] = px.get("age_s")
+            return out
         except Exception as e:
             return {"symbol": symbol, "error": str(e), "ts": int(time.time())}
 
@@ -9926,9 +9936,16 @@ def _tg_new_buyer(payer: str, text: str) -> bool:
 def _tg_sale(payer: str, text: str) -> bool:
     """v48.101.0: "💰" de venda com o botão 🏠 quando o pagador não é da casa. Em 19/nov a
     carteira Phantom do operador já não era "nova" (o botão da 48.99 só aparece na 1ª compra)
-    e 7 compras de teste seguiram contando como receita orgânica — $0.062 de $0.104 nas 24 h."""
-    if payer and not _is_house_payer(payer):
-        return _tg_new_buyer(payer, text)
+    e 7 compras de teste seguiram contando como receita orgânica — $0.062 de $0.104 nas 24 h.
+    v48.102.0: a mensagem diz QUEM pagou ("Pagador: 0xe822…1581"). Em 20/nov o 💰 da compra de
+    teste no /pyth-price (Base direct) só trazia o hash — para decidir o 🏠 era preciso abrir a
+    transação; e as compras baratas espaçadas de ~20 min (00:33, 00:49, 01:08, 01:29 UTC) não
+    diziam se vinham da mesma carteira (monitor pago) ou de clientes diferentes."""
+    p = str(payer or "").strip()
+    if p:
+        text = f"{text}\nPagador: {p[:6]}…{p[-4:]}" if len(p) > 14 else f"{text}\nPagador: {p}"
+    if p and not _is_house_payer(p):
+        return _tg_new_buyer(p, text)
     return _notify_telegram(text)
 
 _PREVIEW_CACHE: dict = {}  # v24.1: última resposta paga por endpoint (modelo delayed)
@@ -11058,6 +11075,15 @@ def paid_endpoint(path):
                 _r.status_code = _code
                 _r.headers["Retry-After"] = str(_body["retry_after_seconds"])
                 return _r
+
+            if path == "/pyth-price" and sig:
+                _price_gate = _v4103_pyth_price_preflight()
+                if _price_gate is not None:
+                    _body, _code = _price_gate
+                    _r = jsonify(_body)
+                    _r.status_code = _code
+                    _r.headers["Retry-After"] = str(_body["retry_after_seconds"])
+                    return _r
 
             if not sig:
                 _fcb_tok = (request.headers.get("X-Session-Token") or "")[:40]
@@ -12226,10 +12252,10 @@ class Premium:
 
         gold = _safe_call(lambda: _brain_with_args(Brain.commodity_price, {"symbol": "GOLD"}))
         eur = _safe_call(lambda: _brain_with_args(Brain.forex_rate, {"pair": "EUR/USD"}))
-        btc = _safe_call(Brain.pyth_price)
+        btc = _safe_call(lambda: _brain_with_args(Brain.pyth_price, {"symbol": "BTC"}))  # v48.102.0
         spy = _safe_call(lambda: _brain_with_args(Brain.stock_quote, {"symbol": "SPY"}))
         baseline = {"gold": gold.get("price"), "eur_usd": eur.get("rate"),
-                    "btc": btc.get("price"), "spy": spy.get("price")}
+                    "btc": btc.get("price_usd"), "spy": spy.get("price")}
 
         scenarios = {
             "hawkish": {"usd": "stronger", "gold": "pressure", "equities": "risk-off",
@@ -23283,18 +23309,18 @@ def _chat_greet_message(ip: str, ua: str) -> dict:
         if visto:
             preco_visto = get_dynamic_price(visto)
             if visto in _PREVIEW_REQUIRE_PAYMENT:
-                msg = (f"Olá de novo! 🤖 Vi que você avaliou o {visto} — custa "
+                msg = (f"Olá de novo! Vi que você avaliou o {visto} — custa "
                        f"${preco_visto:.3f}. Este plano ou bundle não tem preview gratuito; "
                        f"você pode revisar as condições em {base}/plans ou abrir o checkout: "
                        f"{base}/pay{visto}.")
                 chips = ["Ver condições do plano", "Quero o link de pagamento", "Explorar amostras de dados"]
             else:
-                msg = (f"Olá de novo! 🤖 Vi que você avaliou o {visto} — custa "
+                msg = (f"Olá de novo! Vi que você avaliou o {visto} — custa "
                        f"${preco_visto:.3f} por chamada e o checkout está em {base}/pay{visto}. "
                        "Quer ver os detalhes da resposta ou a amostra delayed anunciada antes de pagar?")
                 chips = ["Quero o link de pagamento", f"O que o {visto} retorna?", "Ver planos com bônus"]
         else:
-            msg = (f"Olá! Sou a IA do Losbeto 🤖 São {n} endpoints de dados para "
+            msg = (f"Olá! Sou a IA do Losbeto. São {n} endpoints de dados para "
                    f"agentes de IA, pagamento por chamada em USDC ({_chains_md()}), "
                    f"sem cadastro — a partir de ${price_min:.3f}. "
                    f"Posso te mostrar o mais popular ou um teste grátis agora.")
@@ -23303,17 +23329,17 @@ def _chat_greet_message(ip: str, ua: str) -> dict:
         if visto:
             preco_visto = get_dynamic_price(visto)
             if visto in _PREVIEW_REQUIRE_PAYMENT:
-                msg = (f"Welcome back 🤖 You evaluated {visto} last time — it costs "
+                msg = (f"Welcome back! You evaluated {visto} last time — it costs "
                        f"${preco_visto:.3f}. This plan or bundle has no free preview. "
                        f"Review its terms at {base}/plans or open checkout: {base}/pay{visto}.")
                 chips = ["View plan terms", "Take me to checkout", "Explore data samples"]
             else:
-                msg = (f"Welcome back 🤖 You evaluated {visto} last time — it's "
+                msg = (f"Welcome back! You evaluated {visto} last time — it's "
                        f"${preco_visto:.3f}, and checkout is at {base}/pay{visto}. "
                        "Would you like the response details or its advertised delayed sample first?")
                 chips = ["See response details", "Take me to checkout", "Plans with bonus credit"]
         else:
-            msg = (f"Hi! I'm the Losbeto concierge 🤖 {n} pay-per-call endpoints for AI agents, "
+            msg = (f"Hi! I'm the Losbeto concierge. {n} pay-per-call endpoints for AI agents, "
                    f"from ${price_min:.3f} — no signup, the payment is the auth. Public receipts "
                    f"label operator tests; grade A on x402lint. First call is free at /welcome — "
                    f"or tell me what your agent needs and I'll point to the exact endpoint.")
@@ -26331,8 +26357,9 @@ async function reload(){
        "scanners/catálogos — não compram",""],
     ["📊 Relação vendas/avaliações",`${activityRatio.toFixed(1)}%`,
        "indicador de atividade — não é conversão por coorte",""],
-    ["👥 Compradores",j.stats.buyers,"únicos",""],
-    ["💵 Ticket médio",`$${avgTicket.toFixed(4)}`,"24h · por settlement",""],
+    ["👥 Pagadores (acumulado)",j.stats.buyers,"carteiras únicas · inclui as do operador",""],
+    ["💵 Ticket médio orgânico",`$${(orgTx>0?orgUsd/orgTx:0).toFixed(4)}`,
+       "24h · bruto c/ operador: $"+avgTicket.toFixed(4)+"/settlement",""],
     ["⛓️ Chains",(j.chains||["solana"]).map(c=>({"eip155:8453":"Base","eip155:137":"Polygon","eip155:42161":"Arbitrum"}[c])||c.split(":")[0].replace(/^./,x=>x.toUpperCase())).join(" · "),"ativas",""],
     ["📈 Trust Score",trustActive ? "ATIVO" : "BOOTSTRAP", j.stats.paid_24h+" tx (24h)",trustActive?"green":"amber"],
     ["🌐 Endpoints",j.endpoints,"monetizados",""],
@@ -30476,7 +30503,7 @@ def challenge_entry_json():
 
 
 COMMODITY_ENDPOINTS = {
-    "/pyth-price": "https://hermes.pyth.network (entitled API key; labeled CoinGecko fallback)",
+    "/pyth-price": "https://hermes.pyth.network (entitled API key) -> CoinGecko -> Coinbase/Kraken spot, each labeled",
     "/fear-greed": "https://api.alternative.me/fng/ (public, free)",
     "/forex-rate": "https://exchangerate-api.com (free tier)",
     "/commodity-price": "Yahoo Finance (public)",
@@ -41252,7 +41279,7 @@ _ops_validate = _v4843_ops_validate
 
 _v4842_sanitize_governance()
 
-VERSION = "48.101.0-ONETAP"
+VERSION = "48.103.0-PREGATEPRICE"
 
 
 # ============================================================================
@@ -42623,6 +42650,217 @@ TelegramBot._handle = _tg_handle_house
 
 
 # ============================================================================
+# v48.102.0-LIVEPRICE — preço de cripto: o símbolo pedido, ao vivo, sem sono
+#
+# Log da 48.101 (20/nov 00:10:01 e 00:10:20 UTC): "💲 SOL: last-good servido (601s/620s) —
+# Pyth e CG fora" — respostas pagas levaram preço rotulado "10 min" enquanto o CoinGecko
+# recusava a rajada da indexação. O caminho do /pyth-price (e do /council-deep e do
+# /event-playbook, que o chamam):
+#   1. dormia 2 s em TODA chamada com o feed Pyth em backoff: o _pyth_latest devolve {} na
+#      hora e a 48.33.2 tratava o KeyError como "transitório do Hermes" (sleep + 2ª tentativa);
+#   2. não tinha cache de CoinGecko — cada chamada paga, em cada worker, ia ao free tier;
+#   3. sem CoinGecko, ia direto ao histórico do ML (timestamp arredondado a 10 min, até 24 h
+#      de idade) sem tentar Coinbase/Kraken, que o /oracle-consensus já consulta.
+# Agora: Pyth 1 tentativa e só com feed elegível; CoinGecko com cache compartilhado de
+# CG_PRICE_CACHE_S (30 s — o plano público do CoinGecko atualiza a cada 60 s); Coinbase e
+# Kraken spot ao vivo; last-good com a idade real e teto PRICE_LAST_GOOD_MAX_S (900 s): acima
+# disso a chamada falha e não é cobrada, em vez de vender preço velho como "real-time".
+# ============================================================================
+try:
+    _V4102_CG_FRESH_S = max(0.0, float(os.environ.get("CG_PRICE_CACHE_S", "30") or 0))
+except Exception:
+    _V4102_CG_FRESH_S = 30.0
+try:
+    _V4102_LAST_GOOD_MAX_S = max(0.0, float(os.environ.get("PRICE_LAST_GOOD_MAX_S", "900") or 0))
+except Exception:
+    _V4102_LAST_GOOD_MAX_S = 900.0
+
+_V4102_PX_ALIAS = {"SOLANA": "SOL", "BITCOIN": "BTC", "XBT": "BTC", "ETHEREUM": "ETH",
+                   "ETHER": "ETH", "DOGECOIN": "DOGE", "XDG": "DOGE", "CARDANO": "ADA",
+                   "CHAINLINK": "LINK", "RIPPLE": "XRP", "BINANCECOIN": "BNB"}
+_V4102_PX_SUFFIXES = ("/USDT", "-USDT", "USDT", "/USDC", "-USDC", "USDC", "/USD", "-USD", "USD")
+_V4102_PX_ORDER = ("SOL", "BTC", "ETH", "BNB", "XRP", "DOGE", "ADA", "LINK")
+_V4102_KRAKEN_PAIRS = {"SOL": "SOLUSD", "BTC": "XBTUSD", "ETH": "ETHUSD", "XRP": "XRPUSD",
+                       "DOGE": "XDGUSD", "ADA": "ADAUSD", "LINK": "LINKUSD"}
+
+
+def _v4102_px_supported() -> list:
+    return ([s for s in _V4102_PX_ORDER if s in _FC_FEEDS]
+            + sorted(s for s in _FC_FEEDS if s not in _V4102_PX_ORDER))
+
+
+def _v4102_px_symbol(raw):
+    """Símbolo canônico do /pyth-price, ou None quando está fora de _FC_FEEDS."""
+    s = re.sub(r"\s+", "", str(raw if raw is not None else "")).upper()[:24]
+    if not s:
+        return "SOL"
+    for suf in _V4102_PX_SUFFIXES:
+        if s.endswith(suf) and len(s) > len(suf):
+            s = s[:-len(suf)]
+            break
+    s = _V4102_PX_ALIAS.get(s, s)
+    return s if s in _FC_FEEDS else None
+
+
+_PARAM_RULES["/pyth-price"] = {
+    "param": "symbol",
+    "pattern": (r"^(?:" + "|".join(sorted(set(_FC_FEEDS) | set(_V4102_PX_ALIAS),
+                                          key=len, reverse=True))
+                + r")(?:[-/]?USD[TC]?)?$"),
+    "examples": _v4102_px_supported(),
+}
+
+
+def _v4102_cg_key(cg_id) -> str:
+    return "cg:usd:" + str(cg_id)
+
+
+def _v4102_cg_get(cg_id):
+    """Último preço do CoinGecko gravado por QUALQUER worker: {"usd", "ts"} ou None."""
+    try:
+        rec = LEDGER.cache_get(_v4102_cg_key(cg_id),
+                               int(max(_V4102_LAST_GOOD_MAX_S, _V4102_CG_FRESH_S)) + 120)
+        usd = float((rec or {}).get("usd") or 0)
+        ts = float((rec or {}).get("ts") or 0)
+        if usd > 0 and ts > 0:
+            return {"usd": usd, "ts": ts}
+    except Exception:
+        pass
+    return None
+
+
+def _v4102_cg_put(cg_id, usd, ts):
+    try:
+        LEDGER.cache_set(_v4102_cg_key(cg_id), {"usd": float(usd), "ts": float(ts)})
+    except Exception as e:
+        log.debug(f"cg cache {cg_id}: {e}")
+
+
+_CG_SIMPLE_4101 = _cg_simple_prices
+
+
+def _cg_simple_prices(cg_ids):  # noqa: F811 — camada 48.102.0
+    """simple/price com cache compartilhado entre workers: id lido há menos de
+    CG_PRICE_CACHE_S não vai à rede. Erro de rede/429 continua levantando — quem chama
+    decide o fallback. Todo preço lido fica gravado para o last-good com idade exata."""
+    ids = [str(i) for i in (cg_ids or []) if i]
+    out, faltam = {}, []
+    agora = time.time()
+    for i in ids:
+        rec = _v4102_cg_get(i) if _V4102_CG_FRESH_S > 0 else None
+        if rec and agora - rec["ts"] < _V4102_CG_FRESH_S:
+            out[i] = {"usd": rec["usd"]}
+        else:
+            faltam.append(i)
+    if not faltam:
+        return out
+    j = _CG_SIMPLE_4101(faltam) or {}
+    t = time.time()
+    for i in faltam:
+        try:
+            v = float((j.get(i) or {}).get("usd") or 0)
+        except Exception:
+            v = 0.0
+        if v > 0:
+            out[i] = {"usd": v}
+            _v4102_cg_put(i, v, t)
+    return out
+
+
+def _v4102_spot_sources(sym: str) -> list:
+    fontes = [("Coinbase spot", lambda: _oracle_coinbase(f"{sym}-USD"))]
+    kr = _V4102_KRAKEN_PAIRS.get(sym)
+    if kr:
+        fontes.append(("Kraken spot", lambda: _oracle_kraken(kr)))
+    return fontes
+
+
+def _v4102_hist_last(sym: str):
+    try:
+        with LEDGER._conn() as c:   # leitura WAL sem lock (padrão v48.3.2)
+            row = c.execute("SELECT ts, price FROM ml_price_history WHERE symbol=? "
+                            "ORDER BY ts DESC LIMIT 1", (sym,)).fetchone()
+        if row and row[1] and float(row[1]) > 0:
+            return {"usd": float(row[1]), "ts": float(row[0])}
+    except Exception:
+        pass
+    return None
+
+
+def _sym_price(symbol):  # noqa: F811 — camada 48.102.0
+    """Pyth (1 tentativa, só feed elegível) -> CoinGecko (cache 30 s) -> Coinbase/Kraken spot
+    -> last-good com idade real até PRICE_LAST_GOOD_MAX_S. Rótulo de fonte sempre honesto."""
+    sym = str(symbol or "").upper()
+    fid, cg = _FC_FEEDS[sym]
+    if fid not in _FC_SKIP:
+        try:
+            p = (_pyth_latest([fid]) or {}).get(_v4843_fid(fid)) or {}
+            pd2 = p.get("price") or {}
+            expo = float(pd2.get("expo", 0) or 0)
+            price = float(pd2.get("price", 0) or 0) * (10 ** expo)
+            if price > 0:
+                conf = float(pd2.get("conf", 0) or 0) * (10 ** expo)
+                return {"price": price, "conf": round(conf, 6), "source": "Pyth Network"}
+        except Exception as e:
+            log.debug(f"💲 {sym}: Pyth {str(e)[:80]}")
+    erros = []
+    try:
+        price = float((_cg_simple_prices([cg]).get(cg) or {}).get("usd") or 0)
+        if price > 0:
+            return {"price": price, "conf": None, "source": "CoinGecko (Pyth fallback)"}
+        erros.append("coingecko: sem preço")
+    except Exception as e:
+        erros.append(f"coingecko: {str(e)[:60]}")
+    for nome, fn in _v4102_spot_sources(sym):
+        try:
+            price = float((fn() or {}).get("price") or 0)
+            if price > 0:
+                return {"price": price, "conf": None,
+                        "source": f"{nome} (Pyth and CoinGecko unavailable)"}
+            erros.append(f"{nome}: sem preço")
+        except Exception as e:
+            erros.append(f"{nome}: {str(e)[:40]}")
+    agora = time.time()
+    cands = []
+    rec = _v4102_cg_get(cg)
+    if rec:
+        cands.append((agora - rec["ts"], rec["usd"], False))
+    hist = _v4102_hist_last(sym)
+    if hist:   # ts do histórico = início do bloco de 10 min: idade é um teto, não exata
+        cands.append((agora - hist["ts"], hist["usd"], True))
+    cands = [c for c in cands if 0 <= c[0] <= _V4102_LAST_GOOD_MAX_S]
+    if cands:
+        idade, price, teto = min(cands, key=lambda c: c[0])
+        idade = int(idade)
+        log.info(f"💲 {sym}: last-good servido ({'até ' if teto else ''}{idade}s) — fontes ao vivo "
+                 f"fora: {'; '.join(erros)[:160]}")
+        return {"price": price, "conf": None, "stale": True, "age_s": idade,
+                "source": (f"last-good ({'<=' if teto else ''}{idade} s old) — Pyth, CoinGecko, "
+                           "Coinbase and Kraken unavailable")}
+    log.warning(f"💲 {sym}: nenhuma fonte ao vivo e nenhum last-good até "
+                f"{int(_V4102_LAST_GOOD_MAX_S)}s — chamada falha sem cobrança: {'; '.join(erros)[:160]}")
+    raise RuntimeError(f"no live price source answered and no last-good within "
+                       f"{int(_V4102_LAST_GOOD_MAX_S)} s (not sold stale)")
+
+
+def _v4103_pyth_price_preflight():
+    """Só com pagamento anexado: falha de todas as fontes impede settlement."""
+    try:
+        px = _sym_price(_v4102_px_symbol(request.args.get("symbol", "SOL")))
+        if not isinstance(px, dict) or not px.get("price"):
+            raise RuntimeError("no live price source")
+        from flask import g as _g
+        _g.losbeto_pyth_preflight = px
+        return None
+    except Exception as e:
+        log.info(f"💲 pré-gate /pyth-price: {str(e)[:120]}")
+        return _unavailable_body(
+            "No live price source answered and no fresh last-good is available. "
+            "This endpoint is not being sold right now; no payment challenge or "
+            "settlement was requested.", 900)
+
+
+# ============================================================================
 # v48.85.0-CLEAR — detector de arquivo truncado
 #
 # O arquivo voltou cortado no meio do comentário final três vezes (v48.81, v48.82 e
@@ -42679,4 +42917,6 @@ if _NEXUS_TAIL_OK is False:
 # v48.99.0-HOUSEKEY: botão 🏠 no aviso de novo comprador e comando /casa no Telegram (carteira de teste do operador sai da receita orgânica, retroativo, sem deploy); /health/providers mede Finnhub/Yahoo/exchangerate em segundo plano (cache 120 s) — também acelera o /live/api frio; o /pay confere a versão no /health barato; depois da entrega automática o cartão manual mostra o hash como já usado em vez de devolver "already claimed"; texto da transferência: 1 aceite na carteira, 2 confirmações da rede | base: v48.98.0-CLAIMGUARD
 # v48.100.0-CLAIMRESET: claim manual também marca entrega e destrava com outro hash; Base58 não é normalizado para minúsculas | base: v48.99.0-HOUSEKEY
 # v48.101.0-ONETAP: botão 🏠 também nas mensagens 💰 de venda (facilitador, Base e Solana diretas) quando o pagador não é da casa; /health/providers usa a medição mais nova de qualquer worker e mede na hora acima de 600 s (era possível responder com 3,7 h); manifesto x402 com validade de 15 min e chave que inclui o que está invendável | base: v48.100.0-CLAIMRESET
-# EOF-LOSBETO 48.101.0-ONETAP — fim do arquivo (se esta linha faltar, a copia foi cortada)
+# v48.102.0-LIVEPRICE: /pyth-price vende o símbolo pedido (antes: preço do SOL rotulado com qualquer símbolo; agora SOL/BTC/ETH/BNB/XRP/DOGE/ADA/LINK e apelidos, resto recusado antes do 402), sem o sono de 2 s com o Pyth em backoff, CoinGecko com cache de 30 s entre workers, Coinbase/Kraken antes do last-good e last-good com idade real e teto de 900 s; /event-playbook com BTC no baseline (era sempre null); 💰 no Telegram mostra o pagador; saudação do chat sem 🤖 duplicado; painel com ticket médio orgânico | base: v48.101.0-ONETAP
+# v48.103.0-PREGATEPRICE: /pyth-price só verifica/settle após fonte válida; falha total vira 503 grátis antes do 402; resultado reutilizado sem segunda chamada externa | base: v48.102.0-LIVEPRICE
+# EOF-LOSBETO 48.103.0-PREGATEPRICE — fim do arquivo (se esta linha faltar, a copia foi cortada)
