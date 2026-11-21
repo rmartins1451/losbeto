@@ -1,7 +1,7 @@
 """
 Losbeto x402 — monolithic Flask service for Railway.
 
-Current release: 48.106.0-GEOAUTH.
+Current release: 48.107.0-TRUTHPATHS.
 Payment requirements are server-side. Delivery requires verified settlement;
 pending payments are reconciled against independent chain evidence.
 Operational history lives in CHANGELOG.md, not in executable boot output.
@@ -471,6 +471,47 @@ logging.basicConfig(
 )
 log = logging.getLogger("omega_v10")
 
+
+# Redação central: exceções de requests podem conter a URL completa, inclusive
+# credenciais em query strings. O formatter cobre msg, args e traceback sem
+# alterar respostas, strings de protocolo ou requisitos de pagamento.
+_LOG_QUERY_SECRET = re.compile(
+    r"(?i)([?&](?:api[-_]?key|apikey|key|token|access_token|secret|password|signature|auth|authorization)=)"
+    r"([^&#\s]+)")
+_LOG_HEADER_SECRET = re.compile(
+    r"(?i)(\b(?:authorization|proxy-authorization|x-api-key|x-cg-demo-api-key|"
+    r"x-cg-pro-api-key)\s*[:=]\s*)(?:bearer\s+)?([^\s,;]+)")
+_LOG_PATH_SECRET = re.compile(r"(?i)(https?://api\.telegram\.org/bot)[^/\s]+")
+
+
+def _redact_log_secrets(value):
+    text = str(value)
+    text = _LOG_QUERY_SECRET.sub(r"\1[REDACTED]", text)
+    text = _LOG_PATH_SECRET.sub(r"\1[REDACTED]", text)
+    return _LOG_HEADER_SECRET.sub(r"\1[REDACTED]", text)
+
+
+def _safe_log_origin(value):
+    try:
+        parts = urllib.parse.urlsplit(str(value))
+        if parts.scheme in ("http", "https") and parts.hostname:
+            port = f":{parts.port}" if parts.port else ""
+            return f"{parts.scheme}://{parts.hostname}{port}"
+    except Exception:
+        pass
+    return "[invalid-url]"
+
+
+class _SecretRedactingFormatter(logging.Formatter):
+    def format(self, record):
+        return _redact_log_secrets(super().format(record))
+
+
+for _log_handler in set(logging.getLogger().handlers + log.handlers):
+    _log_handler.setFormatter(
+        _SecretRedactingFormatter("%(asctime)s [%(levelname)s] %(message)s"))
+
+
 def _price_env_key(endpoint: str) -> str:
     return "PRICE_" + endpoint.strip("/").replace("-", "_").upper()
 
@@ -503,7 +544,7 @@ ENDPOINT_DESC = {
     "/mempool":         "Live Solana network conditions: pending transaction pressure, current fee levels and priority-fee guidance for agents timing an execution.",
     "/web-search":      "What is the web saying right now? Live search results condensed into clean text for agent reasoning — answers beyond any model's training cutoff. Results name the configured search provider.",
     "/ai-news":         "Filtered crypto and markets newswire for agents and research bots: headlines with source and timestamp, noise removed.",
-    "/geo-alpha":       "Geographic read on exchange trust scores and BTC volume by venue country: where the volume actually sits and how trustworthy each venue is rated.",
+    "/geo-alpha":       "Geographic read on exchange trust scores and aggregate BTC volume for each configured market; market country and CoinGecko venue country are reported separately.",
     "/sentiment":       "Aggregated crypto sentiment bias with the contributing sources named. Input for contrarian and regime strategies.",
     "/anomalias":       "What is moving abnormally at this exact moment? Price and volume anomalies across the majors, measured against each asset's own recent distribution — a scan that only exists now.",
     "/dex-screen":      "DexScreener pair snapshot with liquidity, 24h volume and pair age, filtered to what is actually tradable.",
@@ -519,8 +560,8 @@ ENDPOINT_DESC = {
     "/swarm-vote":      "Consensus vote across the peer node swarm: how independent nodes read the same market right now, and how wide the disagreement is.",
     "/sinais":          "Actionable trading signals feed with direction, confidence and timestamp. Heuristic, with the methodology declared in the response.",
     "/win-rate-verified": "Ed25519-signed performance metrics with declared methodology (heuristic signal accuracy, not audited PnL). Verifiable integrity plus explicit honesty about what the number is and is not.",
-    "/analise":         "AI deep-dive on any supported asset: technicals, flows and narrative in one written analysis.",
-    "/holder-concentration": "Top USDC holder concentration on Solana via Helius RPC: who holds the float, how concentrated it is, and the share held by the largest accounts. Useful for judging how much of a token's supply can move at once.",
+    "/analise":         "AI market read grounded in five validated top-market-cap coins and the live Fear & Greed Index: momentum, flows, positioning risk, invalidation and directional bias. Incomplete market inputs are refused rather than synthesized.",
+    "/holder-concentration": "Snapshot of the five largest USDC token accounts on Solana, with validated RPC amounts and source. Token accounts are not unique beneficial owners; this endpoint does not claim supply-share or float-concentration percentages.",
     "/sec-filing":      "SEC filing search with an objective market read: what was filed, by whom, and what it means for the tape.",
     "/backtest":        "Strategy backtest with PnL, win rate, drawdown and a written read of where the strategy actually makes its money.",
     "/token-intel":     "Token intelligence report for any contract address or ticker: liquidity, volume, pair age, buy/sell flow, deterministic risk flags (honeypot pattern, wash-trading signature, thin liquidity) plus an AI verdict. Built for pre-execution checks.",
@@ -2468,27 +2509,120 @@ class Market:
             return None
 
     @classmethod
-    def fear_greed(cls):
+    def fear_greed(cls, strict=False):
+        """Fallback neutro só para produtos que o declaram implicitamente.
+
+        Produtos que dependem do índice como dado vendável usam strict=True:
+        indisponibilidade nunca pode virar um "50 Neutral" inventado.
+        """
         def f():
-            r = requests.get("https://api.alternative.me/fng/", timeout=10).json()
-            d = r["data"][0]
-            return {"value": int(d["value"]), "classification": d["value_classification"],
-                    "ts": d["timestamp"]}
-        return cls._cached("fng", f, 600) or {"value": 50, "classification": "Neutral"}
+            r = requests.get("https://api.alternative.me/fng/", timeout=10)
+            if not r.ok:
+                raise RuntimeError(f"alternative.me HTTP {r.status_code}")
+            payload = r.json()
+            rows = payload.get("data") if isinstance(payload, dict) else None
+            if not isinstance(rows, list) or not rows or not isinstance(rows[0], dict):
+                raise RuntimeError("alternative.me invalid payload")
+            d = rows[0]
+            value = int(d["value"])
+            classification = d.get("value_classification")
+            stamp = d.get("timestamp")
+            stamp_value = float(stamp)
+            age = time.time() - stamp_value
+            if (not 0 <= value <= 100 or not isinstance(classification, str)
+                    or not classification.strip() or not math.isfinite(stamp_value)
+                    or not -300 <= age <= 3 * 86400):
+                raise RuntimeError("alternative.me invalid or stale metrics")
+            return {"value": value, "classification": classification.strip(),
+                    "ts": stamp}
+        data = cls._cached("fng", f, 600)
+        if isinstance(data, dict) and "ts" in data:
+            return data
+        if strict:
+            return None
+        return {"value": 50, "classification": "Neutral"}
+
+    @staticmethod
+    def _validated_top_coins(data, n):
+        """HTTP 200 não basta: valida e normaliza o dataset vendável."""
+        if not isinstance(data, list) or len(data) < n:
+            return []
+        out, previous_cap, seen_ids = [], None, set()
+        for item in data[:n]:
+            if not isinstance(item, dict):
+                return []
+            coin_id, symbol = item.get("id"), item.get("symbol")
+            if (not isinstance(coin_id, str) or not coin_id.strip()
+                    or len(coin_id) > 128 or coin_id.strip().lower() in seen_ids
+                    or not isinstance(symbol, str)
+                    or not symbol.strip() or len(symbol.strip()) > 32):
+                return []
+            try:
+                price = float(item.get("current_price"))
+                market_cap = float(item.get("market_cap"))
+                change_24h = float(item.get("price_change_percentage_24h"))
+            except (TypeError, ValueError, OverflowError):
+                return []
+            if (not all(math.isfinite(v) for v in (price, market_cap, change_24h))
+                    or price <= 0 or market_cap <= 0
+                    or (previous_cap is not None and market_cap > previous_cap)):
+                return []
+            coin = dict(item)
+            coin.update({"id": coin_id.strip(), "symbol": symbol.strip(),
+                         "current_price": price, "market_cap": market_cap,
+                         "price_change_percentage_24h": change_24h})
+            for field in ("price_change_percentage_1h_in_currency",
+                          "price_change_percentage_7d_in_currency"):
+                if coin.get(field) is not None:
+                    try:
+                        value = float(coin[field])
+                    except (TypeError, ValueError, OverflowError):
+                        return []
+                    if not math.isfinite(value):
+                        return []
+                    coin[field] = value
+            out.append(coin)
+            seen_ids.add(coin_id.strip().lower())
+            previous_cap = market_cap
+        return out
 
     @classmethod
     def top_coins(cls, n=20):
+        n = int(n)
+        if not 1 <= n <= 250:
+            raise ValueError("top_coins n must be between 1 and 250")
         def f():
-            headers = {"Accept": "application/json"}
+            common = {"Accept": "application/json",
+                      "User-Agent": "Losbeto/48.107 (+https://api.losbeto.xyz)"}
+            attempts = [("https://api.coingecko.com", {})]
             if COINGECKO_KEY:
-                headers["x-cg-pro-api-key"] = COINGECKO_KEY
-            r = requests.get("https://api.coingecko.com/api/v3/coins/markets",
-                params={"vs_currency": "usd", "order": "market_cap_desc",
-                        "per_page": n, "page": 1,
-                        "price_change_percentage": "1h,24h,7d"},
-                timeout=15, headers=headers)
-            return r.json() if r.ok else []
-        return cls._cached(f"top_{n}", f, 60) or []
+                attempts = [
+                    ("https://api.coingecko.com",
+                     {"x-cg-demo-api-key": COINGECKO_KEY}),
+                    ("https://pro-api.coingecko.com",
+                     {"x-cg-pro-api-key": COINGECKO_KEY})]
+            errors = []
+            for root, auth in attempts:
+                try:
+                    r = requests.get(f"{root}/api/v3/coins/markets",
+                        params={"vs_currency": "usd", "order": "market_cap_desc",
+                                "per_page": n, "page": 1,
+                                "price_change_percentage": "1h,24h,7d"},
+                        timeout=15, headers={**common, **auth})
+                    if not r.ok:
+                        errors.append(f"{root} HTTP {r.status_code}")
+                        continue
+                    validated = cls._validated_top_coins(r.json(), n)
+                    if validated:
+                        return validated
+                    errors.append(f"{root} invalid markets payload")
+                except Exception as e:
+                    errors.append(f"{root} {type(e).__name__}")
+            if errors:
+                log.warning(f"top_coins indisponível: {'; '.join(errors)[:240]}")
+            return []
+        cached = cls._cached(f"top_{n}", f, 60)
+        return cls._validated_top_coins(cached, n) if cached else []
 
     @classmethod
     def binance_24h(cls):
@@ -3527,7 +3661,7 @@ def _ig(lst, i):
 
 
 _GEO_ALPHA_MARKETS = {
-    "BR": {"exchange": "mercado-bitcoin", "currency": "BRL", "country": "Brasil"},
+    "BR": {"exchange": "foxbit", "currency": "BRL", "country": "Brasil"},
     "IN": {"exchange": "coindcx", "currency": "INR", "country": "India"},
     "KR": {"exchange": "upbit", "currency": "KRW", "country": "South Korea"},
     "TR": {"exchange": "btcturk", "currency": "TRY", "country": "Turkey"},
@@ -3641,9 +3775,20 @@ class Brain:
     @staticmethod
     def analise():
         top = Market.top_coins(5)
-        fg = Market.fear_greed()
+        fg = Market.fear_greed(strict=True)
+        if len(top) != 5 or not isinstance(fg, dict):
+            missing = []
+            if len(top) != 5:
+                missing.append("top_5_valid_coins")
+            if not isinstance(fg, dict):
+                missing.append("fear_greed_live")
+            return ({"error": "upstream_unavailable", "status": "upstream_unavailable",
+                     "charged": False, "missing": missing, "retry_after_s": 60,
+                     "note": "The complete market dataset is temporarily unavailable; "
+                             "no synthetic market inputs were sent to the AI.",
+                     "ts": int(time.time())}, 503)
         ctx = "\n".join([f"{c['symbol'].upper()}: ${c.get('current_price')} "
-                         f"({(c.get('price_change_percentage_24h') or 0):.1f}% 24h)"
+                         f"({c['price_change_percentage_24h']:.1f}% 24h)"
                          for c in top])
         memory = RAG_STORE.retrieve("market analysis btc eth sol", k=3)
         memory_str = "\n".join([f"- {m[1][:120]}" for m in memory])
@@ -3657,6 +3802,10 @@ class Brain:
                   f"(bullish / neutral / bearish) and your confidence. "
                   f"No preamble. Not financial advice.")
         analysis = _ai_required(prompt, max_tokens=400)
+        if not isinstance(analysis, str) or not analysis.strip():
+            return ({"error": "upstream_unavailable", "status": "upstream_unavailable",
+                     "charged": False, "missing": ["ai_analysis"], "retry_after_s": 60,
+                     "ts": int(time.time())}, 503)
         RAG_STORE.ingest("analise", analysis)
         return {"fear_greed": fg, "top_5": top, "analysis": analysis,
                 "ai_status": "ok", "version": VERSION}
@@ -4182,7 +4331,7 @@ class Brain:
         return {"institutional_directory": Market.smart_money(),
                 "top_usdc_holders_onchain": holders,
                 "method": ("Combine /whale-alert (fluxo 24h real) + /copytrade "
-                           "(sinais de nós com stake) + /holder-concentration (concentração "
+                           "(sinais de nós com stake) + /holder-concentration (maiores contas "
                            "de holders) para tracking acionável."),
                 "honesty": "diretório público de entidades conhecidas + on-chain real quando disponível",
                 "version": VERSION}
@@ -4656,7 +4805,7 @@ class Brain:
                 notes.append("ERC-20 holdings require an indexer — native "
                              "balance and activity only. Declared, not hidden.")
             except Exception as e:
-                log.warning(f"wallet-scan evm: {e}")
+                log.warning(f"wallet-scan evm via {_safe_log_origin(rpc)}: {type(e).__name__}")
                 notes.append("EVM RPC temporarily degraded.")
 
         total_usd = round(sum(h.get("usd") or 0 for h in holdings)
@@ -4708,54 +4857,128 @@ class Brain:
 
 
     @staticmethod
-    def holder_concentration():
-        """v39.4 — RENOMEADO de /nansen-flow.
-
-        Duas razões, ambas sérias. Primeira: este endpoint NUNCA usou a Nansen —
-        consulta Helius RPC e Solscan. Vender sob o nome de outra empresa um
-        dado que não vem dela engana o comprador. Segunda: a Nansen é membro
-        do x402 Foundation e aparece no 'Trusted by' de x402.org; usar a marca
-        dela no catálogo é risco jurídico real, não hipotético.
-
-        O nome novo descreve o que o produto de fato faz.
-        """
-        ts = int(time.time())
-        usdc = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
-        if HELIUS_KEY:
+    def _holder_rows(accounts):
+        """Normaliza cinco token accounts sem aceitar JSON-RPC que só 'parece' 200."""
+        if not isinstance(accounts, list) or len(accounts) < 5:
+            return []
+        rows, seen, previous = [], set(), None
+        for i, account in enumerate(accounts[:5]):
+            if not isinstance(account, dict):
+                return []
+            address = account.get("address")
+            if (not isinstance(address, str) or not _is_valid_solana_address(address)
+                    or address in seen):
+                return []
             try:
-                r = requests.post(
-                    f"https://mainnet.helius-rpc.com/?api-key={HELIUS_KEY}",
+                raw_ui = (account.get("uiAmountString")
+                          if account.get("uiAmountString") is not None
+                          else account.get("uiAmount"))
+                if isinstance(raw_ui, bool):
+                    return []
+                amount = float(raw_ui)
+                if not math.isfinite(amount) or amount < 0:
+                    return []
+                if "decimals" in account:
+                    if isinstance(account["decimals"], bool):
+                        return []
+                    if int(account["decimals"]) != USDC_DECIMALS:
+                        return []
+                if "amount" in account:
+                    atomic_raw = account["amount"]
+                    if isinstance(atomic_raw, bool) or not re.fullmatch(r"\d+", str(atomic_raw)):
+                        return []
+                    atomic = int(atomic_raw)
+                    expected = atomic / (10 ** USDC_DECIMALS)
+                    if abs(amount - expected) > max(0.000001, abs(amount) * 1e-9):
+                        return []
+            except (TypeError, ValueError, OverflowError):
+                return []
+            if previous is not None and amount > previous:
+                return []
+            rows.append({"address": address, "amount_ui": str(raw_ui), "rank": i + 1})
+            seen.add(address)
+            previous = amount
+        return rows
+
+    @staticmethod
+    def _holder_rpc(usdc):
+        rpcs = list(SOLANA_RPCS)
+        if HELIUS_KEY:
+            rpcs.insert(0, f"https://mainnet.helius-rpc.com/?api-key={HELIUS_KEY}")
+        errors, attempted = [], set()
+        for rpc_url in rpcs[:5]:
+            host = "unknown"
+            try:
+                parsed = urllib.parse.urlsplit(str(rpc_url))
+                host = (parsed.hostname or "").lower()
+                identity = (parsed.scheme.lower(), parsed.netloc.lower(), parsed.path)
+                if not host or identity in attempted:
+                    continue
+                attempted.add(identity)
+                r = requests.post(str(rpc_url),
                     json={"jsonrpc": "2.0", "id": 1,
-                          "method": "getTokenLargestAccounts",
-                          "params": [usdc]},
-                    timeout=8)
-                accounts = (r.json().get("result", {}) or {}).get("value", [])[:5]
-                holders = [{"address": a.get("address"),
-                            "amount_ui": a.get("uiAmountString") or a.get("uiAmount"),
-                            "rank": i + 1} for i, a in enumerate(accounts)]
-                if holders:
-                    return {"top_usdc_holders": holders, "token": "USDC",
-                            "source": "helius-rpc", "ts": ts,
-                            "provider": "Losbeto/SmartMoney"}
+                          "method": "getTokenLargestAccounts", "params": [usdc]},
+                    timeout=6)
+                if not r.ok:
+                    errors.append(f"{host}:HTTP {r.status_code}")
+                    continue
+                payload = r.json()
+                if (not isinstance(payload, dict) or payload.get("jsonrpc") != "2.0"
+                        or payload.get("error")):
+                    errors.append(f"{host}:InvalidJSONRPC")
+                    continue
+                result = payload.get("result")
+                accounts = result.get("value") if isinstance(result, dict) else None
+                holders = Brain._holder_rows(accounts)
+                if not holders:
+                    errors.append(f"{host}:InvalidHolderSchema")
+                    continue
+                source = "helius-rpc" if host.endswith("helius-rpc.com") else "solana-rpc"
+                return {"holders": holders, "source": source, "rpc_host": host}, errors
             except Exception as e:
-                log.warning(f"holder_concentration helius: {e}")
+                errors.append(f"{host}:{type(e).__name__}")
+        return None, errors
+
+    @staticmethod
+    def holder_concentration():
+        """Top 5 USDC token accounts, com fonte e schema verificáveis."""
+        ts = int(time.time())
+        usdc = USDC_MINT
+        rpc, errors = Brain._holder_rpc(usdc)
+        if rpc:
+            return {"top_usdc_holders": rpc["holders"], "token": "USDC",
+                    "source": rpc["source"], "rpc_host": rpc["rpc_host"],
+                    "scope": "top_5_token_accounts",
+                    "note": ("Token accounts are not unique beneficial owners; "
+                             "no supply-share or float-concentration percentage is claimed."),
+                    "ts": ts, "provider": "Losbeto/SmartMoney"}
         try:
             r = requests.get(
                 "https://public-api.solscan.io/token/holders"
                 f"?tokenAddress={usdc}&limit=5",
                 headers={"accept": "application/json",
-                         "user-agent": "Losbeto/21 (+x402 node)"},
+                         "user-agent": "Losbeto/48.107 (+https://api.losbeto.xyz)"},
                 timeout=6)
-            if r.ok and "json" in r.headers.get("content-type", ""):
-                holders = r.json().get("data", {}).get("result", [])[:5]
+            if not r.ok:
+                errors.append(f"public-api.solscan.io:HTTP {r.status_code}")
+            else:
+                payload = r.json()
+                data = payload.get("data") if isinstance(payload, dict) else None
+                accounts = data.get("result") if isinstance(data, dict) else None
+                holders = Brain._holder_rows(accounts)
                 if holders:
                     return {"top_usdc_holders": holders, "token": "USDC",
-                            "source": "solscan", "ts": ts,
-                            "provider": "Losbeto/SmartMoney"}
+                            "source": "solscan", "scope": "top_5_token_accounts",
+                            "note": ("Token accounts are not unique beneficial owners; "
+                                     "no supply-share or float-concentration percentage is claimed."),
+                            "ts": ts, "provider": "Losbeto/SmartMoney"}
+                errors.append("public-api.solscan.io:InvalidHolderSchema")
         except Exception as e:
-            log.warning(f"holder_concentration solscan: {e}")
+            errors.append(f"public-api.solscan.io:{type(e).__name__}")
+        if errors:
+            log.warning(f"holder_concentration upstreams: {'; '.join(errors)[:400]}")
         return {"top_usdc_holders": [], "token": "USDC",
-                "status": "upstream_degraded",
+                "status": "upstream_degraded", "scope": "top_5_token_accounts",
                 "note": "On-chain sources are temporarily unavailable — "
                         "try again in a few minutes.",
                 "ts": ts, "provider": "Losbeto/SmartMoney"}
@@ -4786,7 +5009,7 @@ class Brain:
 
     @staticmethod
     def _geo_alpha_upstream(exchange):
-        common = {"Accept": "application/json", "User-Agent": "Losbeto/48.106 (+https://api.losbeto.xyz)"}
+        common = {"Accept": "application/json", "User-Agent": "Losbeto/48.107 (+https://api.losbeto.xyz)"}
         attempts = [("https://api.coingecko.com", {})]
         if COINGECKO_KEY:
             attempts = [("https://api.coingecko.com", {"x-cg-demo-api-key": COINGECKO_KEY}),
@@ -4805,11 +5028,17 @@ class Brain:
                     continue
                 volume = float(data.get("trade_volume_24h_btc"))
                 trust = float(data.get("trust_score"))
+                venue_country = data.get("country")
+                if venue_country is not None and (not isinstance(venue_country, str)
+                                                  or len(venue_country) > 100):
+                    errors.append(f"{root} invalid venue country")
+                    continue
                 if not (math.isfinite(volume) and math.isfinite(trust)
                         and volume >= 0 and 0 <= trust <= 10):
                     errors.append(f"{root} invalid exchange metrics")
                     continue
-                return volume, (int(trust) if trust.is_integer() else trust)
+                return (volume, (int(trust) if trust.is_integer() else trust),
+                        venue_country or None)
             except Exception as e:
                 errors.append(f"{root} {type(e).__name__}: {str(e)[:100]}")
         raise RuntimeError("; ".join(errors)[:360] or "CoinGecko unavailable")
@@ -4822,8 +5051,10 @@ class Brain:
                     "valid_markets": sorted(_GEO_ALPHA_MARKETS), "charged": False}
         info = _GEO_ALPHA_MARKETS[market]
         try:
-            volume, trust = Brain._geo_alpha_upstream(info["exchange"])
-            return {**info, "market": market, "volume_24h_btc": volume,
+            volume, trust, venue_country = Brain._geo_alpha_upstream(info["exchange"])
+            return {**info, "market": market, "market_country": info["country"],
+                    "venue_country": venue_country, "volume_24h_btc": volume,
+                    "volume_scope": "aggregate exchange volume across all pairs; not filtered by market currency",
                     "trust_score": trust, "source": "CoinGecko",
                     "ts": int(time.time()), "provider": "Losbeto/CoinGecko"}
         except Exception as e:
@@ -11083,6 +11314,15 @@ def paid_endpoint(path):
                     _r.headers["Retry-After"] = str(_body["retry_after_seconds"])
                     return _r
 
+            if path == "/analise" and sig and sig != "mpp-tempo":
+                _analysis_gate = _v4107_analysis_preflight()
+                if _analysis_gate is not None:
+                    _body, _code = _analysis_gate
+                    _r = jsonify(_body)
+                    _r.status_code = _code
+                    _r.headers["Retry-After"] = str(_body["retry_after_seconds"])
+                    return _r
+
             if not sig:
                 _fcb_tok = (request.headers.get("X-Session-Token") or "")[:40]
                 if _fcb_tok:
@@ -11495,7 +11735,7 @@ def _evm_rpc(method: str, params: list, ttl: float = 20.0, rpcs=None, upstream=[
                     _CHAIN_CACHE.clear()
                 return j["result"]
         except Exception as e:
-            log.warning(f"evm_rpc {method} via {url}: {e}")
+            log.warning(f"evm_rpc {method} via {_safe_log_origin(url)}: {type(e).__name__}")
     return None
 
 def _hx(v, default=0):
@@ -19877,7 +20117,8 @@ _EMB_MODELS = ({"base": "losbeto/minilm-l6-quantized",
                 "multi": "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"})
 _EMB_CACHE = {k: {"model": None, "vectors": None, "paths": [], "hash": "",
                   "backoff_until": 0.0, "last_used": 0.0} for k in _EMB_MODELS}
-_ML_RERANK = {"model": None, "backoff_until": 0.0, "last_used": 0.0}
+_ML_RERANK = {"model": None, "backoff_until": 0.0, "last_used": 0.0,
+              "building": False}
 _ML_RERANK_ON = os.environ.get("ML_RERANK", "1") != "0"
 _ML_RERANK_MODEL = ("losbeto/reranker-minilm-l6-quantized" if _ML_EMB_QUANTIZED
                     else "Xenova/ms-marco-MiniLM-L-6-v2")
@@ -20181,28 +20422,56 @@ def _semantic_intent_boosts(q: str) -> dict:
 
 
 def _rerank(q, docs):
-    """Cross-encoder ms-marco-MiniLM-L-6 (80MB ONNX): olha query+documento
-    JUNTOS (muito mais preciso que cosseno) e reordena os top-k."""
+    """Rerank síncrono só com modelo quente; download/init ficam fora do request.
+
+    Uma consulta ambígua com reranker frio usa imediatamente o ranking vetorial
+    e dispara uma única carga em background. A chamada seguinte já pode usar o
+    cross-encoder. Assim, TLS/lentidão do Hugging Face não consome o timeout do
+    worker sync nem deixa uma consulta gratuita esperando um modelo opcional.
+    """
     if time.time() < _ML_RERANK["backoff_until"]:
         return None
+    model = _ML_RERANK.get("model")
+    if model is None:
+        if _ML_RERANK.get("building"):
+            return None
+        _ML_RERANK["building"] = True
+
+        def _load_reranker():
+            try:
+                from fastembed.rerank.cross_encoder import TextCrossEncoder
+                if _ML_EMB_QUANTIZED:
+                    from fastembed.common.model_description import ModelSource as _ModelSource
+                    try:
+                        TextCrossEncoder.add_custom_model(
+                            model=_ML_RERANK_MODEL,
+                            sources=_ModelSource(hf="Xenova/ms-marco-MiniLM-L-6-v2"),
+                            model_file="onnx/model_quantized.onnx")
+                    except ValueError:
+                        pass  # modelo já registrado neste worker
+                loaded = TextCrossEncoder(
+                    model_name=_ML_RERANK_MODEL,
+                    cache_dir=str(_ML_DIR / "fastembed_cache"),
+                    threads=_ML_ONNX_THREADS)
+                _ML_RERANK["model"] = loaded
+                _ML_RERANK["last_used"] = time.time()
+            except Exception as e:
+                log.warning(f"🧠 reranker: {e}")
+                _ML_RERANK["backoff_until"] = time.time() + 6 * 3600
+            finally:
+                _ML_RERANK["building"] = False
+
+        try:
+            threading.Thread(target=_load_reranker, daemon=True,
+                             name="ml-rerank-load").start()
+        except Exception as e:
+            _ML_RERANK["building"] = False
+            _ML_RERANK["backoff_until"] = time.time() + 6 * 3600
+            log.warning(f"🧠 reranker thread: {e}")
+        return None
     try:
-        if _ML_RERANK["model"] is None:
-            from fastembed.rerank.cross_encoder import TextCrossEncoder
-            if _ML_EMB_QUANTIZED:
-                from fastembed.common.model_description import ModelSource as _ModelSource
-                try:
-                    TextCrossEncoder.add_custom_model(
-                        model=_ML_RERANK_MODEL,
-                        sources=_ModelSource(hf="Xenova/ms-marco-MiniLM-L-6-v2"),
-                        model_file="onnx/model_quantized.onnx")
-                except ValueError:
-                    pass  # modelo já registrado neste worker
-            _ML_RERANK["model"] = TextCrossEncoder(
-                model_name=_ML_RERANK_MODEL,
-                cache_dir=str(_ML_DIR / "fastembed_cache"),
-                threads=_ML_ONNX_THREADS)
         _ML_RERANK["last_used"] = time.time()
-        return list(_ML_RERANK["model"].rerank_pairs([(q, d) for d in docs]))
+        return list(model.rerank_pairs([(q, d) for d in docs]))
     except Exception as e:
         log.warning(f"🧠 reranker: {e}")
         _ML_RERANK["backoff_until"] = time.time() + 6 * 3600
@@ -20385,16 +20654,46 @@ def _pyth_latest(feed_ids):
 
 
 def _cg_simple_prices(cg_ids):
-    """CoinGecko simple/price em batch — demo key no header, 401 -> pro."""
-    ids = ",".join(cg_ids)
-    url = f"https://api.coingecko.com/api/v3/simple/price?ids={ids}&vs_currencies=usd"
-    headers = {"x-cg-demo-api-key": COINGECKO_KEY} if COINGECKO_KEY else {}
-    r = requests.get(url, headers=headers, timeout=8)
-    if r.status_code == 401 and COINGECKO_KEY:
-        r = requests.get(url, headers={"x-cg-pro-api-key": COINGECKO_KEY}, timeout=8)
-    if not r.ok:
-        raise RuntimeError(f"coingecko HTTP {r.status_code}")
-    return r.json()
+    """simple/price com autenticação no host correto e preços utilizáveis."""
+    ids = list(dict.fromkeys(str(i) for i in (cg_ids or []) if i))
+    if not ids:
+        raise ValueError("coingecko ids required")
+    common = {"Accept": "application/json"}
+    attempts = [("https://api.coingecko.com", {})]
+    if COINGECKO_KEY:
+        attempts = [("https://api.coingecko.com", {"x-cg-demo-api-key": COINGECKO_KEY}),
+                    ("https://pro-api.coingecko.com", {"x-cg-pro-api-key": COINGECKO_KEY})]
+    errors = []
+    for root, auth in attempts:
+        try:
+            r = requests.get(f"{root}/api/v3/simple/price",
+                             params={"ids": ",".join(ids), "vs_currencies": "usd"},
+                             headers={**common, **auth}, timeout=8)
+            if not r.ok:
+                errors.append(f"{root} HTTP {r.status_code}")
+                continue
+            payload = r.json()
+            if not isinstance(payload, dict):
+                errors.append(f"{root} non-object JSON")
+                continue
+            clean = {}
+            for cg_id in ids:
+                rec = payload.get(cg_id)
+                if not isinstance(rec, dict):
+                    continue
+                try:
+                    usd = float(rec.get("usd"))
+                except (TypeError, ValueError, OverflowError):
+                    continue
+                if math.isfinite(usd) and usd > 0:
+                    clean[cg_id] = {**rec, "usd": usd}
+            if len(clean) == len(ids):
+                return clean
+            errors.append(f"{root} incomplete or invalid price payload "
+                          f"({len(clean)}/{len(ids)})")
+        except Exception as e:
+            errors.append(f"{root} {type(e).__name__}")
+    raise RuntimeError("; ".join(errors)[:240] or "coingecko unavailable")
 
 
 def _sym_price(symbol):
@@ -20419,9 +20718,7 @@ def _sym_price(symbol):
 
 
 def _fc_seed():
-    """Backfill de 90 dias (resolucao horaria) via CoinGecko — roda UMA vez por
-    simbolo (flag em meta). Sem o seed o /forecast ficaria semanas sem vender.
-    Sem chave: tier gratuito; com COINGECKO_KEY: header demo (401 -> pro)."""
+    """Backfill real de 90 dias; payload vazio nunca marca o símbolo como seeded."""
     if not _fc_ensure():
         return
     for sym, (_fid, cg_id) in _FC_FEEDS.items():
@@ -20438,30 +20735,65 @@ def _fc_seed():
                     c.execute("INSERT OR REPLACE INTO meta VALUES (?,?)",
                               (f"fc_seeded_{sym}", "1"))
                 continue
-            url = (f"https://api.coingecko.com/api/v3/coins/{cg_id}/market_chart"
-                   f"?vs_currency=usd&days=90")
-            headers = {"x-cg-demo-api-key": COINGECKO_KEY} if COINGECKO_KEY else {}
-            r = requests.get(url, headers=headers, timeout=20)
-            if r.status_code == 401 and COINGECKO_KEY:
-                r = requests.get(url, headers={"x-cg-pro-api-key": COINGECKO_KEY},
-                                 timeout=20)
-            if not r.ok:
-                log.info(f"🧠 /forecast seed {sym}: HTTP {r.status_code} — proximo boot tenta de novo")
+            common = {"Accept": "application/json"}
+            attempts = [("https://api.coingecko.com", {})]
+            if COINGECKO_KEY:
+                attempts = [("https://api.coingecko.com", {"x-cg-demo-api-key": COINGECKO_KEY}),
+                            ("https://pro-api.coingecko.com", {"x-cg-pro-api-key": COINGECKO_KEY})]
+            errors, points = [], {}
+            now = time.time()
+            for root, auth in attempts:
+                try:
+                    r = requests.get(f"{root}/api/v3/coins/{cg_id}/market_chart",
+                        params={"vs_currency": "usd", "days": 90},
+                        headers={**common, **auth}, timeout=20)
+                    if not r.ok:
+                        errors.append(f"{root} HTTP {r.status_code}")
+                        continue
+                    payload = r.json()
+                    raw_points = payload.get("prices") if isinstance(payload, dict) else None
+                    if not isinstance(raw_points, list):
+                        errors.append(f"{root} invalid market_chart payload")
+                        continue
+                    candidate = {}
+                    for row in raw_points:
+                        if not isinstance(row, (list, tuple)) or len(row) < 2:
+                            continue
+                        try:
+                            ms, price = float(row[0]), float(row[1])
+                        except (TypeError, ValueError, OverflowError):
+                            continue
+                        stamp = int(ms // 1000)
+                        if (not math.isfinite(ms) or not math.isfinite(price)
+                                or price <= 0 or stamp <= 0
+                                or stamp > now + 300 or now - stamp > 100 * 86400):
+                            continue
+                        candidate[stamp // 3600 * 3600] = price
+                    if len(candidate) >= _FC_MIN_POINTS:
+                        points = candidate
+                        break
+                    errors.append(f"{root} insufficient valid points ({len(candidate)})")
+                except Exception as e:
+                    errors.append(f"{root} {type(e).__name__}")
+            if not points:
+                log.info(f"🧠 /forecast seed {sym}: sem backfill válido — "
+                         f"{'; '.join(errors)[:220]}")
                 time.sleep(3)
                 continue
-            pts = r.json().get("prices", [])
             n = 0
             with LEDGER._conn() as c:
-                for ms, pr in pts:
+                for stamp, price in sorted(points.items()):
                     n += c.execute("INSERT OR IGNORE INTO ml_price_history VALUES (?,?,?)",
-                                   (sym, int(int(ms) // 1000 // 3600 * 3600),
-                                    float(pr))).rowcount
-                c.execute("INSERT OR REPLACE INTO meta VALUES (?,?)",
-                          (f"fc_seeded_{sym}", "1"))
-            log.info(f"🧠 /forecast seed {sym}: {n} pontos horarios (90d CoinGecko)")
+                                   (sym, stamp, price)).rowcount
+                total = c.execute("SELECT COUNT(*) FROM ml_price_history WHERE symbol=?",
+                                  (sym,)).fetchone()[0]
+                if total >= _FC_MIN_POINTS:
+                    c.execute("INSERT OR REPLACE INTO meta VALUES (?,?)",
+                              (f"fc_seeded_{sym}", "1"))
+            log.info(f"🧠 /forecast seed {sym}: {n} pontos horarios novos; total={total}")
             time.sleep(3)
         except Exception as e:
-            log.info(f"🧠 /forecast seed {sym}: {e}")
+            log.info(f"🧠 /forecast seed {sym}: {type(e).__name__}: {str(e)[:120]}")
             time.sleep(3)
 
 
@@ -27724,7 +28056,6 @@ def run_server():
             "workers":  int(os.environ.get("GUNICORN_WORKERS", "2")),
             "threads":  int(os.environ.get("GUNICORN_THREADS", "8")),
             "timeout":  60,
-            "accesslog": "-",
             "errorlog":  "-",
             "loglevel":  "info",
         }
@@ -32756,6 +33087,7 @@ async function baseRpc(method, params){
   return null;
 }
 async function preflightWallet(from){
+  const forTransfer = arguments.length > 1 && arguments[1] === true;
   const warns = [];
   let insufficient = false, contract = false, delegated = false, noGas = false;
   const who = shortAddr(from);
@@ -32793,7 +33125,7 @@ async function preflightWallet(from){
     }
   }catch(e){}
   let ethWei = null, needWei = null;
-  if(contract && !insufficient && !IS_CREDIT){
+  if((contract || forTransfer) && !insufficient && !IS_CREDIT){
     try{
       // v48.104.0: antes so avisava com saldo EXATAMENTE zero; poeira de ETH passava e a carteira
       // falhava depois com "Unexpected error" (Phantom 7702, 20/nov). Taxa estimada de um
@@ -33153,11 +33485,24 @@ function showXfer(w, from){
   const b = document.getElementById('btnXfer');
   if(b && !IS_CREDIT) b.style.display = 'block';
 }
-async function payByTransfer(w, from){
+async function payByTransfer(w, from, pre){
   const b = document.getElementById('btnXfer');
   if(b) b.disabled = true;
   btn.disabled = true;
   try{
+    // EIP-3009 de EOA não exige ETH do comprador; plain USDC.transfer exige.
+    // Reutiliza apenas o preflight recém-criado pelo fluxo principal. O botão
+    // direto chama sem `pre`, portanto refaz saldo/gas antes de qualquer envio.
+    const check = pre || await preflightWallet(from, true);
+    if(check && (check.insufficient || check.noGas)){
+      setStatus('Payment stopped before transfer: ' +
+        (check.insufficient ? 'insufficient USDC on Base in ' + shortAddr(from) + '.' :
+         'insufficient ETH on Base for the network fee in ' + shortAddr(from) + '.') +
+        ' No transaction was sent and no delivery was claimed. Top up or switch wallet, then retry.', 'err');
+      btn.disabled = false;
+      if(b) b.disabled = false;
+      return;
+    }
     const need = (Number(BigInt(ACCEPT.amount)) / 1e6).toFixed(4);
     setStatus('Confirm in your wallet: send ' + need + ' USDC on Base to ' + shortAddr(ACCEPT.payTo) +
               ' \u2014 a plain transfer, no signature (network fee in ETH, usually under $0.01)\u2026');
@@ -33224,7 +33569,7 @@ async function payAndFetch(retried){
     if (pre && pre.contract && !IS_CREDIT){
       // v48.97.0: assinatura de conta-contrato e recusada pelos facilitadores -> transferencia
       showXfer(w, from);
-      return await payByTransfer(w, from);
+      return await payByTransfer(w, from, pre);
     }
     const validBefore = String(Math.floor(Date.now()/1000)+(ACCEPT.maxTimeoutSeconds||300));
     const authorization = {from,to:ACCEPT.payTo,value:ACCEPT.amount,validAfter:"0",validBefore,nonce:hex32()};
@@ -41189,7 +41534,7 @@ _ops_validate = _v4843_ops_validate
 
 _v4842_sanitize_governance()
 
-VERSION = "48.106.0-GEOAUTH"
+VERSION = "48.107.0-TRUTHPATHS"
 
 
 import ipaddress as _ipaddr_w
@@ -42583,6 +42928,31 @@ def _sym_price(symbol):  # noqa: F811 — camada 48.102.0
                        f"{int(_V4102_LAST_GOOD_MAX_S)} s (not sold stale)")
 
 
+def _v4107_analysis_preflight():
+    """Só com pagamento x402 anexado: dados incompletos impedem settlement.
+
+    O cache de top_coins/fear_greed é reutilizado pelo handler. Sem assinatura,
+    este hook nem é chamado: scanners não ampliam tráfego nos upstreams.
+    """
+    top = Market.top_coins(5)
+    fg = Market.fear_greed(strict=True)
+    if len(top) == 5 and isinstance(fg, dict):
+        return None
+    missing = []
+    if len(top) != 5:
+        missing.append("top_5_valid_coins")
+    if not isinstance(fg, dict):
+        missing.append("fear_greed_live")
+    log.info(f"pré-gate /analise: dataset indisponível ({', '.join(missing)})")
+    return ({"status": "upstream_unavailable", "error": "required_market_data_unavailable",
+             "charged": False, "settlement_attempted": False, "missing": missing,
+             "note": "No settlement was attempted; the attached payment was not "
+                     "verified or captured. Retry with the same payment after the "
+                     "upstream recovers.",
+             "retry_after_seconds": 60, "provider": f"Losbeto/{VERSION}",
+             "ts": int(time.time())}, 503)
+
+
 def _v4103_pyth_price_preflight():
     """Só com pagamento anexado: falha de todas as fontes impede settlement."""
     try:
@@ -43221,4 +43591,4 @@ if _NEXUS_TAIL_OK is False:
 
 
 
-# EOF-LOSBETO 48.106.0-GEOAUTH — fim do arquivo (se esta linha faltar, a copia foi cortada)
+# EOF-LOSBETO 48.107.0-TRUTHPATHS — fim do arquivo (se esta linha faltar, a copia foi cortada)
