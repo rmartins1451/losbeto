@@ -1,7 +1,7 @@
 """
 Losbeto x402 — monolithic Flask service for Railway.
 
-Current release: 48.105.0-TRUTHGUARD.
+Current release: 48.106.0-GEOAUTH.
 Payment requirements are server-side. Delivery requires verified settlement;
 pending payments are reconciled against independent chain evidence.
 Operational history lives in CHANGELOG.md, not in executable boot output.
@@ -3526,6 +3526,17 @@ def _ig(lst, i):
         return None
 
 
+_GEO_ALPHA_MARKETS = {
+    "BR": {"exchange": "mercado-bitcoin", "currency": "BRL", "country": "Brasil"},
+    "IN": {"exchange": "coindcx", "currency": "INR", "country": "India"},
+    "KR": {"exchange": "upbit", "currency": "KRW", "country": "South Korea"},
+    "TR": {"exchange": "btcturk", "currency": "TRY", "country": "Turkey"},
+    "MX": {"exchange": "bitso", "currency": "MXN", "country": "Mexico"},
+    "RU": {"exchange": "gate", "currency": "RUB", "country": "Russia"},
+    "CN": {"exchange": "gate", "currency": "CNY", "country": "China"},
+}
+
+
 class Brain:
     @staticmethod
     def fear_greed():
@@ -4774,25 +4785,52 @@ class Brain:
         return {"hash": h, "payload": payload, "algorithm": "SHA-256", "verifiable": True, "ts": ts, "provider": "Losbeto"}
 
     @staticmethod
+    def _geo_alpha_upstream(exchange):
+        common = {"Accept": "application/json", "User-Agent": "Losbeto/48.106 (+https://api.losbeto.xyz)"}
+        attempts = [("https://api.coingecko.com", {})]
+        if COINGECKO_KEY:
+            attempts = [("https://api.coingecko.com", {"x-cg-demo-api-key": COINGECKO_KEY}),
+                        ("https://pro-api.coingecko.com", {"x-cg-pro-api-key": COINGECKO_KEY})]
+        errors = []
+        for root, auth in attempts:
+            try:
+                r = requests.get(f"{root}/api/v3/exchanges/{exchange}",
+                                 headers={**common, **auth}, timeout=6)
+                if not r.ok:
+                    errors.append(f"{root} HTTP {r.status_code}")
+                    continue
+                data = r.json()
+                if not isinstance(data, dict):
+                    errors.append(f"{root} non-object JSON")
+                    continue
+                volume = float(data.get("trade_volume_24h_btc"))
+                trust = float(data.get("trust_score"))
+                if not (math.isfinite(volume) and math.isfinite(trust)
+                        and volume >= 0 and 0 <= trust <= 10):
+                    errors.append(f"{root} invalid exchange metrics")
+                    continue
+                return volume, (int(trust) if trust.is_integer() else trust)
+            except Exception as e:
+                errors.append(f"{root} {type(e).__name__}: {str(e)[:100]}")
+        raise RuntimeError("; ".join(errors)[:360] or "CoinGecko unavailable")
+
+    @staticmethod
     def geo_alpha():
-        market = request.args.get("market", "BR").upper()
-        markets_map = {
-            "BR": {"exchange": "mercado-bitcoin", "currency": "BRL", "country": "Brasil"},
-            "IN": {"exchange": "coindcx", "currency": "INR", "country": "India"},
-            "KR": {"exchange": "upbit", "currency": "KRW", "country": "South Korea"},
-            "TR": {"exchange": "btcturk", "currency": "TRY", "country": "Turkey"},
-            "MX": {"exchange": "bitso", "currency": "MXN", "country": "Mexico"},
-            "RU": {"exchange": "gate", "currency": "RUB", "country": "Russia"},
-            "CN": {"exchange": "gate", "currency": "CNY", "country": "China"},
-        }
-        info = markets_map.get(market, markets_map["BR"])
+        market = request.args.get("market", "BR").strip().upper()
+        if market not in _GEO_ALPHA_MARKETS:
+            return {"error": "invalid_param", "param": "market", "received": market[:24],
+                    "valid_markets": sorted(_GEO_ALPHA_MARKETS), "charged": False}
+        info = _GEO_ALPHA_MARKETS[market]
         try:
-            r = requests.get(f"https://api.coingecko.com/api/v3/exchanges/{info['exchange']}", timeout=6)
-            data = r.json()
-            return {**info, "market": market, "volume_24h_btc": data.get("trade_volume_24h_btc"),
-                    "trust_score": data.get("trust_score"), "ts": int(time.time()), "provider": "Losbeto/GeoAlpha"}
+            volume, trust = Brain._geo_alpha_upstream(info["exchange"])
+            return {**info, "market": market, "volume_24h_btc": volume,
+                    "trust_score": trust, "source": "CoinGecko",
+                    "ts": int(time.time()), "provider": "Losbeto/CoinGecko"}
         except Exception as e:
-            return {**info, "market": market, "error": str(e), "ts": int(time.time())}
+            log.warning(f"geo_alpha CoinGecko indisponível: {e}")
+            return ({**info, "market": market, "error": "upstream_unavailable",
+                     "status": "upstream_unavailable", "charged": False,
+                     "retry_after_s": 60, "ts": int(time.time())}, 503)
 
     @staticmethod
     def sanctions():
@@ -10249,12 +10287,32 @@ def _weather_coord_problem():
             "ts": int(time.time())}
 
 
+def _geo_alpha_problem():
+    raw = request.args.get("market")
+    if raw is None or not raw.strip():
+        return None
+    market = raw.strip().upper()
+    if market in _GEO_ALPHA_MARKETS:
+        return None
+    base = _public_base()
+    return {"error": "invalid_param", "param": "market", "received": raw[:32],
+            "valid_markets": sorted(_GEO_ALPHA_MARKETS),
+            "valid_examples": ["BR", "IN", "KR", "TR", "MX"],
+            "how_to_call": f"{base}/geo-alpha?market=BR", "charged": False,
+            "note": "No payment challenge was issued. Choose a supported market.",
+            "ts": int(time.time())}
+
+
 def _preflight_param_check(path: str, check_required: bool = False):
     """Roda ANTES de qualquer 402 ou verificação de pagamento.
     check_required=True habilita a barreira de obrigatórios ausentes —
     SÓ usada quando há pagamento x402 anexado e ainda não liquidado
     (v48.26.1-DISCOVERY)."""
     base = _public_base()
+    if path == "/geo-alpha":
+        _geo_bad = _geo_alpha_problem()
+        if _geo_bad:
+            return _geo_bad, 400
     if path == "/weather":
         _wbad = _weather_coord_problem()
         if _wbad:
@@ -41131,7 +41189,7 @@ _ops_validate = _v4843_ops_validate
 
 _v4842_sanitize_governance()
 
-VERSION = "48.105.0-TRUTHGUARD"
+VERSION = "48.106.0-GEOAUTH"
 
 
 import ipaddress as _ipaddr_w
@@ -43163,4 +43221,4 @@ if _NEXUS_TAIL_OK is False:
 
 
 
-# EOF-LOSBETO 48.105.0-TRUTHGUARD — fim do arquivo (se esta linha faltar, a copia foi cortada)
+# EOF-LOSBETO 48.106.0-GEOAUTH — fim do arquivo (se esta linha faltar, a copia foi cortada)
