@@ -1,7 +1,7 @@
 """
 Losbeto x402 — monolithic Flask service for Railway.
 
-Current release: 48.107.0-TRUTHPATHS.
+Current release: 48.108.0-HOLDERGATE.
 Payment requirements are server-side. Delivery requires verified settlement;
 pending payments are reconciled against independent chain evidence.
 Operational history lives in CHANGELOG.md, not in executable boot output.
@@ -2593,7 +2593,7 @@ class Market:
             raise ValueError("top_coins n must be between 1 and 250")
         def f():
             common = {"Accept": "application/json",
-                      "User-Agent": "Losbeto/48.107 (+https://api.losbeto.xyz)"}
+                      "User-Agent": "Losbeto/48.108 (+https://api.losbeto.xyz)"}
             attempts = [("https://api.coingecko.com", {})]
             if COINGECKO_KEY:
                 attempts = [
@@ -4942,6 +4942,11 @@ class Brain:
     @staticmethod
     def holder_concentration():
         """Top 5 USDC token accounts, com fonte e schema verificáveis."""
+        from flask import g as _g, has_request_context as _has_request_context
+        if _has_request_context():
+            _snapshot = _g.get("losbeto_holder_preflight")
+            if isinstance(_snapshot, dict):
+                return _snapshot
         ts = int(time.time())
         usdc = USDC_MINT
         rpc, errors = Brain._holder_rpc(usdc)
@@ -4957,7 +4962,7 @@ class Brain:
                 "https://public-api.solscan.io/token/holders"
                 f"?tokenAddress={usdc}&limit=5",
                 headers={"accept": "application/json",
-                         "user-agent": "Losbeto/48.107 (+https://api.losbeto.xyz)"},
+                         "user-agent": "Losbeto/48.108 (+https://api.losbeto.xyz)"},
                 timeout=6)
             if not r.ok:
                 errors.append(f"public-api.solscan.io:HTTP {r.status_code}")
@@ -5009,7 +5014,7 @@ class Brain:
 
     @staticmethod
     def _geo_alpha_upstream(exchange):
-        common = {"Accept": "application/json", "User-Agent": "Losbeto/48.107 (+https://api.losbeto.xyz)"}
+        common = {"Accept": "application/json", "User-Agent": "Losbeto/48.108 (+https://api.losbeto.xyz)"}
         attempts = [("https://api.coingecko.com", {})]
         if COINGECKO_KEY:
             attempts = [("https://api.coingecko.com", {"x-cg-demo-api-key": COINGECKO_KEY}),
@@ -11323,6 +11328,15 @@ def paid_endpoint(path):
                     _r.headers["Retry-After"] = str(_body["retry_after_seconds"])
                     return _r
 
+            if path == "/holder-concentration" and sig and sig != "mpp-tempo":
+                _holder_gate = _v4108_holder_preflight()
+                if _holder_gate is not None:
+                    _body, _code = _holder_gate
+                    _r = jsonify(_body)
+                    _r.status_code = _code
+                    _r.headers["Retry-After"] = str(_body["retry_after_seconds"])
+                    return _r
+
             if not sig:
                 _fcb_tok = (request.headers.get("X-Session-Token") or "")[:40]
                 if _fcb_tok:
@@ -11543,6 +11557,20 @@ def paid_endpoint(path):
                     "Payment-Receipt,PAYMENT-RESPONSE,X-PAYMENT-RESPONSE,X-Session-Token,X-Session-TTL,X-First-Call-Bonus,X-Savings-Tip,X-Next-Step")
                 resp.headers["X-Session-Token"] = token
                 resp.headers["X-Session-TTL"]   = str(JWT_TTL)
+                try:
+                    _delivery_ctx = ((getattr(_V4842_REQ_CTX, "value", {}) or {})
+                                     if _mpp_info is None else {})
+                    _delivery_rid = re.sub(r"[^A-Za-z0-9_-]", "", str(
+                        info.get("rid") or _delivery_ctx.get("rid") or ""))[:32]
+                    _settlement_tx = (settlement.get("transaction")
+                                      if isinstance(settlement, dict) else "")
+                    _delivery_tx = re.sub(r"[^A-Za-z0-9]", "", str(
+                        info.get("tx") or _settlement_tx or ""))[:128]
+                    log.info(f"✅ entrega concluída no servidor endpoint={path} "
+                             f"rid={_delivery_rid or '-'} tx={_delivery_tx or '-'} "
+                             f"http={resp.status_code} delivery_complete=true")
+                except Exception:
+                    pass  # telemetria nunca converte uma resposta pronta em estorno
                 return resp
             except Exception as e:
                 log.error(f"handler {path}: {e}\n{traceback.format_exc()}")
@@ -41534,7 +41562,7 @@ _ops_validate = _v4843_ops_validate
 
 _v4842_sanitize_governance()
 
-VERSION = "48.107.0-TRUTHPATHS"
+VERSION = "48.108.0-HOLDERGATE"
 
 
 import ipaddress as _ipaddr_w
@@ -42953,6 +42981,32 @@ def _v4107_analysis_preflight():
              "ts": int(time.time())}, 503)
 
 
+def _v4108_holder_preflight():
+    """Valida os cinco token accounts antes do settlement e reutiliza o snapshot.
+
+    O hook só é chamado com pagamento x402 anexado. O snapshot vive somente no
+    request atual: não é cache público nem pode atravessar clientes/requests.
+    """
+    snapshot = Brain.holder_concentration()
+    holders = snapshot.get("top_usdc_holders") if isinstance(snapshot, dict) else None
+    if (isinstance(holders, list) and len(holders) == 5
+            and not _is_error_result(snapshot)):
+        from flask import g as _g
+        _g.losbeto_holder_preflight = snapshot
+        return None
+    log.info("pré-gate /holder-concentration: fontes indisponíveis; settlement não tentado")
+    return ({"status": "upstream_unavailable",
+             "error": "required_holder_data_unavailable",
+             "charged": False, "settlement_attempted": False,
+             "missing": ["top_5_valid_usdc_token_accounts"],
+             "scope": "top_5_token_accounts",
+             "note": "No settlement was attempted; the attached payment was not "
+                     "verified or captured. Retry with the same payment after the "
+                     "on-chain sources recover.",
+             "retry_after_seconds": 60, "provider": f"Losbeto/{VERSION}",
+             "ts": int(time.time())}, 503)
+
+
 def _v4103_pyth_price_preflight():
     """Só com pagamento anexado: falha de todas as fontes impede settlement."""
     try:
@@ -43591,4 +43645,4 @@ if _NEXUS_TAIL_OK is False:
 
 
 
-# EOF-LOSBETO 48.107.0-TRUTHPATHS — fim do arquivo (se esta linha faltar, a copia foi cortada)
+# EOF-LOSBETO 48.108.0-HOLDERGATE — fim do arquivo (se esta linha faltar, a copia foi cortada)
