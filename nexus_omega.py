@@ -1,7 +1,7 @@
 """
 Losbeto x402 — monolithic Flask service for Railway.
 
-Current release: 48.109.0-DEEPGATE.
+Current release: 48.110.0-SMARTFLOW.
 Payment requirements are server-side. Delivery requires verified settlement;
 pending payments are reconciled against independent chain evidence.
 Operational history lives in CHANGELOG.md, not in executable boot output.
@@ -2593,7 +2593,7 @@ class Market:
             raise ValueError("top_coins n must be between 1 and 250")
         def f():
             common = {"Accept": "application/json",
-                      "User-Agent": "Losbeto/48.109 (+https://api.losbeto.xyz)"}
+                      "User-Agent": "Losbeto/48.110 (+https://api.losbeto.xyz)"}
             attempts = [("https://api.coingecko.com", {})]
             if COINGECKO_KEY:
                 attempts = [
@@ -4329,16 +4329,18 @@ class Brain:
         return {"whales_24h": whales, "version": VERSION}
 
     @staticmethod
-    def smart_money():
+    def smart_money(include_holders=True):
         """v23: diretório público de entidades + dados on-chain reais (holders
         USDC via Helius, quando configurado) + método. Nada de lista estática
-        vendida como 'inteligência'."""
+        vendida como 'inteligência'. Compostos que só consomem o diretório podem
+        desativar a coleta de holders para não descartar chamadas RPC pagas/lentas."""
         holders = []
-        try:
-            nf = Brain.holder_concentration()
-            holders = (nf or {}).get("top_usdc_holders", [])[:5]
-        except Exception:
-            pass
+        if include_holders:
+            try:
+                nf = Brain.holder_concentration()
+                holders = (nf or {}).get("top_usdc_holders", [])[:5]
+            except Exception:
+                pass
         return {"institutional_directory": Market.smart_money(),
                 "top_usdc_holders_onchain": holders,
                 "method": ("Combine /whale-alert (fluxo 24h real) + /copytrade "
@@ -4973,7 +4975,7 @@ class Brain:
                 "https://public-api.solscan.io/token/holders"
                 f"?tokenAddress={usdc}&limit=5",
                 headers={"accept": "application/json",
-                         "user-agent": "Losbeto/48.109 (+https://api.losbeto.xyz)"},
+                         "user-agent": "Losbeto/48.110 (+https://api.losbeto.xyz)"},
                 timeout=6)
             if not r.ok:
                 errors.append(f"public-api.solscan.io:HTTP {r.status_code}")
@@ -5025,7 +5027,7 @@ class Brain:
 
     @staticmethod
     def _geo_alpha_upstream(exchange):
-        common = {"Accept": "application/json", "User-Agent": "Losbeto/48.109 (+https://api.losbeto.xyz)"}
+        common = {"Accept": "application/json", "User-Agent": "Losbeto/48.110 (+https://api.losbeto.xyz)"}
         attempts = [("https://api.coingecko.com", {})]
         if COINGECKO_KEY:
             attempts = [("https://api.coingecko.com", {"x-cg-demo-api-key": COINGECKO_KEY}),
@@ -6092,7 +6094,7 @@ class Brain:
                 return {"note": f"{nome} indisponível: {_e}"}
 
         whales = _etapa("whales", lambda: Brain.whale_alert().get("whales_24h", [])[:10])
-        smart = _etapa("smart_money", lambda: Brain.smart_money().get("institutional_wallets", [])[:10])
+        smart = _etapa("smart_money", lambda: Brain.smart_money(include_holders=False).get("institutional_directory", [])[:10])
         holders = (_etapa("holder_concentration", Brain.holder_concentration)
                    if hasattr(Brain, "holder_concentration")
                    else {"note": "holder concentration unavailable"})
@@ -6117,7 +6119,7 @@ class Brain:
         fg = Brain.fear_greed()
         sentiment = Brain.sentiment()
         whales = Brain.whale_alert().get("whales_24h", [])[:5]
-        smart = Brain.smart_money().get("institutional_wallets", [])[:5]
+        smart = Brain.smart_money(include_holders=False).get("institutional_directory", [])[:5]
         alpha = Brain.alpha_signal()
         conviction = 50
         conviction += 12 if fg.get("value", 50) < 35 else 6 if fg.get("value", 50) < 50 else -4
@@ -41613,7 +41615,7 @@ _ops_validate = _v4843_ops_validate
 
 _v4842_sanitize_governance()
 
-VERSION = "48.109.0-DEEPGATE"
+VERSION = "48.110.0-SMARTFLOW"
 
 
 import ipaddress as _ipaddr_w
@@ -43719,4 +43721,4 @@ if _NEXUS_TAIL_OK is False:
 
 
 
-# EOF-LOSBETO 48.109.0-DEEPGATE — fim do arquivo (se esta linha faltar, a copia foi cortada)
+# EOF-LOSBETO 48.110.0-SMARTFLOW — fim do arquivo (se esta linha faltar, a copia foi cortada)
