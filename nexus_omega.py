@@ -1,7 +1,7 @@
 """
 Losbeto x402 — monolithic Flask service for Railway.
 
-Current release: 48.108.0-HOLDERGATE.
+Current release: 48.109.0-DEEPGATE.
 Payment requirements are server-side. Delivery requires verified settlement;
 pending payments are reconciled against independent chain evidence.
 Operational history lives in CHANGELOG.md, not in executable boot output.
@@ -2593,7 +2593,7 @@ class Market:
             raise ValueError("top_coins n must be between 1 and 250")
         def f():
             common = {"Accept": "application/json",
-                      "User-Agent": "Losbeto/48.108 (+https://api.losbeto.xyz)"}
+                      "User-Agent": "Losbeto/48.109 (+https://api.losbeto.xyz)"}
             attempts = [("https://api.coingecko.com", {})]
             if COINGECKO_KEY:
                 attempts = [
@@ -3916,8 +3916,19 @@ class Brain:
     @staticmethod
     def deep_think():
         topic = request.args.get("topic", "BTC outlook 30 days")
-        fg = Market.fear_greed()
-        top = Market.top_coins(5)
+        from flask import g as _g, has_request_context as _has_request_context
+        _snapshot = (_g.get("losbeto_deep_think_preflight")
+                     if _has_request_context() else None)
+        if (isinstance(_snapshot, dict)
+                and len(_snapshot.get("top") or []) == 5
+                and isinstance(_snapshot.get("fear_greed"), dict)):
+            top = _snapshot["top"]
+            fg = _snapshot["fear_greed"]
+        else:
+            # MPP e chamadas internas conservam o fluxo anterior; o pré-gate x402
+            # fornece o snapshot estrito somente no request em que foi validado.
+            fg = Market.fear_greed()
+            top = Market.top_coins(5)
         ctx = "\n".join([f"{c['symbol'].upper()}: {(c.get('price_change_percentage_7d_in_currency') or 0):.1f}% 7d"
                          for c in top])
         memory = RAG_STORE.retrieve(topic, k=4)
@@ -4962,7 +4973,7 @@ class Brain:
                 "https://public-api.solscan.io/token/holders"
                 f"?tokenAddress={usdc}&limit=5",
                 headers={"accept": "application/json",
-                         "user-agent": "Losbeto/48.108 (+https://api.losbeto.xyz)"},
+                         "user-agent": "Losbeto/48.109 (+https://api.losbeto.xyz)"},
                 timeout=6)
             if not r.ok:
                 errors.append(f"public-api.solscan.io:HTTP {r.status_code}")
@@ -5014,7 +5025,7 @@ class Brain:
 
     @staticmethod
     def _geo_alpha_upstream(exchange):
-        common = {"Accept": "application/json", "User-Agent": "Losbeto/48.108 (+https://api.losbeto.xyz)"}
+        common = {"Accept": "application/json", "User-Agent": "Losbeto/48.109 (+https://api.losbeto.xyz)"}
         attempts = [("https://api.coingecko.com", {})]
         if COINGECKO_KEY:
             attempts = [("https://api.coingecko.com", {"x-cg-demo-api-key": COINGECKO_KEY}),
@@ -11323,6 +11334,15 @@ def paid_endpoint(path):
                 _analysis_gate = _v4107_analysis_preflight()
                 if _analysis_gate is not None:
                     _body, _code = _analysis_gate
+                    _r = jsonify(_body)
+                    _r.status_code = _code
+                    _r.headers["Retry-After"] = str(_body["retry_after_seconds"])
+                    return _r
+
+            if path == "/deep-think" and sig and sig != "mpp-tempo":
+                _deep_gate = _v4109_deep_think_preflight()
+                if _deep_gate is not None:
+                    _body, _code = _deep_gate
                     _r = jsonify(_body)
                     _r.status_code = _code
                     _r.headers["Retry-After"] = str(_body["retry_after_seconds"])
@@ -19471,10 +19491,16 @@ def _route_now_live(path: str) -> bool:
     p = (path or "").strip()
     if not p:
         return False
+    # Query e fragment pertencem ao pedido, não ao nome da rota. O caminho
+    # original permanece intacto na telemetria; só este teste usa route_path.
+    route_path = p.split("#", 1)[0].split("?", 1)[0]
+    if not route_path:
+        return False
     try:
         from werkzeug.routing import RequestRedirect
         adapter = app.url_map.bind("radar.local")
-        for cand in (p, p.rstrip("/"), p.rstrip(_PATH_TRAIL_JUNK + "/")):
+        for cand in (route_path, route_path.rstrip("/"),
+                     route_path.rstrip(_PATH_TRAIL_JUNK + "/")):
             if not cand:
                 continue
             try:
@@ -32887,9 +32913,7 @@ __ALSO_HTML__
 the same thing any x402 client library does. Losbeto never asks for your private
 key and never holds custody of funds; the signed authorization only works for this
 exact amount, this exact endpoint, and expires in a few minutes if unused.
-Smart-account wallets (contract or EIP-7702) cannot produce that authorization, so they pay
-with a plain USDC transfer of the same amount to the address shown, confirmed in your wallet
-and verified on-chain before delivery.
+__SMART_ACCOUNT_HELP__
 Prefer an AI agent? <a href="/pricing">See the agent flow</a>.</p>
 </div>
 <script>
@@ -33040,15 +33064,16 @@ function walletErrMsg(e, net){
     return 'You cancelled the request in your wallet \u2014 nothing was charged. Tap the button to try again.';
   if (code === 4100 || /not been authori[sz]ed/i.test(raw))
     return 'Your wallet has not authorized this site for this account (code 4100). Open the wallet, select the account ' +
-           'that holds USDC on ' + net + ', connect it to ' + location.host + ' (Phantom: Settings \u2192 Connected apps) and tap ' +
-           'Pay again \u2014 or use the plain-transfer card below.';
+           'that holds USDC on ' + net + ', connect it to ' + location.host + ' (Phantom: Settings \u2192 Connected apps) and tap Pay again' +
+           (IS_CREDIT ? '.' : ' \u2014 or use the plain-transfer card below.');
   if (code === -32002)
     return 'Your wallet already has a request open \u2014 finish or close it in the wallet, then retry.';
   if (code === 4900 || code === 4901)
     return 'Your wallet is not connected to the ' + net + ' network right now \u2014 switch it to ' + net + ' and retry.';
   if (net === 'Base' && /insufficient funds|exceeds balance|gas required/i.test(raw))
-    return 'Your wallet cannot cover the Base network fee \u2014 add a few cents of ETH on Base and retry, ' +
-           'or use the plain-transfer card below.';
+    return 'Your wallet cannot cover the Base network fee \u2014 add a few cents of ETH on Base and retry' +
+           (IS_CREDIT ? '. Credit plans require a signed x402 authorization from a regular EOA.' :
+                        ' or use the plain-transfer card below.');
   return 'Error: ' + raw;
 }
 // v48.104.0: erro da carteira na transferencia vira instrucao + aviso ao no (antes: "Error: Unexpected
@@ -33361,7 +33386,7 @@ async function paySolana(){
       let m0 = (r0 === 'tx-not-found')
         ? 'The network is still propagating your payment — wait ~10s and tap Pay again.'
         : ('Payment not accepted: ' + r0);
-      if(/facilitator|invalid|no-direct-fallback/i.test(r0)){
+      if(!IS_CREDIT && /facilitator|invalid|no-direct-fallback/i.test(r0)){
         m0 += '\nTip: the manual transfer card below works WITHOUT the facilitator — a plain USDC send on Solana or Base.';
         const mcF = document.getElementById('manualCard');
         if(mcF && !IS_CREDIT) mcF.style.border = '2px solid #f59e0b';
@@ -33589,12 +33614,20 @@ async function payAndFetch(retried){
     const pre = await preflightWallet(from);
     if (pre && pre.insufficient){
       setStatus('Payment stopped before signature: insufficient USDC on Base in ' + shortAddr(from) + '. ' +
-                'Top up, or switch to the account that holds your USDC and tap Pay again \u2014 ' +
-                'or use the plain-transfer option below.','err');
+                (IS_CREDIT
+                  ? 'Top up or switch to the regular EOA that holds your USDC, then tap Pay again. Plain USDC transfers cannot buy credit plans.'
+                  : 'Top up, or switch to the account that holds your USDC and tap Pay again \u2014 or use the plain-transfer option below.'),'err');
       btn.disabled = false;
       return;
     }
-    if (pre && pre.contract && !IS_CREDIT){
+    if (pre && pre.contract && IS_CREDIT){
+      setStatus('Payment stopped before signature: credit plans require an EIP-3009 x402 authorization from a regular EOA. ' +
+                'Switch to a regular MetaMask/Rabby account with USDC on Base and tap Pay again. ' +
+                'No signature was requested, no payment was sent, and plain USDC transfers cannot buy credit plans.', 'err');
+      btn.disabled = false;
+      return;
+    }
+    if (pre && pre.contract){
       // v48.97.0: assinatura de conta-contrato e recusada pelos facilitadores -> transferencia
       showXfer(w, from);
       return await payByTransfer(w, from, pre);
@@ -33822,16 +33855,33 @@ def _pay_bridge_handler(raw_endpoint):
     rails_banner = ""
     try:
         if _rails_facilitator_down():
-            rails_banner = (
-                '<div class="card" style="border-color:#f59e0b">'
-                '<p style="margin:0;font-size:14px;color:#fbbf24">'
-                '<b>⚠ Facilitator rails are temporarily down</b> (CDP + PayAI '
-                'both rejecting settlements at the moment). Wallet signatures '
-                'will fail — use the <b>manual transfer card below</b>: a plain '
-                'USDC send, verified on-chain, same price, instant delivery. '
-                'It works right now.</p></div>')
+            if ep in CREDIT_PLANS:
+                rails_banner = (
+                    '<div class="card" style="border-color:#f59e0b">'
+                    '<p style="margin:0;font-size:14px;color:#fbbf24">'
+                    '<b>⚠ Facilitator rails are temporarily down</b> (CDP + PayAI '
+                    'both rejecting settlements at the moment). Credit plans require '
+                    'the signed x402 flow; do not send a plain transfer because it '
+                    'cannot claim a plan. Wait for the facilitators to recover and retry.</p></div>')
+            else:
+                rails_banner = (
+                    '<div class="card" style="border-color:#f59e0b">'
+                    '<p style="margin:0;font-size:14px;color:#fbbf24">'
+                    '<b>⚠ Facilitator rails are temporarily down</b> (CDP + PayAI '
+                    'both rejecting settlements at the moment). Wallet signatures '
+                    'will fail — use the <b>manual transfer card below</b>: a plain '
+                    'USDC send, verified on-chain, same price, instant delivery. '
+                    'It works right now.</p></div>')
     except Exception:
         rails_banner = ""
+    smart_account_help = (
+        'Credit plans require the signed x402 authorization from a regular EOA. '
+        'Smart-account wallets (contract or EIP-7702) must switch to a regular EOA; '
+        'plain USDC transfers cannot buy credit plans.'
+        if ep in CREDIT_PLANS else
+        'Smart-account wallets (contract or EIP-7702) cannot produce that authorization, so they pay '
+        'with a plain USDC transfer of the same amount to the address shown, confirmed in your wallet '
+        'and verified on-chain before delivery.')
     html = (_PAY_BRIDGE_HTML
             .replace("__RAILS_BANNER__", rails_banner)
             .replace("__PIX_CARD__", pix_card)
@@ -33846,6 +33896,7 @@ def _pay_bridge_handler(raw_endpoint):
             .replace("__SOL_ACCEPT_JSON__", json.dumps(sol_accept) if sol_accept else "null")
             .replace("__PAY_VERSION__", VERSION)
             .replace("__IS_CREDIT__", "true" if ep in CREDIT_PLANS else "false")
+            .replace("__SMART_ACCOUNT_HELP__", smart_account_help)
             .replace("__ALSO_HTML__", _pay_also_html(ep)))
     try:
         LEDGER.log_request(ep, True, 0,
@@ -41562,7 +41613,7 @@ _ops_validate = _v4843_ops_validate
 
 _v4842_sanitize_governance()
 
-VERSION = "48.108.0-HOLDERGATE"
+VERSION = "48.109.0-DEEPGATE"
 
 
 import ipaddress as _ipaddr_w
@@ -42981,6 +43032,29 @@ def _v4107_analysis_preflight():
              "ts": int(time.time())}, 503)
 
 
+def _v4109_deep_think_preflight():
+    """Falha de mercado impede verify/settlement; sucesso fica no request atual."""
+    top = Market.top_coins(5)
+    fg = Market.fear_greed(strict=True)
+    if len(top) == 5 and isinstance(fg, dict):
+        from flask import g as _g
+        _g.losbeto_deep_think_preflight = {"top": top, "fear_greed": fg}
+        return None
+    missing = []
+    if len(top) != 5:
+        missing.append("top_5_valid_coins")
+    if not isinstance(fg, dict):
+        missing.append("fear_greed_live")
+    log.info(f"pré-gate /deep-think: dataset indisponível ({', '.join(missing)})")
+    return ({"status": "upstream_unavailable", "error": "required_market_data_unavailable",
+             "charged": False, "settlement_attempted": False, "missing": missing,
+             "note": "No settlement was attempted; the attached payment was not "
+                     "verified or captured. Retry with the same payment after the "
+                     "upstream recovers.",
+             "retry_after_seconds": 60, "provider": f"Losbeto/{VERSION}",
+             "ts": int(time.time())}, 503)
+
+
 def _v4108_holder_preflight():
     """Valida os cinco token accounts antes do settlement e reutiliza o snapshot.
 
@@ -43645,4 +43719,4 @@ if _NEXUS_TAIL_OK is False:
 
 
 
-# EOF-LOSBETO 48.108.0-HOLDERGATE — fim do arquivo (se esta linha faltar, a copia foi cortada)
+# EOF-LOSBETO 48.109.0-DEEPGATE — fim do arquivo (se esta linha faltar, a copia foi cortada)
