@@ -1,7 +1,7 @@
 """
 Losbeto x402 — monolithic Flask service for Railway.
 
-Current release: 48.111.0-SHELFTRUTH.
+Current release: 48.112.0-COREGUARD.
 Payment requirements are server-side. Delivery requires verified settlement;
 pending payments are reconciled against independent chain evidence.
 Operational history lives in CHANGELOG.md, not in executable boot output.
@@ -2606,7 +2606,7 @@ class Market:
                 try:
                     r = requests.get(f"{root}/api/v3/coins/markets",
                         params={"vs_currency": "usd", "order": "market_cap_desc",
-                                "per_page": n, "page": 1,
+                                "per_page": min(250, n + max(2, n // 5)), "page": 1,
                                 "price_change_percentage": "1h,24h,7d"},
                         timeout=15, headers={**common, **auth})
                     if not r.ok:
@@ -2616,6 +2616,7 @@ class Market:
                     if validated:
                         return validated
                     errors.append(f"{root} invalid markets payload")
+                    _v4112_source_rejected(root)   # v48.112.0: 200 recusado = fonte fora
                 except Exception as e:
                     errors.append(f"{root} {type(e).__name__}")
             if errors:
@@ -4944,6 +4945,7 @@ class Brain:
                     if HELIUS_KEY and _rpc_txt:
                         _rpc_txt = _rpc_txt.replace(HELIUS_KEY, "***")
                     errors.append(f"{host}:InvalidJSONRPC" + (f"({_rpc_txt})" if _rpc_txt else ""))
+                    _v4112_source_rejected(host)   # v48.112.0: 200 com erro = fonte fora
                     continue
                 result = payload.get("result")
                 accounts = result.get("value") if isinstance(result, dict) else None
@@ -26684,7 +26686,8 @@ async function reload(){
     ["🌐 Endpoints",j.endpoints,"monetizados",""],
     ["🧯 Falhas (24h)",(j.failures_24h?(j.failures_24h.delivery_failed+j.failures_24h.refunded+j.failures_24h.checkout_error):"—"),
        (j.failures_24h?("sem estorno "+j.failures_24h.delivery_failed+" · estornadas "+j.failures_24h.refunded+
-        " · checkout no navegador "+j.failures_24h.checkout_error):"—"),
+        " · checkout no navegador "+j.failures_24h.checkout_error+
+        (j.failures_24h.checkout_precheck?(" · parados no pré-check (saldo/gás do comprador) "+j.failures_24h.checkout_precheck):"")):"—"),
        ((j.failures_24h&&j.failures_24h.delivery_failed>0)?"amber":"")],
   ];
   document.getElementById("cards").innerHTML = cards.map(c =>
@@ -41664,7 +41667,7 @@ _ops_validate = _v4843_ops_validate
 
 _v4842_sanitize_governance()
 
-VERSION = "48.111.0-SHELFTRUTH"
+VERSION = "48.112.0-COREGUARD"
 
 
 import ipaddress as _ipaddr_w
@@ -43313,7 +43316,14 @@ def _v4104_call(fn, path: str = "", quiet: bool = False):
         if own:
             _V4104_UPL.events = None
     mine = ev[mark:]
-    if not mine or any(ok for _h, ok in mine):
+    core = sorted({str(h)[6:] for h, _ok in mine if str(h).startswith("!core:")})
+    if core:   # v48.112.0: consumido neste nível; os de fora veem só uma fonte fora
+        for _i in range(mark, len(ev)):
+            if str(ev[_i][0]).startswith("!core:"):
+                ev[_i] = ("core:" + str(ev[_i][0])[6:], False)
+    if core and not _v4112_core_applies(path):
+        core = []          # composto que degrada com elegância (ex.: /council): segue como antes
+    if not core and (not mine or any(ok for _h, ok in mine)):
         return res
     try:
         if _is_error_result(res):
@@ -43323,15 +43333,20 @@ def _v4104_call(fn, path: str = "", quiet: bool = False):
     body = res[0] if isinstance(res, tuple) and res else res
     if not isinstance(body, dict) or _v4104_stale_ok(body):
         return res            # Response (HTML/SVG/CSV) ou dado rotulado como velho: fica
-    hosts = sorted({h for h, _ok in mine})[:6]
+    hosts = sorted({h for h, _ok in mine if not str(h).startswith(("!core:", "core:"))})[:6]
+    failed = (core + [h for h in hosts if h not in core])[:6] if core else hosts
     if not quiet:
         _V4104_STATS["upstream_truth"] += 1
-        _v4104_warn_upstream(path, hosts)
+        _v4104_warn_upstream(path, failed)
+    detail = (("The core data source of this endpoint failed during this call ("
+               + ", ".join(core) + "), so the result would be empty or a placeholder. It is "
+               "not sold as data.") if core else
+              ("Every live data source this endpoint depends on failed during this "
+               "call (" + ", ".join(hosts) + "), so nothing live was produced. It is "
+               "not sold as data."))
     return ({"status": "unavailable", "error": "upstream_unavailable",
-             "detail": ("Every live data source this endpoint depends on failed during this "
-                        "call (" + ", ".join(hosts) + "), so nothing live was produced. It is "
-                        "not sold as data."),
-             "upstreams_failed": hosts, "retry_after_seconds": 60,
+             "detail": detail,
+             "upstreams_failed": failed, "retry_after_seconds": 60,
              "endpoint": path or None, "provider": f"Losbeto/{VERSION}",
              "ts": int(time.time())}, 503)
 
@@ -43704,13 +43719,14 @@ def api_pay_event_v4104():
     who = re.sub(r"[^0-9A-Za-z.…]", "", str(j.get("who") or ""))[:16]
     params = (f"stage={stage}&code={code}&wallet={wallet}&acct={acct}&gas={gas}"
               f"&who={who}&msg={msg}")[:160]
-    LEDGER.log_request(ep, False, 0, ip, kind="checkout_error", ua=ua, params=params)
+    LEDGER.log_request(ep, False, 0, ip, ua=ua, params=params,
+                       kind=("checkout_precheck" if stage == "precheck" else "checkout_error"))
     if stage == "precheck":
         line = (f"{ep} · pré-checagem do /pay · carteira {wallet} · conta {acct} · gás {gas} · "
                 f"{who or '—'} · motivo {code or '—'}\n{msg[:140] or '—'}\n"
                 f"Nenhuma transação foi enviada e nada foi cobrado.")
         log.warning("🧾 checkout parado na pré-checagem do /pay: " + line.replace("\n", " · "))
-        _v4104_payev_tg(line, "🧾 Checkout parado antes da carteira (saldo/gás/conta)")
+        _v4112_precheck_tg(line, who, code)   # v48.112.0: mesma carteira+motivo, 1 aviso/6 h
         return ("", 204)
     line = (f"{ep} · etapa {stage} · carteira {wallet} · conta {acct} · gás {gas} · "
             f"{who or '—'} · código {code or '—'}\nCarteira disse: {msg[:120] or '—'}")
@@ -43756,6 +43772,7 @@ def _v4104_daily_lines(stats: dict) -> str:
                 f"📈 Orgânico acumulado: ${tot['organic_usdc']:.4f} em {tot['organic_tx']} tx\n"
                 f"🧯 Falhas 24h: {f['delivery_failed']} pagas sem estorno · {f['refunded']} estornadas · "
                 f"{f['checkout_error']} no checkout do navegador · "
+                f"{f.get('checkout_precheck', 0)} parados no pré-check do /pay (saldo/gás do comprador) · "
                 f"{f['upstream_truth_since_boot']} chamadas com todas as fontes fora (neste worker, desde o boot)")
     except Exception as e:
         return (f"Ledger: {json.dumps(stats, default=str)[:300]} "
@@ -44030,10 +44047,7 @@ _PREFLIGHT_UNAVAILABLE_4110 = _preflight_unavailable
 def _preflight_unavailable(path: str):  # noqa: F811 — camada 48.111.0
     g = _v4111_gate(path)
     if g is not None:
-        now = time.time()
-        if now - _V4111_GATE_LOG.get(path, 0) >= 600:
-            _V4111_GATE_LOG[path] = now
-            log.warning(f"⛔ pré-gate: {path} recusado sem cobrança — {g[0].get('error')}")
+        _v4112_gate_log(path, g[0].get("error"))   # v48.112.0: era 214 linhas WARNING em 8 h
         return g
     return _PREFLIGHT_UNAVAILABLE_4110(path)
 
@@ -44391,6 +44405,412 @@ _V4104_ORIG_SEND = _v4111_rl_send
 # a parada antes da carteira no /pay também avisa o nó (etapa 'precheck')
 _V4104_PAYEV_STAGES.add("precheck")
 
+# ============================================================================
+# v48.112.0-COREGUARD — fonte NÚCLEO fora não vira produto vazio vendido
+#  1. top_coins (CoinGecko /coins/markets) era tudo-ou-nada: um único item ruim — variação 24h
+#     nula num token novo, id duplicado, market cap fora de ordem entre vizinhos — derrubava a
+#     lista inteira. Em 23/nov, das 10:07 às 11:37 UTC (fim do log), TODA chamada caiu nisso
+#     (22× "invalid markets payload"). Agora cada item é validado sozinho, o inválido sai com o
+#     motivo registrado, os válidos são reordenados por market cap e a consulta pede uma folga
+#     de itens; só recusa a lista se faltar mais de 10% ou se a ordem vier embaralhada.
+#  2. Lista de moedas fora no meio de uma chamada paga agora conta como falha da fonte NÚCLEO:
+#     /arbitrage ($0,15), /cross-chain ($0,15), /relatorio, /sinais, /regime e /sentiment eram
+#     VENDIDOS com resultado vazio ou "unknown/neutral" sempre que a CoinGecko recusava (429,
+#     payload recusado) e outra fonte (Binance, alternative.me, LLM) respondia. Viram 503 +
+#     estorno. O nível mais interno do portão consome o aviso (job com componente fora segue
+#     com os outros componentes).
+#  3. HTTP 200 que o validador recusa conta como fonte FORA no livro de chamadas (CoinGecko
+#     com payload recusado; holder com erro JSON-RPC).
+#  4. /sentiment: símbolo fora do top 50 recebia "neutral, score 0" pago. Agora 422 com a lista
+#     coberta (e 400 antes do 402 quando a lista recente está em cache); fontes nomeadas e o
+#     Fear & Greed ausente aparece como ausente (a conta é a mesma).
+#  5. Disjuntor das fontes de holder também testa sozinho quando nunca foi testado (ou após
+#     6 h): em 23/nov, 8 h sem nenhuma chamada a holder e /holder-concentration + /smart-money
+#     anunciados o tempo todo.
+#  6. Log: o "⛔ pré-gate" da 48.111 foi 214 das 260 linhas WARNING do deploy. Agora uma linha
+#     INFO por produto a cada 6 h (entre todos os workers), com a contagem.
+#  7. /pay: a mesma parada (mesma carteira, mesmo motivo) avisa o Telegram uma vez a cada 6 h;
+#     a parada no pré-check ganha kind próprio no ledger (checkout_precheck) e "Falhas (24h)"
+#     mostra à parte, sem somar como falha do nó.
+#  8. Radar: /api/models, /api/model/list e afins (listagem de modelos de gateway LLM) são
+#     sonda, não "DEMANDA DETECTADA".
+# ============================================================================
+
+_V4112_CG_DIAG = {"ts": 0.0, "last": ""}
+
+
+def _v4112_source_rejected(host):
+    """HTTP 200 com payload que o validador recusou: a chamada mais recente a esse host passa a
+    contar como fonte FORA no livro de chamadas desta execução paga."""
+    ev = getattr(_V4104_UPL, "events", None)
+    if ev is None:
+        return
+    h = str(host or "").lower()
+    if "://" in h:
+        try:
+            h = (_v4104_urlparse(h).hostname or "").lower()
+        except Exception:
+            pass
+    try:
+        for i in range(len(ev) - 1, -1, -1):
+            if ev[i][0] == h:
+                if ev[i][1]:
+                    ev[i] = (h, False)
+                return
+        _v4111_ev_add(ev, h, False)
+    except Exception:
+        pass
+
+
+# produtos em que a lista de moedas da CoinGecko É o produto (sem ela sobra vazio/placeholder).
+# Compostos que degradam com elegância por desenho (/council, /thesis-engine…) ficam de fora.
+_V4112_CORE_PATHS = frozenset((
+    "/regime", "/sinais", "/arbitrage", "/cross-chain", "/sentiment", "/relatorio",
+    "/market-brief", "/analise", "/deep-think", "job:sentiment"))
+
+
+def _v4112_core_applies(path):
+    return str(path or "") in _V4112_CORE_PATHS
+
+
+def _v4112_source_answered(host):
+    """A fonte núcleo entregou dado válido nesta chamada — inclusive do cache de 60 s, que não
+    passa pela rede e por isso não deixava rastro no livro. Sem isso, /sentiment com a lista em
+    cache e o Fear & Greed fora virava "todas as fontes falharam" (503) com o resultado pronto."""
+    ev = getattr(_V4104_UPL, "events", None)
+    if ev is None:
+        return
+    try:
+        # O helper geral substitui a última falha por um sucesso; isso não pode apagar !core:.
+        if ev and not ev[-1][1] and str(ev[-1][0]).startswith("!core:"):
+            return
+        _v4111_ev_add(ev, str(host).lower(), True)
+    except Exception:
+        pass
+
+
+def _v4112_core_failed(label):
+    """A fonte NÚCLEO de um produto pago falhou nesta chamada. Fora de uma execução paga (laço
+    de fundo, pré-gate) não faz nada. O sinal sempre entra, mas sem ultrapassar o teto: com o
+    livro cheio, substitui uma falha antiga ou o último evento, preservando as demais provas."""
+    ev = getattr(_V4104_UPL, "events", None)
+    if ev is None:
+        return
+    try:
+        item = ("!core:" + str(label)[:60], False)
+        if len(ev) < _V4111_EV_CAP:
+            ev.append(item)
+        elif not any(isinstance(x, (tuple, list)) and len(x) >= 2 and x[0] == item[0]
+                     for x in ev):
+            for i in range(len(ev) - 1, -1, -1):
+                if isinstance(ev[i], (tuple, list)) and len(ev[i]) >= 2 and not ev[i][1]:
+                    ev[i] = item
+                    break
+            else:
+                ev[-1] = item
+    except Exception:
+        pass
+
+
+def _v4112_coin_problem(item, seen):
+    if not isinstance(item, dict):
+        return "item não é objeto", None
+    coin_id, symbol = item.get("id"), item.get("symbol")
+    if not isinstance(coin_id, str) or not coin_id.strip() or len(coin_id) > 128:
+        return "id inválido", None
+    if coin_id.strip().lower() in seen:
+        return "id duplicado", None
+    if not isinstance(symbol, str) or not symbol.strip() or len(symbol.strip()) > 32:
+        return "símbolo inválido", None
+    try:
+        price = float(item.get("current_price"))
+        market_cap = float(item.get("market_cap"))
+        change_24h = float(item.get("price_change_percentage_24h"))
+    except (TypeError, ValueError, OverflowError):
+        return "preço, market cap ou variação 24h ausente", None
+    if (not all(math.isfinite(v) for v in (price, market_cap, change_24h))
+            or price <= 0 or market_cap <= 0):
+        return "preço ou market cap não positivo", None
+    coin = dict(item)
+    coin.update({"id": coin_id.strip(), "symbol": symbol.strip(), "current_price": price,
+                 "market_cap": market_cap, "price_change_percentage_24h": change_24h})
+    for field in ("price_change_percentage_1h_in_currency",
+                  "price_change_percentage_7d_in_currency"):
+        if coin.get(field) is None:
+            continue
+        try:
+            value = float(coin[field])
+        except (TypeError, ValueError, OverflowError):
+            coin[field] = None
+            continue
+        coin[field] = value if math.isfinite(value) else None
+    return None, coin
+
+
+def _v4112_validated_top_coins(data, n):
+    """Validação item a item. O inválido sai (motivo no log, no máximo 1 linha a cada 30 min);
+    os válidos são reordenados por market cap. Recusa a lista inteira só se sobrar menos que
+    n − max(1, n // 10) itens (todos, para n ≤ 3) ou se mais da metade vier fora de ordem."""
+    try:
+        n = int(n)
+    except Exception:
+        return []
+    if not isinstance(data, list) or not data or n < 1:
+        if isinstance(data, dict):   # ex.: {"status": {"error_code": …, "error_message": …}}
+            st = data.get("status") if isinstance(data.get("status"), dict) else {}
+            diag = (f"top_coins({n}): resposta é objeto, não lista (chaves: "
+                    f"{', '.join(sorted(map(str, data))[:6])}"
+                    + (f"; {st.get('error_code')}: {str(st.get('error_message') or '')[:120]}"
+                       if st else "") + ")")
+            now = time.time()
+            if diag != _V4112_CG_DIAG["last"] or now - _V4112_CG_DIAG["ts"] >= 1800:
+                _V4112_CG_DIAG.update(ts=now, last=diag)
+                log.warning(f"🪙 {diag}")
+        return []
+    valid, seen, dropped, examples = [], set(), Counter(), {}
+    for item in data:
+        why, coin = _v4112_coin_problem(item, seen)
+        if why:
+            dropped[why] += 1
+            if why not in examples and isinstance(item, dict):
+                examples[why] = str(item.get("id") or item.get("symbol") or "?")[:24]
+            continue
+        valid.append(coin)
+        seen.add(coin["id"].lower())
+    inversions = sum(1 for a, b in zip(valid, valid[1:]) if b["market_cap"] > a["market_cap"])
+    need = n if n <= 3 else n - max(1, n // 10)
+    if len(valid) >= 4 and inversions > len(valid) // 2:
+        dropped["ordem embaralhada (lista inteira recusada)"] += 1
+        valid = []
+    valid.sort(key=lambda c: -c["market_cap"])
+    out = valid[:n] if len(valid) >= min(need, n) else []
+    if dropped or inversions:
+        diag = (f"top_coins({n}): {len(data)} recebidos, {len(out)} usados"
+                + "".join(f"; {k} ×{v} (ex.: {examples.get(k, '—')})" for k, v in dropped.items())
+                + (f"; {inversions} inversão(ões) de market cap reordenada(s)" if inversions else ""))
+        now = time.time()
+        if diag != _V4112_CG_DIAG["last"] or now - _V4112_CG_DIAG["ts"] >= 1800:
+            _V4112_CG_DIAG.update(ts=now, last=diag)
+            (log.warning if not out else log.info)(f"🪙 {diag}")
+    return out
+
+
+Market._validated_top_coins = staticmethod(_v4112_validated_top_coins)
+_TOP_COINS_4111 = Market.top_coins
+
+
+def _v4112_top_coins(n=20):
+    out = _TOP_COINS_4111(n)
+    if not out:
+        _v4112_core_failed("api.coingecko.com top_coins")
+    return out
+
+
+Market.top_coins = staticmethod(_v4112_top_coins)
+
+
+# --------------------------------------------------------------------------------------------
+# /sentiment: símbolo fora do top 50 não vira "neutral" pago
+# --------------------------------------------------------------------------------------------
+def _v4112_sentiment():
+    try:
+        symbol = (request.args.get("symbol") or "BTC").strip().upper()[:16]
+    except RuntimeError:
+        symbol = "BTC"
+    top = Market.top_coins(50)
+    if not top:
+        return ({"status": "unavailable", "error": "upstream_unavailable", "symbol": symbol,
+                 "detail": ("The CoinGecko market list this score is built from did not answer "
+                            "on this call, so no sentiment was computed. It is not sold as data."),
+                 "upstreams_failed": ["api.coingecko.com top_coins"], "retry_after_seconds": 60,
+                 "provider": f"Losbeto/{VERSION}", "ts": int(time.time())}, 503)
+    _v4112_source_answered("api.coingecko.com")   # lista válida (ao vivo ou do cache de 60 s)
+    coin = next((c for c in top if (c.get("symbol") or "").upper() == symbol), None)
+    if coin is None:
+        covered = sorted({(c.get("symbol") or "").upper() for c in top if c.get("symbol")})
+        return ({"error": "symbol_not_covered", "symbol": symbol, "charged": False,
+                 "detail": (f"{symbol} is not among the top {len(top)} coins by market cap right "
+                            "now, and this endpoint only scores those."),
+                 "covered_now": covered, "provider": f"Losbeto/{VERSION}",
+                 "ts": int(time.time())}, 422)
+    ch24 = float(coin.get("price_change_percentage_24h") or 0)
+    ch7d = coin.get("price_change_percentage_7d_in_currency")
+    fg = Market.fear_greed(strict=True)
+    terms, sources = [ch24 * 0.4], ["CoinGecko 24h change"]
+    if isinstance(ch7d, (int, float)) and math.isfinite(float(ch7d)):
+        terms.append(float(ch7d) * 0.3)
+        sources.append("CoinGecko 7d change")
+    else:
+        ch7d = None
+    fg_value = None
+    if isinstance(fg, dict):
+        try:
+            fg_value = int(fg.get("value"))
+            terms.append((fg_value - 50) * 0.6)
+            sources.append("alternative.me Fear & Greed")
+        except Exception:
+            fg_value = None
+    score = max(-1.0, min(1.0, sum(terms) / 30))
+    sent = "bullish" if score > 0.2 else "bearish" if score < -0.2 else "neutral"
+    out = {"symbol": symbol, "sentiment": sent, "score": round(score, 3),
+           "fear_greed": fg_value, "ch_24h": ch24, "ch_7d": ch7d, "sources": sources,
+           "version": VERSION}
+    if fg_value is None:
+        out["note"] = ("The Fear & Greed index did not answer on this call; the score uses "
+                       "price momentum only.")
+    return out
+
+
+_v4104_rebind("/sentiment", _v4112_sentiment)
+_PREFLIGHT_PARAM_CHECK_4111 = _preflight_param_check
+
+
+def _v4112_sentiment_symbol_problem():
+    """Antes do 402, sem rede: só usa a lista top 50 que já está em cache (até 15 min)."""
+    try:
+        raw = (request.args.get("symbol") or "").strip().upper()
+    except RuntimeError:
+        return None
+    if not raw:
+        return None
+    try:
+        cached = LEDGER.cache_get("top_50", 900)
+    except Exception:
+        cached = None
+    if not isinstance(cached, list) or len(cached) < 10:
+        return None
+    covered = {(c.get("symbol") or "").upper() for c in cached if isinstance(c, dict)}
+    if raw in covered:
+        return None
+    return {"error": "invalid_param", "param": "symbol", "received": raw[:32],
+            "detail": (f"{raw[:16]} is not among the top 50 coins by market cap right now; "
+                       "/sentiment scores only those."),
+            "valid_examples": sorted(covered)[:15], "charged": False,
+            "note": "No payment challenge was issued. Pick a covered symbol and retry.",
+            "ts": int(time.time())}
+
+
+def _preflight_param_check(path: str, check_required: bool = False):  # noqa: F811 — 48.112.0
+    if path == "/sentiment":
+        bad = _v4112_sentiment_symbol_problem()
+        if bad:
+            return bad, 400
+    return _PREFLIGHT_PARAM_CHECK_4111(path, check_required)
+
+
+# --------------------------------------------------------------------------------------------
+# disjuntor: sonda também quando nunca testado (ou parado há 6 h)
+# --------------------------------------------------------------------------------------------
+_V4112_BRK_IDLE_S = max(900, int(os.environ.get("SOURCE_BREAKER_IDLE_PROBE_S", "21600")))
+_V4111_BREAKER_PROBE_ORIG = _v4111_breaker_probe
+
+
+def _v4111_breaker_probe():  # noqa: F811 — camada 48.112.0
+    """Meio-aberto (falhou e a espera venceu) OU ocioso (nunca testado / último teste há mais de
+    SOURCE_BREAKER_IDLE_PROBE_S): uma chamada real, fora do caminho pago, decide."""
+    now = time.time()
+    for name in sorted(set(_V4111_SOURCE_GATED.values())):
+        rec = _v4111_brk_get(name)
+        if int(rec.get("fails") or 0) > 0:
+            if _v4111_brk_left(name) > 0:
+                continue
+        else:
+            last = max(float(rec.get(k) or 0) for k in ("last_ok", "last_fail", "last_probe"))
+            if now - last < _V4112_BRK_IDLE_S:
+                continue
+            rec["last_probe"] = int(now)
+            _v4111_brk_put(name, rec)
+        if name == "holder":
+            Brain.holder_concentration()
+
+
+# --------------------------------------------------------------------------------------------
+# log do portão: 1 linha por produto a cada 6 h, entre todos os workers
+# --------------------------------------------------------------------------------------------
+_V4112_GATE_LOG_S = max(600, int(os.environ.get("GATE_LOG_INTERVAL_S", "21600")))
+_V4112_GATE_N = {}
+
+
+def _v4112_gate_log(path, err):
+    _V4112_GATE_N[path] = _V4112_GATE_N.get(path, 0) + 1
+    try:
+        if LEDGER.cache_get("gatelog:" + path, _V4112_GATE_LOG_S) is not None:
+            return
+        LEDGER.cache_set("gatelog:" + path, int(time.time()))
+    except Exception:
+        if time.time() - _V4111_GATE_LOG.get(path, 0) < _V4112_GATE_LOG_S:
+            return
+        _V4111_GATE_LOG[path] = time.time()
+    n = _V4112_GATE_N.pop(path, 0)
+    log.info(f"⛔ fora da vitrine: {path} ({err}) — {n} pedido(s) recusado(s) sem cobrança neste "
+             f"worker desde o último registro; próximo registro em {_V4112_GATE_LOG_S // 3600} h")
+
+
+# --------------------------------------------------------------------------------------------
+# /pay: aviso de pré-check sem repetição; "Falhas (24h)" separa o pré-check
+# --------------------------------------------------------------------------------------------
+_V4112_PRECHECK_TG_S = max(600, int(os.environ.get("PAY_PRECHECK_TG_DEDUPE_S", "21600")))
+
+
+def _v4112_precheck_tg(line, who, code):
+    """Mesma carteira + mesmo motivo: Telegram uma vez a cada 6 h (log e contagem seguem)."""
+    key = f"payev_pre:{who or '?'}:{code or '?'}"
+    try:
+        if LEDGER.cache_get(key, _V4112_PRECHECK_TG_S) is not None:
+            return False
+        LEDGER.cache_set(key, int(time.time()))
+    except Exception:
+        pass
+    _v4104_payev_tg(line, "🧾 Checkout parado antes da carteira (saldo/gás/conta)")
+    return True
+
+
+_V4104_FAILURES_24H_ORIG = _v4104_failures_24h
+
+
+def _v4104_failures_24h() -> dict:  # noqa: F811 — camada 48.112.0
+    now = time.time()
+    if _V4104_FAIL_CACHE["v"] is not None and now - _V4104_FAIL_CACHE["ts"] < 60:
+        return dict(_V4104_FAIL_CACHE["v"])
+    out = {"delivery_failed": 0, "refunded": 0, "checkout_error": 0, "checkout_precheck": 0,
+           "upstream_truth_since_boot": _V4104_STATS["upstream_truth"]}
+    try:
+        with LEDGER._conn() as c:
+            corte = int(now) - 86400
+            for k, n in c.execute(
+                    "SELECT kind, COUNT(*) FROM requests WHERE ts>? AND kind IN "
+                    "('delivery_failed','refunded','checkout_error','checkout_precheck') "
+                    "GROUP BY kind", (corte,)).fetchall():
+                out[str(k)] = int(n)
+            legado = c.execute(      # linhas da 48.111 (kind antigo) nas primeiras 24 h
+                "SELECT COUNT(*) FROM requests WHERE ts>? AND kind='checkout_error' "
+                "AND params LIKE 'stage=precheck%'", (corte,)).fetchone()
+            legado = int((legado or [0])[0] or 0)
+            out["checkout_error"] = max(0, out["checkout_error"] - legado)
+            out["checkout_precheck"] += legado
+    except Exception as e:
+        out["error"] = str(e)[:60]
+    _V4104_FAIL_CACHE.update(ts=now, v=dict(out))
+    return out
+
+
+# --------------------------------------------------------------------------------------------
+# radar: listagem de modelos de gateway LLM é sonda, não pedido de produto
+# --------------------------------------------------------------------------------------------
+_V4112_LLM_LIST_PROBES = frozenset((
+    "/api/models", "/api/model/list", "/api/models/list", "/api/v1/models", "/v1/models",
+    "/v2/models", "/models", "/openai/models", "/openai/v1/models", "/api/tags", "/api/ps",
+    "/api/version", "/v1/engines", "/api/openai/v1/models"))
+_DEMAND_GENERIC_PROBE_4111 = _demand_generic_probe
+
+
+def _demand_generic_probe(path: str) -> str:  # noqa: F811 — camada 48.112.0
+    p = (path or "").split("?", 1)[0].rstrip("/").lower()
+    if p in _V4112_LLM_LIST_PROBES:
+        return ("Sonda de gateway LLM (listagem de modelos estilo OpenAI/Ollama): cliente "
+                "procurando proxy de IA aberto, não pedido de dado x402")
+    return _DEMAND_GENERIC_PROBE_4111(path)
+
 def _v4885_tail_check(path=None):
     """True: a última linha é o marcador. False: arquivo cortado. None: não deu para ler."""
     try:
@@ -44421,4 +44841,5 @@ if _NEXUS_TAIL_OK is False:
 
 
 # v48.111.0-SHELFTRUTH: /copytrade e /swarm-vote (vazios por construção: nenhuma escrita na tabela peers) saem da vitrine e respondem 503 sem cobrar; /smart-money sem holders on-chain não é vendido; pausa do ops vale também para requisição que já chega com X-PAYMENT; disjuntor compartilhado para as fontes de holder (falha total tira /holder-concentration da vitrine e poupa ~3,5 s de /smart-money e /whale-dossier; sonda do ops reabre); pré-gate recusando em série pausa o endpoint; /api/v1/best, /discover, /recommend, "também compraram", /llms.txt e /llms-full.txt só mostram o vendável; amostra grátis não serve falha como amostra; caminho com "?" codificado (%3F) vira 308; mesmo User-Agent em vários IPs não vira LEAD QUENTE; Pyth sem concessão para o tipo de ativo recua o lote inteiro; 429 da CoinGecko respeitado por host; livro de chamadas com teto; parada do /pay antes da carteira avisa o nó (etapa precheck); erro JSON-RPC do provedor no log do holder | base: v48.110.0-SMARTFLOW
-# EOF-LOSBETO 48.111.0-SHELFTRUTH — fim do arquivo (se esta linha faltar, a copia foi cortada)
+# v48.112.0-COREGUARD: top_coins validado item a item (um item ruim não derruba mais a lista; folga na consulta; motivo no log); lista de moedas fora no meio de chamada paga conta como falha da fonte núcleo — /arbitrage, /cross-chain, /relatorio, /sinais, /regime e /sentiment não vendem vazio/placeholder; HTTP 200 recusado pelo validador conta como fonte fora; /sentiment fora do top 50 = 422 (400 antes do 402 com a lista em cache), fontes nomeadas; disjuntor do holder testa sozinho quando ocioso; log do portão 1 linha/6 h; aviso de pré-check do /pay sem repetição e separado das falhas do nó; listagem de modelos de gateway LLM é sonda no radar | base: v48.111.0-SHELFTRUTH
+# EOF-LOSBETO 48.112.0-COREGUARD — fim do arquivo (se esta linha faltar, a copia foi cortada)
