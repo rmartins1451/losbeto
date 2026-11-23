@@ -1,7 +1,7 @@
 """
 Losbeto x402 — monolithic Flask service for Railway.
 
-Current release: 48.110.0-SMARTFLOW.
+Current release: 48.111.0-SHELFTRUTH.
 Payment requirements are server-side. Delivery requires verified settlement;
 pending payments are reconciled against independent chain evidence.
 Operational history lives in CHANGELOG.md, not in executable boot output.
@@ -4938,7 +4938,12 @@ class Brain:
                 payload = r.json()
                 if (not isinstance(payload, dict) or payload.get("jsonrpc") != "2.0"
                         or payload.get("error")):
-                    errors.append(f"{host}:InvalidJSONRPC")
+                    _rpc_err = payload.get("error") if isinstance(payload, dict) else None
+                    _rpc_txt = (f"{_rpc_err.get('code')}: {str(_rpc_err.get('message') or '')[:90]}"
+                                if isinstance(_rpc_err, dict) else "")
+                    if HELIUS_KEY and _rpc_txt:
+                        _rpc_txt = _rpc_txt.replace(HELIUS_KEY, "***")
+                    errors.append(f"{host}:InvalidJSONRPC" + (f"({_rpc_txt})" if _rpc_txt else ""))
                     continue
                 result = payload.get("result")
                 accounts = result.get("value") if isinstance(result, dict) else None
@@ -4994,6 +4999,7 @@ class Brain:
         except Exception as e:
             errors.append(f"public-api.solscan.io:{type(e).__name__}")
         if errors:
+            Brain._holder_last_errors = "; ".join(errors)[:400]   # v48.111.0: lido pelo disjuntor
             log.warning(f"holder_concentration upstreams: {'; '.join(errors)[:400]}")
         return {"top_usdc_holders": [], "token": "USDC",
                 "status": "upstream_degraded", "scope": "top_5_token_accounts",
@@ -6106,7 +6112,8 @@ class Brain:
             "flow_overlay": holders,
             "compliance_overlay": sanctions,
             "actionability": {
-                "monitor": ["/whale-alert", "/smart-money", "/copytrade"],
+                "monitor": [e for e in ("/whale-alert", "/smart-money", "/copytrade")
+                            if _sellable_now(e)],
                 "risk_gate": ["/sanctions"],
             },
             "version": VERSION,
@@ -11078,7 +11085,7 @@ def paid_endpoint(path):
                 fresh = None
                 try:
                     fresh = _call_handler_sanitized(path, handler)   # v48.54.0: isolamento
-                    if isinstance(fresh, dict) and "error" not in fresh:
+                    if isinstance(fresh, dict) and not _is_error_result(fresh):   # v48.111.0
                         _PREVIEW_SERVED[path] += 1
                         _slow = _preview_min_age(path) >= 3600
                         payload = (_premium_teaser(fresh)
@@ -11094,13 +11101,16 @@ def paid_endpoint(path):
                             "note": "Free sample generated on demand. Pay for real-time.", "pay_ready": _preview_payready(path, ip)})
                 except Exception as e:
                     log.debug(f"preview on-demand {path}: {e}")
-                if (isinstance(fresh, tuple) and fresh and isinstance(fresh[0], dict)
-                        and fresh[0].get("error") == "upstream_unavailable"):
+                _fdown = (fresh[0] if (isinstance(fresh, tuple) and fresh and isinstance(fresh[0], dict)
+                                       and fresh[0].get("error") == "upstream_unavailable") else
+                          fresh if (isinstance(fresh, dict) and "error" not in fresh
+                                    and _is_error_result(fresh)) else None)
+                if _fdown is not None:
                     return jsonify({"preview": True, "status": "source_unavailable",
                         "note": ("The live source behind this endpoint is not answering right now, "
                                  "so no sample is shown — this node does not invent one. A paid call "
                                  "made while the source is down returns 503 and is credited back."),
-                        "upstreams_failed": fresh[0].get("upstreams_failed"),
+                        "upstreams_failed": _fdown.get("upstreams_failed"),
                         "retry_after_seconds": 60,
                         "price_usd": _usd3(get_dynamic_price(path))}), 200
                 return jsonify({"preview": True, "status": "warming_up",
@@ -11322,6 +11332,18 @@ def paid_endpoint(path):
                 _r.status_code = _code
                 _r.headers["Retry-After"] = str(_body["retry_after_seconds"])
                 return _r
+
+            if sig and sig != "mpp-tempo":   # v48.111.0: pausado não liquida pagamento pronto
+                _paused_gate = _v4111_paused_gate(path)
+                if _paused_gate is not None:
+                    LEDGER.log_request(path, False, int((time.time() - t0) * 1000), ip,
+                                       kind="refused_unsellable",
+                                       ua=request.headers.get("User-Agent", ""),
+                                       params=_clean_params())
+                    _r = jsonify(_paused_gate)
+                    _r.status_code = 503
+                    _r.headers["Retry-After"] = str(_paused_gate.get("retry_after_seconds", 3600))
+                    return _r
 
             if path == "/pyth-price" and sig and sig != "mpp-tempo":   # v48.104.0: MPP já pago
                 _price_gate = _v4103_pyth_price_preflight()
@@ -24941,7 +24963,7 @@ def llms_txt():
     tiers = {"DISCOVERY ($0.01-0.03)": [], "CORE ($0.04-0.12)": [],
              "PRO ($0.15-0.35)": [], "FLAGSHIP ($0.49-1.00)": []}
     for p, price in sorted(BASE_PRICES.items(), key=lambda x: x[1]):
-        if p in CREDIT_PLANS:
+        if p in CREDIT_PLANS or not _sellable_now(p):   # v48.111.0: só o vendável
             continue
         if price <= 0.03:
             tiers["DISCOVERY ($0.01-0.03)"].append((p, price))
@@ -28460,7 +28482,7 @@ def llms_full_txt():
                  ("FLAGSHIP", 1.0), ("PREMIUM", 999)]
     grouped = {name: [] for name, _cap in tiers_map}
     for p, price in sorted(BASE_PRICES.items(), key=lambda x: x[1]):
-        if p in CREDIT_PLANS:
+        if p in CREDIT_PLANS or not _sellable_now(p):   # v48.111.0: só o vendável
             continue
         for name, cap in tiers_map:
             if price <= cap:
@@ -33111,10 +33133,28 @@ function payBeacon(stage, e){
     const body = JSON.stringify({ep: location.pathname.replace(/^\/pay/, ''), stage: stage,
       code: (code === undefined || code === null) ? '' : String(code).slice(0, 12),
       msg: String((e && e.message) || e || '').slice(0, 160), wallet: wallet, acct: acct, gas: gas,
-      who: (XFER && XFER.from) ? shortAddr(XFER.from) : '', v: PAY_VERSION});
+      who: (e && e.from) ? shortAddr(e.from) : ((XFER && XFER.from) ? shortAddr(XFER.from) : ''),
+      v: PAY_VERSION});
     if(navigator.sendBeacon){ navigator.sendBeacon('/api/pay-event', new Blob([body], {type: 'application/json'})); }
     else { fetch('/api/pay-event', {method: 'POST', headers: {'Content-Type': 'application/json'},
                                     body: body, keepalive: true}); }
+  }catch(_){}
+}
+// v48.111.0: a parada antes da carteira (sem USDC, sem ETH para a taxa, plano de crédito com
+// conta-contrato) também avisa o nó — antes o comprador via o aviso e o operador, nada.
+function preBeacon(code, pre, from){
+  try{
+    const p = pre || PRE_LAST || {};
+    const need = (Number(BigInt(ACCEPT.amount)) / 1e6).toFixed(4);
+    const has = function(v){ return v !== null && v !== undefined; };
+    let msg = '';
+    if(code === 'no_usdc') msg += 'USDC on Base ' + (has(p.usdcBal) ? Number(p.usdcBal).toFixed(4) : '?') +
+                                  ' is below the price ' + need;
+    else if(code === 'no_gas') msg += 'ETH on Base ' + (has(p.ethWei) ? fmtEth(p.ethWei) : '?') +
+                                      ' is below the fee estimate ' + (has(p.needWei) ? fmtEth(p.needWei) : '?');
+    else msg += 'credit plans need an EOA x402 signature; this account is ' +
+                (p.delegated ? 'EIP-7702 delegated' : 'a contract');
+    payBeacon('precheck', {code: code, message: msg, from: from || ''});
   }catch(_){}
 }
 function hex32(){ const b=new Uint8Array(32); crypto.getRandomValues(b);
@@ -33145,6 +33185,7 @@ async function preflightWallet(from){
   const forTransfer = arguments.length > 1 && arguments[1] === true;
   const warns = [];
   let insufficient = false, contract = false, delegated = false, noGas = false;
+  let usdcBal = null;
   const who = shortAddr(from);
   const wb0 = document.getElementById('warnBox');
   if(wb0) wb0.textContent = '';
@@ -33169,6 +33210,7 @@ async function preflightWallet(from){
     const balHex = await baseRpc('eth_call',[{to:ACCEPT.asset, data},'latest']);
     if(balHex && balHex !== '0x'){
       const bal  = Number(BigInt(balHex))/1e6;
+      usdcBal = bal;
       const need = Number(BigInt(ACCEPT.amount))/1e6;
       if(bal < need){
         insufficient = true;
@@ -33205,7 +33247,7 @@ async function preflightWallet(from){
     const mc = document.getElementById('manualCard');
     if(mc && !IS_CREDIT) mc.style.border = '2px solid #f59e0b';
   }
-  PRE_LAST = { ok: warns.length === 0, insufficient, contract, delegated, noGas, ethWei, needWei };
+  PRE_LAST = { ok: warns.length === 0, insufficient, contract, delegated, noGas, ethWei, needWei, usdcBal };
   return PRE_LAST;
 }
 
@@ -33550,6 +33592,7 @@ async function payByTransfer(w, from, pre){
     // direto chama sem `pre`, portanto refaz saldo/gas antes de qualquer envio.
     const check = pre || await preflightWallet(from, true);
     if(check && (check.insufficient || check.noGas)){
+      preBeacon(check.insufficient ? 'no_usdc' : 'no_gas', check, from);
       setStatus('Payment stopped before transfer: ' +
         (check.insufficient ? 'insufficient USDC on Base in ' + shortAddr(from) + '.' :
          'insufficient ETH on Base for the network fee in ' + shortAddr(from) + '.') +
@@ -33615,6 +33658,7 @@ async function payAndFetch(retried){
     setStatus('Connected ' + shortAddr(from) + ' \u2014 checking wallet compatibility and USDC balance on Base\u2026');
     const pre = await preflightWallet(from);
     if (pre && pre.insufficient){
+      preBeacon('no_usdc', pre, from);
       setStatus('Payment stopped before signature: insufficient USDC on Base in ' + shortAddr(from) + '. ' +
                 (IS_CREDIT
                   ? 'Top up or switch to the regular EOA that holds your USDC, then tap Pay again. Plain USDC transfers cannot buy credit plans.'
@@ -33623,6 +33667,7 @@ async function payAndFetch(retried){
       return;
     }
     if (pre && pre.contract && IS_CREDIT){
+      preBeacon('credit_7702', pre, from);
       setStatus('Payment stopped before signature: credit plans require an EIP-3009 x402 authorization from a regular EOA. ' +
                 'Switch to a regular MetaMask/Rabby account with USDC on Base and tap Pay again. ' +
                 'No signature was requested, no payment was sent, and plain USDC transfers cannot buy credit plans.', 'err');
@@ -34466,11 +34511,11 @@ def _api_v1_best_handler():
         with LEDGER._conn() as c:
             rows = c.execute(
                 "SELECT endpoint, COUNT(*) n, SUM(amount) v FROM revenue "
-                "WHERE ts>? GROUP BY endpoint ORDER BY n DESC LIMIT 5",
+                "WHERE ts>? GROUP BY endpoint ORDER BY n DESC LIMIT 15",
                 (corte,)).fetchall()
         top = [{**_rich(ep), "purchases_30d": int(n),
                 "volume_30d_usd": round(float(v or 0), 4)}
-               for ep, n, v in rows if ep in BASE_PRICES]
+               for ep, n, v in rows if ep in BASE_PRICES and _sellable_now(ep)][:5]
     except Exception:
         top = []
     return {"best_sellers_30d": top,
@@ -41420,7 +41465,11 @@ def _v4843_pyth_latest(feed_ids):
                 named = [fid for fid in re.findall(
                     r"(?<![0-9a-f])[0-9a-f]{64}(?![0-9a-f])", body_l)
                     if fid in eligible]
-            targets = named or eligible
+            # v48.111.0: "no grant accepts this feed (asset type 'crypto'…)" nega o TIPO de ativo —
+            # recuar só o feed citado fazia o coletor testar feed a feed (8 chamadas 403 e 8 avisos
+            # em 22/nov). O lote inteiro recua junto; a próxima janela testa de novo.
+            targets = (eligible if (named and len(eligible) > 1 and "no grant accepts" in body_l)
+                       else (named or eligible))
             until = time.time() + PYTH_ENTITLEMENT_BACKOFF_S
             _v4844_pyth_backoff_set(targets, until)
             log.warning(f"🧠 Pyth auth/entitlement HTTP {r.status_code}; "
@@ -41615,7 +41664,7 @@ _ops_validate = _v4843_ops_validate
 
 _v4842_sanitize_governance()
 
-VERSION = "48.110.0-SMARTFLOW"
+VERSION = "48.111.0-SHELFTRUTH"
 
 
 import ipaddress as _ipaddr_w
@@ -43150,6 +43199,20 @@ def _v4104_counted(host: str) -> bool:
 
 
 _V4104_ORIG_SEND = requests.Session.send
+_V4111_EV_CAP = 512
+
+
+def _v4111_ev_add(ev, host, ok):
+    """v48.111.0: o livro de chamadas de uma execução paga tem teto. Uma thread longa iniciada
+    durante a chamada herda a lista e, sem teto, crescia para sempre. Acima do teto só um
+    sucesso ainda entra (o veredito "alguma fonte respondeu" nunca se perde)."""
+    try:
+        if len(ev) < _V4111_EV_CAP:
+            ev.append((host, bool(ok)))
+        elif ok and ev and not ev[-1][1]:
+            ev[-1] = (host, True)
+    except Exception:
+        pass
 
 
 def _v4104_send(self, req, **kw):
@@ -43165,14 +43228,14 @@ def _v4104_send(self, req, **kw):
         r = _V4104_ORIG_SEND(self, req, **kw)
     except Exception:
         if track:
-            ev.append((host, False))
+            _v4111_ev_add(ev, host, False)
         raise
     if track:
         try:
             sc = int(getattr(r, "status_code", 0) or 0)
         except Exception:
             sc = 0
-        ev.append((host, 0 < sc < 400))
+        _v4111_ev_add(ev, host, 0 < sc < 400)
     return r
 
 
@@ -43595,12 +43658,12 @@ _V4104_PAYEV_ENUM = {
     "gas": {"low", "ok", "?"}}
 
 
-def _v4104_payev_tg(line: str):
+def _v4104_payev_tg(line: str, head: str = "🧾 Checkout falhou no navegador"):
     st, now = _V4104_PAYEV, time.time()
     if now - st["tg_at"] >= 600:
         extra = (f"\n(+{st['suppressed']} outro(s) desde o último aviso)" if st["suppressed"] else "")
         st["tg_at"], st["suppressed"] = now, 0
-        _v4104_tg_async("🧾 Checkout falhou no navegador\n" + line + extra)
+        _v4104_tg_async(head + "\n" + line + extra)
     else:
         st["suppressed"] += 1
 
@@ -43642,6 +43705,13 @@ def api_pay_event_v4104():
     params = (f"stage={stage}&code={code}&wallet={wallet}&acct={acct}&gas={gas}"
               f"&who={who}&msg={msg}")[:160]
     LEDGER.log_request(ep, False, 0, ip, kind="checkout_error", ua=ua, params=params)
+    if stage == "precheck":
+        line = (f"{ep} · pré-checagem do /pay · carteira {wallet} · conta {acct} · gás {gas} · "
+                f"{who or '—'} · motivo {code or '—'}\n{msg[:140] or '—'}\n"
+                f"Nenhuma transação foi enviada e nada foi cobrado.")
+        log.warning("🧾 checkout parado na pré-checagem do /pay: " + line.replace("\n", " · "))
+        _v4104_payev_tg(line, "🧾 Checkout parado antes da carteira (saldo/gás/conta)")
+        return ("", 204)
     line = (f"{ep} · etapa {stage} · carteira {wallet} · conta {acct} · gás {gas} · "
             f"{who or '—'} · código {code or '—'}\nCarteira disse: {msg[:120] or '—'}")
     log.warning("🧾 checkout no navegador falhou: " + line.replace("\n", " · "))
@@ -43692,6 +43762,635 @@ def _v4104_daily_lines(stats: dict) -> str:
                 f"(resumo indisponível: {str(e)[:60]})")
 
 
+# ============================================================================
+# v48.111.0-SHELFTRUTH — só fica na vitrine o que pode ser entregue AGORA
+#  1. /copytrade e /swarm-vote: vazios por construção (nenhum código grava a tabela peers;
+#     upsert_peer não tem chamador) e mesmo assim vendidos — no passe Algorand de 22/nov os
+#     dois saíram "ENTREGA VERIFICADA" com copytrade_signals=[] e swarm_size=0. Sem par ativo:
+#     fora dos catálogos e 503 grátis antes do 402; em qualquer trilho (créditos, MCP, batch)
+#     o handler devolve 503 charged=false em vez de lista vazia paga.
+#  2. Pausa do ops vale também para quem chega com o pagamento pronto: antes, a requisição com
+#     X-PAYMENT ia direto ao settlement mesmo com o endpoint pausado (só o 402 era bloqueado),
+#     contrariando o "Compradores recebem 503 grátis" da AUTO-PAUSA.
+#  3. Disjuntor de fonte compartilhado (holder): em 22/nov as 5 fontes on-chain falharam em
+#     todas as tentativas (helius InvalidJSONRPC, mainnet-beta 429, publicnode 403, drpc 400,
+#     solscan 404) e cada /smart-money e /whale-dossier pagava ~3,5 s tentando as 5 de novo.
+#     Falha total abre o disjuntor (5 min, dobra até 60 min): /holder-concentration e
+#     /smart-money saem da vitrine, os compostos não esperam, uma sonda do ciclo de ops reabre
+#     quando a fonte volta. /smart-money sem holders (só a lista fixa de 8 nomes) não é vendido.
+#  4. Pré-gate recusando em série (fonte fora antes do settlement) pausa o endpoint.
+#  5. /api/v1/best (pago), /discover, /recommend e o "também compraram" só recomendam o
+#     vendável (antes: recomendava /rugcheck invendável como "best").
+#  6. '?' codificado no caminho (/weather%3Fpreview=1 — 6 IPs, 3 produtos em 7 dias) vira
+#     308 para a rota certa em vez de 404.
+#  7. Enxame de IPs com o mesmo User-Agent não vira "LEAD QUENTE" (10 alertas Pixel 6 em 2 h).
+#  8. Pyth "no grant accepts this feed (asset type …)": recuo para o lote inteiro (era feed a
+#     feed: 7 chamadas 403 e 7 avisos no ciclo das 21:54 de 22/nov).
+#  9. 429 da CoinGecko respeitado por host (Retry-After): a resposta 429 é reproduzida
+#     localmente durante a espera — mesma semântica para o chamador, sem martelar a API.
+# 10. Livro de chamadas de uma execução paga com teto (thread longa herdava a lista sem fim).
+# 11. (no corpo do arquivo) amostra grátis não serve nem guarda resultado de falha sem chave
+#     "error" (ex.: holder upstream_degraded com lista vazia); /llms.txt e /llms-full.txt só
+#     listam o vendável; parada do /pay antes da carteira avisa o nó (etapa precheck); erro
+#     JSON-RPC do provedor no log do holder.
+# ============================================================================
+
+_V4111_PEER_PATHS = ("/copytrade", "/swarm-vote")
+_V4111_PEER_CACHE = {"ts": 0.0, "n": 0}
+_V4111_GATE_LOG = {}
+
+
+def _v4111_peer_count(fresh: bool = False) -> int:
+    """Pares ativos (vistos nos últimos 10 min). A vitrine consulta isto a cada render, então o
+    valor fica 30 s em memória; o handler pago sempre consulta o ledger (fresh=True)."""
+    now = time.time()
+    if not fresh and now - _V4111_PEER_CACHE["ts"] < 30:
+        return int(_V4111_PEER_CACHE["n"])
+    try:
+        n = len(LEDGER.active_peers() or [])
+    except Exception:
+        n = 0
+    _V4111_PEER_CACHE.update(ts=now, n=n)
+    return n
+
+
+def _v4111_peer_body(path, error="no_active_peers", detail=None):
+    return ({"status": "unavailable", "error": error, "charged": False, "endpoint": path,
+             "detail": detail or ("This product is built only from live peer Losbeto nodes, and no "
+                                  "peer node is registered and active on this node right now. It is "
+                                  "not sold until one is; nothing was charged."),
+             "peers": f"{_public_base()}/peers", "retry_after_seconds": 3600,
+             "provider": f"Losbeto/{VERSION}", "ts": int(time.time())}, 503)
+
+
+_COPYTRADE_4110 = Brain.copytrade
+_SWARM_VOTE_4110 = Brain.swarm_vote
+
+
+def _v4111_copytrade():
+    if _v4111_peer_count(fresh=True) <= 0:
+        return _v4111_peer_body("/copytrade")
+    out = _COPYTRADE_4110()
+    if isinstance(out, dict) and not out.get("copytrade_signals"):
+        return _v4111_peer_body(
+            "/copytrade", "no_peer_signals",
+            "Active peer nodes were asked for their current signals and none returned any, so "
+            "there is nothing to relay. An empty feed is not sold; nothing was charged.")
+    return out
+
+
+def _v4111_swarm_vote():
+    if _v4111_peer_count(fresh=True) <= 0:
+        return _v4111_peer_body("/swarm-vote")
+    out = _SWARM_VOTE_4110()
+    votes = out.get("votes") if isinstance(out, dict) else None
+    if isinstance(votes, list) and not any(isinstance(v, dict) and v.get("online") for v in votes):
+        return _v4111_peer_body(
+            "/swarm-vote", "no_peer_online",
+            "The registered peer nodes did not answer their health check, so there is no swarm "
+            "reading right now. Nothing is sold; nothing was charged.")
+    return out
+
+
+Brain.copytrade = staticmethod(_v4111_copytrade)
+Brain.swarm_vote = staticmethod(_v4111_swarm_vote)
+_v4104_rebind("/copytrade", _v4111_copytrade)
+_v4104_rebind("/swarm-vote", _v4111_swarm_vote)
+ENDPOINT_DESC["/copytrade"] = (
+    "Signals relayed from active peer Losbeto nodes: each peer's current signal output, tagged "
+    "with its node id and win rate. Sold only while at least one peer node is registered and "
+    "answering; otherwise it is out of the catalog and answers 503 without charging. No "
+    "wallet-flow inference is claimed.")
+ENDPOINT_DESC["/swarm-vote"] = (
+    "Peer-swarm check: which registered peer Losbeto nodes answer their health probe right now, "
+    "next to this node's own market-regime read. Sold only while at least one peer node is "
+    "registered and online; otherwise it is out of the catalog and answers 503 without charging.")
+
+
+# --------------------------------------------------------------------------------------------
+# disjuntor de fonte compartilhado entre os workers (estado no cache do ledger)
+# --------------------------------------------------------------------------------------------
+_V4111_BRK_BASE_S = max(60, int(os.environ.get("SOURCE_BREAKER_BASE_S", "300")))
+_V4111_BRK_MAX_S = max(_V4111_BRK_BASE_S, int(os.environ.get("SOURCE_BREAKER_MAX_S", "3600")))
+_V4111_BRK_MEM = {}
+_V4111_SOURCE_GATED = {"/holder-concentration": "holder"}
+
+
+def _v4111_brk_get(name):
+    try:
+        rec = LEDGER.cache_get("brk:" + name, 30 * 86400)
+        if isinstance(rec, dict):
+            return rec
+    except Exception:
+        pass
+    return dict(_V4111_BRK_MEM.get(name) or {})
+
+
+def _v4111_brk_put(name, rec):
+    _V4111_BRK_MEM[name] = dict(rec)
+    try:
+        LEDGER.cache_set("brk:" + name, rec)
+    except Exception as e:
+        log.debug(f"disjuntor {name}: {e}")
+
+
+def _v4111_brk_left(name) -> int:
+    try:
+        return max(0, int(float(_v4111_brk_get(name).get("open_until") or 0) - time.time()))
+    except Exception:
+        return 0
+
+
+def _v4111_brk_label(name):
+    return ", ".join(p for p, s in _V4111_SOURCE_GATED.items() if s == name) or name
+
+
+_V4111_BRK_TG_AT = {}
+
+
+def _v4111_brk_tg_due(name, kind, gap=3600) -> bool:
+    """Fonte que oscila não vira enxurrada no Telegram: no máximo 1 aviso de cada tipo por hora."""
+    k, now = f"{name}:{kind}", time.time()
+    if now - _V4111_BRK_TG_AT.get(k, 0.0) < gap:
+        return False
+    _V4111_BRK_TG_AT[k] = now
+    return True
+
+
+def _v4111_brk_fail(name, detail=""):
+    rec = _v4111_brk_get(name)
+    n = int(rec.get("fails") or 0) + 1
+    hold = min(_V4111_BRK_MAX_S, _V4111_BRK_BASE_S * (2 ** min(n - 1, 8)))
+    rec.update(fails=n, open_until=time.time() + hold, last_error=str(detail or "")[:300],
+               last_fail=int(time.time()))
+    _v4111_brk_put(name, rec)
+    log.warning(f"🔌 disjuntor '{name}' ABERTO por {hold}s (falha nº {n}) — "
+                f"{_v4111_brk_label(name)} fora da vitrine: {str(detail or '')[:220]}")
+    if n == 1 and _v4111_brk_tg_due(name, "open"):
+        _v4104_tg_async(f"🔌 Fora da vitrine: {_v4111_brk_label(name)} — todas as fontes falharam "
+                        f"({str(detail or '')[:200]}). Nada é cobrado enquanto isso; uma sonda "
+                        f"automática testa de novo e o produto volta sozinho quando a fonte responder.")
+    return hold
+
+
+def _v4111_brk_ok(name):
+    rec = _v4111_brk_get(name)
+    if int(rec.get("fails") or 0) or float(rec.get("open_until") or 0):
+        log.warning(f"🔌 disjuntor '{name}' FECHADO — a fonte voltou depois de "
+                    f"{rec.get('fails')} falha(s)")
+        _v4111_brk_put(name, {"fails": 0, "open_until": 0, "last_ok": int(time.time())})
+        if _v4111_brk_tg_due(name, "close"):
+            _v4104_tg_async(f"🔌 De volta à vitrine: {_v4111_brk_label(name)} — a fonte respondeu.")
+
+
+_HOLDER_CONC_4110 = Brain.holder_concentration
+
+
+def _v4111_holder_ok(out) -> bool:
+    h = out.get("top_usdc_holders") if isinstance(out, dict) else None
+    try:
+        bad = _is_error_result(out)
+    except Exception:
+        bad = True
+    return isinstance(h, list) and len(h) == 5 and not bad
+
+
+def _v4111_holder_concentration():
+    """Holder com disjuntor: falha total abre; aberto = resposta degradada imediata (sem 5 RPCs);
+    vencido = meio-aberto (a próxima chamada ou a sonda do ops tenta de verdade)."""
+    try:
+        from flask import g as _g, has_request_context as _hrc
+        if _hrc() and isinstance(_g.get("losbeto_holder_preflight"), dict):
+            return _HOLDER_CONC_4110()       # snapshot validado no pré-gate deste mesmo request
+    except Exception:
+        pass
+    left = _v4111_brk_left("holder")
+    if left > 0:
+        return {"top_usdc_holders": [], "token": "USDC", "status": "upstream_degraded",
+                "scope": "top_5_token_accounts", "breaker": "open",
+                "note": ("The on-chain holder sources failed their last check; they are re-checked "
+                         f"automatically (next in about {left} s) instead of on every call."),
+                "retry_after_seconds": left, "ts": int(time.time()),
+                "provider": "Losbeto/SmartMoney"}
+    Brain._holder_last_errors = ""
+    out = _HOLDER_CONC_4110()
+    if _v4111_holder_ok(out):
+        _v4111_brk_ok("holder")
+    else:
+        _v4111_brk_fail("holder", getattr(Brain, "_holder_last_errors", "")
+                        or "no valid top-5 holder set from any source")
+    return out
+
+
+Brain.holder_concentration = staticmethod(_v4111_holder_concentration)
+_v4104_rebind("/holder-concentration", _v4111_holder_concentration)
+_V4111_SOURCE_GATED["/smart-money"] = "holder"
+
+
+def _v4111_smart_money():
+    """/smart-money pago: o diretório é uma lista fixa de 8 nomes; o produto descrito é o diretório
+    JUNTO com os holders on-chain. Em 22/nov ele foi vendido com top_usdc_holders_onchain=[] (as 5
+    fontes fora). Sem holders não há produto: 503 e o estorno de sempre. Compostos que chamam
+    Brain.smart_money(include_holders=False) não passam por aqui."""
+    out = Brain.smart_money()
+    holders = out.get("top_usdc_holders_onchain") if isinstance(out, dict) else None
+    if isinstance(out, dict) and not holders:
+        return ({"status": "unavailable", "error": "onchain_holders_unavailable", "charged": False,
+                 "endpoint": "/smart-money",
+                 "detail": ("The on-chain holder half of this product could not be fetched right now, "
+                            "and the static institutional directory alone is not sold."),
+                 "retry_after_seconds": max(60, _v4111_brk_left("holder") or 300),
+                 "provider": f"Losbeto/{VERSION}", "ts": int(time.time())}, 503)
+    return out
+
+
+_v4104_rebind("/smart-money", _v4111_smart_money)
+
+
+def _v4111_gate(path):
+    """(corpo, 503) quando o produto não pode ser entregue agora por motivo estrutural conhecido;
+    None quando pode. Vale para o 402, para quem chega pagando e para todos os catálogos."""
+    if path in _V4111_PEER_PATHS and _v4111_peer_count() <= 0:
+        return _v4111_peer_body(path)
+    src = _V4111_SOURCE_GATED.get(path)
+    if src:
+        left = _v4111_brk_left(src)
+        if left > 0:
+            body, code = _unavailable_body(
+                "The live sources this product needs failed their last check, so it is not being "
+                "sold until they recover; an automatic re-check brings it back.", left)
+            body.update(endpoint=path, breaker="open")
+            return body, code
+    return None
+
+
+_PREFLIGHT_UNAVAILABLE_4110 = _preflight_unavailable
+
+
+def _preflight_unavailable(path: str):  # noqa: F811 — camada 48.111.0
+    g = _v4111_gate(path)
+    if g is not None:
+        now = time.time()
+        if now - _V4111_GATE_LOG.get(path, 0) >= 600:
+            _V4111_GATE_LOG[path] = now
+            log.warning(f"⛔ pré-gate: {path} recusado sem cobrança — {g[0].get('error')}")
+        return g
+    return _PREFLIGHT_UNAVAILABLE_4110(path)
+
+
+_SELLABILITY_4110 = _sellability_block
+
+
+def _sellability_block(path):  # noqa: F811 — camada 48.111.0
+    b = _SELLABILITY_4110(path)
+    if b is not None:
+        return b
+    try:
+        g = _v4111_gate(path)
+    except Exception:
+        g = None
+    return g[0] if g else None
+
+
+def _v4111_paused_gate(path):
+    """Pausa do ops para quem já chega com X-PAYMENT: 503 sem verificar nem liquidar."""
+    try:
+        if path not in _ops_paused():
+            return None
+        b = _sellability_block(path)
+    except Exception:
+        return None
+    if not isinstance(b, dict):
+        return None
+    b = dict(b)
+    b.update(charged=False, settlement_attempted=False,
+             note=("This endpoint is paused, so the attached payment was not verified or captured. "
+                   "Retry the same payment after it is back in the catalog."))
+    return b
+
+
+# --------------------------------------------------------------------------------------------
+# pré-gate recusando em série → pausa (a sonda de retomada do ops traz de volta)
+# --------------------------------------------------------------------------------------------
+_V4111_PREGATE_FAILS = max(2, int(os.environ.get("PREGATE_PAUSE_FAILS", "3")))
+_V4111_PREGATE_WINDOW_S = max(300, int(os.environ.get("PREGATE_PAUSE_WINDOW_S", "1800")))
+_V4111_PREGATE_SPAN_S = max(0, int(os.environ.get("PREGATE_PAUSE_SPAN_S", "120")))
+
+
+def _v4111_pregate_record(path, failed):
+    key = "pregate:" + path
+    now = time.time()
+    try:
+        rec = LEDGER.cache_get(key, 7 * 86400) or {}
+    except Exception:
+        rec = {}
+    if not failed:
+        if rec.get("fails"):
+            try:
+                LEDGER.cache_set(key, {"fails": [], "last_ok": int(now)})
+            except Exception:
+                pass
+        return
+    fails = [float(t) for t in (rec.get("fails") or [])
+             if now - float(t) < _V4111_PREGATE_WINDOW_S][-20:]
+    fails.append(now)
+    try:
+        LEDGER.cache_set(key, {"fails": fails, "last_ok": rec.get("last_ok")})
+    except Exception:
+        pass
+    if len(fails) < _V4111_PREGATE_FAILS or (fails[-1] - fails[0]) < _V4111_PREGATE_SPAN_S:
+        return
+    reason = (f"pré-gate recusou {len(fails)} pagamento(s) em {int((fails[-1] - fails[0]) // 60)} min "
+              f"— fonte indisponível antes do settlement (nada foi cobrado)")
+    applied, _msg = _ops_pause(path, reason, "pregate-watch")
+    if not applied:
+        return
+    try:
+        LEDGER.cache_set(key, {"fails": [], "paused_at": int(now)})
+    except Exception:
+        pass
+    if TG_BOT and TG_CHAT:
+        txt = (f"⏸ *AUTO-PAUSA (pré-gate)*\n\n`{path}` saiu da vitrine: "
+               f"{TelegramBot.esc(reason)}.\nCompradores recebem 503 grátis e o endpoint some dos "
+               f"catálogos. Sonda automática em {OPS_PAUSE_COOLDOWN_S // 60} min; retoma sozinho "
+               f"se entregar.")
+        try:
+            threading.Thread(target=TG_BOT.send, args=(TG_CHAT, txt),
+                             kwargs={"buttons": [[{"text": "▶ Retomar agora",
+                                                   "callback_data": f"/ops resume {path}"}]]},
+                             daemon=True).start()
+        except Exception:
+            pass
+
+
+def _v4111_watch_pregate(path, fn):
+    def _w():
+        res = fn()
+        try:
+            _v4111_pregate_record(path, res is not None)
+        except Exception as e:
+            log.debug(f"pregate watch {path}: {e}")
+        return res
+    _w.__name__ = getattr(fn, "__name__", "pregate")
+    _w.__wrapped__ = fn
+    return _w
+
+
+_v4103_pyth_price_preflight = _v4111_watch_pregate("/pyth-price", _v4103_pyth_price_preflight)
+_v4107_analysis_preflight = _v4111_watch_pregate("/analise", _v4107_analysis_preflight)
+_v4109_deep_think_preflight = _v4111_watch_pregate("/deep-think", _v4109_deep_think_preflight)
+_v4108_holder_preflight = _v4111_watch_pregate("/holder-concentration", _v4108_holder_preflight)
+
+_OPS_ERROR_WATCH_4110 = _ops_error_watch
+
+
+def _v4111_breaker_probe():
+    """Meio-aberto: com o disjuntor vencido e a última tentativa em falha, uma chamada real fora
+    do caminho pago decide se a fonte voltou (fecha) ou não (reabre com espera dobrada)."""
+    for name in sorted(set(_V4111_SOURCE_GATED.values())):
+        rec = _v4111_brk_get(name)
+        if int(rec.get("fails") or 0) <= 0 or _v4111_brk_left(name) > 0:
+            continue
+        if name == "holder":
+            Brain.holder_concentration()
+
+
+def _ops_error_watch():  # noqa: F811 — camada 48.111.0
+    _OPS_ERROR_WATCH_4110()
+    try:
+        _v4111_breaker_probe()
+    except Exception as e:
+        log.debug(f"breaker probe: {e}")
+
+
+# --------------------------------------------------------------------------------------------
+# recomendação só do vendável
+# --------------------------------------------------------------------------------------------
+_V4111_SHELF = {"ts": 0.0, "out": frozenset()}
+
+
+def _v4111_unsellable() -> frozenset:
+    now = time.time()
+    if now - _V4111_SHELF["ts"] < 5:
+        return _V4111_SHELF["out"]
+    out = set()
+    for p in list(BASE_PRICES):
+        try:
+            if not _sellable_now(p):
+                out.add(p)
+        except Exception:
+            pass
+    _V4111_SHELF.update(ts=now, out=frozenset(out))
+    return _V4111_SHELF["out"]
+
+
+def _v4111_shelf_ok(p) -> bool:
+    try:
+        return p not in _v4111_unsellable()
+    except Exception:
+        return True
+
+
+_EMB_CATALOG_ASYNC_4110 = _emb_catalog_async
+
+
+def _emb_catalog_async(key="base"):  # noqa: F811 — camada 48.111.0
+    paths, vecs = _EMB_CATALOG_ASYNC_4110(key)
+    if paths is None or vecs is None:
+        return paths, vecs
+    try:
+        keep = [i for i, p in enumerate(paths) if _v4111_shelf_ok(p)]
+        if len(keep) == len(paths):
+            return paths, vecs
+        return [paths[i] for i in keep], [vecs[i] for i in keep]
+    except Exception:
+        return paths, vecs
+
+
+_DISCOVER_KEYWORD_4110 = _discover_keyword
+
+
+def _discover_keyword(q: str, n: int) -> list:  # noqa: F811 — camada 48.111.0
+    n = max(1, int(n))
+    return [p for p in _DISCOVER_KEYWORD_4110(q, n + 40) if _v4111_shelf_ok(p)][:n]
+
+
+_ALSO_BOUGHT_4110 = _also_bought
+
+
+def _also_bought(path):  # noqa: F811 — camada 48.111.0
+    return [r for r in (_ALSO_BOUGHT_4110(path) or [])
+            if not isinstance(r, dict) or _v4111_shelf_ok(r.get("endpoint"))]
+
+
+# --------------------------------------------------------------------------------------------
+# '?' codificado no caminho → 308 para a rota real
+# --------------------------------------------------------------------------------------------
+_V4111_QREDIR = {"n": 0}
+
+
+@app.before_request
+def _v4111_encoded_query_redirect():
+    """/weather%3Fpreview=1 chega como caminho '/weather?preview=1' (o cliente codificou o '?').
+    Rota real para o método → 308 (preserva o método) com a query reconstruída; o resto segue."""
+    try:
+        p = request.path or ""
+        if "?" not in p or request.method not in ("GET", "HEAD", "POST"):
+            return None
+        route, _sep, embedded = p.partition("?")
+        if not route.startswith("/") or route.startswith("//"):
+            return None
+        try:
+            app.url_map.bind_to_environ(request.environ).match(route, method=request.method)
+        except Exception:
+            return None
+        qs = urllib.parse.quote(embedded, safe="=&,:;/@+-._~!$'()*")
+        extra = request.query_string.decode("utf-8", "ignore")
+        target = route + (("?" + qs) if qs else "")
+        if extra:
+            target += ("&" if qs else "?") + extra
+        _V4111_QREDIR["n"] += 1
+        return redirect(target, code=308)
+    except Exception:
+        return None
+
+
+# --------------------------------------------------------------------------------------------
+# lead-alert: o mesmo User-Agent provando o catálogo de vários IPs é automação, não lead
+# --------------------------------------------------------------------------------------------
+LEAD_ALERT_SWARM_IPS = max(2, int(os.environ.get("LEAD_ALERT_SWARM_IPS", "3")))
+_LEAD_SWARM_LOGGED = {}
+_LEAD_SCAN_ONCE_4110 = _lead_scan_once   # versão 48.33 preservada no histórico
+
+
+def _lead_scan_once() -> None:  # noqa: F811 — camada 48.111.0
+    """Lead por ator (IP + UA), nunca pela soma global de um User-Agent. Novo: quando o mesmo
+    User-Agent aparece em LEAD_ALERT_SWARM_IPS ou mais IPs, cada um provando o catálogo na
+    mesma janela, é uma frota distribuída (em 22/nov: 10 alertas "Pixel 6" de IPs diferentes
+    em 2 h) — registra uma linha no log por dia e não manda alerta."""
+    if not (TG_BOT and TG_CHAT):
+        return
+    lim = int(time.time()) - 7200
+    with LEDGER._conn() as c:  # leitura WAL sem lock (padrão v48.3.2)
+        rows = c.execute(
+            "SELECT COALESCE(NULLIF(ip,''),'?') actor_ip, "
+            "COALESCE(NULLIF(ua,''),'(no user-agent)') u, endpoint, COUNT(*) n "
+            "FROM requests WHERE ts>? AND kind='preview' "
+            "GROUP BY actor_ip, u, endpoint", (lim,)).fetchall()
+    by_actor = {}
+    for ip, ua, ep, n in rows:
+        by_actor.setdefault((ip, ua), {})[ep] = int(n)
+    qualifying = {}
+    for (ip, ua), eps in by_actor.items():
+        if len(eps) >= LEAD_ALERT_MIN_EPS:
+            qualifying.setdefault(ua, set()).add(ip)
+    swarm = {ua for ua, ips in qualifying.items() if len(ips) >= LEAD_ALERT_SWARM_IPS}
+    now = time.time()
+    for ua in sorted(swarm):
+        if now - _LEAD_SWARM_LOGGED.get(ua, 0) >= LEAD_ALERT_GAP_S:
+            _LEAD_SWARM_LOGGED[ua] = now
+            log.info(f"🤖 lead-alert: o mesmo User-Agent provou o catálogo de "
+                     f"{len(qualifying[ua])} IPs em 2h — automação distribuída, sem alerta "
+                     f"({ua[:60]})")
+    seen = _lead_seen_load()
+    dirty = False
+    for (ip, ua), eps in sorted(by_actor.items(),
+                                key=lambda kv: -len(kv[1]))[:24]:
+        if len(eps) < LEAD_ALERT_MIN_EPS or not _demand_ua_ok(ua):
+            continue
+        low = ua.lower()
+        if any(b in low for b in _LEAD_UA_BLOCK):
+            continue
+        if ua in swarm:
+            continue
+        actor = hashlib.sha256((ip + "|" + ua).encode()).hexdigest()[:24]
+        last = max(float(_LEAD_SEEN.get(actor, 0)),
+                   float(seen.get(actor, 0) or 0))
+        if now - last < LEAD_ALERT_GAP_S:
+            continue
+        top = sorted(eps.items(), key=lambda kv: -kv[1])[:5]
+        lista = ", ".join(f"{e} ({n}×)" for e, n in top)
+        TG_BOT.send(
+            TG_CHAT,
+            f"🔥 *LEAD QUENTE* — avaliador provando o catálogo\n\n"
+            f"UA: `{TelegramBot.esc(ua[:70])}`\n"
+            f"{len(eps)} endpoints distintos em 2h · 1 ator\n"
+            f"Top: {TelegramBot.esc(lista[:180])}\n\n"
+            f"_Janela de conversão: agora. O savings-tip automático fala no "
+            f"primeiro pagamento._")
+        _LEAD_SEEN[actor] = now
+        seen[actor] = now
+        dirty = True
+        log.info(f"🔥 lead-alert: ator {actor[:8]} ({ua[:28]}) provou {len(eps)} endpoints/2h")
+    if dirty:
+        _lead_seen_save(seen)
+
+
+# --------------------------------------------------------------------------------------------
+# 429 respeitado por host (abaixo do livro de chamadas: a espera conta como fonte fora)
+# --------------------------------------------------------------------------------------------
+_V4111_RL_HOSTS = {"api.coingecko.com", "pro-api.coingecko.com"}
+_V4111_RL_UNTIL = {}
+_V4111_RL_STATS = {"short_circuited": 0, "cooldowns": 0}
+_V4111_SEND_BELOW = _V4104_ORIG_SEND
+
+
+def _v4111_retry_after(value, default=60) -> int:
+    v = str(value or "").strip()
+    if not v:
+        return default
+    try:
+        return int(float(v))
+    except Exception:
+        pass
+    try:
+        from email.utils import parsedate_to_datetime
+        return int(parsedate_to_datetime(v).timestamp() - time.time())
+    except Exception:
+        return default
+
+
+def _v4111_local_429(req, left):
+    r = requests.models.Response()
+    r.status_code = 429
+    r.reason = "Too Many Requests (local cooldown)"
+    r.url = str(getattr(req, "url", "") or "")
+    r.request = req
+    r.headers = requests.structures.CaseInsensitiveDict({
+        "Content-Type": "application/json", "Retry-After": str(int(left) + 1),
+        "X-Losbeto-Local": "rate-limit-cooldown"})
+    r._content = (b'{"status":{"error_code":429,"error_message":'
+                  b'"local cooldown after an upstream 429"}}')
+    r._content_consumed = True
+    r.encoding = "utf-8"
+    return r
+
+
+def _v4111_rl_send(self, req, **kw):
+    try:
+        host = (_v4104_urlparse(str(getattr(req, "url", "") or "")).hostname or "").lower()
+    except Exception:
+        host = ""
+    if host in _V4111_RL_HOSTS:
+        left = _V4111_RL_UNTIL.get(host, 0.0) - time.time()
+        if left > 0:
+            _V4111_RL_STATS["short_circuited"] += 1
+            return _v4111_local_429(req, left)
+    r = _V4111_SEND_BELOW(self, req, **kw)
+    if host in _V4111_RL_HOSTS and getattr(r, "status_code", 0) == 429:
+        wait = max(5, min(300, _v4111_retry_after(r.headers.get("Retry-After"))))
+        _V4111_RL_UNTIL[host] = time.time() + wait
+        _V4111_RL_STATS["cooldowns"] += 1
+        log.info(f"⏳ {host} respondeu 429 — novas chamadas a esse host aguardam {wait}s "
+                 f"(429 reproduzido localmente, sem rede)")
+    return r
+
+
+_V4104_ORIG_SEND = _v4111_rl_send
+
+# a parada antes da carteira no /pay também avisa o nó (etapa 'precheck')
+_V4104_PAYEV_STAGES.add("precheck")
+
 def _v4885_tail_check(path=None):
     """True: a última linha é o marcador. False: arquivo cortado. None: não deu para ler."""
     try:
@@ -43721,4 +44420,5 @@ if _NEXUS_TAIL_OK is False:
 
 
 
-# EOF-LOSBETO 48.110.0-SMARTFLOW — fim do arquivo (se esta linha faltar, a copia foi cortada)
+# v48.111.0-SHELFTRUTH: /copytrade e /swarm-vote (vazios por construção: nenhuma escrita na tabela peers) saem da vitrine e respondem 503 sem cobrar; /smart-money sem holders on-chain não é vendido; pausa do ops vale também para requisição que já chega com X-PAYMENT; disjuntor compartilhado para as fontes de holder (falha total tira /holder-concentration da vitrine e poupa ~3,5 s de /smart-money e /whale-dossier; sonda do ops reabre); pré-gate recusando em série pausa o endpoint; /api/v1/best, /discover, /recommend, "também compraram", /llms.txt e /llms-full.txt só mostram o vendável; amostra grátis não serve falha como amostra; caminho com "?" codificado (%3F) vira 308; mesmo User-Agent em vários IPs não vira LEAD QUENTE; Pyth sem concessão para o tipo de ativo recua o lote inteiro; 429 da CoinGecko respeitado por host; livro de chamadas com teto; parada do /pay antes da carteira avisa o nó (etapa precheck); erro JSON-RPC do provedor no log do holder | base: v48.110.0-SMARTFLOW
+# EOF-LOSBETO 48.111.0-SHELFTRUTH — fim do arquivo (se esta linha faltar, a copia foi cortada)
