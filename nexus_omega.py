@@ -1,9 +1,11 @@
 """
 Losbeto x402 — monolithic Flask service for Railway.
 
-Current release: 48.112.0-COREGUARD.
-Payment requirements are server-side. Delivery requires verified settlement;
-pending payments are reconciled against independent chain evidence.
+Current release: 48.114.0-WALLETRECOVERY.
+Payment requirements are server-side. Delivery requires verified settlement, or a
+verified authorization covered by the signing wallet's prepaid plan (48.113), with
+a durable debit/delivery journal for crash recovery (48.114); pending payments are
+reconciled against independent chain evidence.
 Operational history lives in CHANGELOG.md, not in executable boot output.
 48.63 hardened post-settlement delivery/refund evidence, isolated global-rate
 upstream failures, and made the agentic manifest lightweight and cacheable.
@@ -337,9 +339,9 @@ CREDIT_PLANS = {
                           "bonus": "+25%",
                           "pitch": "Pay $0.99 once, get $1.25 of call credit",
                           "anchor_price": 0.99, "display_price": "$0.99"},
-    "/buy-credits-5":    {"plan": "credits",  "balance_usd": 6.00,  "ttl_days": 60,
-                          "bonus": "+20%",
-                          "pitch": "Pay $4.99 once, get $6.00 of call credit",
+    "/buy-credits-5":    {"plan": "credits",  "balance_usd": 6.50,  "ttl_days": 60,
+                          "bonus": "+30%",
+                          "pitch": "Pay $4.99 once, get $6.50 of call credit",
                           "anchor_price": 4.99, "display_price": "$4.99"},
     "/buy-credits-25":   {"plan": "credits",  "balance_usd": 33.00, "ttl_days": 90,
                           "bonus": "+32%",
@@ -599,7 +601,7 @@ ENDPOINT_DESC = {
 
     "/buy-credits-micro": "CREDITS MICRO-BUNDLE: pay $0.10 once and receive $0.11 of call balance (+10%), valid 14 days, spent via X-API-Key on every endpoint. Sized to clear the default 0.1 USDC spend cap of unconfigured stock x402 clients — the recommended autonomous first purchase.",
     "/buy-credits":     "CREDITS: pay $0.99 once and receive $1.25 of call balance (+25% bonus), spent via the X-API-Key header. One on-chain transaction, then zero settlement latency per request.",
-    "/buy-credits-5":   "CREDITS: pay $4.99 once and receive $6.00 of call balance (+20% bonus), valid 60 days, spent via the X-API-Key header. One on-chain transaction, then zero settlement latency per request.",
+    "/buy-credits-5":   "CREDITS: pay $4.99 once and receive $6.50 of call balance (+30% bonus), valid 60 days, spent via the X-API-Key header. One on-chain transaction, then zero settlement latency per request.",
     "/buy-credits-25":  "CREDITS: pay $24.99 once and receive $33.00 of call balance (+32% bonus), valid 90 days, spent via the X-API-Key header. One on-chain transaction, then zero settlement latency per request.",
     "/day-pass":        "DAY PASS: unlimited calls to every endpoint for 24 hours. One payment, no per-request settlement, no rate limit.",
     "/week-pass":       "WEEK PASS: unlimited calls to every endpoint for 7 days — the same access as the day pass at roughly half the daily cost. For agents running a full evaluation cycle.",
@@ -5002,7 +5004,8 @@ class Brain:
             errors.append(f"public-api.solscan.io:{type(e).__name__}")
         if errors:
             Brain._holder_last_errors = "; ".join(errors)[:400]   # v48.111.0: lido pelo disjuntor
-            log.warning(f"holder_concentration upstreams: {'; '.join(errors)[:400]}")
+            (log.info if int((_v4111_brk_get("holder") or {}).get("fails") or 0) else log.warning)(
+                f"holder_concentration upstreams: {'; '.join(errors)[:400]}")
         return {"top_usdc_holders": [], "token": "USDC",
                 "status": "upstream_degraded", "scope": "top_5_token_accounts",
                 "note": "On-chain sources are temporarily unavailable — "
@@ -6103,7 +6106,7 @@ class Brain:
 
         whales = _etapa("whales", lambda: Brain.whale_alert().get("whales_24h", [])[:10])
         smart = _etapa("smart_money", lambda: Brain.smart_money(include_holders=False).get("institutional_directory", [])[:10])
-        holders = (_etapa("holder_concentration", Brain.holder_concentration)
+        holders = (_etapa("holder_concentration", _v4113_holder_overlay)   # v48.113.0: opcional
                    if hasattr(Brain, "holder_concentration")
                    else {"note": "holder concentration unavailable"})
         sanctions = _etapa("sanctions", Brain.sanctions) if hasattr(Brain, 'sanctions') else {"note": "sanctions unavailable"}
@@ -9727,6 +9730,9 @@ def _verify_payment(endpoint: str, payment_header: str):
                     elif tag == "PayAI":
                         _payai_note_failure(reason)
                     continue
+                _cov = _v4113_wallet_cover(endpoint, payload_ok, req_ok, vdata, fingerprint)
+                if _cov is not None:     # v48.113.0: plano/crédito da carteira cobre — sem settle
+                    return _cov
                 bz = _bazaar_blob(endpoint) if getattr(fac, "is_cdp", False) else None
                 resource = ({"url": f"{_public_base()}{endpoint}",
                              "description": _cap500(ENDPOINT_DESC.get(endpoint, endpoint)),
@@ -11480,9 +11486,18 @@ def paid_endpoint(path):
                     LEDGER.log_request(path, False, int((time.time() - t0) * 1000), ip,
                                         kind="settlement_rejected", ua=request.headers.get("User-Agent", ""),
                                         params=_clean_params())
-                    return jsonify({"error": reason, "transaction": info.get("tx", ""),
-                                    "delivered": False, "new_payment_required": False,
-                                    "note": "No new payment challenge was issued for this transaction."}), 409
+                    _seen_body = {"error": reason, "transaction": info.get("tx", ""),
+                                  "delivered": False, "new_payment_required": False,
+                                  "note": ("The prepaid call is still running. Retry this same request "
+                                           "and payment payload; do not create another payment."
+                                           if reason == "wallet-credit-in-progress" else
+                                           "No new payment challenge was issued for this transaction.")}
+                    _seen_resp = jsonify(_seen_body)
+                    _seen_resp.status_code = 409
+                    _seen_retry = int(info.get("retry_after_seconds") or 0)
+                    if _seen_retry > 0:
+                        _seen_resp.headers["Retry-After"] = str(_seen_retry)
+                    return _seen_resp
                 LEDGER.log_request(path, False, int((time.time() - t0) * 1000), ip,
                                     kind="probe", ua=request.headers.get("User-Agent", ""), params=_clean_params())
                 r = _build_402(path)
@@ -23100,7 +23115,8 @@ Full catalog: {base}/llms.txt · Prices: {base}/get-pricing · OpenAPI: {base}/o
 
 ## Cheaper for repeated use
 
-- Header `X-API-Key: lsk_...` skips settlement latency (~1ms vs 2-5s). Bundles: {base}/buy-credits-micro ($0.10 — sized to clear the 0.1 USDC default spend cap of stock x402 clients), {base}/buy-credits ($0.99 → $1.25), {base}/buy-credits-5 ($4.99 → $6.00), {base}/buy-credits-25 ($24.99 → $33.00) or {base}/day-pass ($2.99 unlimited/24h). Balance: GET {base}/credits-status?key=YOUR_KEY — poll before re-paying; top-ups are idempotent by tx hash.
+- Same wallet, no code change: buy any plan with your x402 client; later x402 payments signed by that wallet are paid from the plan automatically (signature verified, nothing settled; `X-Credit-Mode: settle` opts out). Price your own usage: {base}/plans?calls_per_day=N&days=D&endpoint=/path
+- Header `X-API-Key: lsk_...` skips settlement latency (~1ms vs 2-5s). Bundles: {base}/buy-credits-micro ($0.10 — sized to clear the 0.1 USDC default spend cap of stock x402 clients), {base}/buy-credits ($0.99 → $1.25), {base}/buy-credits-5 ($4.99 → $6.50), {base}/buy-credits-25 ($24.99 → $33.00) or {base}/day-pass ($2.99 unlimited/24h). Balance: GET {base}/credits-status?key=YOUR_KEY — poll before re-paying; top-ups are idempotent by tx hash.
 - MCP live server with a subscription: {base}/mcp (see `alternatives.mcp` in any 402).
 
 ## Trust
@@ -39791,6 +39807,14 @@ def _v4835_replay_delivered():
                 hit = (row["ts"], row["fp"], row["status"], row["body"], row["mime"], row["hdr"])
         if not hit or now - hit[0] > _DELIVER_TTL_S or hit[1] != _deliver_fp():
             return None
+        # Fecha a janela rara: cache da entrega commitado e queda antes do journal.
+        try:
+            _pl = json.loads(base64.b64decode(sig.strip()).decode())
+            _fp = _payment_fingerprint(_pl) if isinstance(_pl, dict) else ""
+            if _fp:
+                _v4114_wc_mark_delivered("wcov:" + _fp, _deliver_fp())
+        except Exception:
+            pass
         resp = app.response_class(hit[3], status=hit[2], mimetype=hit[4])
         for k, v in (hit[5] or {}).items():
             resp.headers[k] = v
@@ -39814,8 +39838,12 @@ _DELIVER_HDRS = ("PAYMENT-RESPONSE", "X-PAYMENT-RESPONSE", "Payment-Receipt", "X
 def _v4835_store_delivered(resp):
     try:
         if (request.method not in ("GET", "POST") or request.path not in BASE_PRICES
-                or not (200 <= resp.status_code < 300) or resp.direct_passthrough
-                or "PAYMENT-RESPONSE" not in resp.headers):
+                or not (200 <= resp.status_code < 300) or "PAYMENT-RESPONSE" not in resp.headers):
+            return resp
+        if resp.direct_passthrough:
+            _mark_wc = globals().get("_v4114_wc_mark_current_delivered")
+            if _mark_wc:
+                _mark_wc()
             return resp
         if "X-Payment-Replay" in resp.headers:
             return resp
@@ -39824,6 +39852,11 @@ def _v4835_store_delivered(resp):
             return resp
         body = resp.get_data()
         if not body or len(body) > _DELIVER_MAX_BYTES:
+            # Sem replay em cache para respostas vazias/grandes, mas com prova durável de que
+            # a resposta foi preparada; uma rotina tardia não pode estornar essa entrega.
+            _mark_wc = globals().get("_v4114_wc_mark_current_delivered")
+            if _mark_wc:
+                _mark_wc()
             return resp
         h = hashlib.sha256(sig.strip().encode()).hexdigest()
         rec = {"ts": time.time(), "fp": _deliver_fp(), "status": resp.status_code,
@@ -39834,6 +39867,9 @@ def _v4835_store_delivered(resp):
                 _DELIVERED.pop(k_, None)
         _DELIVERED[h] = (rec["ts"], rec["fp"], rec["status"], rec["body"], rec["mime"], rec["hdr"])
         LEDGER.cache_set("dlv:" + h, rec)
+        _mark_wc = globals().get("_v4114_wc_mark_current_delivered")
+        if _mark_wc:
+            _mark_wc()
         _REPLAYS_SERVED["stored"] += 1
     except Exception as e:
         log.debug(f"v48.35 store delivered: {e}")
@@ -41667,7 +41703,7 @@ _ops_validate = _v4843_ops_validate
 
 _v4842_sanitize_governance()
 
-VERSION = "48.112.0-COREGUARD"
+VERSION = "48.114.0-WALLETRECOVERY"
 
 
 import ipaddress as _ipaddr_w
@@ -43212,8 +43248,16 @@ def _v4111_ev_add(ev, host, ok):
     try:
         if len(ev) < _V4111_EV_CAP:
             ev.append((host, bool(ok)))
-        elif ok and ev and not ev[-1][1]:
-            ev[-1] = (host, True)
+        elif ok and ev:
+            # Nunca substituir uma falha !core: por um sucesso de cache/rede. Sem esta
+            # proteção no helper raiz, qualquer chamada direta ao helper contorna a
+            # proteção de _v4112_source_answered e pode vender um produto sem sua fonte núcleo.
+            for i in range(len(ev) - 1, -1, -1):
+                item = ev[i]
+                if (isinstance(item, (tuple, list)) and len(item) >= 2 and not item[1]
+                        and not str(item[0]).startswith("!core:")):
+                    ev[i] = (host, True)
+                    break
     except Exception:
         pass
 
@@ -44563,7 +44607,7 @@ def _v4112_validated_top_coins(data, n):
                     + (f"; {st.get('error_code')}: {str(st.get('error_message') or '')[:120]}"
                        if st else "") + ")")
             now = time.time()
-            if diag != _V4112_CG_DIAG["last"] or now - _V4112_CG_DIAG["ts"] >= 1800:
+            if _v4113_diag_due(diag):
                 _V4112_CG_DIAG.update(ts=now, last=diag)
                 log.warning(f"🪙 {diag}")
         return []
@@ -44584,12 +44628,21 @@ def _v4112_validated_top_coins(data, n):
         valid = []
     valid.sort(key=lambda c: -c["market_cap"])
     out = valid[:n] if len(valid) >= min(need, n) else []
+    # Na consulta compartilhada top-50 da 48.113, uma resposta parcial suficiente para o
+    # produto menor (ex.: top-5) continua sendo dado válido. O limite é aplicado ao produto
+    # que será entregue, sem confundir "menos de 50" com "fonte inteiramente indisponível".
+    _shared_ctx = globals().get("_V4113_TOP_CTX")
+    _accept = getattr(_shared_ctx, "accept", None) if _shared_ctx is not None else None
+    if not out and n == globals().get("_V4113_TOP_SHARED", 50) and _accept:
+        _accept_need = _accept if _accept <= 3 else _accept - max(1, _accept // 10)
+        if len(valid) >= _accept_need:
+            out = valid[:_accept]
     if dropped or inversions:
         diag = (f"top_coins({n}): {len(data)} recebidos, {len(out)} usados"
                 + "".join(f"; {k} ×{v} (ex.: {examples.get(k, '—')})" for k, v in dropped.items())
                 + (f"; {inversions} inversão(ões) de market cap reordenada(s)" if inversions else ""))
         now = time.time()
-        if diag != _V4112_CG_DIAG["last"] or now - _V4112_CG_DIAG["ts"] >= 1800:
+        if _v4113_diag_due(diag):
             _V4112_CG_DIAG.update(ts=now, last=diag)
             (log.warning if not out else log.info)(f"🪙 {diag}")
     return out
@@ -44811,6 +44864,1121 @@ def _demand_generic_probe(path: str) -> str:  # noqa: F811 — camada 48.112.0
                 "procurando proxy de IA aberto, não pedido de dado x402")
     return _DEMAND_GENERIC_PROBE_4111(path)
 
+# ============================================================================================
+# v48.113.0-WALLETPLAN — plano que a máquina usa sem mudar o cliente + correções de produção
+# ============================================================================================
+# Produção 48.112 (23/nov, 14:12→21:32 UTC, 0 ERROR):
+#  - /whale-dossier pago às 15:10:47 (Algorand) virou 503 + estorno de $0.20: as baleias vieram do
+#    cache (sem rede, sem rastro no livro), a camada OPCIONAL de holders falhou nas 5 fontes e o
+#    portão leu "todas as fontes falharam" com o produto pronto.
+#  - 96 linhas 🪙 em 7 h pelo mesmo item (figure-heloc): o throttle guardava só a última frase e
+#    as listas top 10/20/50 se alternavam.
+#  - 15:04–15:05: 429 da CoinGecko e o pré-gate recusou /analise e /deep-think (sem cobrar) — 4
+#    caches separados (top 5/10/20/50) = até 4 consultas por minuto ao mesmo endpoint.
+#  - disjuntor do holder: 9 aberturas em 7 h com a MESMA resposta (Helius -32600 para o mint do
+#    USDC, mainnet-beta 429, publicnode 403, drpc 400, solscan 404) → 18 WARNING sem nada novo.
+# Planos: o plano comprado via x402 só servia a quem trocasse para o header X-API-Key — coisa que
+# nenhum cliente x402 de prateleira faz sozinho. Agora a carteira que pagou fica ligada ao plano.
+
+# --------------------------------------------------------------------------------------------
+# 1) dado válido servido do cache, dentro de uma chamada paga, é uma fonte que respondeu
+# --------------------------------------------------------------------------------------------
+_V4113_MC_PREV = Market._cached
+
+
+def _v4113_market_cached(key, fn, ttl=30):
+    """O livro da 48.104 só via a rede: uma etapa servida do cache não deixava rastro e, se a
+    única outra etapa da chamada falhasse, o produto pronto virava "todas as fontes falharam"."""
+    ev = getattr(_V4104_UPL, "events", None)
+    if ev is not None:
+        try:
+            v = LEDGER.cache_get(key, ttl)
+            if v is not None and v != {} and v != [] and not _is_error_result(v):
+                _v4111_ev_add(ev, "cache:" + str(key)[:48], True)
+                return v
+        except Exception:
+            pass
+    return _V4113_MC_PREV(key, fn, ttl)
+
+
+Market._cached = staticmethod(_v4113_market_cached)
+
+
+def _v4113_untracked(fn, *a, **kw):
+    """Roda fn fora do veredito da chamada paga (camada opcional de um composto). As falhas dela
+    continuam valendo para o disjuntor da própria fonte — só não decidem o produto."""
+    ev = getattr(_V4104_UPL, "events", None)
+    if ev is None:
+        return fn(*a, **kw)
+    _V4104_UPL.events = []
+    try:
+        return fn(*a, **kw)
+    finally:
+        _V4104_UPL.events = ev
+
+
+def _v4113_holder_overlay():
+    """Holders no /whale-dossier: camada opcional. Com o disjuntor registrando falha ela não sonda as
+    5 fontes dentro da compra (a sonda do ops faz isso fora do caminho pago, ~4 s a menos) e, quando
+    sonda, não pesa no veredito do produto."""
+    try:
+        rec = _v4111_brk_get("holder")
+        if int(rec.get("fails") or 0) > 0:
+            left = _v4111_brk_left("holder")
+            return {"top_usdc_holders": [], "token": "USDC", "status": "paused",
+                    "breaker": "open" if left > 0 else "half-open",
+                    "note": ("Optional overlay skipped: the on-chain holder sources failed their "
+                             "recent checks and are re-tested outside paid calls. The rest of this "
+                             "dossier is live."),
+                    "ts": int(time.time())}
+    except Exception:
+        pass
+    return _v4113_untracked(Brain.holder_concentration)
+
+
+# --------------------------------------------------------------------------------------------
+# 2) 🪙 diagnóstico do top_coins: 1 linha por motivo a cada 6 h, entre todos os workers
+# --------------------------------------------------------------------------------------------
+_V4113_DIAG_S = max(600, int(os.environ.get("CG_DIAG_LOG_S", "21600")))
+_V4113_DIAG_MEM = {}
+
+
+def _v4113_diag_due(diag) -> bool:
+    """O motivo sem os números (n, recebidos, usados) é a chave."""
+    key = "cgdiag:" + hashlib.sha1(re.sub(r"\d+", "#", str(diag)).encode()).hexdigest()[:16]
+    now = time.time()
+    if now - _V4113_DIAG_MEM.get(key, 0.0) < _V4113_DIAG_S:
+        return False
+    _V4113_DIAG_MEM[key] = now
+    try:
+        if LEDGER.cache_get(key, _V4113_DIAG_S) is not None:
+            return False
+        LEDGER.cache_set(key, int(now))
+    except Exception:
+        pass
+    return True
+
+
+# --------------------------------------------------------------------------------------------
+# 3) top_coins: n < 50 sai da mesma lista top-50 validada (1 consulta/min em vez de até 4)
+# --------------------------------------------------------------------------------------------
+_V4113_TOP_SHARED = 50
+_V4113_TOP_CTX = threading.local()
+
+
+def _v4113_top_coins(n=20):
+    try:
+        k = int(n)
+    except Exception:
+        return _v4112_top_coins(n)
+    if 1 <= k < _V4113_TOP_SHARED:
+        previous = getattr(_V4113_TOP_CTX, "accept", None)
+        _V4113_TOP_CTX.accept = k
+        try:
+            big = _TOP_COINS_4111(_V4113_TOP_SHARED)
+        except Exception:
+            big = []
+        finally:
+            if previous is None:
+                try:
+                    del _V4113_TOP_CTX.accept
+                except AttributeError:
+                    pass
+            else:
+                _V4113_TOP_CTX.accept = previous
+        need = k if k <= 3 else k - max(1, k // 10)
+        if big and len(big) >= need:
+            return list(big[:k])
+        # Uma lista parcial insuficiente também falha o produto: não há segunda consulta nem
+        # venda de placeholder. O marcador núcleo é preservado mesmo com o livro no teto.
+        _v4112_core_failed("api.coingecko.com top_coins")
+        return []
+    return _v4112_top_coins(n)
+
+
+Market.top_coins = staticmethod(_v4113_top_coins)
+
+
+# --------------------------------------------------------------------------------------------
+# 4) disjuntor: a mesma falha N vezes seguidas é estrutural (sonda a cada 6 h, log sem repetir)
+# --------------------------------------------------------------------------------------------
+_V4113_BRK_STRUCT_N = max(2, int(os.environ.get("SOURCE_BREAKER_STRUCTURAL_AFTER", "6")))
+_V4113_BRK_STRUCT_S = max(_V4111_BRK_MAX_S,
+                          int(os.environ.get("SOURCE_BREAKER_STRUCTURAL_S", "21600")))
+
+
+def _v4113_err_sig(detail) -> str:
+    s = re.sub(r"\d+", "#", str(detail or "").lower()).strip()
+    return hashlib.sha1(s.encode()).hexdigest()[:12] if s else ""
+
+
+def _v4113_brk_fail(name, detail=""):
+    """Mesma espera dobrando da 48.111. Novo: assinatura da resposta; igual N vezes seguidas = falha
+    estrutural (espera de SOURCE_BREAKER_STRUCTURAL_S, um aviso só). Reabertura repetida = INFO."""
+    rec = _v4111_brk_get(name)
+    n = int(rec.get("fails") or 0) + 1
+    sig = _v4113_err_sig(detail)
+    same = (int(rec.get("same") or 0) + 1) if (sig and sig == rec.get("sig")) else 1
+    hold = min(_V4111_BRK_MAX_S, _V4111_BRK_BASE_S * (2 ** min(n - 1, 8)))
+    structural = same >= _V4113_BRK_STRUCT_N
+    if structural:
+        hold = max(hold, _V4113_BRK_STRUCT_S)
+    rec.update(fails=n, open_until=time.time() + hold, last_error=str(detail or "")[:300],
+               last_fail=int(time.time()), sig=sig, same=same, structural=bool(structural))
+    _v4111_brk_put(name, rec)
+    label = _v4111_brk_label(name)
+    if n == 1:
+        log.warning(f"🔌 disjuntor '{name}' ABERTO por {hold}s (falha nº {n}) — "
+                    f"{label} fora da vitrine: {str(detail or '')[:220]}")
+    elif structural and same == _V4113_BRK_STRUCT_N:
+        log.warning(f"🔌 disjuntor '{name}': a mesma resposta {same}× seguidas — tratada como falha "
+                    f"estrutural; próxima sonda em {hold // 3600} h. {label} segue fora da vitrine, "
+                    f"sem cobrar ninguém. Resposta: {str(detail or '')[:200]}")
+        if _v4111_brk_tg_due(name, "structural", 86400):
+            _v4104_tg_async(f"🔌 {label}: a mesma falha {same}× seguidas (estrutural). Continua fora "
+                            f"da vitrine sem cobrar; nova sonda a cada {hold // 3600} h. Resposta das "
+                            f"fontes: {str(detail or '')[:220]}")
+    else:
+        log.info(f"🔌 disjuntor '{name}' segue aberto: {hold}s (falha nº {n}, mesma resposta "
+                 f"{same}×) — {label} fora da vitrine")
+    if n == 1 and _v4111_brk_tg_due(name, "open"):
+        _v4104_tg_async(f"🔌 Fora da vitrine: {label} — todas as fontes falharam "
+                        f"({str(detail or '')[:200]}). Nada é cobrado enquanto isso; uma sonda "
+                        f"automática testa de novo e o produto volta sozinho quando a fonte responder.")
+    return hold
+
+
+_V4111_BRK_FAIL_ORIG = _v4111_brk_fail   # a 48.113 substitui (assinatura + falha estrutural)
+_v4111_brk_fail = _v4113_brk_fail
+
+
+# ============================================================================================
+# 5) CRÉDITO NA CARTEIRA — o plano comprado via x402 cobre os x402 seguintes da mesma carteira
+# ============================================================================================
+# Depois de um /verify aceito no facilitador e ANTES do /settle: se a carteira que assinou tem
+# plano (ou crédito de estorno) ativo com saldo, a chamada é debitada do plano e a autorização NÃO
+# é liquidada — nada se move on-chain. Nenhum header, nenhuma chave, nenhuma mudança no cliente.
+# A mesma autorização não serve duas vezes (reserva atômica wcov:<fingerprint>); falha na entrega
+# devolve o crédito e libera a reserva. Carteiras da casa liquidam sempre (as rodadas de indexação
+# precisam do settle on-chain), salvo WALLET_CREDIT_HOUSE=1 ou o header X-Credit-Mode: credit.
+_V4113_WC_ON = os.environ.get("WALLET_CREDIT", "1") != "0"
+_V4113_WC_HOUSE = os.environ.get("WALLET_CREDIT_HOUSE", "0") == "1"
+_V4113_WC_STATS = Counter()
+_V4113_WC_HDRS = ("X-Covered-By", "X-Credits-Cost", "X-Credits-Remaining", "X-Plan-Expires-In",
+                  "X-Credit-Low", "X-Credit-Exhausted")
+
+
+def _v4113_norm(p) -> str:
+    p = str(p or "").strip()
+    return p.lower() if p[:2].lower() == "0x" else p
+
+
+def _v4113_req_usd(req) -> float:
+    for k in ("amount", "maxAmountRequired"):
+        try:
+            v = int(str((req or {}).get(k) or "0").strip())
+        except (TypeError, ValueError, AttributeError):
+            continue
+        if v > 0:
+            return round(v / 1_000_000, 6)
+    return 0.0
+
+
+def _v4113_signed_payer(payload, vdata) -> str:
+    """Quem assinou: o `payer` do /verify do facilitador ou, em EVM, o `from` da autorização
+    EIP-3009 que esse mesmo verify validou. Nunca um campo solto declarado pelo cliente."""
+    p = vdata.get("payer") if isinstance(vdata, dict) else ""
+    if not p:
+        try:
+            inner = payload.get("payload") if isinstance(payload.get("payload"), dict) else {}
+            auth = inner.get("authorization") if isinstance(inner.get("authorization"), dict) else {}
+            p = auth.get("from") or ""
+        except Exception:
+            p = ""
+    return _v4113_norm(p)
+
+
+def _v4113_wallet_keys(payer):
+    """Chaves ativas ligadas à carteira: passes ilimitados primeiro, depois a que vence antes."""
+    p = _v4113_norm(payer)
+    if not p:
+        return []
+    now = int(time.time())
+    try:
+        with LEDGER._conn() as c:
+            if p.startswith("0x"):
+                rows = c.execute("SELECT key, plan, balance_usd, expires FROM api_keys "
+                                 "WHERE lower(payer)=? AND (expires IS NULL OR expires>?)",
+                                 (p, now)).fetchall()
+            else:
+                rows = c.execute("SELECT key, plan, balance_usd, expires FROM api_keys "
+                                 "WHERE payer=? AND (expires IS NULL OR expires>?)",
+                                 (p, now)).fetchall()
+    except Exception as e:
+        log.debug(f"wallet keys {p[:10]}: {e}")
+        return []
+    rows = [r for r in rows if r and r[0]]
+    rows.sort(key=lambda r: (0 if (r[2] is None or float(r[2]) < 0) else 1,
+                             int(r[3] or 2 ** 31)))
+    return rows
+
+
+def _v4113_api_key_use(self, key, cost):
+    """Mesmo contrato da 48.10 (None = chave inválida/vencida/sem saldo). O débito agora é UM
+    UPDATE condicional: SELECT seguido de UPDATE deixava dois workers (o lock é por processo)
+    gastarem o mesmo saldo — e com o plano valendo para a carteira, agente que dispara chamadas em
+    paralelo cai exatamente nesse caso. Saldo nunca fica negativo (negativo = ilimitado no esquema)."""
+    try:
+        cost = round(float(cost), 6)
+    except (TypeError, ValueError):
+        return None
+    if cost < 0:
+        return None
+    now = int(time.time())
+    with self.lock, self._conn() as c:
+        r = c.execute("SELECT balance_usd, expires FROM api_keys WHERE key=?", (key,)).fetchone()
+        if not r:
+            return None
+        bal, exp = r
+        if exp and now > exp:
+            return None
+        if bal is None or bal < 0:
+            c.execute("UPDATE api_keys SET calls_used=calls_used+1 WHERE key=?", (key,))
+            return {"remaining": -1, "unlimited": True, "expires": exp}
+        cur = c.execute("UPDATE api_keys SET balance_usd=MAX(0.0, ROUND(balance_usd-?, 6)), "
+                        "calls_used=calls_used+1 WHERE key=? AND balance_usd>=0 AND balance_usd>=?",
+                        (cost, key, cost))
+        if cur.rowcount != 1:
+            return None
+        nb = c.execute("SELECT balance_usd FROM api_keys WHERE key=?", (key,)).fetchone()
+        return {"remaining": round(float(nb[0] if nb and nb[0] is not None else 0.0), 6),
+                "unlimited": False, "expires": exp}
+
+
+LedgerV10.api_key_use = _v4113_api_key_use
+
+
+# v48.114.0 — journal durável do crédito na carteira. A 48.113 gravava a reserva e o
+# débito, mas não tinha um estado transacional que permitisse recuperar uma queda entre
+# o débito e a entrega. O lease é maior que o timeout de 120 s do Gunicorn: uma reserva
+# recente está em execução; somente uma expirada pode ser retomada sem novo débito.
+_V4114_WC_LEASE_S = max(180, int(os.environ.get("WALLET_CREDIT_LEASE_S", "300")))
+_V4114_WC_COLS = ("claim", "request_fp", "endpoint", "payer", "key", "plan", "kind",
+                  "cost", "expires", "state", "owner", "created_ts", "updated_ts",
+                  "lease_until", "delivered_ts", "recovery_count")
+
+
+def _v4114_wc_migrate():
+    with LEDGER.lock, LEDGER._conn() as c:
+        c.execute("BEGIN IMMEDIATE")
+        c.execute("""CREATE TABLE IF NOT EXISTS wallet_cover_journal(
+            claim TEXT PRIMARY KEY,
+            request_fp TEXT NOT NULL,
+            endpoint TEXT NOT NULL,
+            payer TEXT NOT NULL,
+            key TEXT NOT NULL,
+            plan TEXT NOT NULL,
+            kind TEXT NOT NULL,
+            cost REAL NOT NULL,
+            expires INTEGER,
+            state TEXT NOT NULL,
+            owner TEXT NOT NULL,
+            created_ts INTEGER NOT NULL,
+            updated_ts INTEGER NOT NULL,
+            lease_until INTEGER NOT NULL,
+            delivered_ts INTEGER,
+            recovery_count INTEGER NOT NULL DEFAULT 0
+        )""")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_wc_journal_state_lease "
+                  "ON wallet_cover_journal(state,lease_until)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_wc_journal_key_ts "
+                  "ON wallet_cover_journal(key,updated_ts)")
+        c.execute("INSERT OR REPLACE INTO meta(k,v) VALUES('schema_version','27')")
+        c.commit()
+    LedgerV10.SCHEMA_VERSION = 27
+
+
+_v4114_wc_migrate()
+
+
+def _v4114_wc_row(c, claim):
+    r = c.execute("SELECT " + ",".join(_V4114_WC_COLS) +
+                  " FROM wallet_cover_journal WHERE claim=?", (claim,)).fetchone()
+    return dict(zip(_V4114_WC_COLS, r)) if r else None
+
+
+def _v4114_wc_get(claim, strict=False):
+    try:
+        with LEDGER._conn() as c:
+            return _v4114_wc_row(c, claim)
+    except Exception as e:
+        log.debug(f"wallet credit journal read: {e}")
+        if strict:
+            raise
+        return None
+
+
+def _v4114_wc_begin(claim, request_fp, endpoint, payer, cost, keys):
+    """Reserva + débito + journal em UMA transação. Retry expirado retoma o mesmo débito;
+    falha já estornada pode iniciar uma nova tentativa; entrega concluída nunca debita de novo."""
+    now = int(time.time())
+    owner = secrets.token_urlsafe(18)
+    with LEDGER.lock, LEDGER._conn() as c:
+        c.execute("BEGIN IMMEDIATE")
+        old = _v4114_wc_row(c, claim)
+        if old:
+            if (old.get("request_fp") != request_fp
+                    or _v4113_norm(old.get("payer")) != _v4113_norm(payer)
+                    or str(old.get("endpoint")) != str(endpoint)
+                    or abs(float(old.get("cost") or 0) - float(cost)) > 0.0000005):
+                return {"status": "conflict"}
+            state = old.get("state")
+            if state == "delivered":
+                return {"status": "delivered"}
+            if state == "reserved":
+                if int(old.get("lease_until") or 0) > now:
+                    return {"status": "in_progress",
+                            "retry_after": max(1, int(old.get("lease_until") or 0) - now)}
+                cur = c.execute(
+                    "UPDATE wallet_cover_journal SET owner=?,updated_ts=?,lease_until=?,"
+                    "recovery_count=recovery_count+1 WHERE claim=? AND state='reserved' "
+                    "AND owner=? AND lease_until<=?",
+                    (owner, now, now + _V4114_WC_LEASE_S, claim, old.get("owner"), now))
+                if cur.rowcount != 1:
+                    return {"status": "in_progress", "retry_after": 5}
+                kr = c.execute("SELECT balance_usd,expires FROM api_keys WHERE key=?",
+                               (old.get("key"),)).fetchone()
+                if not kr:
+                    return {"status": "conflict"}
+                bal, exp = kr
+                remaining = "unlimited" if bal is None or float(bal) < 0 else round(float(bal), 6)
+                return {"status": "ok", "resumed": True, "owner": owner,
+                        "key": old.get("key"), "plan": old.get("plan"), "kind": old.get("kind"),
+                        "remaining": remaining, "expires": exp, "cost": old.get("cost")}
+            if state != "refunded":
+                return {"status": "conflict"}
+            # A tentativa anterior foi integralmente estornada: a mesma autorização pode
+            # iniciar outra tentativa, mas somente com um débito novo e registrado.
+            c.execute("DELETE FROM replay WHERE hash=?", (claim,))
+        cur = c.execute("INSERT OR IGNORE INTO replay(hash,ts) VALUES(?,?)", (claim, now))
+        if cur.rowcount != 1:
+            return {"status": "conflict"}
+        for key, plan, _bal, exp in keys:
+            kr = c.execute("SELECT balance_usd,expires,plan,payer FROM api_keys WHERE key=?",
+                           (key,)).fetchone()
+            if not kr or _v4113_norm(kr[3]) != _v4113_norm(payer):
+                continue
+            bal, exp, plan = kr[0], kr[1], kr[2]
+            if exp and now > int(exp):
+                continue
+            if bal is None or float(bal) < 0:
+                cur = c.execute("UPDATE api_keys SET calls_used=calls_used+1 WHERE key=?", (key,))
+                if cur.rowcount != 1:
+                    continue
+                remaining = "unlimited"
+            else:
+                cur = c.execute(
+                    "UPDATE api_keys SET balance_usd=MAX(0.0,ROUND(balance_usd-?,6)),"
+                    "calls_used=calls_used+1 WHERE key=? AND balance_usd>=0 AND balance_usd>=? "
+                    "AND (expires IS NULL OR expires>?)", (cost, key, cost, now))
+                if cur.rowcount != 1:
+                    continue
+                nb = c.execute("SELECT balance_usd FROM api_keys WHERE key=?", (key,)).fetchone()
+                remaining = round(float(nb[0] if nb else 0.0), 6)
+            kind = "refund_credit" if plan == "refund" else "plan"
+            c.execute("""INSERT OR REPLACE INTO wallet_cover_journal(
+                claim,request_fp,endpoint,payer,key,plan,kind,cost,expires,state,owner,
+                created_ts,updated_ts,lease_until,delivered_ts,recovery_count)
+                VALUES(?,?,?,?,?,?,?,?,?,'reserved',?,?,?,?,NULL,0)""",
+                      (claim, request_fp, endpoint, payer, key, plan, kind, cost, exp,
+                       owner, now, now, now + _V4114_WC_LEASE_S))
+            return {"status": "ok", "resumed": False, "owner": owner, "key": key,
+                    "plan": plan, "kind": kind, "remaining": remaining, "expires": exp,
+                    "cost": cost}
+        c.execute("DELETE FROM replay WHERE hash=?", (claim,))
+        return {"status": "exhausted"}
+
+
+def _v4114_wc_mark_delivered(claim, request_fp, owner=None):
+    """Marca a entrega sem apagar a reserva de replay. No retry do cache, owner=None:
+    a resposta persistida é a prova da entrega e fecha uma eventual janela pós-cache."""
+    if not claim or not request_fp:
+        return False
+    try:
+        now = int(time.time())
+        with LEDGER.lock, LEDGER._conn() as c:
+            c.execute("BEGIN IMMEDIATE")
+            row = _v4114_wc_row(c, claim)
+            if not row or row.get("request_fp") != request_fp:
+                return False
+            if row.get("state") == "delivered":
+                return True
+            if row.get("state") != "reserved":
+                return False
+            if owner is not None and row.get("owner") != owner:
+                return False
+            if owner is None:
+                cur = c.execute("UPDATE wallet_cover_journal SET state='delivered',"
+                                "updated_ts=?,lease_until=0,delivered_ts=? WHERE claim=? "
+                                "AND state='reserved'", (now, now, claim))
+            else:
+                cur = c.execute("UPDATE wallet_cover_journal SET state='delivered',"
+                                "updated_ts=?,lease_until=0,delivered_ts=? WHERE claim=? "
+                                "AND state='reserved' AND owner=?", (now, now, claim, owner))
+            return cur.rowcount == 1
+    except Exception as e:
+        log.error(f"wallet credit delivery journal {str(claim)[:24]}: {e}")
+        return False
+
+
+def _v4114_wc_mark_current_delivered():
+    try:
+        from flask import g as _g
+        wc = getattr(_g, "_v4113_wc", None) or {}
+        if wc.get("claim"):
+            return _v4114_wc_mark_delivered(wc.get("claim"), wc.get("request_fp"),
+                                            wc.get("owner"))
+    except Exception as e:
+        log.debug(f"wallet credit current delivery: {e}")
+    return False
+
+
+def _v4114_wc_refund(wc):
+    """Recredita somente a tentativa dona do lease. Entrega concluída nunca é estornada;
+    estado refunded é idempotente e não devolve o mesmo valor duas vezes."""
+    claim = str((wc or {}).get("claim") or "")
+    if not claim:
+        return {"ok": False, "reason": "missing_claim"}
+    try:
+        now = int(time.time())
+        with LEDGER.lock, LEDGER._conn() as c:
+            c.execute("BEGIN IMMEDIATE")
+            row = _v4114_wc_row(c, claim)
+            if not row or row.get("request_fp") != wc.get("request_fp"):
+                return {"ok": False, "reason": "missing_or_mismatch"}
+            if row.get("state") == "delivered":
+                return {"ok": False, "reason": "delivered"}
+            if row.get("state") == "reserved" and row.get("owner") != wc.get("owner"):
+                return {"ok": False, "reason": "superseded"}
+            kr = c.execute("SELECT balance_usd FROM api_keys WHERE key=?", (row.get("key"),)).fetchone()
+            if not kr:
+                return {"ok": False, "reason": "key_missing"}
+            bal = kr[0]
+            unlimited = bal is None or float(bal) < 0
+            if row.get("state") != "refunded":
+                if unlimited:
+                    c.execute("UPDATE api_keys SET calls_used=MAX(0,calls_used-1) WHERE key=?",
+                              (row.get("key"),))
+                    remaining = "unlimited"
+                else:
+                    nb = round(float(bal) + float(row.get("cost") or 0), 6)
+                    c.execute("UPDATE api_keys SET balance_usd=?,calls_used=MAX(0,calls_used-1) "
+                              "WHERE key=?", (nb, row.get("key")))
+                    remaining = nb
+                c.execute("UPDATE wallet_cover_journal SET state='refunded',updated_ts=?,"
+                          "lease_until=0 WHERE claim=? AND state='reserved' AND owner=?",
+                          (now, claim, row.get("owner")))
+                c.execute("DELETE FROM replay WHERE hash=?", (claim,))
+            else:
+                remaining = "unlimited" if unlimited else round(float(bal), 6)
+            return {"ok": True, "remaining": remaining, "unlimited": unlimited,
+                    "idempotent": row.get("state") == "refunded"}
+    except Exception as e:
+        log.error(f"wallet credit refund journal {claim[:24]}: {e}")
+        return {"ok": False, "reason": "database_error"}
+
+
+def _v4113_wallet_cover(endpoint, payload, req, vdata, fingerprint):
+    """None = segue o settle normal. Uma reserva já existente, porém, nunca pode cair no
+    settle: ela representa um débito ainda não entregue ou uma entrega já concluída."""
+    if not fingerprint or endpoint in CREDIT_PLANS:
+        return None
+    claim = "wcov:" + fingerprint
+    old = None
+    try:
+        old = _v4114_wc_get(claim, strict=True)
+        if not _V4113_WC_ON and (not old or old.get("state") == "refunded"):
+            return None
+        mode = (request.headers.get("X-Credit-Mode") or "").strip().lower()
+        if (mode in ("settle", "onchain", "off", "never", "0")
+                and (not old or old.get("state") == "refunded")):
+            return None
+        payer = _v4113_signed_payer(payload, vdata)
+        if not payer:
+            return None
+        if old and _v4113_norm(old.get("payer")) != _v4113_norm(payer):
+            return False, "replay-blocked", {"settlement_seen": True, "covered_by_credit": True}
+        # Mudança de preferência/carteira da casa só vale para tentativa nova ou já estornada.
+        if not old or old.get("state") == "refunded":
+            try:
+                house = _is_house_payer(payer)
+            except Exception:
+                house = False
+            if house and not (_V4113_WC_HOUSE or mode in ("credit", "use", "on", "1")):
+                return None
+        cost = _v4113_req_usd(req)
+        if cost <= 0:
+            return None if not old else (False, "replay-blocked",
+                                         {"settlement_seen": True, "covered_by_credit": True})
+        keys = [] if old and old.get("state") == "reserved" else _v4113_wallet_keys(payer)
+        if not keys and not old:
+            return None
+        from flask import g as _g
+    except Exception as e:
+        log.debug(f"wallet credit (antes do débito) {endpoint}: {e}")
+        return False, "wallet-credit-unavailable", {"settlement_seen": True,
+                                                     "covered_by_credit": True,
+                                                     "retry_after_seconds": 30}
+    try:
+        used = _v4114_wc_begin(claim, _deliver_fp(), endpoint, payer, cost, keys)
+    except Exception as e:
+        # O resultado do commit pode ser incerto; nunca liquidar a mesma autorização nesse caso.
+        log.error(f"wallet credit journal begin {endpoint}: {e}")
+        return False, "wallet-credit-unavailable", {"settlement_seen": True,
+                                                     "covered_by_credit": True}
+    status = used.get("status")
+    if status == "exhausted":
+        _g._v4113_wc_short = {"plans": sorted({str(k[1]) for k in keys}), "cost": cost}
+        _V4113_WC_STATS["exhausted"] += 1
+        return None
+    if status != "ok":
+        _V4113_WC_STATS["replay"] += 1
+        reason = ("wallet-credit-in-progress" if status == "in_progress" else "replay-blocked")
+        return False, reason, {"settlement_seen": True, "covered_by_credit": True,
+                               "retry_after_seconds": used.get("retry_after", 5)}
+    key, plan, kind = used.get("key"), used.get("plan"), used.get("kind")
+    remaining = used.get("remaining")
+    settlement = {"success": True, "transaction": "", "network": str(req.get("network") or ""),
+                  "payer": payer, "settled": False, "coveredBy": kind, "plan": plan,
+                  "creditsCost": cost, "creditsRemaining": remaining}
+    info = {"payer": payer, "tx": "", "payment_verified": True, "amount_usd": 0.0,
+            "required_usd": cost, "via": "wallet-credit", "covered_by": kind, "plan": plan,
+            "settlement": settlement}
+    _g._v4113_wc = {"key": key, "claim": claim, "cost": cost, "kind": kind, "plan": plan,
+                    "remaining": remaining, "expires": used.get("expires"),
+                    "payer": payer, "restored": False, "owner": used.get("owner"),
+                    "request_fp": _deliver_fp(), "resumed": bool(used.get("resumed"))}
+    _V4113_WC_STATS[kind] += 1
+    _left = "∞" if remaining == "unlimited" else f"${float(remaining):.4f}"
+    log.info(f"🎟️ {endpoint} coberto por {kind} ({plan}) · carteira {payer[:10]}… · "
+             f"${cost:.4f} · restam {_left} — autorização verificada, sem settle"
+             f"{' · recuperação pós-crash' if used.get('resumed') else ''}")
+    try:   # o operador fica sabendo do 1º uso de cada plano no dia (sem 1 aviso por chamada)
+        _tk = "wcov_tg:" + hashlib.sha256(str(key).encode()).hexdigest()[:16]
+        if LEDGER.cache_get(_tk, 86400) is None:
+            LEDGER.cache_set(_tk, int(time.time()))
+            _v4104_tg_async(f"🎟️ Plano em uso sem mudar o cliente: {plan} da carteira "
+                            f"{payer[:6]}…{payer[-4:]} cobriu {endpoint} (${cost:.4f}); restam "
+                            f"{_left}. Nada liquidado nesta chamada — a receita entrou na compra.")
+    except Exception:
+        pass
+    return True, "wallet-credit", info
+
+
+_V4113_VERIFY_PREV = _verify_payment
+
+
+def _v4113_verify_payment(endpoint, payment_header):
+    """Entrega idempotente sai no before_request. Aqui, o journal distingue conflito, entrega,
+    execução em andamento e queda recuperável — sem transformar reserva antiga em settle."""
+    if not payment_header:
+        return _V4113_VERIFY_PREV(endpoint, payment_header)
+    try:
+        pl = json.loads(base64.b64decode(str(payment_header).strip()).decode())
+        fp = _payment_fingerprint(pl) if isinstance(pl, dict) else ""
+    except Exception:
+        return _V4113_VERIFY_PREV(endpoint, payment_header)
+    if not fp:
+        return _V4113_VERIFY_PREV(endpoint, payment_header)
+    claim = "wcov:" + fp
+    try:
+        row = _v4114_wc_get(claim, strict=True)
+        replay = LEDGER.replay_seen(claim) if not row else False
+    except Exception as e:
+        # Se o banco não responde, a existência de um débito é incerta: nunca liquidar.
+        log.warning(f"wallet credit precheck indisponível {endpoint}: {e}")
+        return False, "wallet-credit-unavailable", {"settlement_seen": True,
+                                                     "covered_by_credit": True,
+                                                     "retry_after_seconds": 30}
+    if row:
+        if row.get("request_fp") != _deliver_fp() or row.get("endpoint") != endpoint:
+            return False, "replay-blocked", {"settlement_seen": True,
+                                             "covered_by_credit": True}
+        state = row.get("state")
+        if state == "delivered":
+            return False, "replay-blocked", {"settlement_seen": True,
+                                             "covered_by_credit": True}
+        if state == "reserved":
+            left = int(row.get("lease_until") or 0) - int(time.time())
+            if left > 0:
+                return False, "wallet-credit-in-progress", {
+                    "settlement_seen": True, "covered_by_credit": True,
+                    "retry_after_seconds": min(left, 30)}
+            if not _V4113_WC_ON:
+                return False, "wallet-credit-unavailable", {
+                    "settlement_seen": True, "covered_by_credit": True,
+                    "retry_after_seconds": 30}
+    elif replay:
+        # Reserva anterior ao journal (ou inconsistência): falhar fechado, nunca settled.
+        return False, "replay-blocked", {"settlement_seen": True,
+                                         "covered_by_credit": True}
+    return _V4113_VERIFY_PREV(endpoint, payment_header)
+
+
+_verify_payment = _v4113_verify_payment
+_PSF_4112 = _post_settle_failure
+
+
+def _v4113_cover_failure(path, payer, info, body, status, t0, ip, session_token=""):
+    """Chamada coberta pelo crédito que não entregou: o crédito volta para a mesma chave, a reserva
+    da autorização é liberada (o cliente pode repetir) e nada foi liquidado."""
+    from flask import g as _g
+    wc = getattr(_g, "_v4113_wc", None) or {}
+    restored = None
+    if wc.get("claim"):
+        refund = _v4114_wc_refund(wc)
+        if refund.get("ok"):
+            restored = refund
+            wc["restored"] = True
+            wc["remaining"] = ("unlimited" if refund.get("unlimited")
+                               else round(float(refund.get("remaining") or 0), 6))
+        else:
+            log.error(f"🚨 crédito da carteira NÃO devolvido em {path}: "
+                      f"{refund.get('reason') or 'falha desconhecida'}")
+    try:
+        LEDGER.log_request(path, False, int((time.time() - t0) * 1000), ip,
+                           kind="refunded" if restored is not None else "delivery_failed",
+                           ua=request.headers.get("User-Agent", ""), params=_clean_params())
+    except Exception:
+        pass
+    ok_back = restored is not None
+    public = dict(body) if isinstance(body, dict) else {}
+    public.update({
+        "charged": not ok_back, "payment_verified": True, "settled_onchain": False,
+        "covered_by": info.get("covered_by"), "plan": info.get("plan"),
+        "delivered": False, "delivery_complete": False, "new_payment_required": False,
+        "delivery_status": ("not_delivered_credit_restored" if ok_back
+                            else "not_delivered_credit_not_restored"),
+        "credit_restored_usd": round(float(wc.get("cost") or 0), 6) if ok_back else 0.0,
+        "credits_remaining": wc.get("remaining"),
+        "note": ("This call was paid from your wallet's credit (nothing was settled on-chain) and it "
+                 "did not deliver, so the credit was returned. You can retry the same request."
+                 if ok_back else
+                 "This call was paid from your wallet's credit and did not deliver; the automatic "
+                 "credit return failed. Keep this response — the operator was alerted."),
+    })
+    if not ok_back:
+        _v4104_tg_async(f"🚨 Crédito da carteira não devolvido: {path} · {str(payer)[:10]}… · "
+                        f"${float(wc.get('cost') or 0):.4f}")
+    log.warning(f"📦 coberto por crédito e não entregue: {path} · carteira {str(payer)[:10]} · "
+                f"HTTP {status} · {'crédito devolvido' if ok_back else 'crédito NÃO devolvido'}")
+    try:
+        code = int(status)
+    except Exception:
+        code = 500
+    if code < 400 or code > 599:
+        code = 500
+    resp = jsonify(public)
+    resp.status_code = code
+    ra = public.get("retry_after_seconds")
+    if isinstance(ra, (int, float)) and ra > 0:
+        resp.headers["Retry-After"] = str(int(ra))
+    st = dict(info.get("settlement") or {})
+    st.update(success=False, errorReason=("delivery_failed_credit_restored" if ok_back
+                                          else "delivery_failed_credit_not_restored"))
+    return _attach_settlement_proof(resp, dict(info, settlement=st), session_token)
+
+
+def _post_settle_failure(path, payer, info, body, status, t0, ip,  # noqa: F811 — camada 48.113.0
+                         session_token: str = ""):
+    if isinstance(info, dict) and info.get("via") == "wallet-credit":
+        return _v4113_cover_failure(path, payer, info, body, status, t0, ip, session_token)
+    return _PSF_4112(path, payer, info, body, status, t0, ip, session_token=session_token)
+
+
+def _v4113_topup_hint(cost):
+    """O menor pacote de crédito que cobre ≥ 25 chamadas a este preço."""
+    try:
+        cost = float(cost)
+        packs = sorted((get_dynamic_price(ep), ep) for ep, cfg in CREDIT_PLANS.items()
+                       if cfg.get("plan") == "credits" and ep in BASE_PRICES
+                       and float(cfg.get("balance_usd") or 0) >= 25 * cost)
+        return f"{_public_base()}{packs[0][1]}" if packs else f"{_public_base()}/plans"
+    except Exception:
+        return f"{_public_base()}/plans"
+
+
+@app.after_request
+def _v4113_wc_after(resp):
+    try:
+        from flask import g as _g
+        wc = getattr(_g, "_v4113_wc", None)
+        short = getattr(_g, "_v4113_wc_short", None)
+        if not wc and not short:
+            return resp
+        added = []
+        if wc:
+            rem = wc.get("remaining")
+            resp.headers["X-Covered-By"] = str(wc.get("kind"))
+            resp.headers["X-Credits-Cost"] = ("0.000000" if wc.get("restored")
+                                              else f"{float(wc.get('cost') or 0):.6f}")
+            resp.headers["X-Credits-Remaining"] = ("unlimited" if rem == "unlimited"
+                                                   else f"{float(rem or 0):.6f}")
+            exp = wc.get("expires")
+            if exp:
+                resp.headers["X-Plan-Expires-In"] = str(max(0, int(float(exp) - time.time())))
+            added += ["X-Covered-By", "X-Credits-Cost", "X-Credits-Remaining", "X-Plan-Expires-In"]
+            if (rem != "unlimited" and not wc.get("restored")
+                    and float(rem or 0) < max(0.10, 5 * float(wc.get("cost") or 0))):
+                resp.headers["X-Credit-Low"] = (f"remaining_usd={float(rem or 0):.4f};"
+                                                f"top_up={_v4113_topup_hint(wc.get('cost'))}")
+                added.append("X-Credit-Low")
+            if (200 <= resp.status_code < 300 and not wc.get("restored")
+                    and not resp.direct_passthrough and resp.mimetype == "application/json"):
+                b = resp.get_json(silent=True)
+                if isinstance(b, dict) and "paid_from_credit" not in b:
+                    b["paid_from_credit"] = {
+                        "settled_onchain": False, "covered_by": wc.get("kind"),
+                        "plan": wc.get("plan"), "cost_usd": wc.get("cost"),
+                        "credits_remaining_usd": rem,
+                        "note": ("Your wallet's x402 authorization was verified and not settled: "
+                                 "this call was paid from your prepaid credit. Send the header "
+                                 "X-Credit-Mode: settle to pay on-chain instead.")}
+                    resp.set_data(json.dumps(b, default=str))
+        elif short and 200 <= resp.status_code < 300:
+            resp.headers["X-Credit-Exhausted"] = (
+                f"plans={','.join(short.get('plans') or [])};"
+                f"top_up={_v4113_topup_hint(short.get('cost'))}")
+            added.append("X-Credit-Exhausted")
+        if added:
+            cur = resp.headers.get("Access-Control-Expose-Headers", "")
+            resp.headers["Access-Control-Expose-Headers"] = ",".join(x for x in [cur] + added if x)
+    except Exception as e:
+        log.debug(f"wallet credit headers: {e}")
+    return resp
+
+
+_DELIVER_HDRS = tuple(_DELIVER_HDRS) + tuple(h for h in _V4113_WC_HDRS if h not in _DELIVER_HDRS)
+
+
+# ============================================================================================
+# 6) matemática dos planos: custo real para um perfil de uso (vencimento incluído)
+# ============================================================================================
+def _v4113_plan_cost(cfg, plan_price, unit, calls_per_day, days):
+    """Custo mínimo para cobrir `calls_per_day` chamadas/dia por `days` dias só com este plano,
+    comprando quando acaba ou vence (crédito que vence sem uso se perde)."""
+    try:
+        plan_price, unit = float(plan_price), float(unit)
+        calls_per_day, days = float(calls_per_day), float(days)
+    except (TypeError, ValueError):
+        return None
+    if plan_price <= 0 or unit <= 0 or calls_per_day <= 0 or days <= 0:
+        return None
+    ttl = max(1, int(cfg.get("ttl_days") or 1))
+    if cfg.get("balance_usd") == -1:
+        n = int(math.ceil(days / ttl - 1e-9))
+        return {"purchases": n, "cost": round(n * plan_price, 6)}
+    per = int((float(cfg.get("balance_usd") or 0) + 1e-9) // unit)
+    if per < 1:
+        return None
+    # Um pacote termina quando esgota OU vence; o saldo dele não é reiniciado a cada
+    # bloco de validade. Com uso constante, cada pacote cobre exatamente este intervalo.
+    span = min(float(ttl), float(per) / calls_per_day)
+    if span <= 0:
+        return None
+    n = max(1, int(math.ceil(days / span - 1e-9)))
+    return {"purchases": n, "cost": round(n * plan_price, 6)}
+
+
+def _v4113_plan_matrix(unit, calls_per_day, days):
+    """(custo pagando por chamada, opções ordenadas pelo custo total)."""
+    base = _public_base()
+    try:
+        ppc = round(float(calls_per_day) * float(days) * float(unit), 6)
+    except (TypeError, ValueError):
+        return 0.0, []
+    rows = []
+    for ep, cfg in CREDIT_PLANS.items():
+        if ep not in BASE_PRICES:
+            continue
+        try:
+            price = get_dynamic_price(ep)
+        except Exception:
+            continue
+        r = _v4113_plan_cost(cfg, price, unit, calls_per_day, days)
+        if not r:
+            continue
+        rows.append({"plan": cfg.get("plan"), "endpoint": ep, "buy": f"{base}{ep}",
+                     "price_usdc": round(price, 2), "purchases": r["purchases"],
+                     "total_usd": round(r["cost"], 4),
+                     "saves_usd": round(ppc - r["cost"], 4),
+                     "saves_pct": (round(100.0 * (ppc - r["cost"]) / ppc, 1) if ppc > 0 else 0.0)})
+    rows.sort(key=lambda x: (x["total_usd"], x["purchases"]))
+    return ppc, rows
+
+
+_V4113_DT_CALLS = (10, 100, 1000, 10000)
+_V4113_ASSUMPTION = ("calls spread evenly over the period; a pack is bought when the previous one "
+                     "runs out or expires; credit that expires unused is lost")
+
+
+def _v4113_decision_table(unit, days=30):
+    out = []
+    for k in _V4113_DT_CALLS:
+        ppc, rows = _v4113_plan_matrix(unit, k / float(days), days)
+        best = rows[0] if (rows and rows[0]["total_usd"] < ppc - 1e-9) else None
+        row = {"calls_in_%d_days" % days: k, "pay_per_call_usd": round(ppc, 4),
+               "best": best["endpoint"] if best else "pay per call",
+               "best_total_usd": round(best["total_usd"] if best else ppc, 4),
+               "saves_usd": round(best["saves_usd"], 4) if best else 0.0}
+        if best and best["purchases"] > 1:
+            row["purchases"] = best["purchases"]
+        out.append(row)
+    return {"assumption": _V4113_ASSUMPTION, "rows": out,
+            "your_numbers": f"{_public_base()}/plans?calls_per_day=N&days=D&endpoint=/path"}
+
+
+def _v4113_wallet_binding_doc():
+    return {
+        "enabled": _V4113_WC_ON,
+        "how": ("Buy any plan with your normal x402 client. Afterwards every x402 payment signed by "
+                "that same wallet is verified and NOT settled while the plan has credit (or the pass "
+                "is valid): the call is paid from the plan. No header, no key, no code change."),
+        "requires": ("the same wallet; it still signs the normal authorization for the listed price, "
+                     "so it must hold that amount — nothing moves on-chain while the plan covers the call"),
+        "receipt": ("PAYMENT-RESPONSE carries settled:false, coveredBy and creditsRemaining; headers "
+                    "X-Covered-By and X-Credits-Remaining"),
+        "opt_out": "send the header X-Credit-Mode: settle to pay on-chain anyway",
+        "also_covers": "refund credit issued to that wallet after a failed delivery",
+        "limits": ("x402-signed calls keep the per-IP limit of "
+                   f"{RL_RPM_IP}/min; the X-API-Key returned by the purchase has none"),
+    }
+
+
+_SUB_OFFER_4112 = _subscription_offer
+
+
+def _subscription_offer(endpoint, unit_price):  # noqa: F811 — camada 48.113.0
+    out = _SUB_OFFER_4112(endpoint, unit_price)
+    if not isinstance(out, dict):
+        return out
+    try:
+        unit = float(unit_price)
+        for p in out.get("plans") or []:
+            cov = p.get("covers_calls")
+            if isinstance(cov, int) and cov > 0 and unit > 0:
+                eff = float(p.get("price_usdc") or 0) / cov
+                p["effective_usd_per_call"] = round(eff, 6)
+                p["discount_vs_pay_per_call_pct"] = round(100.0 * (1.0 - eff / unit), 1)
+        out["how_to_use"] = ("Buy the plan with this same x402 client: later x402 payments from that "
+                             "wallet are covered by it automatically (verified, not settled). The "
+                             "purchase also returns a key for the X-API-Key header.")
+        out["wallet_binding"] = _v4113_wallet_binding_doc()
+        out["decision_table"] = _v4113_decision_table(unit)
+    except Exception as e:
+        log.debug(f"oferta 48.113: {e}")
+    return out
+
+
+_CREDITS_PAYLOAD_4112 = _credits_payload
+
+
+def _credits_payload(endpoint, plan, key, balance_usd, expires, idempotent=False):  # noqa: F811
+    out = _CREDITS_PAYLOAD_4112(endpoint, plan, key, balance_usd, expires, idempotent=idempotent)
+    try:
+        from flask import g as _g
+        payer = _v4113_norm(getattr(_g, "losbeto_payer", "") or "")
+        try:
+            house = bool(payer) and _is_house_payer(payer)
+        except Exception:
+            house = False
+        active = bool(payer) and _V4113_WC_ON and (not house or _V4113_WC_HOUSE)
+        out["wallet_binding"] = {
+            "wallet": payer or None, "active": active,
+            "how": ("x402 payments signed by this wallet are now paid from this plan automatically: "
+                    "the node verifies the signature and does not settle it. Nothing to configure."
+                    if active else
+                    ("Operator wallet: its x402 payments keep settling on-chain; send "
+                     "X-Credit-Mode: credit to use this plan instead." if house else
+                     "Use the key in the X-API-Key header.")),
+            "opt_out": "X-Credit-Mode: settle",
+            "status": f"{_public_base()}/credits-status?key=<your key>"}
+        hu = out.get("how_to_use")
+        if isinstance(hu, dict) and active:
+            hu["no_code_change"] = ("Keep calling with your x402 client from this wallet — calls are "
+                                    "covered by this plan; the key is optional.")
+    except Exception as e:
+        log.debug(f"wallet binding payload: {e}")
+    return out
+
+
+# --------------------------------------------------------------------------------------------
+# 7) dica de economia (X-Savings-Tip): uso real, sem contar compra de plano, com projeção
+# --------------------------------------------------------------------------------------------
+def _v4113_usage_window(payer, window_s):
+    """(chamadas, gasto, 1º ts) do pagador na janela — só consumo por chamada (planos fora)."""
+    p = _v4113_norm(payer)
+    ck = f"psw3:{p[:48]}:{int(window_s)}"
+    try:
+        hit = LEDGER.cache_get(ck, 120)
+        if isinstance(hit, dict):
+            return int(hit["calls"]), float(hit["spent"]), int(hit["first"])
+    except Exception:
+        pass
+    plans = tuple(CREDIT_PLANS)
+    since = int(time.time()) - int(window_s)
+    try:
+        with LEDGER._conn() as c:
+            col = "lower(payer)" if p.startswith("0x") else "payer"
+            row = c.execute(
+                f"SELECT COUNT(*), COALESCE(SUM(amount),0), COALESCE(MIN(ts),0) FROM revenue "
+                f"WHERE {col}=? AND ts>? AND endpoint NOT IN ({','.join('?' * len(plans))})",
+                (p, since) + plans).fetchone()
+        out = (int(row[0] or 0), float(row[1] or 0.0), int(row[2] or 0))
+    except Exception as e:
+        log.debug(f"usage window {p[:10]}: {e}")
+        return 0, 0.0, 0
+    try:
+        LEDGER.cache_set(ck, {"calls": out[0], "spent": out[1], "first": out[2]})
+    except Exception:
+        pass
+    return out
+
+
+_UPSELL_NOTE_4112 = _upsell_note   # a 48.113 reescreve a dica (a anterior contava compra de plano)
+
+
+def _upsell_note(payer):  # noqa: F811 — camada 48.113.0
+    """Só fala quando o número favorece o cliente. 48.113: compra de plano não conta como uso (quem
+    acabava de pagar $4.99 recebia sugestão de outro plano); carteira com plano ativo não recebe
+    dica; recomenda pelo custo real de 30 dias no ritmo observado, vencimento incluído."""
+    if not payer:
+        return None
+    p = _v4113_norm(payer)
+    try:
+        if _is_house_payer(p) or p in {str(w).lower() for w in _self_pay_wallets()}:
+            return None
+    except Exception:
+        pass
+    try:
+        if any(str(k[1]) != "refund" for k in _v4113_wallet_keys(p)):
+            return None
+        calls, spent, first = _v4113_usage_window(p, UPSELL_WINDOW)
+        if calls < 3 or spent <= 0:
+            return None
+        days_seen = max(1.0, min(UPSELL_WINDOW / 86400.0, (time.time() - first) / 86400.0))
+        cpd, unit = calls / days_seen, spent / calls
+        ppc30, rows = _v4113_plan_matrix(unit, cpd, 30)
+        best = next((r for r in rows if r["total_usd"] <= ppc30 * 0.9
+                     and ppc30 - r["total_usd"] >= 0.01), None)
+        if not best:
+            return None
+        _ppc_w, rows_w = _v4113_plan_matrix(unit, cpd, days_seen)
+        saved_w = next((r["saves_usd"] for r in rows_w if r["endpoint"] == best["endpoint"]), 0.0)
+        buys = (f" ({best['purchases']} purchases)" if best["purchases"] > 1 else "")
+        return {
+            "you_spent_usdc": round(spent, 4), "calls_in_window": calls,
+            "window_days": round(days_seen, 1), "avg_usd_per_call": round(unit, 6),
+            "plan": CREDIT_PLANS[best["endpoint"]].get("plan"), "plan_endpoint": best["endpoint"],
+            "plan_price_usdc": best["price_usdc"],
+            "projected_30d_pay_per_call_usdc": round(ppc30, 4),
+            "projected_30d_with_plan_usdc": best["total_usd"],
+            "projected_30d_savings_usdc": best["saves_usd"],
+            "would_have_saved_usdc": round(max(0.0, float(saved_w)), 4),
+            "buy": best["buy"], "wallet_binding": _V4113_WC_ON,
+            "message": (f"This wallet paid ${spent:.4f} for {calls} calls in the last "
+                        f"{days_seen:.1f} days (avg ${unit:.4f}/call). At that pace 30 days cost about "
+                        f"${ppc30:.2f} paying per call; {best['endpoint']} covers it for "
+                        f"${best['total_usd']:.2f}{buys}. Buy it with this same x402 client — this "
+                        f"wallet's next x402 calls are then paid from the plan automatically "
+                        f"(signature verified, nothing settled)."),
+        }
+    except Exception as e:
+        log.debug(f"upsell 48.113: {e}")
+        return None
+
+
+# --------------------------------------------------------------------------------------------
+# 8) /plans: cotação para o perfil de uso do agente + ligação à carteira
+# --------------------------------------------------------------------------------------------
+_PLANS_VIEW_4112 = app.view_functions.get("plans_json")
+
+
+def _v4113_plans_view():
+    resp = _PLANS_VIEW_4112()
+    try:
+        b = resp.get_json(silent=True)
+        if not isinstance(b, dict):
+            return resp
+        unit = float((b.get("reference") or {}).get("price_usdc") or 0)
+        b["wallet_binding"] = _v4113_wallet_binding_doc()
+        for p in b.get("plans") or []:
+            p["how_to_use"] = ("Pay once via x402. Later x402 payments from the same wallet are "
+                               "covered automatically (verified, not settled); the returned key also "
+                               "works in the X-API-Key header.")
+        cpd_raw, days_raw = request.args.get("calls_per_day"), request.args.get("days")
+        if cpd_raw or days_raw:
+            try:
+                cpd = float(cpd_raw or 0)
+                days = int(float(days_raw or 30))
+                if not (0 < cpd <= 1_000_000) or not (1 <= days <= 365) or not math.isfinite(cpd):
+                    raise ValueError
+            except (TypeError, ValueError):
+                b["quote"] = {"error": "calls_per_day must be in (0, 1000000] and days in [1, 365]"}
+            else:
+                ppc, rows = _v4113_plan_matrix(unit, cpd, days)
+                best = rows[0] if (rows and rows[0]["total_usd"] < ppc - 1e-9) else None
+                b["quote"] = {
+                    "unit_price_usdc": round(unit, 6), "calls_per_day": cpd, "days": days,
+                    "total_calls": round(cpd * days, 2), "pay_per_call_usd": round(ppc, 4),
+                    "best": best or {"plan": "pay-per-call", "total_usd": round(ppc, 4),
+                                     "why": "no plan costs less than paying per call for this usage"},
+                    "options": rows[:8], "assumption": _V4113_ASSUMPTION}
+        else:
+            b["decision_table"] = _v4113_decision_table(unit)
+        resp.set_data(json.dumps(b, default=str))
+    except Exception as e:
+        log.debug(f"/plans 48.113: {e}")
+    return resp
+
+
+if _PLANS_VIEW_4112 is not None:
+    app.view_functions["plans_json"] = _v4113_plans_view
+
+
+# --------------------------------------------------------------------------------------------
+# 9) descrições dos planos (402, Bazaar, manifestos, MCP) dizem que a carteira fica ligada
+# --------------------------------------------------------------------------------------------
+_V4113_BIND_TXT = (" The paying wallet is bound to the plan: its later x402 payments are covered "
+                   "automatically (verified, not settled) — no code change.")
+for _ep113 in CREDIT_PLANS:
+    _d113 = ENDPOINT_DESC.get(_ep113)
+    if isinstance(_d113, str) and "paying wallet is bound" not in _d113:
+        ENDPOINT_DESC[_ep113] = _d113.rstrip() + _V4113_BIND_TXT
+
+
+def _v4113_credit_ladder_check():
+    """Pacote maior tem que render pelo menos o mesmo bônus que o menor (escada racional)."""
+    packs = []
+    for ep, cfg in CREDIT_PLANS.items():
+        if cfg.get("plan") != "credits" or ep not in BASE_PRICES:
+            continue
+        price = get_dynamic_price(ep)
+        if price > 0:
+            packs.append((price, float(cfg.get("balance_usd") or 0) / price, ep))
+    packs.sort()
+    best = 0.0
+    for price, ratio, ep in packs:
+        if ratio + 1e-9 < best:
+            log.warning(f"🚨 ESCADA DE CRÉDITO INVERTIDA: {ep} (${price:.2f}) rende {ratio:.3f}× — "
+                        f"menos que um pacote menor ({best:.3f}×). Comprador racional evita o maior.")
+        best = max(best, ratio)
+    return [(round(p, 2), round(r, 3), ep) for p, r, ep in packs]
+
+
+_V4113_CREDIT_LADDER = _v4113_credit_ladder_check()
+
+
 def _v4885_tail_check(path=None):
     """True: a última linha é o marcador. False: arquivo cortado. None: não deu para ler."""
     try:
@@ -44842,4 +46010,5 @@ if _NEXUS_TAIL_OK is False:
 
 # v48.111.0-SHELFTRUTH: /copytrade e /swarm-vote (vazios por construção: nenhuma escrita na tabela peers) saem da vitrine e respondem 503 sem cobrar; /smart-money sem holders on-chain não é vendido; pausa do ops vale também para requisição que já chega com X-PAYMENT; disjuntor compartilhado para as fontes de holder (falha total tira /holder-concentration da vitrine e poupa ~3,5 s de /smart-money e /whale-dossier; sonda do ops reabre); pré-gate recusando em série pausa o endpoint; /api/v1/best, /discover, /recommend, "também compraram", /llms.txt e /llms-full.txt só mostram o vendável; amostra grátis não serve falha como amostra; caminho com "?" codificado (%3F) vira 308; mesmo User-Agent em vários IPs não vira LEAD QUENTE; Pyth sem concessão para o tipo de ativo recua o lote inteiro; 429 da CoinGecko respeitado por host; livro de chamadas com teto; parada do /pay antes da carteira avisa o nó (etapa precheck); erro JSON-RPC do provedor no log do holder | base: v48.110.0-SMARTFLOW
 # v48.112.0-COREGUARD: top_coins validado item a item (um item ruim não derruba mais a lista; folga na consulta; motivo no log); lista de moedas fora no meio de chamada paga conta como falha da fonte núcleo — /arbitrage, /cross-chain, /relatorio, /sinais, /regime e /sentiment não vendem vazio/placeholder; HTTP 200 recusado pelo validador conta como fonte fora; /sentiment fora do top 50 = 422 (400 antes do 402 com a lista em cache), fontes nomeadas; disjuntor do holder testa sozinho quando ocioso; log do portão 1 linha/6 h; aviso de pré-check do /pay sem repetição e separado das falhas do nó; listagem de modelos de gateway LLM é sonda no radar | base: v48.111.0-SHELFTRUTH
-# EOF-LOSBETO 48.112.0-COREGUARD — fim do arquivo (se esta linha faltar, a copia foi cortada)
+# v48.113.0-WALLETPLAN: plano comprado via x402 cobre os x402 seguintes da mesma carteira (verify aceito, sem settle; reserva por autorização; falha devolve o crédito; carteiras da casa liquidam; X-Credit-Mode: settle desliga) — crédito de estorno também; 402 e /plans com tabela de decisão e cotação por perfil de uso (vencimento incluído); dica de economia sem contar compra de plano e com projeção de 30 dias; pacote de $4.99 rende $6.50 (+30%, escada racional); /whale-dossier: cache válido conta como fonte que respondeu e a camada de holders é opcional (fim do 503 falso de 23/nov); top_coins ≤ 50 sai de uma lista só (1 consulta/min); 🪙 1 linha por motivo a cada 6 h; disjuntor com falha estrutural (mesma resposta 6×) sonda a cada 6 h e não repete WARNING | base: v48.112.0-COREGUARD (GitHub 334f255)
+# EOF-LOSBETO 48.114.0-WALLETRECOVERY — fim do arquivo (se esta linha faltar, a copia foi cortada)
