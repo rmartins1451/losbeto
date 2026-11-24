@@ -1,7 +1,7 @@
 """
 Losbeto x402 — monolithic Flask service for Railway.
 
-Current release: 48.114.0-WALLETRECOVERY.
+Current release: 48.115.0-STEADY.
 Payment requirements are server-side. Delivery requires verified settlement, or a
 verified authorization covered by the signing wallet's prepaid plan (48.113), with
 a durable debit/delivery journal for crash recovery (48.114); pending payments are
@@ -2603,7 +2603,7 @@ class Market:
                      {"x-cg-demo-api-key": COINGECKO_KEY}),
                     ("https://pro-api.coingecko.com",
                      {"x-cg-pro-api-key": COINGECKO_KEY})]
-            errors = []
+            errors, failure_kinds = [], []
             for root, auth in attempts:
                 try:
                     r = requests.get(f"{root}/api/v3/coins/markets",
@@ -2613,16 +2613,33 @@ class Market:
                         timeout=15, headers={**common, **auth})
                     if not r.ok:
                         errors.append(f"{root} HTTP {r.status_code}")
+                        failure_kinds.append(f"http:{int(r.status_code)}")
                         continue
-                    validated = cls._validated_top_coins(r.json(), n)
+                    try:
+                        payload = r.json()
+                    except Exception as e:
+                        errors.append(f"{root} invalid markets JSON ({type(e).__name__})")
+                        failure_kinds.append("schema")
+                        _v4112_source_rejected(root)
+                        continue
+                    validated = cls._validated_top_coins(payload, n)
                     if validated:
                         return validated
                     errors.append(f"{root} invalid markets payload")
+                    failure_kinds.append("schema")
                     _v4112_source_rejected(root)   # v48.112.0: 200 recusado = fonte fora
                 except Exception as e:
                     errors.append(f"{root} {type(e).__name__}")
+                    network_errors = (requests.exceptions.RequestException, urllib.error.URLError,
+                                      socket.timeout, TimeoutError, ConnectionError, OSError)
+                    failure_kinds.append("network" if isinstance(e, network_errors) else "exception")
             if errors:
                 log.warning(f"top_coins indisponível: {'; '.join(errors)[:240]}")
+            # A 48.115 só usa last-good para indisponibilidade transitória comprovada.
+            # O registro também classifica o [] servido pelo cache de 60 s nas chamadas seguintes.
+            _failure_store = globals().get("_v4115_top_failure_store")
+            if _failure_store:
+                _failure_store(n, failure_kinds or ["exception"])
             return []
         cached = cls._cached(f"top_{n}", f, 60)
         return cls._validated_top_coins(cached, n) if cached else []
@@ -10656,10 +10673,16 @@ _WEATHER_PREFLIGHT_LOG_AT = {"cooldown": 0.0, "probe": 0.0}
 
 
 def _weather_preflight_log(kind: str) -> bool:
-    """One weather warning per process/kind/15 min; HTTP behavior is unchanged."""
+    """One weather warning per process/kind/15 min; HTTP behavior is unchanged.
+
+    ``0.0`` significa "nunca registrado", inclusive quando o relógio monotônico
+    ainda está no início do processo. Antes, esse sentinela suprimia o primeiro
+    WARNING durante os primeiros 15 minutos de uptime.
+    """
     now = time.monotonic()
     quiet_s = max(60, int(os.environ.get("WEATHER_LOG_QUIET_S", "900")))
-    if now - _WEATHER_PREFLIGHT_LOG_AT.get(kind, 0.0) < quiet_s:
+    previous = float(_WEATHER_PREFLIGHT_LOG_AT.get(kind, 0.0) or 0.0)
+    if previous > 0.0 and now - previous < quiet_s:
         return False
     _WEATHER_PREFLIGHT_LOG_AT[kind] = now
     return True
@@ -10671,7 +10694,8 @@ def _preflight_unavailable(path: str):
         _retry_fn = globals().get("_v4890_weather_retry")
         retry = max(1, _retry_fn() if _retry_fn else Brain._weather_upstream_remaining())
         if _weather_preflight_log("cooldown"):
-            log.warning(f"⛔ pré-gate: /weather recusado sem cobrança — provedor licenciado em cooldown")
+            log.warning(f"⛔ pré-gate: /weather recusado sem cobrança — provedor licenciado em cooldown"
+                        f"{_v4115_weather_why()}")
         return _unavailable_body(
             "The licensed weather provider is temporarily unavailable. This endpoint "
             "is not being sold right now; no payment challenge was issued and no "
@@ -10681,7 +10705,8 @@ def _preflight_unavailable(path: str):
         _retry_fn = globals().get("_v4890_weather_retry")
         retry = max(1, _retry_fn() if _retry_fn else Brain._weather_upstream_remaining())
         if _weather_preflight_log("probe"):
-            log.warning("⛔ pré-gate: /weather recusado sem cobrança — sonda do provedor licenciado falhou")
+            log.warning("⛔ pré-gate: /weather recusado sem cobrança — sonda do provedor licenciado falhou"
+                        + _v4115_weather_why())
         return _unavailable_body(
             "The weather provider is still failing its health probe. This endpoint "
             "is not being sold right now; no payment challenge was issued and no "
@@ -11812,7 +11837,8 @@ def _evm_rpc(method: str, params: list, ttl: float = 20.0, rpcs=None, upstream=[
     hit = _CHAIN_CACHE.get(key)
     if hit and (time.time() - hit[0]) < ttl:
         return hit[1]
-    for url in (rpcs or _EVM_RPCS):
+    _errs, _urls = [], list(rpcs or _EVM_RPCS)   # v48.115.0: alerta só se TODAS caíram
+    for url in _urls:
         try:
             r = requests.post(url, json={"jsonrpc": "2.0", "id": 1,
                                          "method": method, "params": params}, timeout=8)
@@ -11822,9 +11848,15 @@ def _evm_rpc(method: str, params: list, ttl: float = 20.0, rpcs=None, upstream=[
                 _CHAIN_CACHE[key] = (time.time(), j["result"])
                 if len(_CHAIN_CACHE) > 3000:
                     _CHAIN_CACHE.clear()
+                if _errs:
+                    log.info(f"evm_rpc {method}: failover ok depois de {'; '.join(_errs)[:160]}")
                 return j["result"]
         except Exception as e:
-            log.warning(f"evm_rpc {method} via {_safe_log_origin(url)}: {type(e).__name__}")
+            _errs.append(f"{_safe_log_origin(url)}: {type(e).__name__}")
+    if _errs and len(_errs) == len(_urls):
+        log.warning(f"evm_rpc {method}: nenhuma RPC respondeu ({'; '.join(_errs)[:200]})")
+    elif _errs:
+        log.info(f"evm_rpc {method}: {'; '.join(_errs)[:160]} — as demais responderam sem result")
     return None
 
 def _hx(v, default=0):
@@ -26958,6 +26990,7 @@ class TelegramBot:
                 log.warning(f"TG getUpdates HTTP {r.status_code}: {r.text[:120]}")
                 time.sleep(5)
                 return
+            self._poll_net_errs = 0          # v48.115.0: conexão voltou
             _us = r.json().get("result", [])
             if _us:
                 try:
@@ -26977,7 +27010,11 @@ class TelegramBot:
                     continue
                 self._handle(msg)
         except Exception as e:
-            log.warning(f"TG poll: {str(e).replace(self.token, '***')}")
+            _net = isinstance(e, (requests.exceptions.ConnectionError, requests.exceptions.Timeout))
+            self._poll_net_errs = (getattr(self, "_poll_net_errs", 0) + 1) if _net else 0
+            (log.info if (_net and self._poll_net_errs < 3) else log.warning)(
+                f"TG poll: {str(e).replace(self.token, '***')}"
+                + (f" (falha de rede nº {self._poll_net_errs} seguida)" if _net else ""))
             time.sleep(5)
 
     def _handle_button(self, cq):
@@ -41703,7 +41740,7 @@ _ops_validate = _v4843_ops_validate
 
 _v4842_sanitize_governance()
 
-VERSION = "48.114.0-WALLETRECOVERY"
+VERSION = "48.115.0-STEADY"
 
 
 import ipaddress as _ipaddr_w
@@ -43379,7 +43416,9 @@ def _v4104_call(fn, path: str = "", quiet: bool = False):
         return res            # Response (HTML/SVG/CSV) ou dado rotulado como velho: fica
     hosts = sorted({h for h, _ok in mine if not str(h).startswith(("!core:", "core:"))})[:6]
     failed = (core + [h for h in hosts if h not in core])[:6] if core else hosts
-    if not quiet:
+    if not quiet and getattr(_V4104_UPL, "warming", False):
+        _v4115_warm_failed(path, failed)      # v48.115.0: refresh de preview, nada vendido
+    elif not quiet:
         _V4104_STATS["upstream_truth"] += 1
         _v4104_warn_upstream(path, failed)
     detail = (("The core data source of this endpoint failed during this call ("
@@ -44636,7 +44675,7 @@ def _v4112_validated_top_coins(data, n):
     if not out and n == globals().get("_V4113_TOP_SHARED", 50) and _accept:
         _accept_need = _accept if _accept <= 3 else _accept - max(1, _accept // 10)
         if len(valid) >= _accept_need:
-            out = valid[:_accept]
+            out = valid[:n]     # v48.115.0: todos os válidos; cada chamador fatia o seu k
     if dropped or inversions:
         diag = (f"top_coins({n}): {len(data)} recebidos, {len(out)} usados"
                 + "".join(f"; {k} ×{v} (ex.: {examples.get(k, '—')})" for k, v in dropped.items())
@@ -45979,6 +46018,322 @@ def _v4113_credit_ladder_check():
 _V4113_CREDIT_LADDER = _v4113_credit_ladder_check()
 
 
+# ============================================================================================
+# v48.115.0-STEADY — dado de análise estável sob 429, recusa com recibo "não liquidado", log limpo
+# ============================================================================================
+# Produção 48.114 (24/nov, 01:11→11:02 UTC, 0 ERROR/Traceback):
+#  - as duas rodadas de indexação perderam /analise e /deep-think: a CoinGecko respondeu 429 no
+#    meio da rajada (01:54:28, 01:54:46, 10:25:27) e o pré-gate recusou por falta do top 5 — e a
+#    rodada da Base PAROU em /analise ("settled_uncertain"), deixando 50 endpoints sem indexar,
+#    embora nada tivesse sido liquidado.
+#  - 03:47:40 "🧯 /br-macro … 503 sem vender dado (estorno/crédito …)" era o WARMER atualizando
+#    preview: nada foi vendido nem estornado, e o contador de vendas bloqueadas subiu.
+#  - 05:54 /weather recusado 3× "provedor licenciado em cooldown" sem dizer por quê.
+#  - 1 WARNING por timeout de uma RPC que tem failover; 1 WARNING por queda isolada do Telegram.
+
+# --------------------------------------------------------------------------------------------
+# 1) warmer não é venda: falha de fonte ao atualizar preview vira INFO e não conta como bloqueio
+# --------------------------------------------------------------------------------------------
+_V4115_WARM_AT = {}
+
+
+def _v4115_warm_failed(path, hosts):
+    now = time.time()
+    if now - _V4115_WARM_AT.get(path, 0.0) < 600:
+        return
+    _V4115_WARM_AT[path] = now
+    log.info(f"🔥 warmer: {path or '?'} não atualizado — fontes falharam ({', '.join(hosts)}); "
+             f"o preview anterior fica (nada vendido, nada estornado)")
+
+
+_WARM_ONCE_4114 = _warm_once
+
+
+def _warm_once(paths, label):  # noqa: F811 — camada 48.115.0
+    _V4104_UPL.warming = True
+    try:
+        return _WARM_ONCE_4114(paths, label)
+    finally:
+        _V4104_UPL.warming = False
+
+
+# --------------------------------------------------------------------------------------------
+# 2) última lista validada do top de mercado para produtos de ANÁLISE (com idade na resposta)
+# --------------------------------------------------------------------------------------------
+# Só quando a CoinGecko não responde (429/queda) e só para análise, onde variação de 24 h com
+# alguns minutos de idade não muda a leitura. Produtos que comparam preço ao vivo (/arbitrage,
+# /cross-chain, /sinais …) continuam recusando: preço velho contra preço vivo inventa spread.
+_V4115_LG_S = max(60, int(os.environ.get("TOP_COINS_LAST_GOOD_S", "600")))
+_V4115_LG_PATHS = frozenset(p.strip() for p in os.environ.get(
+    "TOP_COINS_LAST_GOOD_PATHS",
+    "/analise,/deep-think,/regime,/sentiment,/market-brief,/relatorio").split(",") if p.strip())
+_V4115_LG_KEY = "top_50:last_good"
+_V4115_LG_MEM = {"saved": 0.0}
+_V4115_TOP_TRANSIENT_HTTP = frozenset({408, 425, 429, 500, 502, 503, 504})
+
+
+def _v4115_top_failure_store(n, kinds):
+    """Classifica também o [] que o cache de 60 s pode servir após uma falha ao vivo."""
+    try:
+        n = int(n)
+        normalized = [str(k)[:24] for k in (kinds or [])][:8]
+        transient = bool(normalized)
+        for kind in normalized:
+            if kind == "network":
+                continue
+            if kind.startswith("http:"):
+                try:
+                    if int(kind.split(":", 1)[1]) in _V4115_TOP_TRANSIENT_HTTP:
+                        continue
+                except (TypeError, ValueError):
+                    pass
+            transient = False
+            break
+        LEDGER.cache_set(f"top_{n}:live_failure", {
+            "ts": time.time(), "transient": transient, "kinds": normalized})
+    except Exception as e:
+        log.debug(f"top_coins failure classification: {e}")
+
+
+def _v4115_top_failure_allows(k):
+    """Fail closed: sem evidência transitória recente, não há fallback."""
+    try:
+        shared_n = _V4113_TOP_SHARED if 1 <= int(k) < _V4113_TOP_SHARED else int(k)
+        rec = LEDGER.cache_get(f"top_{shared_n}:live_failure", 60)
+        if not isinstance(rec, dict) or rec.get("transient") is not True:
+            return False
+        age = time.time() - float(rec.get("ts") or 0)
+        return 0 <= age <= 60
+    except Exception:
+        return False
+
+
+def _v4115_lg_allowed() -> bool:
+    if getattr(_V4104_UPL, "warming", False):
+        return False          # preview nunca é atualizado com dado velho
+    try:
+        return request.path in _V4115_LG_PATHS
+    except RuntimeError:
+        return False          # laço de fundo, sem requisição
+
+
+def _v4115_lg_save():
+    """Copia a lista válida sem rejuvenescê-la e sem regredir freshness entre workers."""
+    now = time.time()
+    if now - _V4115_LG_MEM["saved"] < 30:
+        return
+    try:
+        # O ts da linha top_50 é gravado quando a resposta validada entra no cache.
+        # Tanto o ts interno quanto o da linha last-good herdam essa origem; uma cópia
+        # 30/60 s depois, portanto, não ganha um novo TTL de dez minutos.
+        with LEDGER.lock, LEDGER._conn() as c:
+            c.execute("BEGIN IMMEDIATE")
+            row = c.execute("SELECT value, ts FROM cache WHERE key='top_50'").fetchone()
+            if row:
+                source_ts = int(row[1] or 0)
+                cur = json.loads(row[0])
+                if (0 < source_ts <= int(now) + 1 and now - source_ts <= 60
+                        and isinstance(cur, list) and len(cur) >= 45):
+                    previous_row = c.execute(
+                        "SELECT value FROM cache WHERE key=?", (_V4115_LG_KEY,)).fetchone()
+                    try:
+                        previous = json.loads(previous_row[0]) if previous_row else {}
+                    except Exception:
+                        previous = {}
+                    previous_ts = float(previous.get("ts") or 0) if isinstance(previous, dict) else 0.0
+                    previous_coins = (previous.get("coins") if isinstance(previous, dict) else None)
+                    previous_valid = (isinstance(previous_coins, list) and len(previous_coins) >= 45
+                                      and 0 < previous_ts <= now + 1)
+                    if not (previous_valid and previous_ts >= source_ts):
+                        rec = {"ts": source_ts, "coins": cur}
+                        c.execute("INSERT OR REPLACE INTO cache(key,value,ts) VALUES(?,?,?)",
+                                  (_V4115_LG_KEY, json.dumps(rec, default=str), source_ts))
+            c.commit()
+        _V4115_LG_MEM["saved"] = now
+    except Exception as e:
+        log.debug(f"top_coins last-good save: {e}")
+
+
+def _v4115_lg_get(k):
+    try:
+        rec = LEDGER.cache_get(_V4115_LG_KEY, _V4115_LG_S)
+        if not isinstance(rec, dict):
+            return None, None, None
+        coins = rec.get("coins") if isinstance(rec.get("coins"), list) else []
+        source_ts = float(rec.get("ts") or 0)
+        age = time.time() - source_ts
+        need = k if k <= 3 else k - max(1, k // 10)
+        if source_ts <= 0 or age < 0 or age > _V4115_LG_S or len(coins) < need:
+            return None, None, None
+        return [dict(c) for c in coins[:k]], int(age), int(source_ts)
+    except Exception:
+        return None, None, None
+
+
+def _v4115_top_coins(n=20):
+    out = _v4113_top_coins(n)
+    if out:
+        _v4115_lg_save()
+        try:
+            from flask import g as _g
+            si = getattr(_g, "_v4115_stale_inputs", None)
+            if isinstance(si, dict):
+                si.pop("top_coins", None)   # a fonte voltou no meio da requisição
+        except Exception:
+            pass
+        return out
+    try:
+        k = int(n)
+    except Exception:
+        return out
+    if k < 1 or not _v4115_lg_allowed() or not _v4115_top_failure_allows(k):
+        return out
+    coins, age, source_ts = _v4115_lg_get(k)
+    if not coins:
+        return out
+    ev = getattr(_V4104_UPL, "events", None)
+    if isinstance(ev, list):     # a falha vira fonte fora comum + prova do dado servido
+        for i in range(len(ev) - 1, -1, -1):
+            if str(ev[i][0]) == "!core:api.coingecko.com top_coins":
+                ev[i] = ("api.coingecko.com", False)
+        _v4111_ev_add(ev, "cache:top_50:last-good", True)
+    try:
+        from flask import g as _g
+        si = getattr(_g, "_v4115_stale_inputs", None) or {}
+        si["top_coins"] = {"age_s": age, "source_ts": source_ts, "live": False,
+                           "source": "CoinGecko — last validated top-market-cap list",
+                           "reason": "transient live-source failure during this call"}
+        _g._v4115_stale_inputs = si
+        log.info(f"🪙 {request.path}: top_coins({k}) da última lista validada ({age}s) — "
+                 f"falha transitória da CoinGecko; idade declarada na resposta")
+    except Exception:
+        pass
+    return coins
+
+
+Market.top_coins = staticmethod(_v4115_top_coins)
+
+
+@app.after_request
+def _v4115_freshness_label(resp):
+    """Mescla freshness e recalcula a idade também num replay/cache de entrega."""
+    try:
+        from flask import g as _g
+        if (not (200 <= resp.status_code < 300) or resp.direct_passthrough
+                or resp.mimetype != "application/json"):
+            return resp
+        b = resp.get_json(silent=True)
+        if not isinstance(b, dict):
+            return resp
+        si = getattr(_g, "_v4115_stale_inputs", None)
+        existing = b.get("input_freshness")
+        if existing is not None and not isinstance(existing, dict):
+            return resp       # não destrói um contrato de freshness já produzido pelo handler
+        freshness = dict(existing) if isinstance(existing, dict) else {}
+        changed = False
+        if isinstance(si, dict) and si:
+            for key, value in si.items():
+                if freshness.get(key) != value:
+                    freshness[key] = value
+                    changed = True
+            b["input_freshness"] = freshness
+        top = freshness.get("top_coins")
+        if isinstance(top, dict) and top.get("live") is False:
+            try:
+                source_ts = float(top.get("source_ts") or 0)
+                now = time.time()
+                if 0 < source_ts <= now + 1:
+                    age = max(0, int(now - source_ts))
+                    if top.get("age_s") != age:
+                        top["age_s"] = age
+                        changed = True
+            except (TypeError, ValueError, OverflowError):
+                pass
+            if b.get("stale_inputs") is not True:
+                b["stale_inputs"] = True
+                changed = True
+        elif isinstance(si, dict) and si and b.get("stale_inputs") is not True:
+            b["stale_inputs"] = True
+            changed = True
+        if changed:
+            if freshness:
+                b["input_freshness"] = freshness
+            resp.set_data(json.dumps(b, default=str))
+    except Exception as e:
+        log.debug(f"freshness label: {e}")
+    return resp
+
+
+# --------------------------------------------------------------------------------------------
+# 3) recusa ANTES do settle com pagamento anexado: recibo x402 explícito de "não liquidado"
+# --------------------------------------------------------------------------------------------
+# O corpo já dizia charged:false, mas cliente x402 lê o recibo do header. Sem ele, um 503 depois
+# de assinar parece "liquidado ou não?" — a rodada da Base parou exatamente aí. Só quando o corpo
+# afirma charged:false; 402, 409 (autorização já vista) e respostas com recibo ficam como estão.
+@app.after_request
+def _v4115_not_settled_receipt(resp):
+    try:
+        sig = request.headers.get("PAYMENT-SIGNATURE") or request.headers.get("X-PAYMENT")
+        if (not sig or resp.status_code < 400 or resp.status_code in (402, 409)
+                or resp.headers.get("PAYMENT-RESPONSE") or resp.headers.get("X-PAYMENT-RESPONSE")
+                or resp.direct_passthrough or resp.mimetype != "application/json"):
+            return resp
+        b = resp.get_json(silent=True)
+        if not isinstance(b, dict) or b.get("charged") is not False:
+            return resp
+        from flask import g as _g
+        # Um corpo charged:false isolado não prova ausência de cobrança. Depois de verify/settle,
+        # cobertura, reconciliação ou reembolso, este hook nunca fabrica um recibo contraditório.
+        payment_state = getattr(_g, "losbeto_payment", None)
+        wallet_cover = getattr(_g, "_v4113_wc", None)
+        error_name = str(b.get("error") or "").lower()
+        if (payment_state or wallet_cover or b.get("payment_verified") is True
+                or b.get("settled") is True or b.get("settled_onchain") is True
+                or b.get("settlement_attempted") is True or b.get("pending") is True
+                or b.get("transaction") or "refunded" in b or "refund_status" in b
+                or "delivery_status" in b or "settlement" in b
+                or "settlement_pending" in error_name or "duplicate_settlement" in error_name
+                or "settlement-mismatch" in error_name):
+            return resp
+        net = ""
+        try:
+            pl = json.loads(base64.b64decode(str(sig).strip()).decode())
+            acc = pl.get("accepted") if isinstance(pl.get("accepted"), dict) else {}
+            net = str(acc.get("network") or pl.get("network") or "")[:64]
+        except Exception:
+            pass
+        st = {"success": False, "transaction": "", "network": net, "settled": False,
+              "charged": False,
+              "errorReason": str(b.get("error") or b.get("status") or f"http_{resp.status_code}")[:80]}
+        enc = base64.b64encode(json.dumps(st, separators=(",", ":")).encode()).decode()
+        resp.headers["PAYMENT-RESPONSE"] = enc
+        resp.headers["X-PAYMENT-RESPONSE"] = enc
+        cur = resp.headers.get("Access-Control-Expose-Headers", "")
+        if "PAYMENT-RESPONSE" not in cur:
+            resp.headers["Access-Control-Expose-Headers"] = ",".join(
+                x for x in [cur, "PAYMENT-RESPONSE", "X-PAYMENT-RESPONSE"] if x)
+    except Exception as e:
+        log.debug(f"not-settled receipt: {e}")
+    return resp
+
+
+# --------------------------------------------------------------------------------------------
+# 4) /weather recusado: o log diz por quê (a sonda guarda o motivo, o log não mostrava)
+# --------------------------------------------------------------------------------------------
+def _v4115_weather_why() -> str:
+    try:
+        rec = LEDGER.cache_get("weather:metno:probe", 600) or {}
+        if isinstance(rec, dict) and rec.get("why") and not rec.get("ok"):
+            age = int(time.time() - float(rec.get("ts") or 0))
+            return f" (MET Norway: {str(rec.get('why'))[:120]}; sonda de {age}s atrás)"
+        up = LEDGER.cache_get("weather:upstream:open", 7 * 86400) or {}
+        if isinstance(up, dict) and up.get("reason"):
+            return f" (último motivo: {str(up.get('reason'))[:120]})"
+    except Exception:
+        pass
+    return ""
+
+
 def _v4885_tail_check(path=None):
     """True: a última linha é o marcador. False: arquivo cortado. None: não deu para ler."""
     try:
@@ -46011,4 +46366,6 @@ if _NEXUS_TAIL_OK is False:
 # v48.111.0-SHELFTRUTH: /copytrade e /swarm-vote (vazios por construção: nenhuma escrita na tabela peers) saem da vitrine e respondem 503 sem cobrar; /smart-money sem holders on-chain não é vendido; pausa do ops vale também para requisição que já chega com X-PAYMENT; disjuntor compartilhado para as fontes de holder (falha total tira /holder-concentration da vitrine e poupa ~3,5 s de /smart-money e /whale-dossier; sonda do ops reabre); pré-gate recusando em série pausa o endpoint; /api/v1/best, /discover, /recommend, "também compraram", /llms.txt e /llms-full.txt só mostram o vendável; amostra grátis não serve falha como amostra; caminho com "?" codificado (%3F) vira 308; mesmo User-Agent em vários IPs não vira LEAD QUENTE; Pyth sem concessão para o tipo de ativo recua o lote inteiro; 429 da CoinGecko respeitado por host; livro de chamadas com teto; parada do /pay antes da carteira avisa o nó (etapa precheck); erro JSON-RPC do provedor no log do holder | base: v48.110.0-SMARTFLOW
 # v48.112.0-COREGUARD: top_coins validado item a item (um item ruim não derruba mais a lista; folga na consulta; motivo no log); lista de moedas fora no meio de chamada paga conta como falha da fonte núcleo — /arbitrage, /cross-chain, /relatorio, /sinais, /regime e /sentiment não vendem vazio/placeholder; HTTP 200 recusado pelo validador conta como fonte fora; /sentiment fora do top 50 = 422 (400 antes do 402 com a lista em cache), fontes nomeadas; disjuntor do holder testa sozinho quando ocioso; log do portão 1 linha/6 h; aviso de pré-check do /pay sem repetição e separado das falhas do nó; listagem de modelos de gateway LLM é sonda no radar | base: v48.111.0-SHELFTRUTH
 # v48.113.0-WALLETPLAN: plano comprado via x402 cobre os x402 seguintes da mesma carteira (verify aceito, sem settle; reserva por autorização; falha devolve o crédito; carteiras da casa liquidam; X-Credit-Mode: settle desliga) — crédito de estorno também; 402 e /plans com tabela de decisão e cotação por perfil de uso (vencimento incluído); dica de economia sem contar compra de plano e com projeção de 30 dias; pacote de $4.99 rende $6.50 (+30%, escada racional); /whale-dossier: cache válido conta como fonte que respondeu e a camada de holders é opcional (fim do 503 falso de 23/nov); top_coins ≤ 50 sai de uma lista só (1 consulta/min); 🪙 1 linha por motivo a cada 6 h; disjuntor com falha estrutural (mesma resposta 6×) sonda a cada 6 h e não repete WARNING | base: v48.112.0-COREGUARD (GitHub 334f255)
-# EOF-LOSBETO 48.114.0-WALLETRECOVERY — fim do arquivo (se esta linha faltar, a copia foi cortada)
+# v48.114.0-WALLETRECOVERY: journal durável do crédito na carteira (reserva+débito numa transação, lease de 300 s, retomada pós-queda sem novo débito, entrega marcada no journal); marcador !core: protegido no helper raiz; lista top-50 parcial aceita para n menor | base: v48.113.0-WALLETPLAN
+# v48.115.0-STEADY: produtos de análise (/analise, /deep-think, /regime, /sentiment, /market-brief, /relatorio) usam a última lista top-50 validada (≤ 10 min, idade declarada em input_freshness) quando a CoinGecko responde 429 — fim das recusas nas rodadas de indexação; recusa antes do settle com pagamento anexado leva PAYMENT-RESPONSE {success:false, charged:false}; lista parcial guarda todos os válidos (cache de 60 s não envenena mais top 10/20); falha do warmer vira INFO e não conta como venda bloqueada; /weather recusado diz o motivo da sonda; evm_rpc e Telegram só alertam quando a falha persiste | base: v48.114.0-WALLETRECOVERY (GitHub 6c1a5ca)
+# EOF-LOSBETO 48.115.0-STEADY — fim do arquivo (se esta linha faltar, a copia foi cortada)
