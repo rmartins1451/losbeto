@@ -1,7 +1,7 @@
 """
 Losbeto x402 — monolithic Flask service for Railway.
 
-Current release: 48.115.0-STEADY.
+Current release: 48.116.0-PHANTOMFIX.
 Payment requirements are server-side. Delivery requires verified settlement, or a
 verified authorization covered by the signing wallet's prepaid plan (48.113), with
 a durable debit/delivery journal for crash recovery (48.114); pending payments are
@@ -13748,8 +13748,11 @@ def api_sol_usdc_balance():
                             best_amt, best_key = amt, a["pubkey"]
                     except Exception:
                         continue
-                found = True
-                if best_key is not None:
+                # Resposta válida com lista vazia = conta inexistente, não
+                # "conta encontrada com zero". Uma conta real com amount=0
+                # continua found=True porque best_key é selecionada (0 > -1).
+                found = best_key is not None
+                if found:
                     have, src_addr = best_amt / 1e6, best_key
             bh = _sol_rpc_call(url, "getLatestBlockhash",
                                [{"commitment": "confirmed"}])
@@ -33104,20 +33107,36 @@ document.getElementById('qrImg').src =
 document.getElementById('dlMetamask').href  = 'https://metamask.app.link/dapp/' + bare;
 document.getElementById('dlCoinbase').href  = 'https://go.cb-w.com/dapp?cb_url=' + enc;
 document.getElementById('dlRainbow').href   = 'https://rnbwapp.com/dapp?url=' + enc;
-if (SOL_ACCEPT) document.getElementById('dlPhantom').href = 'https://phantom.app/ul/browse/' + enc;
+if (SOL_ACCEPT) document.getElementById('dlPhantom').href = 'https://phantom.com/ul/browse/' + enc;
 else document.getElementById('dlPhantom').style.display = 'none';
 
 // v48.9.8: Phantom injeta window.ethereum E window.solana — mostrar os DOIS
 // cartões nesse caso (o usuário escolhe a rede onde tem saldo).
+// v48.116.0-PHANTOMFIX: namespace oficial primeiro; o alias legado continua
+// necessário para signTransaction. Reavalia injeção tardia sem duplicar cartões.
+function phantomProvider(){
+  const modern = window.phantom && window.phantom.solana;
+  if (modern && modern.isPhantom) return modern;
+  const legacy = window.solana;
+  if (legacy && (legacy.isPhantom || typeof legacy.connect === 'function')) return legacy;
+  return null;
+}
+function revealPhantomCard(){
+  const p = phantomProvider();
+  if (!SOL_ACCEPT || !p) return null;
+  document.getElementById('cardSol').style.display = 'block';
+  return p;
+}
+function onPhantomReady(){
+  if (revealPhantomCard()) document.getElementById('cardMobile').style.display = 'none';
+}
+window.addEventListener('phantom#initialized', onPhantomReady);
 let anyCard = false;
 if (window.ethereum || EIP6963.length) {
   document.getElementById('cardInjected').style.display = 'block';
   anyCard = true;
 }
-if (SOL_ACCEPT && window.solana) {
-  document.getElementById('cardSol').style.display = 'block';
-  anyCard = true;
-}
+if (revealPhantomCard()) anyCard = true;
 if (!anyCard) {
   document.getElementById('cardMobile').style.display = 'block';
   // v48.5.0 (correção de copy): o pagamento E o resultado acontecem DENTRO
@@ -33126,6 +33145,15 @@ if (!anyCard) {
   // o fluxo não cumpre; trocada por instrução honesta.
   statusMEl.textContent = 'Do it all inside the wallet app: open this page there, ' +
                           'tap pay, and your result shows up on the spot.';
+}
+if (SOL_ACCEPT && !phantomProvider()){
+  let phantomPolls = 0;
+  const phantomPoll = setInterval(function(){
+    phantomPolls += 1;
+    if (phantomProvider()){
+      clearInterval(phantomPoll); onPhantomReady();
+    } else if (phantomPolls >= 30) clearInterval(phantomPoll);
+  }, 100);
 }
 
 function setStatus(msg, cls){ statusEl.textContent=msg; statusEl.className='status'+(cls?(' '+cls):''); }
@@ -33180,12 +33208,13 @@ function payBeacon(stage, e){
   try{
     const code = e && (e.code !== undefined ? e.code : (e.data && e.data.code));
     if(code === 4001 || /user (rejected|denied|cancel)/i.test(String((e && e.message) || ''))) return;
+    const isSol = stage === 'sol' || !!(e && e.network === 'Solana');
     const w = (XFER && XFER.w) || (typeof evmProvider === 'function' ? evmProvider() : null) || {};
-    const wallet = stage === 'sol' ? 'phantom-sol' : (w.isPhantom ? 'phantom' : w.isRabby ? 'rabby' :
+    const wallet = isSol ? 'phantom-sol' : (w.isPhantom ? 'phantom' : w.isRabby ? 'rabby' :
                    w.isCoinbaseWallet ? 'coinbase' : w.isMetaMask ? 'metamask' : 'other');
-    const acct = PRE_LAST ? (PRE_LAST.delegated ? '7702' : (PRE_LAST.contract ? 'contract' : 'eoa')) : '?';
-    const gas = (!PRE_LAST || PRE_LAST.ethWei === null || PRE_LAST.ethWei === undefined) ? '?' :
-                (PRE_LAST.noGas ? 'low' : 'ok');
+    const acct = isSol ? '?' : (PRE_LAST ? (PRE_LAST.delegated ? '7702' : (PRE_LAST.contract ? 'contract' : 'eoa')) : '?');
+    const gas = isSol ? '?' : ((!PRE_LAST || PRE_LAST.ethWei === null || PRE_LAST.ethWei === undefined) ? '?' :
+                (PRE_LAST.noGas ? 'low' : 'ok'));
     const body = JSON.stringify({ep: location.pathname.replace(/^\/pay/, ''), stage: stage,
       code: (code === undefined || code === null) ? '' : String(code).slice(0, 12),
       msg: String((e && e.message) || e || '').slice(0, 160), wallet: wallet, acct: acct, gas: gas,
@@ -33382,14 +33411,24 @@ async function paySolana(){
   const setS = (m, c) => { st.textContent = m; st.className = 'status' + (c ? ' ' + c : ''); };
   btnS.disabled = true;
   if (!requiredFilled()){ setS(PAYGATE_MSG, 'err'); btnS.disabled = false; return; }
+  const provider = phantomProvider();
+  if (!provider){
+    const e = {code: -32601, message: 'Phantom provider not found in this browser'};
+    payBeacon('sol', e);
+    setS('Phantom is not available here. Open this page in the Phantom app or a browser with the Phantom extension, then retry. No signature was requested.', 'err');
+    btnS.disabled = false; return;
+  }
   if (!(await ensureFresh(setS))) return;   // v48.16.5: aba velha nunca mais assina
   try{
     setS('Loading Solana runtime…');
     await loadJs('https://unpkg.com/@solana/web3.js@1.95.3/lib/index.iife.min.js');
     const w3 = window.solanaWeb3;
     setS('Connecting Phantom…');
-    const conn = await window.solana.connect();
+    const conn = await provider.connect();
     const owner = new w3.PublicKey(conn.publicKey.toString());
+    const solPre = function(code, msg){
+      payBeacon('precheck', {code: code, message: msg, from: owner.toBase58(), network: 'Solana'});
+    };
     const mint  = new w3.PublicKey(SOL_ACCEPT.asset);
     let rpc   = new w3.Connection(SOL_RPC, 'confirmed');  // v48.14.3: reatribuido ao RPC saudavel
     const dstAta = await ataOf(w3, new w3.PublicKey(SOL_ACCEPT.payTo), mint);
@@ -33438,18 +33477,25 @@ async function paySolana(){
       }
     }
     if (!answered){
-      setS('\u26a0 Could not reach the Solana network right now (public RPC unstable). ' +
-           'Your balance was NOT checked — please retry in a few seconds.', 'err');
+      solPre('sol_rpc', 'Solana RPC unavailable; balance not checked; no signature requested');
+      setS('\u26a0 Could not reach the Solana network for Phantom account ' + shortAddr(owner.toBase58()) + '. ' +
+           'Your balance was NOT checked and no signature was requested. Please retry in a few seconds.', 'err');
       btnS.disabled = false; return;
     }
     if (!found){
-      setS('\u26a0 No USDC token account on Solana for this wallet. Add USDC on the Solana network ' +
-           'in Phantom first (or use the Base option above).', 'err');
+      solPre('sol_no_ata', 'No USDC token account on Solana; no signature requested');
+      setS('\u26a0 Phantom account ' + shortAddr(owner.toBase58()) + ' has no USDC token account on Solana. ' +
+           'No signature was requested and nothing was charged. Add USDC on Solana or select another account ' +
+           'in Phantom, then retry (or use the Base option above).', 'err');
       btnS.disabled = false; return;
     }
     if (have < need){
-      setS('\u26a0 USDC on Solana: ' + have.toFixed(4) + ' — this payment needs ' + need.toFixed(4) +
-           '. Top up USDC (Solana network) in Phantom first.', 'err');
+      solPre('sol_no_usdc', 'USDC on Solana ' + have.toFixed(6) + ' is below the price ' + need.toFixed(6) +
+                            '; no signature requested');
+      setS('\u26a0 Phantom account ' + shortAddr(owner.toBase58()) + ' has ' + have.toFixed(4) +
+           ' USDC on Solana; this payment needs ' + need.toFixed(4) +
+           '. No signature was requested and nothing was charged. Top up or select the account that holds ' +
+           'USDC on Solana in Phantom, then retry.', 'err');
       btnS.disabled = false; return;
     }
     setS('Building transaction — the facilitator pays the gas…');
@@ -33473,7 +33519,12 @@ async function paySolana(){
     tx.add(ixComputeBudget(w3, 3, 1000));
     tx.add(ixTransferChecked(w3, srcAta, mint, dstAta, owner, SOL_ACCEPT.amount));
     setS('Approve in Phantom…');
-    const signed = await window.solana.signTransaction(tx);
+    // Phantom documenta signTransaction como legado via window.solana. O provider
+    // oficial faz a conexão; o alias legado assina quando estiver disponível.
+    const signer = (window.solana && typeof window.solana.signTransaction === 'function')
+      ? window.solana : ((typeof provider.signTransaction === 'function') ? provider : null);
+    if (!signer) throw Object.assign(new Error('This Phantom provider cannot sign a partially-signed x402 transaction'), {code: -32601});
+    const signed = await signer.signTransaction(tx);
     const b64tx = b64encode(signed.serialize({ requireAllSignatures: false, verifySignatures: false }));
     const header = btoa(JSON.stringify({ x402Version: 2, scheme: 'exact',
       network: SOL_ACCEPT.network, payload: { transaction: b64tx },
@@ -41740,7 +41791,7 @@ _ops_validate = _v4843_ops_validate
 
 _v4842_sanitize_governance()
 
-VERSION = "48.115.0-STEADY"
+VERSION = "48.116.0-PHANTOMFIX"
 
 
 import ipaddress as _ipaddr_w
@@ -46368,4 +46419,5 @@ if _NEXUS_TAIL_OK is False:
 # v48.113.0-WALLETPLAN: plano comprado via x402 cobre os x402 seguintes da mesma carteira (verify aceito, sem settle; reserva por autorização; falha devolve o crédito; carteiras da casa liquidam; X-Credit-Mode: settle desliga) — crédito de estorno também; 402 e /plans com tabela de decisão e cotação por perfil de uso (vencimento incluído); dica de economia sem contar compra de plano e com projeção de 30 dias; pacote de $4.99 rende $6.50 (+30%, escada racional); /whale-dossier: cache válido conta como fonte que respondeu e a camada de holders é opcional (fim do 503 falso de 23/nov); top_coins ≤ 50 sai de uma lista só (1 consulta/min); 🪙 1 linha por motivo a cada 6 h; disjuntor com falha estrutural (mesma resposta 6×) sonda a cada 6 h e não repete WARNING | base: v48.112.0-COREGUARD (GitHub 334f255)
 # v48.114.0-WALLETRECOVERY: journal durável do crédito na carteira (reserva+débito numa transação, lease de 300 s, retomada pós-queda sem novo débito, entrega marcada no journal); marcador !core: protegido no helper raiz; lista top-50 parcial aceita para n menor | base: v48.113.0-WALLETPLAN
 # v48.115.0-STEADY: produtos de análise (/analise, /deep-think, /regime, /sentiment, /market-brief, /relatorio) usam a última lista top-50 validada (≤ 10 min, idade declarada em input_freshness) quando a CoinGecko responde 429 — fim das recusas nas rodadas de indexação; recusa antes do settle com pagamento anexado leva PAYMENT-RESPONSE {success:false, charged:false}; lista parcial guarda todos os válidos (cache de 60 s não envenena mais top 10/20); falha do warmer vira INFO e não conta como venda bloqueada; /weather recusado diz o motivo da sonda; evm_rpc e Telegram só alertam quando a falha persiste | base: v48.114.0-WALLETRECOVERY (GitHub 6c1a5ca)
-# EOF-LOSBETO 48.115.0-STEADY — fim do arquivo (se esta linha faltar, a copia foi cortada)
+# v48.116.0-PHANTOMFIX: checkout Solana resolve window.phantom.solana + alias legado, inclusive injeção tardia; conecta pelo provider oficial e assina com o método legado exigido pelo x402; recusas de RPC/conta/saldo agora identificam a conta, informam que não houve assinatura e emitem pré-checagem; lista vazia de token accounts deixa de virar found=true | base: v48.115.0-STEADY
+# EOF-LOSBETO 48.116.0-PHANTOMFIX — fim do arquivo (se esta linha faltar, a copia foi cortada)
