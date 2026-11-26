@@ -1,7 +1,7 @@
 """
 Losbeto x402 — monolithic Flask service for Railway.
 
-Current release: 48.116.0-PHANTOMFIX.
+Current release: 48.117.0-ALPHAGATE.
 Payment requirements are server-side. Delivery requires verified settlement, or a
 verified authorization covered by the signing wallet's prepaid plan (48.113), with
 a durable debit/delivery journal for crash recovery (48.114); pending payments are
@@ -586,7 +586,7 @@ ENDPOINT_DESC = {
     "/market-brief":    "Premium bundle: regime, sentiment, signals and risk in one predictable JSON object — the four calls an agent makes every morning, merged.",
     "/multi-chain-arbitrage": "Real-time cross-chain spread scanner across Solana, Base and Ethereum. Flags USDC/USDT/SOL/ETH opportunities above the declared spread threshold.",
     "/agent-composable": "Bundle: 5 endpoints in 1 request — regime + sentiment + signals + whale flow + risk. Roughly 40% cheaper than the calls made separately.",
-    "/alpha-signal":    "Proprietary Losbeto Alpha Score (0-100) combining Fear & Greed, market regime, sentiment and momentum into one composite trading signal.",
+    "/alpha-signal":    "Up to three high-confidence (>= 0.70) momentum signals from the validated top-20 market-cap list, using 1h/24h/7d changes, plus declared node signal-history statistics. Missing market input is refused before settlement.",
     "/insider-track":   "Insider tracking on new launches: which wallets entered before the crowd, how early, and what that pattern historically preceded.",
     "/mev-flow":        "Jito bundle flow, tip floor and MEV pressure on Solana: what it currently costs to get included, and where the extraction is concentrated.",
     "/portfolio-copilot": "AI portfolio copilot: best DeFi yields, market regime, credit profile and allocation mode in one premium response.",
@@ -3902,8 +3902,10 @@ class Brain:
         return risk
 
     @staticmethod
-    def sinais():
-        top = Market.top_coins(20)
+    def sinais(_validated_top=None):
+        # /alpha-signal pode fornecer a lista validada pelo pré-gate deste mesmo
+        # request. Os demais chamadores conservam a coleta e o cache anteriores.
+        top = Market.top_coins(20) if _validated_top is None else _validated_top
         signals = []
         for c in top:
             ch24 = c.get("price_change_percentage_24h") or 0
@@ -4392,10 +4394,17 @@ class Brain:
 
     @staticmethod
     def alpha_signal():
-        sigs = Brain.sinais().get("signals", [])
+        from flask import g as _g, has_request_context as _has_request_context
+        snapshot = (_g.get("losbeto_alpha_preflight")
+                    if _has_request_context() else None)
+        # No x402, o pré-gate congela a lista antes de verify/settle. MPP já está
+        # pago e as chamadas internas conservam o fluxo anterior sem o snapshot.
+        sigs = Brain.sinais(snapshot).get("signals", [])
         alpha = [s for s in sigs if s.get("confidence", 0) >= 0.7][:3]
         return {"alpha_signals": alpha, "win_rate": LEDGER.win_rate(),
                 "poi_multiplier": LEDGER.get_poi_multiplier(),
+                "method": ("1h/24h/7d momentum over the validated top-20 market-cap "
+                           "list; confidence >= 0.70 only; at most three signals."),
                 "version": VERSION}
 
     @staticmethod
@@ -11405,6 +11414,15 @@ def paid_endpoint(path):
                     _r.headers["Retry-After"] = str(_body["retry_after_seconds"])
                     return _r
 
+            if path == "/alpha-signal" and sig and sig != "mpp-tempo":
+                _alpha_gate = _v4117_alpha_preflight()
+                if _alpha_gate is not None:
+                    _body, _code = _alpha_gate
+                    _r = jsonify(_body)
+                    _r.status_code = _code
+                    _r.headers["Retry-After"] = str(_body["retry_after_seconds"])
+                    return _r
+
             if path == "/holder-concentration" and sig and sig != "mpp-tempo":
                 _holder_gate = _v4108_holder_preflight()
                 if _holder_gate is not None:
@@ -13262,7 +13280,7 @@ def losbeto_alpha_free():
             "service":          "Losbeto — Alpha Score (Preview)",
             "version":          VERSION,
             "ts":               ts,
-            "notice":           "PREVIEW — Score composto proprietário Losbeto. Versão completa com recomendação IA em /alpha-signal",
+            "notice":           "PREVIEW — Score composto gratuito. /alpha-signal é um produto separado: sinais de momentum 1h/24h/7d com confiança >= 0.70.",
             "losbeto_alpha_score": {
                 "score":          round(alpha_score, 1),
                 "max":            100,
@@ -13283,8 +13301,9 @@ def losbeto_alpha_free():
                 "endpoint":       f"{base}/alpha-signal",
                 "price_usdc":     get_dynamic_price("/alpha-signal"),
                 "unlock_full_at": f"{base}/alpha-signal",
-                "includes":       ["Recomendação IA detalhada", "Top 3 sinais alpha (conf > 70%)", 
-                                   "Triggers com preço de entrada", "Stop-loss e take-profit sugeridos"],
+                "includes":       ["Até 3 sinais de momentum com confiança >= 70%",
+                                   "Variações 1h/24h/7d e preço da lista validada",
+                                   "Estatísticas declaradas do histórico de sinais do nó"],
             },
             "_agent_metadata": {
                 "provider":     "Losbeto",
@@ -15190,7 +15209,7 @@ tr:hover td{background:var(--bg2)}
   <div class="feat">
     <div class="ic">🍒</div>
     <h3>Losbeto Alpha Score <span class="tag free">FREE</span></h3>
-    <p>Proprietary 0-100 composite index combining 4 factors (Fear&amp;Greed, Regime, Sentiment, Momentum). Free preview — full version at <code>/alpha-signal</code></p>
+    <p>Free 0-100 composite preview at <code>/losbeto-alpha</code>. The separate paid <code>/alpha-signal</code> product returns up to three high-confidence 1h/24h/7d momentum signals — not an AI recommendation or a composite score.</p>
   </div>
   <div class="feat">
     <div class="ic">🔗</div>
@@ -41791,7 +41810,7 @@ _ops_validate = _v4843_ops_validate
 
 _v4842_sanitize_governance()
 
-VERSION = "48.116.0-PHANTOMFIX"
+VERSION = "48.117.0-ALPHAGATE"
 
 
 import ipaddress as _ipaddr_w
@@ -43233,6 +43252,61 @@ def _v4109_deep_think_preflight():
              "ts": int(time.time())}, 503)
 
 
+def _v4117_alpha_payment_seen():
+    """Replay/pending precisa chegar ao reconciliador, nunca virar charged:false."""
+    sig = (request.headers.get("PAYMENT-SIGNATURE")
+           or request.headers.get("X-PAYMENT") or "").strip()
+    if not sig:
+        return False
+    try:
+        if LEDGER.replay_seen(hashlib.sha256(sig.encode()).hexdigest()):
+            return True
+    except Exception as e:
+        log.warning(f"pré-gate /alpha-signal: estado local do pagamento indisponível: {e}")
+        return None
+    try:
+        pdata = json.loads(base64.b64decode(sig).decode())
+        fp = _payment_fingerprint(pdata) if isinstance(pdata, dict) else ""
+    except Exception:
+        return False       # formato inválido é recusado pelo verificador, não é falha do DB
+    if not fp:
+        return False
+    try:
+        return bool(LEDGER.payment_fingerprint_lookup(fp) or LEDGER.pending_get(fp))
+    except Exception as e:
+        log.warning(f"pré-gate /alpha-signal: estado local do pagamento indisponível: {e}")
+        return None
+
+
+def _v4117_alpha_preflight():
+    """Valida o dataset e o congela neste request ANTES de verify/settlement."""
+    seen = _v4117_alpha_payment_seen()
+    if seen is None:
+        # Sem charged:false: um replay pode já ter liquidado. O reconciliador decide.
+        return ({"status": "unavailable", "error": "payment_state_unavailable",
+                 "new_payment_required": False, "retry_after_seconds": 30,
+                 "note": ("The local payment state could not be checked safely. Retry "
+                          "this same request and payment payload; do not create a new payment."),
+                 "provider": f"Losbeto/{VERSION}", "ts": int(time.time())}, 503)
+    if seen:
+        return None
+    top = Market.top_coins(20)
+    # A camada 48.113 admite no máximo 10% de itens recusados numa lista de 20.
+    if isinstance(top, list) and len(top) >= 18:
+        from flask import g as _g
+        _g.losbeto_alpha_preflight = [dict(c) for c in top[:20]]
+        return None
+    log.info("pré-gate /alpha-signal: dataset indisponível (top_20_valid_coins)")
+    return ({"status": "upstream_unavailable", "error": "required_market_data_unavailable",
+             "charged": False, "settlement_attempted": False,
+             "missing": ["top_20_valid_coins"],
+             "note": ("No settlement was attempted; the attached payment was not "
+                      "verified or captured. Retry with the same payment after the "
+                      "upstream recovers."),
+             "retry_after_seconds": 60, "provider": f"Losbeto/{VERSION}",
+             "ts": int(time.time())}, 503)
+
+
 def _v4108_holder_preflight():
     """Valida os cinco token accounts antes do settlement e reutiliza o snapshot.
 
@@ -44287,6 +44361,7 @@ def _v4111_watch_pregate(path, fn):
 _v4103_pyth_price_preflight = _v4111_watch_pregate("/pyth-price", _v4103_pyth_price_preflight)
 _v4107_analysis_preflight = _v4111_watch_pregate("/analise", _v4107_analysis_preflight)
 _v4109_deep_think_preflight = _v4111_watch_pregate("/deep-think", _v4109_deep_think_preflight)
+_v4117_alpha_preflight = _v4111_watch_pregate("/alpha-signal", _v4117_alpha_preflight)
 _v4108_holder_preflight = _v4111_watch_pregate("/holder-concentration", _v4108_holder_preflight)
 
 _OPS_ERROR_WATCH_4110 = _ops_error_watch
@@ -44599,7 +44674,7 @@ def _v4112_source_rejected(host):
 # produtos em que a lista de moedas da CoinGecko É o produto (sem ela sobra vazio/placeholder).
 # Compostos que degradam com elegância por desenho (/council, /thesis-engine…) ficam de fora.
 _V4112_CORE_PATHS = frozenset((
-    "/regime", "/sinais", "/arbitrage", "/cross-chain", "/sentiment", "/relatorio",
+    "/regime", "/sinais", "/alpha-signal", "/arbitrage", "/cross-chain", "/sentiment", "/relatorio",
     "/market-brief", "/analise", "/deep-think", "job:sentiment"))
 
 
@@ -46420,4 +46495,5 @@ if _NEXUS_TAIL_OK is False:
 # v48.114.0-WALLETRECOVERY: journal durável do crédito na carteira (reserva+débito numa transação, lease de 300 s, retomada pós-queda sem novo débito, entrega marcada no journal); marcador !core: protegido no helper raiz; lista top-50 parcial aceita para n menor | base: v48.113.0-WALLETPLAN
 # v48.115.0-STEADY: produtos de análise (/analise, /deep-think, /regime, /sentiment, /market-brief, /relatorio) usam a última lista top-50 validada (≤ 10 min, idade declarada em input_freshness) quando a CoinGecko responde 429 — fim das recusas nas rodadas de indexação; recusa antes do settle com pagamento anexado leva PAYMENT-RESPONSE {success:false, charged:false}; lista parcial guarda todos os válidos (cache de 60 s não envenena mais top 10/20); falha do warmer vira INFO e não conta como venda bloqueada; /weather recusado diz o motivo da sonda; evm_rpc e Telegram só alertam quando a falha persiste | base: v48.114.0-WALLETRECOVERY (GitHub 6c1a5ca)
 # v48.116.0-PHANTOMFIX: checkout Solana resolve window.phantom.solana + alias legado, inclusive injeção tardia; conecta pelo provider oficial e assina com o método legado exigido pelo x402; recusas de RPC/conta/saldo agora identificam a conta, informam que não houve assinatura e emitem pré-checagem; lista vazia de token accounts deixa de virar found=true | base: v48.115.0-STEADY
-# EOF-LOSBETO 48.116.0-PHANTOMFIX — fim do arquivo (se esta linha faltar, a copia foi cortada)
+# v48.117.0-ALPHAGATE: /alpha-signal valida top_coins(20) antes de verify/settle, reutiliza o snapshot no handler, deixa replay/pending para o reconciliador e entra no COREGUARD; descrição pública passa a refletir os sinais de momentum realmente entregues, sem prometer score/IA inexistentes | base: v48.116.0-PHANTOMFIX
+# EOF-LOSBETO 48.117.0-ALPHAGATE — fim do arquivo (se esta linha faltar, a copia foi cortada)
