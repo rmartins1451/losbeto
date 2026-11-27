@@ -1,7 +1,7 @@
 """
 Losbeto x402 — monolithic Flask service for Railway.
 
-Current release: 48.117.0-ALPHAGATE.
+Current release: 48.118.0-CLEARPATH.
 Payment requirements are server-side. Delivery requires verified settlement, or a
 verified authorization covered by the signing wallet's prepaid plan (48.113), with
 a durable debit/delivery journal for crash recovery (48.114); pending payments are
@@ -1461,6 +1461,24 @@ class LedgerV10:
         with self.lock, self._conn() as c:
             c.execute("INSERT OR REPLACE INTO cache(key,value,ts) VALUES(?,?,?)",
                       (key, json.dumps(value, default=str), int(time.time())))
+
+    def cache_claim(self, key: str, ttl: int) -> bool:
+        """Reserva uma janela uma única vez, inclusive entre processos Gunicorn.
+
+        O UPSERT condicional é uma única instrução SQLite: a inserção ou a
+        renovação de uma janela vencida e a verificação de conflito são
+        serializadas pelo próprio banco. Assim não existe a brecha de
+        cache_get() seguido de cache_set(), na qual vários workers podiam
+        decidir emitir o mesmo WARNING ao mesmo tempo.
+        """
+        now = int(time.time())
+        with self.lock, self._conn() as c:
+            cur = c.execute(
+                "INSERT INTO cache(key,value,ts) VALUES(?,?,?) "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value,ts=excluded.ts "
+                "WHERE cache.ts < ?",
+                (key, json.dumps(now), now, now - int(ttl)))
+            return cur.rowcount == 1
 
     def jwt_save(self, jti: str, payer: str, endpoint: str, tx_sig: str, ttl: int):
         with self.lock, self._conn() as c:
@@ -27870,7 +27888,7 @@ def _acp_ensure_agent():
     rc, out, err = _acp_run(["agent", "use", "--agent-id", agent_id,
                              "--json"], timeout=30)
     if rc == 0:
-        log.warning(f"🏪 ACP agent ativo: {agent_id}")
+        log.info(f"🏪 ACP agent ativo: {agent_id}")
         return agent_id
     log.error(f"🏪 agent use FALHOU rc={rc}: out={out[:200]} err={err[:300]}")
     rc2, out2, err2 = _acp_run(["agent", "list", "--json"], timeout=30)
@@ -28000,7 +28018,7 @@ def _acp_start_listener():
             ["acp", "events", "listen", "--output", _ACP_EVENTS_FILE,
              "--json"], env=_acp_env(),
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        log.warning("🏪 ACP listener de eventos ativo (Railway)")
+        log.info("🏪 ACP listener de eventos ativo (Railway)")
     except Exception as e:
         log.error(f"🏪 listener ACP falhou: {str(e)[:120]}")
 
@@ -28028,7 +28046,7 @@ def acp_railway_seller_loop():
         while not _acp_ensure_signer(agent_id):
             log.warning("🔗 signer expirou/falhou — link NOVO em 60s")
             time.sleep(60)
-        log.warning("🏪🏪 VENDEDOR ACP NO RAILWAY — ONLINE E ARMADO")
+        log.info("🏪🏪 VENDEDOR ACP NO RAILWAY — ONLINE E ARMADO")
     except Exception as e:
         log.error(f"🏪 bootstrap ACP: {str(e)[:150]}")
         return
@@ -32990,7 +33008,7 @@ __PIX_CARD__
 
 <div class="card" id="manualCard" style="border:1px dashed var(--dim)">
   <p style="margin:0 0 6px;font-size:14px;color:var(--dim)">
-    <b>Signature rejected (smart wallet) or wallet trouble?</b>
+    <b>Wallet did not open, or it cannot pay from this account?</b>
     Pay with a <b>plain USDC transfer</b> — no signature needed, works from
     Coinbase Smart Wallet, Binance Web3, passkey wallets, a Phantom send,
     even an exchange withdrawal:</p>
@@ -33126,7 +33144,10 @@ document.getElementById('qrImg').src =
 document.getElementById('dlMetamask').href  = 'https://metamask.app.link/dapp/' + bare;
 document.getElementById('dlCoinbase').href  = 'https://go.cb-w.com/dapp?cb_url=' + enc;
 document.getElementById('dlRainbow').href   = 'https://rnbwapp.com/dapp?url=' + enc;
-if (SOL_ACCEPT) document.getElementById('dlPhantom').href = 'https://phantom.com/ul/browse/' + enc;
+// v48.118.0: a doc da Phantom (phantom-deeplinks/other-methods/browse) exige ?ref=<URL do app>.
+const PAGE_ORIGIN = (String(PAGE_URL).match(/^https?:\/\/[^\/?#]+/) || [''])[0];
+if (SOL_ACCEPT) document.getElementById('dlPhantom').href = 'https://phantom.com/ul/browse/' + enc +
+                                                            '?ref=' + encodeURIComponent(PAGE_ORIGIN || PAGE_URL);
 else document.getElementById('dlPhantom').style.display = 'none';
 
 // v48.9.8: Phantom injeta window.ethereum E window.solana — mostrar os DOIS
@@ -33504,7 +33525,7 @@ async function paySolana(){
     if (!found){
       solPre('sol_no_ata', 'No USDC token account on Solana; no signature requested');
       setS('\u26a0 Phantom account ' + shortAddr(owner.toBase58()) + ' has no USDC token account on Solana. ' +
-           'No signature was requested and nothing was charged. Add USDC on Solana or select another account ' +
+           'Phantom was not opened (no signature requested) and nothing was charged. Add USDC on Solana or select another account ' +
            'in Phantom, then retry (or use the Base option above).', 'err');
       btnS.disabled = false; return;
     }
@@ -33513,7 +33534,7 @@ async function paySolana(){
                             '; no signature requested');
       setS('\u26a0 Phantom account ' + shortAddr(owner.toBase58()) + ' has ' + have.toFixed(4) +
            ' USDC on Solana; this payment needs ' + need.toFixed(4) +
-           '. No signature was requested and nothing was charged. Top up or select the account that holds ' +
+           '. Phantom was not opened (no signature requested) and nothing was charged. Top up or select the account that holds ' +
            'USDC on Solana in Phantom, then retry.', 'err');
       btnS.disabled = false; return;
     }
@@ -33719,10 +33740,16 @@ async function payByTransfer(w, from, pre){
     const check = pre || await preflightWallet(from, true);
     if(check && (check.insufficient || check.noGas)){
       preBeacon(check.insufficient ? 'no_usdc' : 'no_gas', check, from);
-      setStatus('Payment stopped before transfer: ' +
+      // v48.118.0: a carteira nao abre de proposito (a transferencia falharia); a tela diz isso.
+      setStatus('Payment stopped before the wallet opened: ' +
         (check.insufficient ? 'insufficient USDC on Base in ' + shortAddr(from) + '.' :
          'insufficient ETH on Base for the network fee in ' + shortAddr(from) + '.') +
-        ' No transaction was sent and no delivery was claimed. Top up or switch wallet, then retry.', 'err');
+        ' From this account the transfer would fail, so the wallet was not asked to send it.' +
+        ' No transaction was sent and no delivery was claimed. Top up or switch wallet, then retry.' +
+        ((!check.insufficient && (check.contract || check.delegated))
+          ? ' Fastest fix without ETH: switch to a regular account (not a smart account) that holds USDC on' +
+            ' Base — it pays by signature and the facilitator pays the network fee.'
+          : ''), 'err');
       btn.disabled = false;
       if(b) b.disabled = false;
       return;
@@ -33785,7 +33812,8 @@ async function payAndFetch(retried){
     const pre = await preflightWallet(from);
     if (pre && pre.insufficient){
       preBeacon('no_usdc', pre, from);
-      setStatus('Payment stopped before signature: insufficient USDC on Base in ' + shortAddr(from) + '. ' +
+      setStatus('Payment stopped before the wallet opened (no signature requested): insufficient USDC on Base in ' +
+                shortAddr(from) + '. ' +
                 (IS_CREDIT
                   ? 'Top up or switch to the regular EOA that holds your USDC, then tap Pay again. Plain USDC transfers cannot buy credit plans.'
                   : 'Top up, or switch to the account that holds your USDC and tap Pay again \u2014 or use the plain-transfer option below.'),'err');
@@ -33794,7 +33822,8 @@ async function payAndFetch(retried){
     }
     if (pre && pre.contract && IS_CREDIT){
       preBeacon('credit_7702', pre, from);
-      setStatus('Payment stopped before signature: credit plans require an EIP-3009 x402 authorization from a regular EOA. ' +
+      setStatus('Payment stopped before the wallet opened (no signature requested): credit plans require an ' +
+                'EIP-3009 x402 authorization from a regular EOA. ' +
                 'Switch to a regular MetaMask/Rabby account with USDC on Base and tap Pay again. ' +
                 'No signature was requested, no payment was sent, and plain USDC transfers cannot buy credit plans.', 'err');
       btn.disabled = false;
@@ -37334,7 +37363,7 @@ def _factory_reload(force=False):
                               "reason": why}
                 if p not in _V4895_FACTORY_WARNED:
                     _V4895_FACTORY_WARNED.add(p)
-                    log.warning(f"🏭 {p} fora do catálogo: {why}")
+                    log.info(f"🏭 {p} fora do catálogo: {why}")
         _V4896_FACTORY_RETIRED.clear()
         _V4896_FACTORY_RETIRED.update(retired)
         for p in list(_FACTORY["owned"]):
@@ -41120,7 +41149,7 @@ def _v4842_reconcile_cycle():
 
 
 def _v4842_reconcile_loop():
-    log.warning("💳 reconciliador v48.42 ativo — hash on-chain + retry da operação original")
+    log.info("💳 reconciliador v48.42 ativo — hash on-chain + retry da operação original")
     while True:
         try:
             _v4842_reconcile_cycle()
@@ -41186,7 +41215,7 @@ def _v4842_fc_skip_write():
 try:
     _v4842_fc_skip_write()
     if _FC_SKIP_LEGACY:
-        log.warning(f"🧠 Pyth skip legacy resetado: {len(_FC_SKIP_LEGACY)} exclusão(ões) "
+        log.info(f"🧠 Pyth skip legacy resetado: {len(_FC_SKIP_LEGACY)} exclusão(ões) "
                     "sem prova HTTP 400 não serão preservadas; CoinGecko segue fallback")
 except Exception as e:
     log.warning(f"Pyth skip migration: {e}")
@@ -41618,9 +41647,10 @@ def _v4843_pyth_latest(feed_ids):
                        else (named or eligible))
             until = time.time() + PYTH_ENTITLEMENT_BACKOFF_S
             _v4844_pyth_backoff_set(targets, until)
-            log.warning(f"🧠 Pyth auth/entitlement HTTP {r.status_code}; "
-                        f"backoff temporário para {len(targets)} feed(s), "
-                        f"NENHUM feed excluído: {body[:160]}")
+            (globals().get("_v4118_pyth_ent_log") or log.warning)(   # v48.118.0: 1 WARNING/dia
+                f"🧠 Pyth auth/entitlement HTTP {r.status_code}; "
+                f"backoff temporário para {len(targets)} feed(s), "
+                f"NENHUM feed excluído: {body[:160]}")
         else:
             log.warning(f"🧠 Pyth HTTP {r.status_code} ids={len(eligible)}: {body[:180]}")
         raise RuntimeError(f"pyth HTTP {r.status_code}: {body[:160]}")
@@ -41810,7 +41840,7 @@ _ops_validate = _v4843_ops_validate
 
 _v4842_sanitize_governance()
 
-VERSION = "48.117.0-ALPHAGATE"
+VERSION = "48.118.0-CLEARPATH"
 
 
 import ipaddress as _ipaddr_w
@@ -43933,7 +43963,7 @@ def api_pay_event_v4104():
         line = (f"{ep} · pré-checagem do /pay · carteira {wallet} · conta {acct} · gás {gas} · "
                 f"{who or '—'} · motivo {code or '—'}\n{msg[:140] or '—'}\n"
                 f"Nenhuma transação foi enviada e nada foi cobrado.")
-        log.warning("🧾 checkout parado na pré-checagem do /pay: " + line.replace("\n", " · "))
+        log.info("🧾 checkout parado na pré-checagem do /pay: " + line.replace("\n", " · "))   # v48.118.0
         _v4112_precheck_tg(line, who, code)   # v48.112.0: mesma carteira+motivo, 1 aviso/6 h
         return ("", 204)
     line = (f"{ep} · etapa {stage} · carteira {wallet} · conta {acct} · gás {gas} · "
@@ -45632,9 +45662,14 @@ def _v4113_wallet_cover(endpoint, payload, req, vdata, fingerprint):
         _tk = "wcov_tg:" + hashlib.sha256(str(key).encode()).hexdigest()[:16]
         if LEDGER.cache_get(_tk, 86400) is None:
             LEDGER.cache_set(_tk, int(time.time()))
-            _v4104_tg_async(f"🎟️ Plano em uso sem mudar o cliente: {plan} da carteira "
-                            f"{payer[:6]}…{payer[-4:]} cobriu {endpoint} (${cost:.4f}); restam "
-                            f"{_left}. Nada liquidado nesta chamada — a receita entrou na compra.")
+            if str(plan) == "refund" or str(kind) == "refund_credit":   # v48.118.0
+                _v4104_tg_async(f"↩️ Crédito de estorno antigo em uso (não é falha nova): a carteira "
+                                f"{payer[:6]}…{payer[-4:]} usou crédito de uma chamada já estornada para "
+                                f"{endpoint} (${cost:.4f}); restam {_left}. Nada liquidado nesta chamada.")
+            else:
+                _v4104_tg_async(f"🎟️ Plano em uso sem mudar o cliente: {plan} da carteira "
+                                f"{payer[:6]}…{payer[-4:]} cobriu {endpoint} (${cost:.4f}); restam "
+                                f"{_left}. Nada liquidado nesta chamada — a receita entrou na compra.")
     except Exception:
         pass
     return True, "wallet-credit", info
@@ -46460,6 +46495,214 @@ def _v4115_weather_why() -> str:
     return ""
 
 
+# ============================================================================
+# v48.118.0-CLEARPATH — camada (auditoria de 26/nov sobre a 48.117 em produção)
+#  1. Pagamento assinado recusado antes do settle (verify, requisito, rede) deixa UMA linha INFO
+#     com endpoint, rede, pagador e motivo. Antes, recusas "invalid_exact_*" não deixavam rastro
+#     nenhum no log: o /pulse da rodada Base de 26/nov (settled_uncertain no indexador) ficou sem
+#     explicação do lado do nó. Payload ilegível (lixo de scanner) continua sem linha.
+#  2. Radar de demanda: permutações de sufixo de fuzzer (/<x>/x402, /402, /pay, /paid, /data,
+#     /api, /api/x402, /weather), /__debug__/ e painéis de hospedagem (whm, cpanel, webmail) são
+#     sonda — eram 19 dos 20 alertas "DEMANDA DETECTADA" do Telegram em 26/nov.
+#  3. /help e /pay (índice) gratuitos: pedidos de 5 e 7 IPs em 7 dias que terminavam em 404.
+#  4. Pyth 403 de entitlement: 1 WARNING por dia entre todos os workers; repetições em INFO.
+# ============================================================================
+_V4118_VERIFY_PREV = _verify_payment
+_V4118_REJ = {"seen": {}, "hour": 0, "n": 0}
+_V4118_REJ_QUIET_S = 600
+_V4118_REJ_MAX_PER_HOUR = 20
+_V4118_EVM_ADDR = re.compile(r"^0x[0-9a-fA-F]{40}$")
+
+
+def _v4118_rejected_meta(header):
+    """(rede, pagador) de um X-PAYMENT legível; None para lixo/sonda sem payload de pagamento."""
+    try:
+        raw = base64.b64decode(str(header or "").strip() + "===")
+        pdata = json.loads(raw.decode("utf-8"))
+    except Exception:
+        return None
+    if not isinstance(pdata, dict):
+        return None
+    acc = pdata.get("accepted") if isinstance(pdata.get("accepted"), dict) else {}
+    net = str(pdata.get("network") or acc.get("network") or "")[:32]
+    inner = pdata.get("payload") if isinstance(pdata.get("payload"), dict) else {}
+    if not net or not inner:
+        return None
+    auth = inner.get("authorization") if isinstance(inner.get("authorization"), dict) else {}
+    payer = str(auth.get("from") or "")
+    if _V4118_EVM_ADDR.match(payer):
+        return {"net": net, "payer": payer.lower()}
+    tx = inner.get("transaction")
+    if isinstance(tx, str) and len(tx) >= 120:
+        return {"net": net, "payer": ""}
+    return None
+
+
+def _v4118_note_rejected(endpoint, header, reason):
+    meta = _v4118_rejected_meta(header)
+    if meta is None:
+        return False
+    now = time.time()
+    hour = int(now // 3600)
+    st = _V4118_REJ
+    if st["hour"] != hour:
+        st["hour"], st["n"] = hour, 0
+    who = meta["payer"]
+    if not who:
+        try:
+            who = "ip:" + ((request.headers.get("X-Forwarded-For") or request.remote_addr or "")
+                           .split(",")[0].strip())[:40]
+        except Exception:
+            who = "?"
+    rs = str(reason or "rejected")
+    key = (who, rs[:60])
+    if now - float(st["seen"].get(key, 0.0)) < _V4118_REJ_QUIET_S or st["n"] >= _V4118_REJ_MAX_PER_HOUR:
+        return False
+    st["seen"][key] = now
+    st["n"] += 1
+    if len(st["seen"]) > 2000:
+        st["seen"].clear()
+    short = (f"{meta['payer'][:6]}…{meta['payer'][-4:]}" if meta["payer"] else "não declarado")
+    log.info(f"💳 pagamento recusado antes do settle: {endpoint} · {meta['net'] or '?'} · "
+             f"pagador {short} · motivo {rs[:160]} — nada cobrado; o cliente recebeu 402 "
+             f"(mesma carteira+motivo: 1 linha a cada {_V4118_REJ_QUIET_S // 60} min)")
+    return True
+
+
+def _verify_payment(endpoint, payment_header):  # noqa: F811 — camada 48.118.0
+    ok, reason, info = _V4118_VERIFY_PREV(endpoint, payment_header)
+    if not ok:
+        try:
+            if not (isinstance(info, dict) and (info.get("verify_throttled")
+                                                or info.get("settlement_pending")
+                                                or info.get("settlement_seen"))):
+                _v4118_note_rejected(endpoint, payment_header, reason)
+        except Exception as e:
+            log.debug(f"rastro de pagamento recusado: {e}")
+    return ok, reason, info
+
+
+_V4118_SCAN_PREV = _is_scan_noise
+_V4118_FUZZ_SUFFIX = re.compile(
+    r"^/[^/]+/(?:x402|402|pay|paid|data|api|api/x402|weather)/?$", re.I)
+_V4118_SCAN_MORE = re.compile(r"(?:^|/)__debug__(?:/|$)|(?:^|/)(?:whm|cpanel|webmail)(?:/|$)", re.I)
+
+
+def _v4118_is_scan_noise(path):
+    p = str(path or "")
+    return bool(_V4118_SCAN_PREV(p) or _V4118_FUZZ_SUFFIX.search(p) or _V4118_SCAN_MORE.search(p))
+
+
+_is_scan_noise = _v4118_is_scan_noise
+
+
+def _v4118_pyth_ent_log(msg):
+    """1 WARNING por janela de 24 h (todos os workers); o resto em INFO."""
+    try:
+        if LEDGER.cache_claim("pyth:entitlement:warned", 86400):
+            log.warning(msg + " — próximo aviso igual em 24 h (repetições em INFO)")
+            return
+    except Exception:
+        pass
+    log.info(msg)
+
+
+def _v4118_checkout_list(limit=40):
+    base = _public_base()
+    seen, out = set(), []
+    for p in list(FEATURED_ENDPOINTS) + sorted(BASE_PRICES, key=lambda x: get_dynamic_price(x)):
+        if p in seen or p not in BASE_PRICES or p in CREDIT_PLANS:
+            continue
+        seen.add(p)
+        try:
+            if not _sellable_now(p):
+                continue
+            out.append({"endpoint": p, "price_usd": round(float(get_dynamic_price(p)), 6),
+                        "pay_url": f"{base}/pay{p}",
+                        "about": (ENDPOINT_DESC.get(p, "") or "")[:140]})
+        except Exception:
+            continue
+        if len(out) >= limit:
+            break
+    return out
+
+
+def _v4118_wants_html():
+    acc = (request.headers.get("Accept") or "").lower()
+    return "text/html" in acc and "application/json" not in acc
+
+
+def _v4118_help_payload():
+    base = _public_base()
+    return {
+        "service": SERVICE_NAME, "version": VERSION, "free": True,
+        "what": ("Pay-per-call market data, Brazil macro and AI tools for agents over x402 "
+                 "(USDC on Base, Solana, Algorand and Polygon). No account, no API key needed."),
+        "start_free": {"tasting_menu": f"{base}/try",
+                       "previews": f"{base}/<endpoint>?preview=1 (where free_preview is advertised)",
+                       "catalog": f"{base}/x402-resources", "openapi": f"{base}/openapi.json",
+                       "llms_txt": f"{base}/llms.txt", "mcp": f"{base}/mcp"},
+        "how_to_pay": {
+            "x402": ("GET the endpoint -> HTTP 402 with PAYMENT-REQUIRED (accepts[]) -> retry the same "
+                     "request with PAYMENT-SIGNATURE (or X-PAYMENT) -> 200 with a PAYMENT-RESPONSE receipt."),
+            "refused_before_settlement": ("A 4xx/5xx with charged:false and PAYMENT-RESPONSE "
+                                          "{success:false} means nothing was charged; retry later."),
+            "browser_checkout": f"{base}/pay (index) or {base}/pay/<endpoint>",
+            "plain_transfer": ("Send the exact USDC amount to the payTo address, then POST the tx hash to "
+                               f"{base}/api/claim-transfer (works for smart wallets and exchanges)."),
+        },
+        "plans": {"compare": f"{base}/plans", "credits": f"{base}/buy-credits",
+                  "same_wallet": ("A plan is bound to the paying wallet: later x402 payments from that wallet "
+                                  "are verified and debited from credit instead of settled on-chain.")},
+        "status": {"health": f"{base}/health", "providers": f"{base}/health/providers",
+                   "receipts": f"{base}/receipts"},
+        "checkout_index": f"{base}/pay",
+    }
+
+
+@app.route("/help")
+def _v4118_help():
+    body = _v4118_help_payload()
+    if _v4118_wants_html():
+        from html import escape as _e
+        rows = "".join(f'<li><a href="{_e(v)}">{_e(k)}</a></li>' for k, v in
+                       list(body["start_free"].items()) + list(body["plans"].items())[:2]
+                       + list(body["status"].items()) if str(v).startswith("http"))
+        page = ("<!doctype html><html lang=en><head><meta charset=utf-8>"
+                "<meta name=viewport content='width=device-width,initial-scale=1'>"
+                f"<title>Help — {_e(SERVICE_NAME)}</title></head>"
+                "<body style='font:15px/1.6 system-ui,sans-serif;max-width:680px;margin:24px auto;padding:0 16px'>"
+                f"<h1>{_e(SERVICE_NAME)} — help</h1><p>{_e(body['what'])}</p>"
+                f"<p><b>Pay:</b> {_e(body['how_to_pay']['x402'])}</p>"
+                f"<p><a href='{_e(body['checkout_index'])}'>Browser checkout for every endpoint</a></p>"
+                f"<ul>{rows}</ul><p>{_e(body['plans']['same_wallet'])}</p></body></html>")
+        return Response(page, mimetype="text/html")
+    return jsonify(body)
+
+
+@app.route("/pay")
+def _v4118_pay_index():
+    items = _v4118_checkout_list()
+    base = _public_base()
+    if _v4118_wants_html():
+        from html import escape as _e
+        rows = "".join(
+            f"<tr><td><a href='{_e(it['pay_url'])}'>{_e(it['endpoint'])}</a></td>"
+            f"<td style='text-align:right'>${it['price_usd']:.4f}</td><td>{_e(it['about'])}</td></tr>"
+            for it in items)
+        page = ("<!doctype html><html lang=en><head><meta charset=utf-8>"
+                "<meta name=viewport content='width=device-width,initial-scale=1'>"
+                f"<title>Checkout — {_e(SERVICE_NAME)}</title></head>"
+                "<body style='font:15px/1.6 system-ui,sans-serif;max-width:900px;margin:24px auto;padding:0 16px'>"
+                f"<h1>Pay per call</h1><p>One tap with a browser wallet (USDC on Base or Solana). "
+                f"Plans: <a href='{base}/plans'>{base}/plans</a> · help: <a href='{base}/help'>{base}/help</a></p>"
+                f"<table style='border-collapse:collapse;width:100%'>{rows}</table></body></html>")
+        return Response(page, mimetype="text/html")
+    return jsonify({"checkout": items, "count": len(items), "plans": f"{base}/plans",
+                    "help": f"{base}/help", "free": True,
+                    "note": "Each pay_url opens a one-tap browser checkout for that endpoint."})
+
+
 def _v4885_tail_check(path=None):
     """True: a última linha é o marcador. False: arquivo cortado. None: não deu para ler."""
     try:
@@ -46496,4 +46739,5 @@ if _NEXUS_TAIL_OK is False:
 # v48.115.0-STEADY: produtos de análise (/analise, /deep-think, /regime, /sentiment, /market-brief, /relatorio) usam a última lista top-50 validada (≤ 10 min, idade declarada em input_freshness) quando a CoinGecko responde 429 — fim das recusas nas rodadas de indexação; recusa antes do settle com pagamento anexado leva PAYMENT-RESPONSE {success:false, charged:false}; lista parcial guarda todos os válidos (cache de 60 s não envenena mais top 10/20); falha do warmer vira INFO e não conta como venda bloqueada; /weather recusado diz o motivo da sonda; evm_rpc e Telegram só alertam quando a falha persiste | base: v48.114.0-WALLETRECOVERY (GitHub 6c1a5ca)
 # v48.116.0-PHANTOMFIX: checkout Solana resolve window.phantom.solana + alias legado, inclusive injeção tardia; conecta pelo provider oficial e assina com o método legado exigido pelo x402; recusas de RPC/conta/saldo agora identificam a conta, informam que não houve assinatura e emitem pré-checagem; lista vazia de token accounts deixa de virar found=true | base: v48.115.0-STEADY
 # v48.117.0-ALPHAGATE: /alpha-signal valida top_coins(20) antes de verify/settle, reutiliza o snapshot no handler, deixa replay/pending para o reconciliador e entra no COREGUARD; descrição pública passa a refletir os sinais de momentum realmente entregues, sem prometer score/IA inexistentes | base: v48.116.0-PHANTOMFIX
-# EOF-LOSBETO 48.117.0-ALPHAGATE — fim do arquivo (se esta linha faltar, a copia foi cortada)
+# v48.118.0-CLEARPATH: /pay diz quando e por que a carteira não abriu (e o caminho sem ETH para conta inteligente), link da Phantom com ?ref= exigido pela documentação; pagamento assinado recusado antes do settle deixa 1 linha INFO com endpoint, rede, pagador e motivo; parada no pré-check, faixas de boot e 403 repetido da Pyth deixam de ser WARNING; radar ignora permutações de sufixo de fuzzer; /help e /pay (índice) gratuitos; Telegram distingue crédito de estorno antigo | base: v48.117.0-ALPHAGATE (GitHub 90d9911)
+# EOF-LOSBETO 48.118.0-CLEARPATH — fim do arquivo (se esta linha faltar, a copia foi cortada)
