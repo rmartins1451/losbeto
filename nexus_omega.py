@@ -1,7 +1,7 @@
 """
 Losbeto x402 — monolithic Flask service for Railway.
 
-Current release: 48.118.0-CLEARPATH.
+Current release: 48.119.0-CHAINPROOF.
 Payment requirements are server-side. Delivery requires verified settlement, or a
 verified authorization covered by the signing wallet's prepaid plan (48.113), with
 a durable debit/delivery journal for crash recovery (48.114); pending payments are
@@ -13843,14 +13843,20 @@ _CLAIM_RL: Dict[str, list] = {}
 def _base_rpc_call(method: str, params: list, timeout: int = 10):
     last = None
     for url in _BASE_RPCS[:4]:
+        host = urllib.parse.urlparse(str(url)).hostname or "?"
         try:
             r = requests.post(url, json={"jsonrpc": "2.0", "id": 1,
                                          "method": method,
                                          "params": params}, timeout=timeout)
+            # HTTP de erro nunca é prova, mesmo se o corpo trouxer "result".
+            if not (200 <= r.status_code < 300):
+                last = RuntimeError(f"{host}: HTTP {r.status_code}")
+                continue
             j = r.json()
-            if isinstance(j, dict) and not j.get("error"):
+            if isinstance(j, dict) and "result" in j and not j.get("error"):
                 return j.get("result")
-            last = RuntimeError(str((j or {}).get("error"))[:120])
+            err = (j.get("error") if isinstance(j, dict) else None) or "invalid-json-rpc-envelope"
+            last = RuntimeError(f"{host}: {str(err)[:120]}")
         except Exception as e:
             last = e
     raise last or RuntimeError("base rpc indisponivel")
@@ -13940,7 +13946,11 @@ def _evm_receipt_verify(txh: str, requirement: dict, min_confirmations: int = 0,
                 "received_usd": got / 1_000_000, "block_number": bn,
                 "block_time": block_time}
     except Exception as e:
-        log.warning(f"evm receipt {network} {txh[:18]}: {e}")
+        _w4119 = globals().get("_v4119_rpc_warn")      # v48.119.0: 1 WARNING/15 min, sem URL
+        if _w4119:
+            _w4119(network, txh, e)
+        else:
+            log.warning(f"evm receipt {network} {txh[:18]}: {e}")
         return False, "rpc-error", {}
 
 
@@ -26772,11 +26782,12 @@ async function reload(){
     ["⛓️ Chains",(j.chains||["solana"]).map(c=>({"eip155:8453":"Base","eip155:137":"Polygon","eip155:42161":"Arbitrum"}[c])||c.split(":")[0].replace(/^./,x=>x.toUpperCase())).join(" · "),"ativas",""],
     ["📈 Trust Score",trustActive ? "ATIVO" : "BOOTSTRAP", j.stats.paid_24h+" tx (24h)",trustActive?"green":"amber"],
     ["🌐 Endpoints",j.endpoints,"monetizados",""],
-    ["🧯 Falhas (24h)",(j.failures_24h?(j.failures_24h.delivery_failed+j.failures_24h.refunded+j.failures_24h.checkout_error):"—"),
+    ["🧯 Falhas (24h)",(j.failures_24h?(j.failures_24h.delivery_failed+j.failures_24h.refunded+j.failures_24h.checkout_error+(j.failures_24h.pending_open||0)):"—"),
        (j.failures_24h?("sem estorno "+j.failures_24h.delivery_failed+" · estornadas "+j.failures_24h.refunded+
         " · checkout no navegador "+j.failures_24h.checkout_error+
+        (j.failures_24h.pending_open?(" · pagos aguardando prova on-chain "+j.failures_24h.pending_open):"")+
         (j.failures_24h.checkout_precheck?(" · parados no pré-check (saldo/gás do comprador) "+j.failures_24h.checkout_precheck):"")):"—"),
-       ((j.failures_24h&&j.failures_24h.delivery_failed>0)?"amber":"")],
+       ((j.failures_24h&&(j.failures_24h.delivery_failed>0||j.failures_24h.pending_open>0))?"amber":"")],
   ];
   document.getElementById("cards").innerHTML = cards.map(c =>
     `<div class="card ${c[3]==='hero'?'hero':''}"><h3>${c[0]}</h3><div class="v ${c[3]==='green'?'green':c[3]==='amber'?'amber':''}">${c[1]}</div><div class="sub">${c[2]}</div></div>`
@@ -39941,7 +39952,8 @@ def _v4835_replay_delivered():
             row = LEDGER.cache_get("dlv:" + h, _DELIVER_TTL_S)
             if row:
                 hit = (row["ts"], row["fp"], row["status"], row["body"], row["mime"], row["hdr"])
-        if not hit or now - hit[0] > _DELIVER_TTL_S or hit[1] != _deliver_fp():
+        if (not hit or now - hit[0] > _DELIVER_TTL_S or hit[1] != _deliver_fp()
+                or int(hit[2] or 0) == 202):       # v48.119.0: 202 antigo no cache não é entrega
             return None
         # Fecha a janela rara: cache da entrega commitado e queda antes do journal.
         try:
@@ -39974,7 +39986,8 @@ _DELIVER_HDRS = ("PAYMENT-RESPONSE", "X-PAYMENT-RESPONSE", "Payment-Receipt", "X
 def _v4835_store_delivered(resp):
     try:
         if (request.method not in ("GET", "POST") or request.path not in BASE_PRICES
-                or not (200 <= resp.status_code < 300) or "PAYMENT-RESPONSE" not in resp.headers):
+                or not (200 <= resp.status_code < 300) or "PAYMENT-RESPONSE" not in resp.headers
+                or resp.status_code == 202):        # v48.119.0: 202 settlement_pending não é entrega
             return resp
         if resp.direct_passthrough:
             _mark_wc = globals().get("_v4114_wc_mark_current_delivered")
@@ -40596,16 +40609,22 @@ def _v4842_pending_due(self, limit=12):
     return [r[0] for r in rows]
 
 
-def _v4842_pending_claim(self, fingerprint, owner, lease_s=60):
+def _v4842_pending_claim(self, fingerprint, owner, lease_s=60, due_only=False):
     now = int(time.time())
     with self.lock:
         c = self._conn()
         try:
             c.execute("BEGIN IMMEDIATE")
-            cur = c.execute("""UPDATE pending_settlements
+            # O reconciliador revalida next_attempt dentro da transação: outro worker
+            # pode ter liberado backoff depois que o snapshot de pending_due foi lido.
+            # O retry interativo conserva o comportamento anterior (due_only=False).
+            due = "next_attempt<=? AND " if due_only else ""
+            params = ((now + int(lease_s), owner, now, fingerprint)
+                      + ((now,) if due_only else ()) + (now,))
+            cur = c.execute(f"""UPDATE pending_settlements
                 SET lease_until=?,lease_owner=?,attempts=attempts+1,last_attempt=?
-                WHERE fingerprint=? AND lease_until<? AND state NOT IN ('needs_review','resolved')""",
-                (now + int(lease_s), owner, now, fingerprint, now))
+                WHERE fingerprint=? AND {due}lease_until<?
+                AND state NOT IN ('needs_review','resolved')""", params)
             c.commit()
             return cur.rowcount == 1
         except Exception:
@@ -40998,11 +41017,12 @@ def _v4842_facilitator_for(pending):
     return None
 
 
-def _v4842_retry_original_settle(pending, allow_plan_delivery):
+def _v4842_retry_original_settle(pending, allow_plan_delivery, due_only=False):
     fp = pending["fingerprint"]
     owner = f"{os.getpid()}:{threading.get_ident()}:{secrets.token_hex(4)}"
     try:
-        if not LEDGER.pending_claim(fp, owner, lease_s=max(60, int(FAC_SETTLE_TIMEOUT) + 20)):
+        if not LEDGER.pending_claim(fp, owner, lease_s=max(60, int(FAC_SETTLE_TIMEOUT) + 20),
+                                    due_only=due_only):
             current = LEDGER.pending_get(fp) or pending
             return _v4842_pending_response(current, "operation-in-flight")
     except Exception as e:
@@ -41135,7 +41155,7 @@ def _v4842_reconcile_cycle():
             if pending.get("tx"):
                 _v4842_reconcile_known(pending, allow_plan_delivery=False)
             elif pending.get("payload") and pending.get("facilitator"):
-                _v4842_retry_original_settle(pending, allow_plan_delivery=False)
+                _v4842_retry_original_settle(pending, allow_plan_delivery=False, due_only=True)
             else:
                 LEDGER.pending_release(fp, "legacy operation lacks facilitator/payload",
                                        "legacy_incomplete", retry_s=3600)
@@ -41840,7 +41860,7 @@ _ops_validate = _v4843_ops_validate
 
 _v4842_sanitize_governance()
 
-VERSION = "48.118.0-CLEARPATH"
+VERSION = "48.119.0-CHAINPROOF"
 
 
 import ipaddress as _ipaddr_w
@@ -44009,6 +44029,7 @@ def _v4104_daily_lines(stats: dict) -> str:
                 f"{stats.get('paid_24h', 0)} settlements\n"
                 f"📈 Orgânico acumulado: ${tot['organic_usdc']:.4f} em {tot['organic_tx']} tx\n"
                 f"🧯 Falhas 24h: {f['delivery_failed']} pagas sem estorno · {f['refunded']} estornadas · "
+                f"{f.get('pending_open', 0)} pagos aguardando prova on-chain · "
                 f"{f['checkout_error']} no checkout do navegador · "
                 f"{f.get('checkout_precheck', 0)} parados no pré-check do /pay (saldo/gás do comprador) · "
                 f"{f['upstream_truth_since_boot']} chamadas com todas as fontes fora (neste worker, desde o boot)")
@@ -46703,6 +46724,242 @@ def _v4118_pay_index():
                     "note": "Each pay_url opens a one-tap browser checkout for that endpoint."})
 
 
+# ============================================================================
+# v48.119.0-CHAINPROOF — camada (auditoria de 27/nov sobre a 48.118 em produção)
+#  1. Polygon: os dois RPCs padrão (polygon-rpc.com e rpc.ankr.com/polygon) passaram a exigir
+#     chave da Ankr ("Keyless public access has been deprecated"). Toda prova on-chain de
+#     pagamento na Polygon falhava com "Unauthorized": o facilitador liquidava, o nó não
+#     conseguia provar e respondia 202 settlement_pending para sempre — 2 compras de
+#     /chain-block pagas e não entregues em 27/nov. Agora: POLYGON_RPC/ARBITRUM_RPC (lista
+#     separada por vírgula) primeiro e depois RPCs públicos sem chave da documentação oficial
+#     (dRPC, PublicNode, 1RPC, Tenderly; Arbitrum: arb1, dRPC, PublicNode). URL que responde
+#     401/403/"API key" sai da rotação por 1 h.
+#  2. Reconciliador: o ciclo em segundo plano chamava a reconciliação sem pending_claim, então
+#     `attempts` nunca subia e o intervalo ficava em 2 s — 396 tentativas e 1.581 WARNING em
+#     53 min para 2 pagamentos. Agora reserva o pendente (attempts+1) e o intervalo cresce
+#     2→4→8…→256 s; o WARNING do RPC sai 1 vez a cada 15 min por rede+erro (resto em DEBUG).
+#  3. Pago e ainda sem entrega há 10 min: 1 alerta no Telegram por pagamento; "Falhas (24h)",
+#     painel e relatório diário passam a contar "pagos aguardando prova on-chain".
+#  4. Mensagem de erro de RPC sai sem URL/caminho: uma chave em POLYGON_RPC não vaza no log.
+#  5. Cache de entrega (48.35) não guarda nem serve o 202 settlement_pending (edição na própria
+#     função): antes, o "retry com o mesmo payload" recebia o 202 do cache por 15 min.
+# ============================================================================
+_V4119_EVM_RPC_ORIG = _evm_rpc_call                   # versões anteriores, guardadas p/ diagnóstico
+_V4119_RECONCILE_CYCLE_ORIG = _v4842_reconcile_cycle
+_V4119_EVM_DEFAULTS = {
+    "polygon": ("https://polygon.drpc.org", "https://polygon-bor-rpc.publicnode.com",
+                "https://tenderly.rpc.polygon.community"),
+    "arbitrum": ("https://arb1.arbitrum.io/rpc", "https://arbitrum.drpc.org",
+                 "https://arbitrum-one-rpc.publicnode.com"),
+}
+# Quarentena por processo: o SQLite compartilhado deduplica os WARNINGs entre workers.
+_V4119_RPC_DEAD = {}
+_V4119_RPC_LAST = {}
+_V4119_RPC_DEAD_S = 3600
+_V4119_AUTH_HINTS = ("unauthorized", "api key", "apikey", "authenticate", "forbidden")
+
+
+def _v4119_host(url):
+    try:
+        return urllib.parse.urlparse(str(url)).hostname or "?"
+    except Exception:
+        return "?"
+
+
+def _v4119_redact(text):
+    """Mantém só scheme+host: userinfo, caminho e query podem conter segredos."""
+    s = str(text or "")
+
+    def safe_url(match):
+        try:
+            parsed = urllib.parse.urlsplit(match.group(0))
+            host = parsed.hostname or "?"
+            return f"{parsed.scheme.lower()}://{host}/…"
+        except Exception:
+            return "https://…/…"
+
+    s = re.sub(r"https?://[^\s'\"<>]+", safe_url, s, flags=re.I)
+    s = re.sub(r"(\burl:\s*)\S+", r"\1…", s, flags=re.I)
+    s = re.sub(r"([?&](?:key|apikey|api_key|token)=)[^&\s'\"]+", r"\1…", s, flags=re.I)
+    return s
+
+
+def _v4119_rpc_urls(chain):
+    env = "POLYGON_RPC" if chain == "polygon" else "ARBITRUM_RPC"
+    conf = [u.strip() for u in os.environ.get(env, "").split(",") if u.strip().startswith("https://")]
+    out = []
+    for u in conf + list(_V4119_EVM_DEFAULTS.get(chain, ())):
+        if u not in out:
+            out.append(u)
+    return out
+
+
+def _evm_rpc_call(network: str, method: str, params: list, timeout: int = 10):  # noqa: F811 — 48.119.0
+    if _canonical_network(network) == BASE_CAIP2.lower():
+        return _base_rpc_call(method, params, timeout=timeout)
+    chain = _chain_for_network(network)
+    urls = _v4119_rpc_urls(chain)
+    now = time.time()
+    live = [u for u in urls if float(_V4119_RPC_DEAD.get(u, 0)) <= now]
+    if not live:
+        # Não reativar todos imediatamente: isso repetiria a rajada de 401/403.
+        # A mensagem segura preserva a deduplicação sem reter traceback/frames com URLs.
+        previous = _V4119_RPC_LAST.get(chain)
+        if previous:
+            raise RuntimeError(previous)
+        reason = "todos os RPCs em quarentena temporaria" if urls else "nenhum RPC HTTPS configurado"
+        raise RuntimeError(f"{chain}: {reason}")
+    last = None
+    for url in live:
+        host = _v4119_host(url)
+        try:
+            r = requests.post(url, json={"jsonrpc": "2.0", "id": 1, "method": method,
+                                         "params": params}, timeout=timeout)
+            if r.status_code in (401, 403):
+                _V4119_RPC_DEAD[url] = now + _V4119_RPC_DEAD_S
+                last = RuntimeError(f"{host}: HTTP {r.status_code} (exige chave)")
+                continue
+            if not (200 <= r.status_code < 300):
+                last = RuntimeError(f"{host}: HTTP {r.status_code}")
+                continue
+            j = r.json()
+            # result:null é válido (ex.: receipt ainda inexistente); ausência de result não é.
+            if isinstance(j, dict) and "result" in j and not j.get("error"):
+                return j.get("result")
+            err_obj = (j.get("error") if isinstance(j, dict) else None) or "invalid-json-rpc-envelope"
+            err = str(err_obj)[:200]
+            if any(h in err.lower() for h in _V4119_AUTH_HINTS):
+                _V4119_RPC_DEAD[url] = now + _V4119_RPC_DEAD_S
+            last = RuntimeError(f"{host}: {_v4119_redact(err)[:160]}")
+        except Exception as e:
+            last = RuntimeError(f"{host}: {type(e).__name__}: {_v4119_redact(e)[:160]}")
+    if last is not None:
+        _V4119_RPC_LAST[chain] = str(last)
+    raise last or RuntimeError("evm rpc indisponivel")
+
+
+def _v4119_rpc_warn(network, txh, err):
+    msg = _v4119_redact(err)[:220]
+    first = True
+    try:
+        first = LEDGER.cache_claim(f"rpcwarn:{network}:{msg[:80]}", 900)
+    except Exception:
+        pass
+    if first:
+        log.warning(f"evm receipt {network} {str(txh)[:18]}: {msg} — repetições iguais nos próximos "
+                    f"15 min ficam em DEBUG; o pagamento fica pendente e é reconciliado sozinho")
+    else:
+        log.debug(f"evm receipt {network} {str(txh)[:18]}: {msg}")
+
+
+_V4119_ALERT_AFTER_S = int(os.environ.get("PENDING_ALERT_AFTER_S", "600"))
+
+
+def _v4119_pending_watch(pending, out):
+    """Pago e sem entrega há 10 min: um alerta; falha real de Telegram permite retry."""
+    try:
+        if not isinstance(out, tuple) or out[0] or "settlement-pending" not in str(out[1]):
+            return False
+        age = time.time() - float(pending.get("ts") or time.time())
+        if age < _V4119_ALERT_AFTER_S:
+            return False
+        fp = str(pending.get("fingerprint") or "")
+        if not fp:
+            return False
+        req = pending.get("requirement") or {}
+        chain = _chain_for_network(req.get("network", ""))
+        why = str(out[1]).split(":", 1)[-1]
+        hint = {"polygon": "POLYGON_RPC", "arbitrum": "ARBITRUM_RPC", "base": "BASE_RPC"}.get(chain, "RPC")
+        txt = (f"💳 PAGO, AINDA SEM ENTREGA há {int(age // 60)} min: {pending.get('endpoint')} · {chain} · "
+               f"tx {str(pending.get('tx') or '')[:18]} · motivo {why}. O nó tenta de novo sozinho "
+               f"(intervalo crescente até ~4 min) e o comprador recebe 202 'retry same payload'. "
+               + (f"rpc-error = RPC da rede fora: confira {hint} (aceita lista por vírgula)."
+                  if why == "rpc-error" else ""))
+        key = f"pending:alert:{fp}"
+        if not LEDGER.cache_claim(key, 30 * 86400):
+            return False
+        log.warning(txt)
+        try:
+            sent = _notify_telegram(txt)
+        except Exception:
+            sent = False
+        if sent is False and TG_TOKEN and TG_CHAT:
+            # O envio não aconteceu: liberar a marca para a próxima reconciliação.
+            # Sem Telegram configurado, o WARNING local continua sendo o alerta único.
+            try:
+                with LEDGER.lock, LEDGER._conn() as c:
+                    c.execute("DELETE FROM cache WHERE key=?", (key,))
+            except Exception as e:
+                log.debug(f"nao foi possivel reabrir alerta de pendente: {e}")
+            return False
+        return True
+    except Exception as e:
+        log.debug(f"alerta de pendente: {e}")
+        return False
+
+
+def _v4119_reconcile_lease(pending):
+    """Cobre 4 polls × 2 RPCs × N URLs × 10 s; evita lease vencido durante a prova."""
+    req = pending.get("requirement") or {}
+    chain = _chain_for_network(req.get("network", ""))
+    if chain == "base":
+        url_count = len(_BASE_RPCS[:4])
+    elif chain in ("polygon", "arbitrum"):
+        url_count = len(_v4119_rpc_urls(chain))
+    else:
+        return 90
+    return max(90, max(1, url_count) * 2 * 4 * 10 + 20)
+
+
+def _v4842_reconcile_cycle():  # noqa: F811 — camada 48.119.0: reserva (attempts+1) antes de tentar
+    processed = 0
+    owner = f"{os.getpid()}:{threading.get_ident()}:reconcile"
+    for fp in LEDGER.pending_due(limit=12):
+        pending = LEDGER.pending_get(fp)
+        if not pending:
+            continue
+        processed += 1
+        try:
+            if pending.get("tx"):
+                if not LEDGER.pending_claim(fp, owner, lease_s=_v4119_reconcile_lease(pending),
+                                            due_only=True):
+                    continue
+                pending = LEDGER.pending_get(fp) or pending
+                out = _v4842_reconcile_known(pending, allow_plan_delivery=False)
+                _v4119_pending_watch(pending, out)
+            elif pending.get("payload") and pending.get("facilitator"):
+                _v4842_retry_original_settle(pending, allow_plan_delivery=False, due_only=True)
+            else:
+                LEDGER.pending_release(fp, "legacy operation lacks facilitator/payload",
+                                       "legacy_incomplete", retry_s=3600)
+        except Exception as e:
+            log.error(f"reconcile {pending.get('endpoint')} fp={fp[:12]}: {str(e)[:160]}")
+            try:
+                LEDGER.pending_release(fp, f"reconcile-error:{e}", "pending")
+            except Exception:
+                pass
+    return processed
+
+
+_V4119_FAIL_PREV = _v4104_failures_24h
+
+
+def _v4104_failures_24h() -> dict:  # noqa: F811 — camada 48.119.0: + pagos aguardando prova
+    out = dict(_V4119_FAIL_PREV())
+    try:
+        now = int(time.time())
+        with LEDGER._conn() as c:
+            r = c.execute("SELECT COUNT(*) FROM pending_settlements WHERE "
+                          "ts>=? AND TRIM(COALESCE(tx_sig,''))<>'' AND "
+                          "COALESCE(state,'pending')<>'resolved'",
+                          (now - 86400,)).fetchone()
+        # needs_review e planos aguardando entrega continuam visíveis: ainda são pagos abertos.
+        out["pending_open"] = int((r or [0])[0] or 0)
+    except Exception:
+        out.setdefault("pending_open", 0)
+    return out
+
+
 def _v4885_tail_check(path=None):
     """True: a última linha é o marcador. False: arquivo cortado. None: não deu para ler."""
     try:
@@ -46740,4 +46997,5 @@ if _NEXUS_TAIL_OK is False:
 # v48.116.0-PHANTOMFIX: checkout Solana resolve window.phantom.solana + alias legado, inclusive injeção tardia; conecta pelo provider oficial e assina com o método legado exigido pelo x402; recusas de RPC/conta/saldo agora identificam a conta, informam que não houve assinatura e emitem pré-checagem; lista vazia de token accounts deixa de virar found=true | base: v48.115.0-STEADY
 # v48.117.0-ALPHAGATE: /alpha-signal valida top_coins(20) antes de verify/settle, reutiliza o snapshot no handler, deixa replay/pending para o reconciliador e entra no COREGUARD; descrição pública passa a refletir os sinais de momentum realmente entregues, sem prometer score/IA inexistentes | base: v48.116.0-PHANTOMFIX
 # v48.118.0-CLEARPATH: /pay diz quando e por que a carteira não abriu (e o caminho sem ETH para conta inteligente), link da Phantom com ?ref= exigido pela documentação; pagamento assinado recusado antes do settle deixa 1 linha INFO com endpoint, rede, pagador e motivo; parada no pré-check, faixas de boot e 403 repetido da Pyth deixam de ser WARNING; radar ignora permutações de sufixo de fuzzer; /help e /pay (índice) gratuitos; Telegram distingue crédito de estorno antigo | base: v48.117.0-ALPHAGATE (GitHub 90d9911)
-# EOF-LOSBETO 48.118.0-CLEARPATH — fim do arquivo (se esta linha faltar, a copia foi cortada)
+# v48.119.0-CHAINPROOF: prova on-chain da Polygon volta a funcionar (polygon-rpc.com e rpc.ankr.com passaram a exigir chave; RPCs públicos sem chave da documentação oficial + POLYGON_RPC/ARBITRUM_RPC em lista); reconciliador com intervalo crescente de verdade (reserva o pendente, attempts sobe; antes 2 s fixos = 1.581 WARNING/53 min); pago e sem entrega há 10 min gera 1 alerta e entra em "Falhas (24h)" e no relatório diário; 202 settlement_pending deixa de ir para o cache de entrega (o retry com o mesmo payload volta a entregar); erro de RPC sem URL no log | base: v48.118.0-CLEARPATH (GitHub de9685c)
+# EOF-LOSBETO 48.119.0-CHAINPROOF — fim do arquivo (se esta linha faltar, a copia foi cortada)
